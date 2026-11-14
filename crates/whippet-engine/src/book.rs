@@ -5,15 +5,15 @@
 //! Structure:
 //! - contiguous array price ladder indexed by tick,
 //! - occupancy bitmap per side for O(1)-ish best-price search,
+//! - cached best bid/ask indices so the common lookup is a single field read,
 //! - intrusive doubly linked FIFO per level over a preallocated order arena,
-//! - open-addressed-ish `HashMap` index from order id to arena slot.
+//! - open-addressed `FxHashMap` index from order id to arena slot.
 //!
-//! The book never reads the wall clock, never iterates a `HashMap` in a
-//! decision path, and never allocates once constructed (apart from the
-//! `HashMap` index growing if the arena capacity is misconfigured).
+//! The book never reads the wall clock, never iterates a hash map in a
+//! decision path, and never allocates once constructed (the arena, free list,
+//! and order-id index are all preallocated to the configured capacity).
 
-use std::collections::HashMap;
-
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use whippet_core::config::InstrumentConfig;
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Symbol};
@@ -118,7 +118,12 @@ pub struct Book {
     ask_bitmap: Vec<u64>,
     slots: Vec<Slot>,
     free: Vec<u32>,
-    index: HashMap<OrderId, u32>,
+    index: FxHashMap<OrderId, u32>,
+    /// Cached best occupied ladder indices. `None` means that side is empty.
+    /// Kept in sync by `insert` and `unlink`; the bitmap is the fallback when
+    /// the cached level empties.
+    best_bid_idx: Option<usize>,
+    best_ask_idx: Option<usize>,
     order_count: usize,
     last_trade_price: Price,
     last_trade_qty: Qty,
@@ -145,7 +150,9 @@ impl Book {
             ask_bitmap: vec![0; words],
             slots,
             free,
-            index: HashMap::with_capacity(config.max_orders),
+            index: FxHashMap::with_capacity_and_hasher(config.max_orders, Default::default()),
+            best_bid_idx: None,
+            best_ask_idx: None,
             order_count: 0,
             last_trade_price: Price::ZERO,
             last_trade_qty: Qty::ZERO,
@@ -220,6 +227,7 @@ impl Book {
             return Err(BookError::InvalidQty(qty.0));
         }
         let price_idx = self.price_index(price)?;
+        let was_empty = self.levels(side)[price_idx].orders == 0;
         if self.levels(side)[price_idx]
             .qty
             .checked_add(qty.0)
@@ -265,8 +273,12 @@ impl Book {
         level.qty = level.qty.saturating_add(qty.0);
         level.orders += 1;
         self.set_bit(side, price_idx);
+        if was_empty && self.is_better_best(side, price_idx) {
+            self.set_best(side, Some(price_idx));
+        }
         self.index.insert(order_id, slot_index);
         self.order_count += 1;
+        debug_assert_eq!(self.best_index(side), self.bitmap_best_index(side));
         Ok(slot_index)
     }
 
@@ -358,6 +370,17 @@ impl Book {
                 Side::Sell => &mut self.ask_bitmap,
             };
             bitmap[word] &= !(1u64 << bit);
+            let was_best = match side {
+                Side::Buy => self.best_bid_idx == Some(price_idx),
+                Side::Sell => self.best_ask_idx == Some(price_idx),
+            };
+            if was_best {
+                // The removed level was the cached best. The next occupied
+                // level in matching order is the new best; `next_index` only
+                // scans the current bitmap word and upward/downward as needed.
+                let recomputed = self.next_index(side, price_idx);
+                self.set_best(side, recomputed);
+            }
         }
 
         self.index.remove(&slot.order_id);
@@ -366,6 +389,7 @@ impl Book {
         self.slots[index as usize].prev = NONE;
         self.free.push(index);
         self.order_count = self.order_count.saturating_sub(1);
+        debug_assert_eq!(self.best_index(side), self.bitmap_best_index(side));
     }
 
     /// Reduce a resting order by `fill`. Returns `true` when it was fully
@@ -397,6 +421,30 @@ impl Book {
     }
 
     pub(crate) fn best_index(&self, side: Side) -> Option<usize> {
+        match side {
+            Side::Buy => self.best_bid_idx,
+            Side::Sell => self.best_ask_idx,
+        }
+    }
+
+    fn set_best(&mut self, side: Side, index: Option<usize>) {
+        match side {
+            Side::Buy => self.best_bid_idx = index,
+            Side::Sell => self.best_ask_idx = index,
+        }
+    }
+
+    /// True when `price_idx` is a better price than the cached best, or the
+    /// side is currently empty.
+    fn is_better_best(&self, side: Side, price_idx: usize) -> bool {
+        match side {
+            Side::Buy => self.best_bid_idx.is_none_or(|best| price_idx > best),
+            Side::Sell => self.best_ask_idx.is_none_or(|best| price_idx < best),
+        }
+    }
+
+    /// Slow path: scan the occupancy bitmap from the top of the ladder.
+    fn bitmap_best_index(&self, side: Side) -> Option<usize> {
         match side {
             Side::Buy => {
                 for (word_index, word) in self.bid_bitmap.iter().enumerate().rev() {
@@ -881,5 +929,213 @@ mod tests {
         assert_eq!(book.executable_qty(Side::Sell, Price(102)), 30);
         assert_eq!(book.executable_qty(Side::Sell, Price(103)), 60);
         assert_eq!(book.executable_qty(Side::Sell, Price(100)), 0);
+    }
+
+    fn add(book: &mut Book, id: u128, side: Side, price: i64, qty: u64) {
+        book.insert(
+            OrderId(id),
+            ParticipantId(1),
+            side,
+            Price(price),
+            Qty(qty),
+            id as u64,
+        )
+        .expect("insert");
+    }
+
+    #[test]
+    fn best_cache_tracks_better_and_worse_inserts() {
+        let mut book = Book::new(&config());
+        assert_eq!(book.best_bid(), None);
+        assert_eq!(book.best_ask(), None);
+
+        add(&mut book, 1, Side::Buy, 100, 1);
+        assert_eq!(book.best_bid(), Some(Price(100)));
+        add(&mut book, 2, Side::Buy, 105, 1);
+        assert_eq!(book.best_bid(), Some(Price(105)), "better bid must win");
+        add(&mut book, 3, Side::Buy, 102, 1);
+        assert_eq!(
+            book.best_bid(),
+            Some(Price(105)),
+            "worse bid must not move the cache"
+        );
+        add(&mut book, 4, Side::Buy, 105, 1);
+        assert_eq!(
+            book.best_bid(),
+            Some(Price(105)),
+            "adding to the cached level keeps it best"
+        );
+
+        add(&mut book, 5, Side::Sell, 110, 1);
+        assert_eq!(book.best_ask(), Some(Price(110)));
+        add(&mut book, 6, Side::Sell, 108, 1);
+        assert_eq!(book.best_ask(), Some(Price(108)), "better ask must win");
+        add(&mut book, 7, Side::Sell, 109, 1);
+        assert_eq!(
+            book.best_ask(),
+            Some(Price(108)),
+            "worse ask must not move the cache"
+        );
+        add(&mut book, 8, Side::Sell, 108, 1);
+        assert_eq!(
+            book.best_ask(),
+            Some(Price(108)),
+            "adding to the cached level keeps it best"
+        );
+    }
+
+    #[test]
+    fn cancelling_the_best_level_recomputes_the_cache() {
+        let mut book = Book::new(&config());
+        add(&mut book, 1, Side::Buy, 100, 5);
+        add(&mut book, 2, Side::Buy, 103, 5);
+        add(&mut book, 3, Side::Buy, 101, 5);
+        add(&mut book, 4, Side::Buy, 103, 5);
+        add(&mut book, 5, Side::Sell, 110, 5);
+        add(&mut book, 6, Side::Sell, 108, 5);
+        add(&mut book, 7, Side::Sell, 109, 5);
+        add(&mut book, 8, Side::Sell, 108, 5);
+
+        // Two orders at the best bid; removing one keeps the level.
+        book.cancel(OrderId(2), None).expect("cancel");
+        assert_eq!(book.best_bid(), Some(Price(103)));
+        book.cancel(OrderId(4), None).expect("cancel");
+        assert_eq!(
+            book.best_bid(),
+            Some(Price(101)),
+            "emptying the best level falls back to the bitmap"
+        );
+        book.cancel(OrderId(3), None).expect("cancel");
+        assert_eq!(book.best_bid(), Some(Price(100)));
+
+        // A cancel below the best must not disturb the cache.
+        book.cancel(OrderId(1), None).expect("cancel");
+        assert_eq!(book.best_bid(), None);
+
+        book.cancel(OrderId(6), None).expect("cancel");
+        assert_eq!(book.best_ask(), Some(Price(108)));
+        book.cancel(OrderId(8), None).expect("cancel");
+        assert_eq!(book.best_ask(), Some(Price(109)));
+        book.cancel(OrderId(7), None).expect("cancel");
+        assert_eq!(book.best_ask(), Some(Price(110)));
+        book.cancel(OrderId(5), None).expect("cancel");
+        assert_eq!(book.best_ask(), None);
+        assert!(book.is_empty());
+    }
+
+    #[test]
+    fn filling_the_best_level_recomputes_the_cache() {
+        let mut book = Book::new(&config());
+        let first = book
+            .insert(
+                OrderId(1),
+                ParticipantId(1),
+                Side::Sell,
+                Price(105),
+                Qty(10),
+                1,
+            )
+            .unwrap();
+        let second = book
+            .insert(
+                OrderId(2),
+                ParticipantId(1),
+                Side::Sell,
+                Price(106),
+                Qty(10),
+                2,
+            )
+            .unwrap();
+        assert_eq!(book.best_ask(), Some(Price(105)));
+
+        assert!(!book.reduce(first, Qty(4)));
+        assert_eq!(book.best_ask(), Some(Price(105)));
+        assert!(book.reduce(first, Qty(6)));
+        assert_eq!(
+            book.best_ask(),
+            Some(Price(106)),
+            "filling the best order moves the cache down a level"
+        );
+
+        assert!(book.reduce(second, Qty(10)));
+        assert_eq!(book.best_ask(), None);
+    }
+
+    #[test]
+    fn best_cache_handles_bitmap_word_boundaries() {
+        // The ladder starts at tick 100, so prices 100/163/164/165 map to
+        // indices 0/63/64/65: the first bit of the first word and the last,
+        // first, and second bits across a word boundary.
+        let mut book = Book::new(&config());
+        add(&mut book, 1, Side::Buy, 100, 1); // index 0
+        add(&mut book, 2, Side::Buy, 163, 1); // index 63
+        add(&mut book, 3, Side::Buy, 164, 1); // index 64
+        add(&mut book, 4, Side::Buy, 165, 1); // index 65
+        assert_eq!(book.best_bid(), Some(Price(165)));
+        book.cancel(OrderId(4), None).unwrap();
+        assert_eq!(book.best_bid(), Some(Price(164)));
+        book.cancel(OrderId(3), None).unwrap();
+        assert_eq!(book.best_bid(), Some(Price(163)));
+        book.cancel(OrderId(2), None).unwrap();
+        assert_eq!(book.best_bid(), Some(Price(100)));
+        book.cancel(OrderId(1), None).unwrap();
+        assert_eq!(book.best_bid(), None);
+
+        add(&mut book, 5, Side::Sell, 165, 1); // index 65
+        add(&mut book, 6, Side::Sell, 164, 1); // index 64
+        add(&mut book, 7, Side::Sell, 163, 1); // index 63
+        add(&mut book, 8, Side::Sell, 100, 1); // index 0
+        assert_eq!(book.best_ask(), Some(Price(100)));
+        book.cancel(OrderId(8), None).unwrap();
+        assert_eq!(book.best_ask(), Some(Price(163)));
+        book.cancel(OrderId(7), None).unwrap();
+        assert_eq!(book.best_ask(), Some(Price(164)));
+        book.cancel(OrderId(6), None).unwrap();
+        assert_eq!(book.best_ask(), Some(Price(165)));
+        book.cancel(OrderId(5), None).unwrap();
+        assert_eq!(book.best_ask(), None);
+    }
+
+    #[test]
+    fn snapshot_restore_rebuilds_the_best_cache() {
+        let mut book = Book::new(&config());
+        add(&mut book, 1, Side::Buy, 100, 5);
+        add(&mut book, 2, Side::Buy, 104, 5);
+        add(&mut book, 3, Side::Sell, 108, 5);
+        add(&mut book, 4, Side::Sell, 110, 5);
+
+        let mut restored = Book::from_snapshot(&config(), book.snapshot()).expect("restore");
+        assert_eq!(restored.best_bid(), Some(Price(104)));
+        assert_eq!(restored.best_ask(), Some(Price(108)));
+        assert_eq!(restored.order_count(), book.order_count());
+
+        // The restored cache must keep tracking removals.
+        restored.cancel(OrderId(2), None).expect("cancel best bid");
+        assert_eq!(restored.best_bid(), Some(Price(100)));
+        restored.cancel(OrderId(3), None).expect("cancel best ask");
+        assert_eq!(restored.best_ask(), Some(Price(110)));
+    }
+
+    #[test]
+    fn derived_views_use_the_cached_best() {
+        let mut book = Book::new(&config());
+        add(&mut book, 1, Side::Buy, 100, 5);
+        add(&mut book, 2, Side::Buy, 104, 7);
+        add(&mut book, 3, Side::Sell, 108, 11);
+        add(&mut book, 4, Side::Sell, 110, 13);
+
+        let (bids, asks) = book.snapshot_levels(2);
+        assert_eq!(bids[0].price, Price(104));
+        assert_eq!(asks[0].price, Price(108));
+        assert_eq!(book.executable_qty(Side::Sell, Price(108)), 11);
+        assert_eq!(book.executable_qty(Side::Buy, Price(104)), 7);
+
+        book.cancel(OrderId(2), None).unwrap();
+        book.cancel(OrderId(3), None).unwrap();
+        let (bids, asks) = book.snapshot_levels(2);
+        assert_eq!(bids[0].price, Price(100));
+        assert_eq!(asks[0].price, Price(110));
+        assert_eq!(book.executable_qty(Side::Sell, Price(108)), 0);
+        assert_eq!(book.executable_qty(Side::Buy, Price(100)), 5);
     }
 }

@@ -7,8 +7,7 @@
 //! vectors are reused by the caller). Every output carries the input offset
 //! that caused it, so replay can be verified against a state hash.
 
-use std::collections::HashMap;
-
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use whippet_core::config::{ExchangeConfig, InstrumentConfig};
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Seq, Symbol};
@@ -41,6 +40,11 @@ pub struct EngineOutput {
     pub executions: Vec<ExecutionReport>,
     pub md: Vec<MdEvent>,
     pub snapshots: Vec<MdSnapshot>,
+    /// True when this command landed on the engine-state persistence interval.
+    /// The node uses it to save `snapshot_state`; the engine does not emit a
+    /// full market-data snapshot for this cadence. Market-data snapshots are
+    /// published separately on `snapshots`.
+    pub state_snapshot_due: bool,
 }
 
 impl EngineOutput {
@@ -49,6 +53,7 @@ impl EngineOutput {
             executions: Vec::with_capacity(executions),
             md: Vec::with_capacity(md),
             snapshots: Vec::new(),
+            state_snapshot_due: false,
         }
     }
 
@@ -56,6 +61,7 @@ impl EngineOutput {
         self.executions.clear();
         self.md.clear();
         self.snapshots.clear();
+        self.state_snapshot_due = false;
     }
 }
 
@@ -89,7 +95,11 @@ pub struct SymbolEngine {
     last_ts_ns: u64,
     commands: u64,
     halted: bool,
+    /// How often the node should persist engine state (book + dedup). This
+    /// does not emit a market-data snapshot.
     snapshot_every: u64,
+    /// How often a full market-data snapshot is emitted on `EngineOutput`.
+    md_snapshot_every: u64,
 }
 
 impl SymbolEngine {
@@ -107,6 +117,7 @@ impl SymbolEngine {
             commands: 0,
             halted: false,
             snapshot_every: 10_000,
+            md_snapshot_every: 100_000,
         }
     }
 
@@ -117,6 +128,15 @@ impl SymbolEngine {
 
     pub fn set_snapshot_interval(&mut self, every: u64) {
         self.snapshot_every = every.max(1);
+    }
+
+    pub fn with_md_snapshot_interval(mut self, every: u64) -> Self {
+        self.md_snapshot_every = every.max(1);
+        self
+    }
+
+    pub fn set_md_snapshot_interval(&mut self, every: u64) {
+        self.md_snapshot_every = every.max(1);
     }
 
     pub fn config(&self) -> &InstrumentConfig {
@@ -162,7 +182,9 @@ impl SymbolEngine {
             CommandKind::NewOrder => self.process_new_order(command, out),
         }
 
-        if self.snapshot_every > 0 && self.commands.is_multiple_of(self.snapshot_every) {
+        out.state_snapshot_due =
+            self.snapshot_every > 0 && self.commands.is_multiple_of(self.snapshot_every);
+        if self.md_snapshot_every > 0 && self.commands.is_multiple_of(self.md_snapshot_every) {
             out.snapshots.push(self.snapshot());
         }
     }
@@ -673,6 +695,7 @@ impl SymbolEngine {
             commands: snapshot.commands,
             halted: snapshot.halted,
             snapshot_every: 10_000,
+            md_snapshot_every: 100_000,
         };
         let actual = engine.state_hash();
         if actual != snapshot.state_hash {
@@ -697,12 +720,12 @@ impl SymbolEngine {
 
 pub struct ShardEngine {
     shard_id: u32,
-    engines: HashMap<Symbol, SymbolEngine>,
+    engines: FxHashMap<Symbol, SymbolEngine>,
 }
 
 impl ShardEngine {
     pub fn new(shard_id: u32, exchange: &ExchangeConfig) -> Self {
-        let mut engines = HashMap::new();
+        let mut engines = FxHashMap::default();
         for instrument in &exchange.instruments {
             if instrument.symbol.partition(exchange.partitions) == shard_id {
                 engines.insert(instrument.symbol, SymbolEngine::new(instrument.clone()));
@@ -726,6 +749,12 @@ impl ShardEngine {
     pub fn set_snapshot_interval(&mut self, every: u64) {
         for engine in self.engines.values_mut() {
             engine.set_snapshot_interval(every);
+        }
+    }
+
+    pub fn set_md_snapshot_interval(&mut self, every: u64) {
+        for engine in self.engines.values_mut() {
+            engine.set_md_snapshot_interval(every);
         }
     }
 
@@ -796,7 +825,7 @@ impl ShardEngine {
                 snapshot.shard_id, found, expected
             )));
         }
-        let mut engines = HashMap::new();
+        let mut engines = FxHashMap::default();
         for symbol_snapshot in snapshot.symbols {
             let expected_shard = symbol_snapshot.symbol.partition(exchange.partitions);
             if expected_shard != snapshot.shard_id {
@@ -825,14 +854,13 @@ impl ShardEngine {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"whippet-shard-v1");
         hasher.update(&self.shard_id.to_le_bytes());
-        let mut snapshots: Vec<_> = self
-            .engines
-            .values()
-            .map(SymbolEngine::snapshot_state)
-            .collect();
-        snapshots.sort_unstable_by_key(|snapshot| snapshot.symbol);
-        for snapshot in snapshots {
-            hasher.update(&snapshot.state_hash);
+        // Hash each symbol engine directly instead of materializing full
+        // snapshots. Symbol order is canonical (sorted), so the bytes match the
+        // previous snapshot-based computation exactly.
+        let mut engines: Vec<_> = self.engines.iter().collect();
+        engines.sort_unstable_by_key(|(symbol, _)| **symbol);
+        for (_, engine) in engines {
+            hasher.update(&engine.state_hash());
         }
         *hasher.finalize().as_bytes()
     }
@@ -1125,6 +1153,150 @@ mod tests {
         let restored = SymbolEngine::from_snapshot(config(), snapshot).unwrap();
         assert_eq!(restored.state_hash(), engine.state_hash());
         assert_eq!(restored.book().best_ask(), engine.book().best_ask());
+    }
+
+    #[test]
+    fn state_and_md_snapshot_intervals_are_independent() {
+        let mut engine = SymbolEngine::new(config())
+            .with_snapshot_interval(10)
+            .with_md_snapshot_interval(100);
+        let mut out = EngineOutput::with_capacity(8, 8);
+        let mut state_due_at = Vec::new();
+        let mut md_snapshot_at = Vec::new();
+
+        for offset in 0..100u64 {
+            out.clear();
+            engine.process(
+                &limit(Side::Buy, 100, 1, u128::from(offset) + 1, 1),
+                offset,
+                &mut out,
+            );
+            if out.state_snapshot_due {
+                state_due_at.push(engine.commands());
+            }
+            if !out.snapshots.is_empty() {
+                assert_eq!(out.snapshots.len(), 1, "one MD snapshot per due command");
+                md_snapshot_at.push(engine.commands());
+            }
+        }
+
+        assert_eq!(
+            state_due_at,
+            (1..=10).map(|n| n * 10).collect::<Vec<u64>>(),
+            "state persistence is due every ten commands"
+        );
+        assert_eq!(
+            md_snapshot_at,
+            vec![100],
+            "market-data snapshots follow the separate, slower interval"
+        );
+    }
+
+    #[test]
+    fn md_snapshot_interval_setters_do_not_touch_state_interval() {
+        let mut engine = SymbolEngine::new(config());
+        engine.set_snapshot_interval(1_000);
+        engine.set_md_snapshot_interval(3);
+        let mut out = EngineOutput::with_capacity(8, 8);
+        let mut state_due = 0usize;
+        let mut md_snapshots = 0usize;
+
+        for offset in 0..6u64 {
+            out.clear();
+            engine.process(
+                &limit(Side::Buy, 100, 1, u128::from(offset) + 1, 1),
+                offset,
+                &mut out,
+            );
+            state_due += usize::from(out.state_snapshot_due);
+            md_snapshots += out.snapshots.len();
+        }
+
+        assert_eq!(state_due, 0, "state interval of 1000 was not reached");
+        assert_eq!(md_snapshots, 2, "MD snapshots at commands 3 and 6");
+    }
+
+    #[test]
+    fn snapshot_intervals_do_not_affect_state_hash() {
+        let commands = [
+            limit(Side::Sell, 105, 10, 1, 1),
+            limit(Side::Buy, 100, 7, 2, 2),
+            limit(Side::Buy, 105, 3, 3, 3),
+            limit(Side::Sell, 104, 4, 4, 4),
+        ];
+        let mut eager = SymbolEngine::new(config())
+            .with_snapshot_interval(1)
+            .with_md_snapshot_interval(1);
+        let mut lazy = SymbolEngine::new(config())
+            .with_snapshot_interval(u64::MAX)
+            .with_md_snapshot_interval(u64::MAX);
+        let mut out = EngineOutput::with_capacity(8, 8);
+        for (offset, command) in commands.iter().enumerate() {
+            eager.process(command, offset as u64, &mut out);
+            out.clear();
+            lazy.process(command, offset as u64, &mut out);
+            out.clear();
+        }
+        assert_eq!(eager.state_hash(), lazy.state_hash());
+    }
+
+    #[test]
+    fn shard_state_hash_matches_sorted_symbol_hashes() {
+        let mut eth_config = config();
+        eth_config.symbol = Symbol::new("ETH-USD").unwrap();
+        let exchange = ExchangeConfig {
+            venue: "test".into(),
+            partitions: 2,
+            mode: whippet_core::config::Mode::Durable,
+            instruments: vec![config(), eth_config],
+        };
+        let btc = symbol();
+        let eth = Symbol::new("ETH-USD").unwrap();
+        let shard = btc.partition(exchange.partitions);
+        assert_eq!(
+            shard,
+            eth.partition(exchange.partitions),
+            "this test needs both symbols on the same shard"
+        );
+
+        let mut engine = ShardEngine::new(shard, &exchange);
+        let mut out = EngineOutput::with_capacity(8, 8);
+        let commands = [
+            (btc, Side::Buy, 100i64),
+            (eth, Side::Sell, 101),
+            (btc, Side::Sell, 102),
+            (eth, Side::Buy, 99),
+        ];
+        for (offset, (sym, side, price)) in commands.into_iter().enumerate() {
+            let command = Command::new_order(
+                sym,
+                side,
+                OrderType::Limit,
+                Price(price),
+                Qty(5),
+                OrderId(offset as u128 + 1),
+                ParticipantId(1),
+                offset as u64,
+            );
+            engine.process(&command, offset as u64, &mut out).unwrap();
+            out.clear();
+        }
+
+        // The shard hash must be exactly the sorted per-symbol state hashes.
+        let mut symbols: Vec<Symbol> = engine.symbols().collect();
+        symbols.sort_unstable();
+        let mut expected = blake3::Hasher::new();
+        expected.update(b"whippet-shard-v1");
+        expected.update(&shard.to_le_bytes());
+        for sym in symbols {
+            let state_hash = engine
+                .engine(sym)
+                .expect("symbol engine")
+                .snapshot_state()
+                .state_hash;
+            expected.update(&state_hash);
+        }
+        assert_eq!(engine.state_hash(), *expected.finalize().as_bytes());
     }
 
     #[test]

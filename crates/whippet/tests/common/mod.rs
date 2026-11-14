@@ -54,6 +54,9 @@ impl TestNode {
             snapshot_every: 10_000,
             dashboard_dir: tempdir.path().join("dashboard"),
             build: "test".into(),
+            api_token: None,
+            api_participant: "api".into(),
+            rate_limit_per_sec: 0,
         };
         let journal = Arc::new(Journal::memory());
         let hub = MdHub::new(

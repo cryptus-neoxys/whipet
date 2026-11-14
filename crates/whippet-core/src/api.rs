@@ -34,6 +34,28 @@ fn default_order_type() -> OrderType {
     OrderType::Limit
 }
 
+/// Iggy 0.10's default `message_bus.max_batch`; the gateway and bench use the
+/// same cap so a batch is one append, not a silent split.
+pub const MAX_BATCH_ORDERS: usize = 256;
+
+/// Batch ingress request. Phase 1 requires one symbol per batch so the gateway
+/// can make exactly one Iggy append; mixed-symbol batches are rejected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchOrderRequest {
+    pub orders: Vec<OrderRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchOrderAck {
+    pub partition: u32,
+    pub base_offset: u64,
+    pub count: u32,
+    pub mode: Mode,
+    pub durable_ack_ms: f64,
+    /// One ack per input order, with offsets `base_offset + i`.
+    pub orders: Vec<OrderAck>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelRequest {
     pub symbol: Symbol,
@@ -173,6 +195,9 @@ pub struct HealthView {
     pub version: String,
     pub uptime_s: u64,
     pub partitions: u32,
+    /// True when ingress requires a bearer token. False means order submission
+    /// and cancel are anonymous; that is a demo posture, not a safe default.
+    pub auth_required: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,6 +240,17 @@ mod tests {
         let json = r#"{"symbol":"BTC-USD","side":"buy","price_cents":6500000,"qty":10}"#;
         let request: OrderRequest = serde_json::from_str(json).unwrap();
         assert_eq!(request.order_type, OrderType::Limit);
+    }
+
+    #[test]
+    fn batch_order_request_round_trips() {
+        let json = r#"{"orders":[
+            {"symbol":"BTC-USD","side":"buy","price_cents":6500000,"qty":10},
+            {"symbol":"BTC-USD","side":"sell","price_cents":6500100,"qty":4}
+        ]}"#;
+        let request: BatchOrderRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.orders.len(), 2);
+        assert_eq!(request.orders[0].symbol.as_str(), "BTC-USD");
     }
 
     #[test]

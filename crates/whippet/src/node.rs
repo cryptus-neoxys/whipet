@@ -1,10 +1,12 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use axum::serve::ListenerExt;
 use tokio::sync::watch;
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -93,17 +95,32 @@ pub async fn run(args: NodeArgs) -> Result<()> {
     let app = gateway::router(Arc::clone(&ctx));
     let listener = tokio::net::TcpListener::bind(config.http_addr)
         .await
-        .with_context(|| format!("binding {}", config.http_addr))?;
+        .with_context(|| format!("binding {}", config.http_addr))?
+        .tap_io(|stream| {
+            // Small request/response frames on the order path: do not let
+            // Nagle/delayed-ACK add latency.
+            let _ = stream.set_nodelay(true);
+        });
     info!(
         address = %config.http_addr,
         dashboard = %config.dashboard_dir.display(),
+        auth_required = config.auth_required(),
+        rate_limit_per_sec = config.rate_limit_per_sec,
         "HTTP API and dashboard listening"
     );
+    if !config.auth_required() {
+        warn!(
+            "order ingress is anonymous; set WHIPPET_API_TOKEN before exposing this node to another host"
+        );
+    }
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("serving HTTP")?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("serving HTTP")?;
 
     info!("shutdown requested; flushing snapshots");
     let _ = ctx.shutdown.send(true);

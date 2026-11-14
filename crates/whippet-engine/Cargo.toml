@@ -11,10 +11,16 @@ repository.workspace = true
 [dependencies]
 bincode.workspace = true
 blake3.workspace = true
+rustc-hash.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 whippet-core.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 proptest.workspace = true
 whippet-testkit.workspace = true
+
+[[bench]]
+name = "engine"
+harness = false

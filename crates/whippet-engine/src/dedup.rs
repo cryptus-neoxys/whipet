@@ -8,8 +8,9 @@
 //! therefore keeps its own `client_order_id` table, snapshotted atomically
 //! with the book and the input offset.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use whippet_core::ids::{OrderId, Seq};
 
@@ -33,16 +34,21 @@ pub struct DedupEntry {
 
 pub struct DedupTable {
     capacity: usize,
-    map: HashMap<OrderId, DedupEntry>,
+    map: FxHashMap<OrderId, DedupEntry>,
     insertion_order: VecDeque<OrderId>,
+    /// Terminal entries in transition order. This keeps eviction O(1) even
+    /// when the table is full of active resting orders; the old insertion-order
+    /// scan could rotate thousands of entries per insert.
+    terminal_order: VecDeque<OrderId>,
 }
 
 impl DedupTable {
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity: capacity.max(1),
-            map: HashMap::with_capacity(capacity.min(1_000_000)),
+            map: FxHashMap::with_capacity_and_hasher(capacity.min(1_000_000), Default::default()),
             insertion_order: VecDeque::with_capacity(capacity.min(1_000_000)),
+            terminal_order: VecDeque::with_capacity(capacity.min(1_000_000)),
         }
     }
 
@@ -72,32 +78,55 @@ impl DedupTable {
         // record even if it is older than the window, otherwise a late retry
         // could rest a second copy. If every entry is active, grow beyond the
         // soft capacity rather than break that invariant.
-        let mut attempts = self.insertion_order.len().min(4_096);
-        while self.map.len() >= self.capacity && attempts > 0 {
-            attempts -= 1;
-            let Some(oldest) = self.insertion_order.pop_front() else {
+        while self.map.len() >= self.capacity {
+            let Some(candidate) = self.terminal_order.pop_front() else {
                 break;
             };
-            let terminal = self.map.get(&oldest).is_none_or(|entry| {
+            let terminal = self.map.get(&candidate).is_some_and(|entry| {
                 matches!(
                     entry.status,
                     DedupStatus::Filled | DedupStatus::Cancelled | DedupStatus::Rejected
                 )
             });
             if terminal {
-                self.map.remove(&oldest);
-            } else {
-                self.insertion_order.push_back(oldest);
+                self.map.remove(&candidate);
             }
         }
         self.map.insert(order_id, entry);
         self.insertion_order.push_back(order_id);
+        self.compact_if_needed();
         None
     }
 
     pub fn update(&mut self, order_id: OrderId, status: DedupStatus) {
+        let was_terminal = self.map.get(&order_id).is_some_and(|entry| {
+            matches!(
+                entry.status,
+                DedupStatus::Filled | DedupStatus::Cancelled | DedupStatus::Rejected
+            )
+        });
         if let Some(entry) = self.map.get_mut(&order_id) {
             entry.status = status;
+        }
+        let is_terminal = matches!(
+            status,
+            DedupStatus::Filled | DedupStatus::Cancelled | DedupStatus::Rejected
+        );
+        if is_terminal && !was_terminal {
+            self.terminal_order.push_back(order_id);
+        }
+    }
+
+    fn compact_if_needed(&mut self) {
+        if self.insertion_order.len() > self.map.len().saturating_mul(2).max(1_024) {
+            let map = &self.map;
+            self.insertion_order
+                .retain(|order_id| map.contains_key(order_id));
+        }
+        if self.terminal_order.len() > self.map.len().saturating_mul(2).max(1_024) {
+            let map = &self.map;
+            self.terminal_order
+                .retain(|order_id| map.contains_key(order_id));
         }
     }
 
@@ -114,6 +143,12 @@ impl DedupTable {
         let mut table = Self::new(capacity.max(entries.len()));
         for (order_id, entry) in entries {
             table.insertion_order.push_back(order_id);
+            if matches!(
+                entry.status,
+                DedupStatus::Filled | DedupStatus::Cancelled | DedupStatus::Rejected
+            ) {
+                table.terminal_order.push_back(order_id);
+            }
             table.map.insert(order_id, entry);
         }
         table
@@ -122,12 +157,17 @@ impl DedupTable {
     pub fn hash_into(&self, hasher: &mut blake3::Hasher) {
         hasher.update(b"dedup");
         hasher.update(&(self.map.len() as u64).to_le_bytes());
-        for (order_id, entry) in self.entries_in_order() {
-            hasher.update(&order_id.0.to_le_bytes());
-            hasher.update(&[entry.status as u8]);
-            hasher.update(&entry.input_offset.to_le_bytes());
-            hasher.update(&entry.timestamp_ns.to_le_bytes());
-            hasher.update(&entry.seq.0.to_le_bytes());
+        // Walk the insertion-order deque directly. Eviction depends on this
+        // order, so the hash must preserve it; the map is lookup-only here and
+        // no temporary Vec is allocated.
+        for order_id in &self.insertion_order {
+            if let Some(entry) = self.map.get(order_id) {
+                hasher.update(&order_id.0.to_le_bytes());
+                hasher.update(&[entry.status as u8]);
+                hasher.update(&entry.input_offset.to_le_bytes());
+                hasher.update(&entry.timestamp_ns.to_le_bytes());
+                hasher.update(&entry.seq.0.to_le_bytes());
+            }
         }
     }
 }
@@ -198,6 +238,20 @@ mod tests {
     }
 
     #[test]
+    fn full_table_of_active_orders_grows_without_rotating() {
+        let mut table = DedupTable::new(2);
+        table.insert(OrderId(1), entry(1));
+        table.update(OrderId(1), DedupStatus::Resting);
+        table.insert(OrderId(2), entry(2));
+        table.update(OrderId(2), DedupStatus::Resting);
+        table.insert(OrderId(3), entry(3));
+        assert_eq!(table.len(), 3);
+        assert!(table.contains(OrderId(1)));
+        assert!(table.contains(OrderId(2)));
+        assert!(table.contains(OrderId(3)));
+    }
+
+    #[test]
     fn snapshot_restore_preserves_eviction_order() {
         let mut table = DedupTable::new(2);
         table.insert(OrderId(5), entry(5));
@@ -209,5 +263,32 @@ mod tests {
         restored.insert(OrderId(9), entry(9));
         assert_eq!(table.contains(OrderId(5)), restored.contains(OrderId(5)));
         assert_eq!(table.contains(OrderId(1)), restored.contains(OrderId(1)));
+    }
+
+    #[test]
+    fn hash_into_walks_insertion_order_without_collecting() {
+        let mut table = DedupTable::new(8);
+        for id in [3u128, 1, 2] {
+            table.insert(OrderId(id), entry(id as u64));
+        }
+        table.update(OrderId(1), DedupStatus::Resting);
+
+        // Independent computation over the insertion-ordered entries. If
+        // `hash_into` ever used map iteration order or collected a different
+        // sequence, this would diverge.
+        let mut expected = blake3::Hasher::new();
+        expected.update(b"dedup");
+        expected.update(&(table.len() as u64).to_le_bytes());
+        for (order_id, entry) in table.entries_in_order() {
+            expected.update(&order_id.0.to_le_bytes());
+            expected.update(&[entry.status as u8]);
+            expected.update(&entry.input_offset.to_le_bytes());
+            expected.update(&entry.timestamp_ns.to_le_bytes());
+            expected.update(&entry.seq.0.to_le_bytes());
+        }
+
+        let mut actual = blake3::Hasher::new();
+        table.hash_into(&mut actual);
+        assert_eq!(actual.finalize(), expected.finalize());
     }
 }

@@ -25,6 +25,15 @@ use whippet_core::protocol::{MdEvent, MdKind, MdSnapshot, Side};
 const TRADE_TAPE_LEN: usize = 250;
 const BOOK_DEPTH: usize = 20;
 
+/// Publisher cadence. `spawn_publisher` ticks at this interval.
+const PUBLISH_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Coalescing window for redundant `publish()` calls. It sits just below the
+/// publisher cadence so scheduler jitter or the time spent building a frame
+/// never suppresses a scheduled 20 Hz tick. A dirty hub always publishes
+/// immediately; only back-to-back publishes with no new events are skipped.
+const PUBLISH_COALESCE_WINDOW: Duration = Duration::from_millis(45);
+
 #[derive(Debug, Clone, Copy)]
 struct OrderRef {
     side: Side,
@@ -271,10 +280,21 @@ struct HubState {
     books: BTreeMap<Symbol, BookState>,
     trades: VecDeque<TradeView>,
     last_update_ns: u64,
+    last_publish: Option<Instant>,
     sequence: u64,
     md_events: u64,
     trades_count: u64,
     dirty: bool,
+}
+
+/// Fields gathered while the hub lock is held. `metrics.snapshot()` runs after
+/// the lock is released, so a histogram or rate lock never blocks the MD
+/// consumer.
+struct StateParts {
+    symbols: Vec<BookView>,
+    trades: Vec<TradeView>,
+    freshness_ms: u64,
+    sequence: u64,
 }
 
 /// Shared metrics. Counters are atomics; percentiles come from HDR histograms
@@ -458,10 +478,19 @@ impl MdHub {
             );
         }
         let metrics = Arc::new(Metrics::new(config.mode, config.partitions));
+        // Seed the watch channel with a fully shaped frame (empty books, no
+        // trades). Read-only consumers can call `latest()` before the first
+        // 20 Hz publish and still see the configured symbols.
+        let symbols: Vec<BookView> = config
+            .instruments
+            .iter()
+            .filter_map(|instrument| books.get(&instrument.symbol))
+            .map(BookState::view)
+            .collect();
         let initial = Arc::new(StateView {
             mode: config.mode,
             venue: config.venue.clone(),
-            symbols: Vec::new(),
+            symbols,
             trades: Vec::new(),
             metrics: metrics.snapshot(),
             freshness_ms: 0,
@@ -478,6 +507,7 @@ impl MdHub {
                 books,
                 trades: VecDeque::with_capacity(TRADE_TAPE_LEN),
                 last_update_ns: 0,
+                last_publish: None,
                 sequence: 0,
                 md_events: 0,
                 trades_count: 0,
@@ -554,19 +584,69 @@ impl MdHub {
         state.dirty = true;
     }
 
-    /// Build a fresh state view and publish it to WebSocket subscribers.
+    /// Most recently published frame. This is an `Arc` clone, not a rebuild:
+    /// use it for read-only consumers such as `GET /api/state`, `GET
+    /// /api/trades`, and the initial WebSocket frame.
+    pub fn latest(&self) -> Arc<StateView> {
+        self.watch.borrow().clone()
+    }
+
+    /// Counters and latency percentiles without building a state frame.
+    ///
+    /// Intended call sites:
+    /// - `GET /metrics`: `ctx.hub.metrics_snapshot()` for the counters, plus
+    ///   `ctx.hub.latest()` if the exposition also needs `freshness_ms` and
+    ///   `sequence`. Do not call `state()` there.
+    /// - health checks: `ctx.metrics.snapshot()` already avoids the hub state
+    ///   lock entirely.
+    pub fn metrics_snapshot(&self) -> MetricsView {
+        self.metrics.snapshot()
+    }
+
+    /// Build a fresh frame and publish it. Coalesces back-to-back calls when
+    /// nothing changed, but never suppresses a scheduled 20 Hz tick.
     pub fn publish(&self) {
-        let state = self.build_state();
-        let _ = self.watch.send(Arc::new(state));
+        if let Some(state) = self.build_publish_state() {
+            // `send` refuses to update the stored value when there are no
+            // receivers; `latest()` must still advance, so use `send_replace`.
+            self.watch.send_replace(Arc::new(state));
+        }
     }
 
+    /// Build a fresh frame without touching the publish cadence or the dirty
+    /// flag. Tests and tools use this; HTTP/WS read paths should use
+    /// `latest()` instead.
     pub fn state(&self) -> StateView {
-        self.build_state()
+        let state = self.state.lock().expect("md state poisoned");
+        let parts = self.state_parts(&state);
+        drop(state);
+        self.finish(parts)
     }
 
-    fn build_state(&self) -> StateView {
+    fn build_publish_state(&self) -> Option<StateView> {
         let mut state = self.state.lock().expect("md state poisoned");
+        let now = Instant::now();
+        // Freshness still updates on the next 20 Hz tick. This window is below
+        // the publisher cadence, so it only collapses redundant manual calls
+        // (for example a caller that publishes after every applied event).
+        if !state.dirty
+            && state
+                .last_publish
+                .is_some_and(|last| now.duration_since(last) < PUBLISH_COALESCE_WINDOW)
+        {
+            return None;
+        }
         state.dirty = false;
+        state.last_publish = Some(now);
+        let parts = self.state_parts(&state);
+        drop(state);
+        Some(self.finish(parts))
+    }
+
+    /// Build the symbol views and trade tape while the hub lock is held. The
+    /// caller must drop the guard before `finish`, which snapshots metrics
+    /// (and therefore locks the histograms and the rate estimator).
+    fn state_parts(&self, state: &HubState) -> StateParts {
         let now = now_ns();
         let freshness_ms = if state.last_update_ns == 0 {
             0
@@ -580,14 +660,27 @@ impl MdHub {
             .filter_map(|instrument| state.books.get(&instrument.symbol))
             .map(BookState::view)
             .collect();
+        // One clone per trade, with the capacity reserved up front. The tape is
+        // small and bounded by TRADE_TAPE_LEN.
+        let mut trades = Vec::with_capacity(state.trades.len());
+        trades.extend(state.trades.iter().rev().cloned());
+        StateParts {
+            symbols,
+            trades,
+            freshness_ms,
+            sequence: state.sequence,
+        }
+    }
+
+    fn finish(&self, parts: StateParts) -> StateView {
         StateView {
             mode: self.config.mode,
             venue: self.config.venue.clone(),
-            symbols,
-            trades: state.trades.iter().rev().cloned().collect(),
+            symbols: parts.symbols,
+            trades: parts.trades,
             metrics: self.metrics.snapshot(),
-            freshness_ms,
-            sequence: state.sequence,
+            freshness_ms: parts.freshness_ms,
+            sequence: parts.sequence,
             iggy_addr: self.iggy_addr.clone(),
             journal: self.journal.clone(),
             guarantee: self.config.mode.guarantee().to_string(),
@@ -599,7 +692,7 @@ impl MdHub {
     pub fn spawn_publisher(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let hub = Arc::clone(self);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(50));
+            let mut interval = tokio::time::interval(PUBLISH_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
@@ -619,7 +712,7 @@ fn now_ns() -> u64 {
 mod tests {
     use super::*;
     use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Seq, Symbol};
-    use whippet_core::protocol::{MdEvent, MdKind, MdSnapshot, Side};
+    use whippet_core::protocol::{MdEvent, MdKind, MdOrder, MdSnapshot, Side};
 
     fn config() -> ExchangeConfig {
         ExchangeConfig::default()
@@ -843,5 +936,146 @@ mod tests {
         assert_eq!(btc.best_bid_cents, Some(6_500_100));
         assert_eq!(btc.bids[0].qty, 7);
         assert_eq!(state.sequence, 1000);
+    }
+
+    #[test]
+    fn latest_returns_the_last_published_frame() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+
+        // The watch channel is seeded with the configured symbols, so a read
+        // before the first publish is still a valid frame.
+        let initial = hub.latest();
+        assert_eq!(initial.symbols.len(), 3);
+        assert_eq!(initial.sequence, 0);
+
+        let add = event(MdKind::Add, Side::Buy, 65_000, 10, 1);
+        let first_seq = add.seq;
+        hub.apply(&add);
+        hub.publish();
+
+        let first = hub.latest();
+        assert_eq!(first.sequence, first_seq.0);
+        let btc = first
+            .symbols
+            .iter()
+            .find(|book| book.symbol.as_str() == "BTC-USD")
+            .unwrap();
+        assert_eq!(btc.bids[0].qty, 10);
+
+        // Applying without publishing must not move the published frame.
+        hub.apply(&event(MdKind::Add, Side::Buy, 65_000, 5, 2));
+        assert!(Arc::ptr_eq(&first, &hub.latest()));
+
+        hub.publish();
+        let second = hub.latest();
+        assert!(!Arc::ptr_eq(&first, &second));
+        let btc = second
+            .symbols
+            .iter()
+            .find(|book| book.symbol.as_str() == "BTC-USD")
+            .unwrap();
+        assert_eq!(btc.bids[0].qty, 15);
+        assert_eq!(btc.bids[0].orders, 2);
+    }
+
+    #[test]
+    fn metrics_snapshot_does_not_rebuild_the_published_frame() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        let before = hub.latest();
+
+        hub.apply(&event(MdKind::Trade, Side::Buy, 65_000, 4, 1));
+        let metrics = hub.metrics_snapshot();
+        assert_eq!(metrics.md_events, 1);
+        assert_eq!(metrics.trades, 1);
+        // The read path did not build or publish a new state frame.
+        assert!(Arc::ptr_eq(&before, &hub.latest()));
+    }
+
+    #[test]
+    fn duplicate_and_stale_events_leave_the_published_frame_correct() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        let add = event(MdKind::Add, Side::Buy, 65_000, 10, 1);
+        hub.apply(&add);
+        let trade = event(MdKind::Trade, Side::Buy, 65_000, 4, 2);
+        hub.apply(&trade);
+        hub.publish();
+        let baseline = hub.latest();
+
+        // At-least-once replay: the add and trade are applied again.
+        hub.apply(&add);
+        hub.apply(&trade);
+        // A stale reduce below the last applied sequence is ignored.
+        let mut stale = event(MdKind::Reduce, Side::Buy, 65_000, 1, 1);
+        stale.seq = Seq(add.seq.0.saturating_sub(1));
+        hub.apply(&stale);
+
+        hub.publish();
+        let after = hub.latest();
+        let btc = after
+            .symbols
+            .iter()
+            .find(|book| book.symbol.as_str() == "BTC-USD")
+            .unwrap();
+        assert_eq!(btc.bids[0].qty, 10);
+        assert_eq!(btc.bids[0].orders, 1);
+        assert_eq!(after.trades.len(), 1);
+        assert_eq!(after.metrics.md_events, 2);
+        assert_eq!(after.metrics.trades, 1);
+        assert_eq!(after.sequence, baseline.sequence);
+    }
+
+    #[test]
+    fn snapshot_plus_deltas_publishes_the_full_book() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        let symbol = Symbol::new("BTC-USD").unwrap();
+        // 45 orders across three price levels. `view()` must aggregate every
+        // level for depth, not just the 20 levels shown in the ladder.
+        let orders: Vec<MdOrder> = (0..45u128)
+            .map(|index| MdOrder {
+                order_id: OrderId(index + 1),
+                side: Side::Buy,
+                price: Price(65_000 + (index % 3) as i64),
+                qty: Qty(1),
+                participant: ParticipantId(1),
+            })
+            .collect();
+        let snapshot = MdSnapshot {
+            symbol,
+            seq: Seq(1),
+            cause_offset: 0,
+            timestamp_ns: 0,
+            last_trade_price: Price::ZERO,
+            last_trade_qty: Qty::ZERO,
+            bids: vec![],
+            asks: vec![],
+            orders,
+        };
+        hub.apply_snapshot(&snapshot);
+        hub.publish();
+
+        let state = hub.latest();
+        let btc = state
+            .symbols
+            .iter()
+            .find(|book| book.symbol.as_str() == "BTC-USD")
+            .unwrap();
+        assert_eq!(btc.bids.len(), 3);
+        assert_eq!(btc.depth_bid_qty, 45);
+        assert_eq!(btc.best_bid_cents, Some(6_500_200));
+
+        let mut remove = event(MdKind::Remove, Side::Buy, 65_000, 0, 1);
+        remove.seq = Seq(2);
+        hub.apply(&remove);
+        hub.publish();
+
+        let state = hub.latest();
+        let btc = state
+            .symbols
+            .iter()
+            .find(|book| book.symbol.as_str() == "BTC-USD")
+            .unwrap();
+        assert_eq!(btc.bids.len(), 3);
+        assert_eq!(btc.depth_bid_qty, 44);
+        assert_eq!(btc.best_bid_cents, Some(6_500_200));
     }
 }

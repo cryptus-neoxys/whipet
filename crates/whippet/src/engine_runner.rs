@@ -33,6 +33,7 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
             let mut engine = ShardEngine::from_snapshot(exchange, snapshot)
                 .with_context(|| format!("restoring shard {shard_id}"))?;
             engine.set_snapshot_interval(ctx.config.snapshot_every);
+            engine.set_md_snapshot_interval(1_000_000);
             info!(
                 shard = shard_id,
                 hash = %hex(&engine.state_hash()),
@@ -41,7 +42,13 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
             engine
         }
         None => {
-            ShardEngine::new_with_snapshot_interval(shard_id, exchange, ctx.config.snapshot_every)
+            let mut engine = ShardEngine::new_with_snapshot_interval(
+                shard_id,
+                exchange,
+                ctx.config.snapshot_every,
+            );
+            engine.set_md_snapshot_interval(1_000_000);
+            engine
         }
     };
 
@@ -84,22 +91,28 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
         consumer,
         "engine shard running"
     );
-    let mut out = EngineOutput::with_capacity(64, 64);
+    let mut out = EngineOutput::with_capacity(1_024, 1_024);
     let mut shutdown = ctx.shutdown.subscribe();
+    let mut last_snapshot_at = Instant::now();
 
     loop {
         let records = tokio::select! {
             _ = shutdown.changed() => {
                 let snapshot = engine.snapshot_state();
+                let hashes: Vec<String> = snapshot
+                    .symbols
+                    .iter()
+                    .map(|symbol| hex(&symbol.state_hash))
+                    .collect();
                 let store = ctx.snapshots.clone();
                 match tokio::task::spawn_blocking(move || store.save(&snapshot)).await {
-                    Ok(Ok(_)) => info!(shard = shard_id, hash = %hex(&engine.state_hash()), "engine shard stopped"),
+                    Ok(Ok(_)) => info!(shard = shard_id, hashes = ?hashes, "engine shard stopped"),
                     Ok(Err(error)) => warn!(shard = shard_id, error = %error, "final snapshot write failed"),
                     Err(error) => warn!(shard = shard_id, error = %error, "final snapshot task failed"),
                 }
                 return Ok(());
             }
-            result = ctx.journal.read(Topic::Orders, shard_id, &consumer, next_offset, 256, 50) => result,
+            result = ctx.journal.read_payloads(Topic::Orders, shard_id, &consumer, next_offset, 1_024, 50) => result,
         };
         let records = match records {
             Ok(records) => records,
@@ -155,8 +168,8 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
                         for event in &out.md {
                             md_messages.push(md_message(event));
                         }
+                        snapshot_due |= out.state_snapshot_due;
                         for snapshot in &out.snapshots {
-                            snapshot_due = true;
                             md_messages.push(snapshot_message(snapshot));
                         }
                     }
@@ -190,15 +203,20 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
         commit_with_retry(&ctx, Topic::Orders, shard_id, &consumer, batch_last_offset).await?;
         next_offset = batch_last_offset.saturating_add(1);
 
-        if snapshot_due {
+        if snapshot_due && last_snapshot_at.elapsed() >= Duration::from_secs(5) {
+            last_snapshot_at = Instant::now();
             let snapshot = engine.snapshot_state();
+            let hashes: Vec<String> = snapshot
+                .symbols
+                .iter()
+                .map(|symbol| hex(&symbol.state_hash))
+                .collect();
             let store = ctx.snapshots.clone();
-            let hash = hex(&engine.state_hash());
             match tokio::task::spawn_blocking(move || store.save(&snapshot)).await {
                 Ok(Ok(path)) => info!(
                     shard = shard_id,
                     path = %path.display(),
-                    hash,
+                    hashes = ?hashes,
                     "snapshot written"
                 ),
                 Ok(Err(error)) => {
@@ -236,7 +254,7 @@ pub async fn run_md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
     loop {
         let records = tokio::select! {
             _ = shutdown.changed() => return Ok(()),
-            result = ctx.journal.read(Topic::Md, shard_id, &consumer, next_offset, 1_024, 100) => result,
+            result = ctx.journal.read_payloads(Topic::Md, shard_id, &consumer, next_offset, 1_024, 100) => result,
         };
         let records = match records {
             Ok(records) => records,
@@ -267,24 +285,26 @@ pub async fn run_md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
                 Some(code) if code == MdKind::Snapshot.as_code() => {
                     match MdSnapshot::decode(&record.payload) {
                         Ok(snapshot) => ctx.hub.apply_snapshot(&snapshot),
-                        Err(error) => warn!(
-                            shard = shard_id,
-                            offset = record.offset,
-                            error = %error,
-                            "skipping undecodable MD snapshot"
-                        ),
+                        Err(error) => {
+                            ctx.mark_shard_failed();
+                            anyhow::bail!(
+                                "undecodable MD snapshot on shard {shard_id} at offset {}: {error}; refusing to advance past a lost recovery point",
+                                record.offset
+                            );
+                        }
                     }
                 }
                 _ => match MdEvent::decode(&record.payload) {
                     Ok(event) => {
                         ctx.hub.apply(&event);
                     }
-                    Err(error) => warn!(
-                        shard = shard_id,
-                        offset = record.offset,
-                        error = %error,
-                        "skipping undecodable MD event"
-                    ),
+                    Err(error) => {
+                        ctx.mark_shard_failed();
+                        anyhow::bail!(
+                            "undecodable MD event on shard {shard_id} at offset {}: {error}; refusing to desynchronise the book",
+                            record.offset
+                        );
+                    }
                 },
             }
             last_offset = record.offset;

@@ -1,7 +1,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Args;
 use whippet_core::config::{ExchangeConfig, Mode, default_instruments};
@@ -91,6 +91,19 @@ pub struct NodeArgs {
     /// Optional build label shown on the dashboard.
     #[arg(long, env = "WHIPPET_BUILD", default_value = "dev")]
     pub build: String,
+    /// Optional bearer token for order ingress and cancel. When unset, those
+    /// endpoints accept anonymous requests: a demo convenience, not a
+    /// deployment posture. Set this for anything reachable by another host.
+    #[arg(long, env = "WHIPPET_API_TOKEN")]
+    pub api_token: Option<String>,
+    /// Participant name assigned to authenticated ingress. Requests may omit
+    /// `participant`; supplying a different one is rejected with 403.
+    #[arg(long, env = "WHIPPET_API_PARTICIPANT", default_value = "api")]
+    pub api_participant: String,
+    /// Per-IP ingress token bucket, in requests per second. `0` disables the
+    /// limiter, which is the single-node demo default.
+    #[arg(long, env = "WHIPPET_RATE_LIMIT_PER_SEC", default_value_t = 0)]
+    pub rate_limit_per_sec: u32,
 }
 
 #[derive(Clone)]
@@ -106,26 +119,25 @@ pub struct NodeConfig {
     pub snapshot_every: u64,
     pub dashboard_dir: PathBuf,
     pub build: String,
+    /// Bearer token required by ingress when set. Never logged or serialized.
+    pub api_token: Option<String>,
+    /// Participant derived from a valid token.
+    pub api_participant: String,
+    /// 0 disables per-IP ingress limiting.
+    pub rate_limit_per_sec: u32,
 }
 
 impl NodeConfig {
+    pub fn auth_required(&self) -> bool {
+        self.api_token.is_some()
+    }
+
     pub fn from_args(args: NodeArgs) -> Result<Self, ConfigError> {
         let http_addr: SocketAddr = args.http_addr.parse().map_err(|_| {
             ConfigError::Invalid(format!("invalid HTTP address: {}", args.http_addr))
         })?;
         let journal = JournalKind::parse(&args.journal)?;
-        let iggy_password = match &args.iggy_password_file {
-            Some(path) => std::fs::read_to_string(path)
-                .map_err(|error| {
-                    ConfigError::Invalid(format!(
-                        "could not read Iggy password file {}: {error}",
-                        path.display()
-                    ))
-                })?
-                .trim_end_matches(['\r', '\n'])
-                .to_string(),
-            None => args.iggy_password,
-        };
+        let iggy_password = read_password(&args.iggy_password, args.iggy_password_file.as_deref())?;
         let mode: Mode = args.mode.parse()?;
         if mode == Mode::Turbo {
             return Err(ConfigError::Invalid(
@@ -139,40 +151,15 @@ impl NodeConfig {
             ));
         }
 
-        let mut requested: Vec<Symbol> = args
-            .symbols
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(Symbol::new)
-            .collect::<Result<_, _>>()?;
-        requested.sort_unstable();
-        requested.dedup();
-        if requested.is_empty() {
+        let api_participant = args.api_participant;
+        if api_participant.is_empty() || api_participant.len() > 64 {
             return Err(ConfigError::Invalid(
-                "at least one symbol is required".into(),
+                "api participant must be between 1 and 64 bytes".into(),
             ));
         }
-        let mut instruments = Vec::new();
-        for instrument in default_instruments() {
-            if requested.contains(&instrument.symbol) {
-                instruments.push(instrument);
-            }
-        }
-        for instrument in &instruments {
-            instrument.validate()?;
-        }
-        if instruments.len() != requested.len() {
-            let known: Vec<_> = default_instruments()
-                .iter()
-                .map(|instrument| instrument.symbol.to_string())
-                .collect();
-            return Err(ConfigError::Invalid(format!(
-                "unknown symbol in {:?}; known symbols: {}",
-                args.symbols,
-                known.join(", ")
-            )));
-        }
+        let api_token = args.api_token.filter(|value| !value.trim().is_empty());
+
+        let exchange = exchange_config(&args.venue, args.partitions, mode, &args.symbols)?;
 
         Ok(Self {
             http_addr,
@@ -181,18 +168,81 @@ impl NodeConfig {
             iggy_password,
             journal,
             mode,
-            exchange: ExchangeConfig {
-                venue: args.venue,
-                partitions: args.partitions,
-                mode,
-                instruments,
-            },
+            exchange,
             snapshot_dir: args.snapshot_dir,
             snapshot_every: args.snapshot_every.max(1),
             dashboard_dir: args.dashboard_dir,
             build: args.build,
+            api_token,
+            api_participant,
+            rate_limit_per_sec: args.rate_limit_per_sec,
         })
     }
+}
+
+/// Resolve the Iggy password the same way for the node and `whippet doctor`.
+/// The file wins when both are present, matching Compose secret mounts.
+pub fn read_password(inline: &str, file: Option<&Path>) -> Result<String, ConfigError> {
+    match file {
+        Some(path) => Ok(std::fs::read_to_string(path)
+            .map_err(|error| {
+                ConfigError::Invalid(format!(
+                    "could not read Iggy password file {}: {error}",
+                    path.display()
+                ))
+            })?
+            .trim_end_matches(['\r', '\n'])
+            .to_string()),
+        None => Ok(inline.to_string()),
+    }
+}
+
+/// Build the configured instrument set the same way for the node and
+/// `whippet doctor`, so snapshot verification uses the right symbols.
+pub fn exchange_config(
+    venue: &str,
+    partitions: u32,
+    mode: Mode,
+    symbols: &str,
+) -> Result<ExchangeConfig, ConfigError> {
+    let mut requested: Vec<Symbol> = symbols
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(Symbol::new)
+        .collect::<Result<_, _>>()?;
+    requested.sort_unstable();
+    requested.dedup();
+    if requested.is_empty() {
+        return Err(ConfigError::Invalid(
+            "at least one symbol is required".into(),
+        ));
+    }
+    let mut instruments = Vec::new();
+    for instrument in default_instruments() {
+        if requested.contains(&instrument.symbol) {
+            instruments.push(instrument);
+        }
+    }
+    for instrument in &instruments {
+        instrument.validate()?;
+    }
+    if instruments.len() != requested.len() {
+        let known: Vec<_> = default_instruments()
+            .iter()
+            .map(|instrument| instrument.symbol.to_string())
+            .collect();
+        return Err(ConfigError::Invalid(format!(
+            "unknown symbol in {symbols:?}; known symbols: {}",
+            known.join(", ")
+        )));
+    }
+    Ok(ExchangeConfig {
+        venue: venue.to_string(),
+        partitions,
+        mode,
+        instruments,
+    })
 }
 
 #[cfg(test)]
@@ -237,6 +287,48 @@ mod tests {
     #[test]
     fn unknown_symbol_is_rejected() {
         let cli = Cli::parse_from(["test", "--symbols", "DOGE-USD"]);
+        assert!(NodeConfig::from_args(cli.node).is_err());
+    }
+
+    #[test]
+    fn ingress_defaults_to_anonymous_without_a_rate_limit() {
+        let cli = Cli::parse_from(["test"]);
+        let config = NodeConfig::from_args(cli.node).unwrap();
+        assert!(config.api_token.is_none());
+        assert!(!config.auth_required());
+        assert_eq!(config.api_participant, "api");
+        assert_eq!(config.rate_limit_per_sec, 0);
+    }
+
+    #[test]
+    fn api_token_and_participant_are_configurable() {
+        let cli = Cli::parse_from([
+            "test",
+            "--api-token",
+            "s3cret",
+            "--api-participant",
+            "desk-1",
+            "--rate-limit-per-sec",
+            "250",
+        ]);
+        let config = NodeConfig::from_args(cli.node).unwrap();
+        assert_eq!(config.api_token.as_deref(), Some("s3cret"));
+        assert!(config.auth_required());
+        assert_eq!(config.api_participant, "desk-1");
+        assert_eq!(config.rate_limit_per_sec, 250);
+    }
+
+    #[test]
+    fn an_empty_api_token_keeps_anonymous_ingress() {
+        let cli = Cli::parse_from(["test", "--api-token", "   "]);
+        let config = NodeConfig::from_args(cli.node).unwrap();
+        assert!(config.api_token.is_none());
+        assert!(!config.auth_required());
+    }
+
+    #[test]
+    fn an_empty_api_participant_is_rejected() {
+        let cli = Cli::parse_from(["test", "--api-participant", ""]);
         assert!(NodeConfig::from_args(cli.node).is_err());
     }
 }

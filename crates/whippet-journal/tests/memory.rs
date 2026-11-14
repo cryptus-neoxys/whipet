@@ -87,6 +87,81 @@ fn topics_are_separate_logs() {
 }
 
 #[tokio::test]
+async fn memory_journal_has_no_lanes_to_recover() {
+    let journal = Journal::memory();
+    assert!(!journal.recover_operation(7).await);
+}
+
+#[tokio::test]
+async fn owned_append_and_payload_reads_match_the_borrowed_api() {
+    let journal = Journal::memory();
+
+    let borrowed = journal
+        .append(Topic::Md, 1, &[message(1)])
+        .await
+        .expect("borrowed append");
+    assert_eq!(borrowed.base_offset, 0);
+
+    let owned = journal
+        .append_owned(Topic::Md, 1, vec![message(2), message(3)])
+        .await
+        .expect("owned append");
+    assert_eq!(owned.partition, 1);
+    assert_eq!(owned.base_offset, 1, "owned append continues the log");
+    assert_eq!(owned.count, 2);
+
+    let empty = journal
+        .append_owned(Topic::Md, 1, Vec::new())
+        .await
+        .expect("empty owned append");
+    assert_eq!(empty.count, 0);
+
+    let records = journal
+        .read(Topic::Md, 1, "md-p1", 0, 10, 0)
+        .await
+        .expect("full read");
+    let payloads = journal
+        .read_payloads(Topic::Md, 1, "md-p1", 0, 10, 0)
+        .await
+        .expect("payload read");
+
+    assert_eq!(payloads.len(), records.len());
+    for (payload, record) in payloads.iter().zip(records.iter()) {
+        assert_eq!(payload.offset, record.offset);
+        assert_eq!(payload.timestamp_ns, record.timestamp_ns);
+        assert_eq!(
+            payload.payload.as_ref(),
+            record.payload.as_slice(),
+            "payload bytes match the full read path"
+        );
+    }
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.payload.clone())
+            .collect::<Vec<_>>(),
+        vec![vec![1], vec![2], vec![3]]
+    );
+    assert_eq!(records[0].header("n"), Some("1"));
+
+    // Offsets past the tail and other partitions stay empty.
+    assert!(
+        journal
+            .read_payloads(Topic::Md, 1, "md-p1", 9, 10, 0)
+            .await
+            .expect("tail read")
+            .is_empty()
+    );
+    assert!(
+        journal
+            .read_payloads(Topic::Md, 0, "md-p0", 0, 10, 0)
+            .await
+            .expect("empty partition read")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn journal_memory_wrapper_matches_the_sync_api() {
     let journal = Journal::memory();
     assert!(journal.ping().await);

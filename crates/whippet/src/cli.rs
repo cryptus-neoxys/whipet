@@ -1,16 +1,21 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
+use iggy::prelude::{
+    AutoLogin, Client as IggyClientTrait, Credentials, Identifier, IggyClient, TopicClient,
+};
 use reqwest::Client;
 use whippet_bench::BenchConfig;
-use whippet_core::config::ExchangeConfig;
+use whippet_core::config::{ExchangeConfig, Mode};
 use whippet_core::protocol::Command;
 use whippet_engine::ShardEngine;
 use whippet_journal::{IggyJournal, Journal, Topic};
 
+use crate::config::{exchange_config, read_password};
 use crate::snapshot::SnapshotStore;
 
 #[derive(Args, Debug, Clone)]
@@ -39,6 +44,10 @@ pub struct BenchArgs {
     pub max_in_flight: usize,
     #[arg(long, default_value_t = 5_000)]
     pub timeout_ms: u64,
+    /// Orders per HTTP request. 1 is the single-order path; up to 256 matches
+    /// the Iggy default message batch.
+    #[arg(long, default_value_t = 1)]
+    pub batch_size: usize,
 }
 
 pub async fn run_bench(args: BenchArgs) -> Result<()> {
@@ -62,6 +71,8 @@ pub async fn run_bench(args: BenchArgs) -> Result<()> {
         label: args.label,
         max_in_flight: args.max_in_flight,
         timeout_ms: args.timeout_ms,
+        batch_size: args.batch_size,
+        ..BenchConfig::default()
     };
     let manifest = whippet_bench::run(config).await?;
     println!(
@@ -250,7 +261,7 @@ pub async fn run_replay(args: ReplayArgs) -> Result<()> {
             break;
         }
         let records = journal
-            .read(Topic::Orders, args.partition, &consumer, offset, 1_000, 100)
+            .read_payloads(Topic::Orders, args.partition, &consumer, offset, 1_000, 100)
             .await
             .with_context(|| format!("reading orders from offset {offset}"))?;
         if records.is_empty() {
@@ -317,4 +328,205 @@ pub async fn run_replay(args: ReplayArgs) -> Result<()> {
         println!("state hash matches expectation");
     }
     Ok(())
+}
+
+/// Read-only preflight. It never creates topics or snapshots; it reports what
+/// the node would find if it started now.
+#[derive(Args, Clone)]
+pub struct DoctorArgs {
+    #[arg(long, env = "WHIPPET_IGGY_ADDR", default_value = "127.0.0.1:8090")]
+    pub iggy_addr: String,
+    #[arg(long, env = "WHIPPET_IGGY_USER", default_value = "iggy")]
+    pub iggy_user: String,
+    #[arg(long, env = "WHIPPET_IGGY_PASSWORD", default_value = "iggy")]
+    pub iggy_password: String,
+    /// Read the Iggy password from a file, as the node does.
+    #[arg(long, env = "WHIPPET_IGGY_PASSWORD_FILE")]
+    pub iggy_password_file: Option<PathBuf>,
+    #[arg(long, env = "WHIPPET_PARTITIONS", default_value_t = 16)]
+    pub partitions: u32,
+    #[arg(
+        long,
+        env = "WHIPPET_SYMBOLS",
+        default_value = "BTC-USD,ETH-USD,SOL-USD"
+    )]
+    pub symbols: String,
+    #[arg(long, env = "WHIPPET_SNAPSHOT_DIR", default_value = "data/snapshots")]
+    pub snapshot_dir: PathBuf,
+    #[arg(long, default_value = "http://127.0.0.1:8080")]
+    pub gateway: String,
+    #[arg(long, default_value_t = 3_000)]
+    pub timeout_ms: u64,
+}
+
+pub async fn run_doctor(args: DoctorArgs) -> Result<()> {
+    if args.partitions == 0 {
+        bail!("--partitions must be at least 1");
+    }
+    let exchange = exchange_config("whippet", args.partitions, Mode::Durable, &args.symbols)?;
+    let password = read_password(&args.iggy_password, args.iggy_password_file.as_deref())?;
+    let mut failures: Vec<String> = Vec::new();
+
+    println!("whippet doctor");
+    println!("  iggy      {}", args.iggy_addr);
+    println!("  gateway   {}", args.gateway);
+    println!("  snapshots {}", args.snapshot_dir.display());
+    println!("  partitions {}", exchange.partitions);
+    println!("  symbols   {}", args.symbols);
+
+    // Doctor talks to Iggy directly for a read-only topic inventory. The
+    // node's data path still goes through `whippet-journal`; this client only
+    // inspects topics and never creates, appends, or commits.
+    let client = IggyClient::builder()
+        .with_tcp()
+        .with_server_address(args.iggy_addr.clone())
+        .with_no_delay()
+        .with_auto_sign_in(AutoLogin::Enabled(Credentials::UsernamePassword(
+            args.iggy_user.clone(),
+            password.into(),
+        )))
+        .build()?;
+    let timeout = Duration::from_millis(args.timeout_ms);
+    match tokio::time::timeout(timeout, client.connect()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => bail!("could not connect to Iggy at {}: {error}", args.iggy_addr),
+        Err(_) => bail!(
+            "timed out connecting to Iggy at {} after {} ms",
+            args.iggy_addr,
+            args.timeout_ms
+        ),
+    }
+    println!("iggy: connected");
+
+    for topic in Topic::ALL {
+        let stream_id = Identifier::named(topic.stream())?;
+        let topic_id = Identifier::named(topic.name())?;
+        let expected = topic.partition_count(&exchange);
+        let details =
+            match tokio::time::timeout(timeout, client.get_topic(&stream_id, &topic_id)).await {
+                Ok(Ok(details)) => details,
+                Ok(Err(error)) => {
+                    println!("  FAIL {topic:<26} {error}");
+                    failures.push(format!("topic {topic} could not be inspected: {error}"));
+                    continue;
+                }
+                Err(_) => {
+                    println!("  FAIL {topic:<26} timed out");
+                    failures.push(format!("topic {topic} inspection timed out"));
+                    continue;
+                }
+            };
+        match details {
+            None => {
+                println!("  FAIL {topic:<26} missing (expected {expected} partitions)");
+                failures.push(format!("topic {topic} is missing"));
+            }
+            Some(details) => {
+                let actual = details.partitions_count;
+                if actual != expected {
+                    println!("  FAIL {topic:<26} partitions {actual}, expected {expected}");
+                    failures.push(format!(
+                        "topic {topic} has {actual} partitions, expected {expected}"
+                    ));
+                } else {
+                    println!("  ok   {topic:<26} partitions {actual}");
+                }
+                let missing: Vec<u32> = (0..expected)
+                    .filter(|id| !details.partitions.iter().any(|part| part.id == *id))
+                    .collect();
+                if !missing.is_empty() {
+                    println!("       missing partition ids: {missing:?}");
+                    failures.push(format!("topic {topic} is missing partitions {missing:?}"));
+                }
+                let heads: Vec<String> = details
+                    .partitions
+                    .iter()
+                    .map(|part| format!("{}:{}", part.id, part.current_offset))
+                    .collect();
+                println!("       head {}", heads.join(" "));
+            }
+        }
+    }
+
+    let store = SnapshotStore::new(args.snapshot_dir.clone());
+    let mut snapshots = 0u32;
+    for shard in 0..exchange.partitions {
+        match store.load(shard) {
+            Ok(None) => {}
+            Ok(Some(snapshot)) => {
+                snapshots += 1;
+                match ShardEngine::from_snapshot(&exchange, snapshot) {
+                    Ok(engine) => {
+                        let last_offset = engine
+                            .snapshot_state()
+                            .symbols
+                            .iter()
+                            .map(|symbol| symbol.last_offset)
+                            .max()
+                            .unwrap_or(0);
+                        println!(
+                            "  ok   snapshot shard {shard:<3} hash={} last_offset={last_offset}",
+                            hex(&engine.state_hash())
+                        );
+                    }
+                    Err(error) => {
+                        println!("  FAIL snapshot shard {shard}: {error}");
+                        failures.push(format!(
+                            "snapshot shard {shard} failed verification: {error}"
+                        ));
+                    }
+                }
+            }
+            Err(error) => {
+                println!("  FAIL snapshot shard {shard}: {error}");
+                failures.push(format!("snapshot shard {shard} could not be read: {error}"));
+            }
+        }
+    }
+    if snapshots == 0 {
+        println!(
+            "snapshots: none in {} (the node writes one every N commands)",
+            args.snapshot_dir.display()
+        );
+    } else {
+        println!("snapshots: verified {snapshots} shard file(s)");
+    }
+
+    let http = Client::builder()
+        .timeout(Duration::from_millis(args.timeout_ms))
+        .build()?;
+    let url = format!("{}/api/health", args.gateway.trim_end_matches('/'));
+    match http.get(&url).send().await {
+        Ok(response) => {
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+            let health = body
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            let auth_required = body
+                .get("auth_required")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            println!("gateway: HTTP {status} status={health} auth_required={auth_required}");
+            if !status.is_success() || health != "ok" {
+                failures.push(format!(
+                    "gateway {url} reports HTTP {status} status={health}"
+                ));
+            }
+        }
+        Err(error) => {
+            println!("gateway: unreachable at {url} ({error}); skipped");
+        }
+    }
+
+    if failures.is_empty() {
+        println!("doctor: all checks passed");
+        Ok(())
+    } else {
+        for failure in &failures {
+            eprintln!("doctor: {failure}");
+        }
+        bail!("{} hard failure(s)", failures.len())
+    }
 }

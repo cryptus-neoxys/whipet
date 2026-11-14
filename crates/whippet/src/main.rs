@@ -31,6 +31,8 @@ enum Commands {
     Verify(whippet::cli::VerifyArgs),
     /// Replay the order log for one partition and print the deterministic state hash.
     Replay(whippet::cli::ReplayArgs),
+    /// Read-only preflight: Iggy topics, snapshot hashes, and node health.
+    Doctor(whippet::cli::DoctorArgs),
 }
 
 #[tokio::main]
@@ -54,5 +56,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Healthcheck(args) => whippet::cli::run_health(args).await,
         Commands::Verify(args) => whippet::cli::run_verify(args),
         Commands::Replay(args) => whippet::cli::run_replay(args).await,
+        Commands::Doctor(args) => whippet::cli::run_doctor(args).await,
     }
 }
