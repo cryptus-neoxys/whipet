@@ -1,6 +1,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -11,6 +12,7 @@ use whippet_core::headers::{MessageMeta, SCHEMA_EXECUTION, SCHEMA_MD_EVENT, SCHE
 use whippet_core::protocol::{Command, ExecKind, ExecutionReport, MdEvent, MdKind, MdSnapshot};
 use whippet_engine::{EngineOutput, ShardEngine};
 use whippet_journal::{JournalMessage, Topic};
+use whippet_marketdata::ShardMetrics;
 
 use crate::context::NodeContext;
 use crate::snapshot::{SequencedSnapshot, SnapshotWriter};
@@ -23,6 +25,11 @@ const COMMIT_MAX_DELAY: Duration = Duration::from_millis(100);
 
 /// A single commit attempt is bounded so a wedged broker cannot stall the loop.
 const COMMIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// An output append is retried this many times before the shard fails. Without
+/// a bound, a wedged output topic stalls matching while the gateway keeps
+/// acknowledging new orders.
+const APPEND_MAX_ATTEMPTS: u32 = 30;
 
 /// Backoff for a commit that failed; the loop keeps applying records meanwhile.
 const COMMIT_RETRY_INITIAL: Duration = Duration::from_millis(100);
@@ -37,6 +44,10 @@ const BATCH_CAPACITY: usize = 1_024;
 
 /// Snapshot requests in flight between the shard loop and the writer.
 const SNAPSHOT_QUEUE_CAPACITY: usize = 2;
+
+/// Batches buffered between the reader and the matcher, and between the matcher
+/// and the writer. Small on purpose: this is the backpressure boundary.
+const SHARD_RING_CAPACITY: usize = 2;
 
 /// Minimum spacing between engine-state snapshots.
 const SNAPSHOT_MIN_INTERVAL: Duration = Duration::from_secs(5);
@@ -61,7 +72,7 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
             .map(|symbol| symbol.last_offset)
             .max()
     });
-    let mut engine = match loaded {
+    let engine = match loaded {
         Some(snapshot) => {
             let mut engine = ShardEngine::from_snapshot(exchange, snapshot)
                 .with_context(|| format!("restoring shard {shard_id}"))?;
@@ -104,7 +115,7 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
             }
         },
     };
-    let mut next_offset = match committed_offset {
+    let next_offset = match committed_offset {
         Some(offset) => offset.saturating_add(1),
         None => 0,
     };
@@ -119,7 +130,10 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
         .collect();
     if !initial.is_empty() {
         let messages: Vec<JournalMessage> = initial.iter().map(snapshot_message).collect();
-        if let Err(error) = append_with_retry(&ctx, Topic::Md, shard_id, &messages).await {
+        let mut startup_shutdown = ctx.shutdown.subscribe();
+        if let Err(error) =
+            append_with_retry(&ctx, Topic::Md, shard_id, &messages, &mut startup_shutdown).await
+        {
             warn!(shard = shard_id, error = %error, "initial MD snapshot was not published");
         }
     }
@@ -130,129 +144,208 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
         consumer,
         "engine shard running"
     );
-    let mut out = EngineOutput::with_capacity(BATCH_CAPACITY, BATCH_CAPACITY);
-    // Hoisted out of the batch loop and reused: a shard polls continuously, so
-    // allocating these per batch is pure overhead. They are cleared at the top
-    // of every batch.
-    let mut executions: Vec<JournalMessage> = Vec::with_capacity(BATCH_CAPACITY);
-    let mut md_messages: Vec<JournalMessage> = Vec::with_capacity(BATCH_CAPACITY);
-
-    let (snapshot_tx, snapshot_rx) = mpsc::channel(SNAPSHOT_QUEUE_CAPACITY);
+    // --- Dedicated shard thread and bounded rings ---------------------------
+    //
+    // The matcher owns the engine on a plain OS thread. It never awaits and
+    // never calls the journal: `read_orders` fills the input ring and
+    // `run_writer` drains the output ring. Ring capacity is the backpressure
+    // boundary; a full ring blocks the producer instead of growing memory.
+    let (input_tx, input_rx) = mpsc::channel::<InputBatch>(SHARD_RING_CAPACITY);
+    let (output_tx, output_rx) = mpsc::channel::<OutputBatch>(SHARD_RING_CAPACITY);
+    // The matcher hands the polled buffer back so the reader can refill it
+    // instead of allocating a Vec per batch.
+    let (recycle_tx, recycle_rx) =
+        mpsc::channel::<Vec<whippet_journal::PayloadRecord>>(SHARD_RING_CAPACITY);
+    let (snapshot_tx, snapshot_rx) = mpsc::channel::<SequencedSnapshot>(SNAPSHOT_QUEUE_CAPACITY);
     let snapshot_writer = spawn_snapshot_writer(Arc::clone(&ctx), shard_id, snapshot_rx);
-    let mut snapshot_sequence: u64 = 0;
+    // Highest offset whose executions/MD are actually in the journal. A
+    // periodic snapshot is only taken once this catches up with the matcher,
+    // otherwise the snapshot could claim an offset whose outputs were lost.
+    let appended_offset = Arc::new(AtomicU64::new(committed_offset.unwrap_or(0)));
 
-    let mut shutdown = ctx.shutdown.subscribe();
-    let mut last_snapshot_at = Instant::now();
-    let mut watermark = CommitWatermark::new(committed_offset);
-    let mut commit_retry = CommitRetry::new();
-    // The next poll is issued alongside the output appends. Matching and the
-    // broker round trip then overlap instead of running one after the other.
-    let mut prefetched: Option<Vec<whippet_journal::PayloadRecord>> = None;
+    let reader = tokio::spawn(read_orders(
+        Arc::clone(&ctx),
+        shard_id,
+        consumer.clone(),
+        next_offset,
+        input_tx,
+        recycle_rx,
+        ctx.shutdown.subscribe(),
+    ));
 
+    let matcher_ctx = Arc::clone(&ctx);
+    let matcher_appended = Arc::clone(&appended_offset);
+    let matcher = std::thread::Builder::new()
+        .name(format!("whippet-shard-{shard_id}"))
+        .spawn(move || {
+            run_matcher(
+                matcher_ctx,
+                shard_id,
+                engine,
+                input_rx,
+                output_tx,
+                recycle_tx,
+                matcher_appended,
+                next_offset.saturating_sub(1),
+            )
+        })
+        .with_context(|| format!("spawning matcher thread for shard {shard_id}"))?;
+
+    let result = run_writer(
+        Arc::clone(&ctx),
+        shard_id,
+        consumer,
+        committed_offset,
+        output_rx,
+        snapshot_tx,
+        snapshot_writer,
+        Arc::clone(&appended_offset),
+    )
+    .await;
+
+    // On shutdown the reader exits on the watch and drops its sender, which
+    // closes the matcher input; the matcher sends its final snapshot and exits.
+    // Abort is a safety net for a writer that stopped first.
+    reader.abort();
+    if matcher.join().is_err() {
+        ctx.mark_shard_failed();
+        anyhow::bail!("matcher thread for shard {shard_id} panicked");
+    }
+    result
+}
+
+/// One poll's worth of orders, handed to the matcher thread.
+struct InputBatch {
+    records: Vec<whippet_journal::PayloadRecord>,
+}
+
+/// One batch of matcher output, handed to the async writer.
+struct OutputBatch {
+    executions: Vec<JournalMessage>,
+    md: Vec<JournalMessage>,
+    last_offset: u64,
+    snapshot: Option<SequencedSnapshot>,
+    /// The matcher is exiting: flush the final snapshot and commit.
+    final_batch: bool,
+}
+
+/// Poll the orders log and feed the matcher. This is the only task that reads
+/// the orders topic, so the consumer offset advances in one place.
+async fn read_orders(
+    ctx: Arc<NodeContext>,
+    shard_id: u32,
+    consumer: String,
+    start_offset: u64,
+    sender: mpsc::Sender<InputBatch>,
+    mut recycle: mpsc::Receiver<Vec<whippet_journal::PayloadRecord>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut next_offset = start_offset;
     loop {
-        // `biased` checks shutdown before the prefetched batch, so a steady
-        // stream of prefetched batches cannot starve graceful shutdown.
-        let prefetched_now = prefetched.take();
-        let records = tokio::select! {
-            biased;
-            _ = shutdown.changed() => {
-                    // Persist progress before the final snapshot. The snapshot is the
-                    // authoritative resume point, but the committed offset is what the
-                    // lag metric and any other reader sees.
-                    if let Some(offset) = watermark.pending() {
-                        match commit_once(&ctx, Topic::Orders, shard_id, &consumer, offset).await {
-                            Ok(()) => {
-                                watermark.mark_committed(offset, Instant::now());
-                                info!(shard = shard_id, offset, "committed final applied offset");
-                            }
-                            Err(error) => warn!(
-                                shard = shard_id,
-                                offset,
-                                error = %error,
-                                "final offset commit failed; the snapshot still records the applied state"
-                            ),
-                        }
-                    }
-                    snapshot_sequence += 1;
-                    let final_snapshot = SequencedSnapshot {
-                        sequence: snapshot_sequence,
-                        snapshot: engine.snapshot_state(),
-                    };
-                    match tokio::time::timeout(
-                        FINAL_SNAPSHOT_SEND_TIMEOUT,
-                        snapshot_tx.send(final_snapshot),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => {}
-                        Ok(Err(_)) => warn!(
-                            shard = shard_id,
-                            "snapshot writer stopped before the final snapshot was queued"
-                        ),
-                        Err(_) => warn!(shard = shard_id, "timed out queueing the final snapshot"),
-                    }
-                    // Close the queue so the writer drains and exits.
-                    drop(snapshot_tx);
-                    match tokio::time::timeout(FINAL_SNAPSHOT_JOIN_TIMEOUT, snapshot_writer).await {
-                        Ok(Ok(())) => info!(
-                            shard = shard_id,
-                            sequence = snapshot_sequence,
-                            "engine shard stopped"
-                        ),
-                        Ok(Err(error)) => warn!(shard = shard_id, error = %error, "final snapshot writer failed"),
-                        Err(_) => warn!(
-                            shard = shard_id,
-                            "final snapshot did not finish within the shutdown budget"
-                        ),
-                    }
-                    return Ok(());
-            }
-            result = ctx.journal.read_payloads(Topic::Orders, shard_id, &consumer, next_offset, BATCH_CAPACITY as u32, 50), if prefetched_now.is_none() => {
-                match result {
-                    Ok(records) => records,
-                    Err(error) => {
-                        warn!(shard = shard_id, error = %error, "order poll failed; retrying");
-                        sleep(Duration::from_millis(250)).await;
-                        continue;
-                    }
-                }
-            }
-            _ = std::future::ready(()), if prefetched_now.is_some() => {
-                prefetched_now.expect("prefetched batch")
-            }
-        };
-        if records.is_empty() {
-            // Nothing new arrived. A due commit is still worth flushing so the
-            // watermark does not sit uncommitted through an idle period.
-            maybe_commit(
-                &ctx,
+        // Reuse the buffer the matcher returned; `read_payloads_into` clears it.
+        let mut records = recycle.try_recv().unwrap_or_default();
+        let result = tokio::select! {
+            _ = shutdown.changed() => break,
+            result = ctx.journal.read_payloads_into(
                 Topic::Orders,
                 shard_id,
                 &consumer,
-                &mut watermark,
-                &mut commit_retry,
-            )
-            .await;
+                next_offset,
+                BATCH_CAPACITY as u32,
+                50,
+                &mut records,
+            ) => result,
+        };
+        let count = match result {
+            Ok(count) => count,
+            Err(error) => {
+                warn!(shard = shard_id, error = %error, "order poll failed; retrying");
+                sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+        };
+        if count == 0 {
             if !ctx.journal.is_iggy() {
                 sleep(Duration::from_millis(1)).await;
             }
             continue;
         }
-        if let Some(first) = records.first()
-            && first.offset > next_offset
-        {
-            anyhow::bail!(
-                "order log gap on shard {shard_id}: requested offset {next_offset}, first available {}; a snapshot or reset is required",
-                first.offset
-            );
+        // Validate the whole batch, not just its first record: an interior
+        // gap would otherwise be skipped and the engine would silently miss an
+        // order.
+        if let (Some(first), Some(last)) = (records.first(), records.last()) {
+            let span = last.offset.saturating_sub(first.offset).saturating_add(1);
+            if first.offset != next_offset || span != records.len() as u64 {
+                ctx.mark_shard_failed();
+                error!(
+                    shard = shard_id,
+                    requested = next_offset,
+                    first = first.offset,
+                    last = last.offset,
+                    count = records.len(),
+                    "order log gap or overlap; a snapshot or reset is required"
+                );
+                break;
+            }
         }
+        next_offset = records
+            .last()
+            .map(|record| record.offset.saturating_add(1))
+            .unwrap_or(next_offset);
+        if sender.send(InputBatch { records }).await.is_err() {
+            break;
+        }
+    }
+}
 
-        executions.clear();
-        md_messages.clear();
-        let mut batch_last_offset = next_offset.saturating_sub(1);
+/// The matcher: a pure, blocking loop that owns the engine. No await, no I/O,
+/// no lock. It records match latency and builds output messages, then hands
+/// the batch to the writer.
+#[allow(clippy::too_many_arguments)]
+fn run_matcher(
+    ctx: Arc<NodeContext>,
+    shard_id: u32,
+    mut engine: ShardEngine,
+    mut input: mpsc::Receiver<InputBatch>,
+    output: mpsc::Sender<OutputBatch>,
+    recycle: mpsc::Sender<Vec<whippet_journal::PayloadRecord>>,
+    appended_offset: Arc<AtomicU64>,
+    start_last_offset: u64,
+) {
+    let mut out = EngineOutput::with_capacity(BATCH_CAPACITY, BATCH_CAPACITY);
+    // Per-shard recorder: no global lock on the match path. It is merged into
+    // the global metrics once a second, and once on exit.
+    let shard_metrics = ShardMetrics::new();
+    let mut last_merge = Instant::now();
+    let mut snapshot_sequence: u64 = 0;
+    let mut last_snapshot_at = Instant::now();
+    let mut last_offset = start_last_offset;
+    // A snapshot that came due while the writer was behind. It is taken at the
+    // next batch boundary where every output up to `last_offset` is appended.
+    let mut snapshot_pending = false;
+
+    while let Some(batch) = input.blocking_recv() {
+        let mut executions: Vec<JournalMessage> = Vec::with_capacity(BATCH_CAPACITY);
+        let mut md_messages: Vec<JournalMessage> = Vec::with_capacity(BATCH_CAPACITY);
         let mut snapshot_due = false;
+        // If a snapshot was deferred, this boundary is a candidate: the state
+        // is still at `last_offset`, which the writer may now have caught up to.
+        let mut snapshot = if snapshot_pending
+            && appended_offset.load(Ordering::Acquire) >= last_offset
+            && last_snapshot_at.elapsed() >= SNAPSHOT_MIN_INTERVAL
+        {
+            snapshot_pending = false;
+            last_snapshot_at = Instant::now();
+            snapshot_sequence += 1;
+            Some(SequencedSnapshot {
+                sequence: snapshot_sequence,
+                snapshot: engine.snapshot_state_without_hash(),
+            })
+        } else {
+            None
+        };
 
-        for record in records {
+        for record in &batch.records {
             match Command::decode(&record.payload) {
                 Ok(command) => {
                     let started = Instant::now();
@@ -264,13 +357,12 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
                             "engine rejected an input for this shard"
                         );
                     } else {
-                        ctx.metrics
-                            .record_match_latency_us(started.elapsed().as_micros() as u64);
-                        ctx.metrics.record_engine_command();
+                        shard_metrics.record_match_latency_us(started.elapsed().as_micros() as u64);
+                        shard_metrics.record_engine_command();
                         for execution in &out.executions {
-                            ctx.metrics.record_execution();
+                            shard_metrics.record_execution();
                             if matches!(execution.kind, ExecKind::Accepted | ExecKind::Rejected) {
-                                ctx.metrics
+                                shard_metrics
                                     .record_order_outcome(execution.kind == ExecKind::Rejected);
                             }
                             executions.push(execution_message(execution));
@@ -293,49 +385,115 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
                     );
                 }
             }
-            batch_last_offset = record.offset;
+            last_offset = record.offset;
         }
 
-        let next_offset_after = batch_last_offset.saturating_add(1);
-        // Executions and MD are independent topics, and the next orders poll is
-        // independent of both. Join all three: the shard pays one overlapped
-        // round trip per batch instead of three sequential ones. Both appends
-        // must succeed before the applied offset advances.
-        let (execution_result, md_result, poll_result) = tokio::join!(
-            append_with_retry(&ctx, Topic::Executions, shard_id, &executions),
-            append_with_retry(&ctx, Topic::Md, shard_id, &md_messages),
-            ctx.journal.read_payloads(
-                Topic::Orders,
-                shard_id,
-                &consumer,
-                next_offset_after,
-                BATCH_CAPACITY as u32,
-                50,
-            ),
-        );
-        if let Err(error) = execution_result {
-            error!(shard = shard_id, error = %error, "execution publish failed");
-            sleep(Duration::from_millis(250)).await;
-            continue;
-        }
-        if let Err(error) = md_result {
-            error!(shard = shard_id, error = %error, "MD publish failed");
-            sleep(Duration::from_millis(250)).await;
-            continue;
-        }
-        // A failed prefetch is not a batch failure: the offset is still applied,
-        // and the next iteration polls again from the same offset.
-        match poll_result {
-            Ok(records) => prefetched = Some(records),
-            Err(error) => {
-                warn!(shard = shard_id, error = %error, "prefetch poll failed; polling next iteration")
+        if snapshot.is_none() && snapshot_due {
+            if appended_offset.load(Ordering::Acquire) >= last_offset
+                && last_snapshot_at.elapsed() >= SNAPSHOT_MIN_INTERVAL
+            {
+                last_snapshot_at = Instant::now();
+                snapshot_sequence += 1;
+                snapshot = Some(SequencedSnapshot {
+                    sequence: snapshot_sequence,
+                    snapshot: engine.snapshot_state_without_hash(),
+                });
+            } else {
+                snapshot_pending = true;
             }
         }
-        // The outputs are already appended, so this offset is fully applied.
-        // The commit itself is decoupled: it is retried with backoff on later
-        // iterations and never blocks the loop or re-reads the batch.
-        watermark.note_applied(batch_last_offset);
-        next_offset = next_offset_after;
+
+        // Hand the polled buffer back for reuse.
+        let _ = recycle.try_send(batch.records);
+        // One global merge per second, not one lock per command.
+        if last_merge.elapsed() >= Duration::from_secs(1) {
+            shard_metrics.merge_into(&ctx.metrics);
+            last_merge = Instant::now();
+        }
+
+        if output
+            .blocking_send(OutputBatch {
+                executions,
+                md: md_messages,
+                last_offset,
+                snapshot,
+                final_batch: false,
+            })
+            .is_err()
+        {
+            shard_metrics.merge_into(&ctx.metrics);
+            return;
+        }
+    }
+    shard_metrics.merge_into(&ctx.metrics);
+
+    // Input closed: shutdown. Build the final snapshot here, where the engine
+    // lives, and let the writer persist it inside the shutdown budget.
+    snapshot_sequence += 1;
+    let final_snapshot = SequencedSnapshot {
+        sequence: snapshot_sequence,
+        snapshot: engine.snapshot_state_without_hash(),
+    };
+    let _ = output.blocking_send(OutputBatch {
+        executions: Vec::new(),
+        md: Vec::new(),
+        last_offset,
+        snapshot: Some(final_snapshot),
+        final_batch: true,
+    });
+}
+
+/// Drain matcher output, publish executions and MD, commit the watermark, and
+/// forward snapshots. This is the async journal edge for the shard.
+#[allow(clippy::too_many_arguments)]
+async fn run_writer(
+    ctx: Arc<NodeContext>,
+    shard_id: u32,
+    consumer: String,
+    committed_offset: Option<u64>,
+    mut output: mpsc::Receiver<OutputBatch>,
+    snapshot_tx: mpsc::Sender<SequencedSnapshot>,
+    snapshot_writer: tokio::task::JoinHandle<()>,
+    appended_offset: Arc<AtomicU64>,
+) -> Result<()> {
+    let mut watermark = CommitWatermark::new(committed_offset);
+    let mut commit_retry = CommitRetry::new();
+    let mut final_snapshot: Option<SequencedSnapshot> = None;
+
+    let mut shutdown_exec = ctx.shutdown.subscribe();
+    let mut shutdown_md = ctx.shutdown.subscribe();
+
+    while let Some(batch) = output.recv().await {
+        // Executions and MD are independent topics: join them so the shard
+        // pays one overlapped round trip per batch, not two sequential ones.
+        let (execution_result, md_result) = tokio::join!(
+            append_with_retry(
+                &ctx,
+                Topic::Executions,
+                shard_id,
+                &batch.executions,
+                &mut shutdown_exec,
+            ),
+            append_with_retry(&ctx, Topic::Md, shard_id, &batch.md, &mut shutdown_md),
+        );
+        // Do not advance the applied offset or commit unless both outputs are
+        // durable. Advancing here would let a restart skip orders whose
+        // executions/MD never reached the log.
+        if execution_result.is_err() || md_result.is_err() {
+            ctx.mark_shard_failed();
+            if let Err(error) = execution_result {
+                error!(shard = shard_id, error = %error, "execution publish failed; shard stopped");
+            }
+            if let Err(error) = md_result {
+                error!(shard = shard_id, error = %error, "MD publish failed; shard stopped");
+            }
+            anyhow::bail!(
+                "shard {shard_id} stopped after an output append failed; orders are not being matched"
+            );
+        }
+
+        appended_offset.store(batch.last_offset, Ordering::Release);
+        watermark.note_applied(batch.last_offset);
         maybe_commit(
             &ctx,
             Topic::Orders,
@@ -346,19 +504,67 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
         )
         .await;
 
-        if snapshot_due && last_snapshot_at.elapsed() >= SNAPSHOT_MIN_INTERVAL {
-            last_snapshot_at = Instant::now();
-            // Hand the state to the writer; the save (serialise + fsync +
-            // rename) happens off this task.
-            request_snapshot(
-                &ctx,
-                shard_id,
-                &engine,
-                &mut snapshot_sequence,
-                &snapshot_tx,
-            );
+        if batch.final_batch {
+            final_snapshot = batch.snapshot;
+            break;
+        }
+
+        if let Some(snapshot) = batch.snapshot {
+            let sequence = snapshot.sequence;
+            match snapshot_tx.try_send(snapshot) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => warn!(
+                    shard = shard_id,
+                    sequence, "snapshot writer is behind; skipped this snapshot"
+                ),
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    warn!(
+                        shard = shard_id,
+                        "snapshot writer stopped; engine state is no longer being persisted"
+                    );
+                    ctx.mark_shard_failed();
+                }
+            }
         }
     }
+
+    if let Some(snapshot) = final_snapshot {
+        match tokio::time::timeout(FINAL_SNAPSHOT_SEND_TIMEOUT, snapshot_tx.send(snapshot)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => warn!(
+                shard = shard_id,
+                "snapshot writer stopped before the final snapshot was queued"
+            ),
+            Err(_) => warn!(shard = shard_id, "timed out queueing the final snapshot"),
+        }
+    }
+
+    if let Some(offset) = watermark.pending() {
+        match commit_once(&ctx, Topic::Orders, shard_id, &consumer, offset).await {
+            Ok(()) => {
+                watermark.mark_committed(offset, Instant::now());
+                info!(shard = shard_id, offset, "committed final applied offset");
+            }
+            Err(error) => warn!(
+                shard = shard_id,
+                offset,
+                error = %error,
+                "final offset commit failed; the snapshot still records the applied state"
+            ),
+        }
+    }
+
+    // Close the queue so the writer drains and exits, then wait for the flush.
+    drop(snapshot_tx);
+    match tokio::time::timeout(FINAL_SNAPSHOT_JOIN_TIMEOUT, snapshot_writer).await {
+        Ok(Ok(())) => info!(shard = shard_id, "engine shard stopped"),
+        Ok(Err(error)) => warn!(shard = shard_id, error = %error, "final snapshot writer failed"),
+        Err(_) => warn!(
+            shard = shard_id,
+            "final snapshot did not finish within the shutdown budget"
+        ),
+    }
+    Ok(())
 }
 
 /// Consume the canonical market-data log and apply it to the dashboard cache.
@@ -684,40 +890,6 @@ async fn commit_once(
     }
 }
 
-/// Hand a snapshot to the writer task. Never awaits: if the writer is still busy
-/// with an older snapshot, this one is dropped and the next one (5s later, with
-/// a newer sequence) supersedes it.
-fn request_snapshot(
-    ctx: &NodeContext,
-    shard_id: u32,
-    engine: &ShardEngine,
-    sequence: &mut u64,
-    sender: &mpsc::Sender<SequencedSnapshot>,
-) {
-    *sequence += 1;
-    let request = SequencedSnapshot {
-        sequence: *sequence,
-        snapshot: engine.snapshot_state(),
-    };
-    match sender.try_send(request) {
-        Ok(()) => {}
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            warn!(
-                shard = shard_id,
-                sequence = *sequence,
-                "snapshot writer is behind; skipped this snapshot"
-            );
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
-            warn!(
-                shard = shard_id,
-                "snapshot writer stopped; engine state is no longer being persisted"
-            );
-            ctx.mark_shard_failed();
-        }
-    }
-}
-
 /// Owns the snapshot file. `save` is blocking, so the whole writer runs on a
 /// blocking thread and the shard loop only ever hands over an owned
 /// `ShardSnapshot`.
@@ -728,8 +900,11 @@ fn spawn_snapshot_writer(
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         let mut writer = SnapshotWriter::new(ctx.snapshots.clone());
-        while let Some(request) = pending.blocking_recv() {
+        while let Some(mut request) = pending.blocking_recv() {
             let sequence = request.sequence;
+            // The shard only cloned the state; the hash is computed here, on
+            // the blocking writer, so the match loop does not pay it.
+            whippet_engine::fill_symbol_hashes(&mut request.snapshot);
             // Diagnostics are built here, off the shard loop.
             let hashes: Vec<String> = request
                 .snapshot
@@ -776,17 +951,36 @@ async fn append_with_retry(
     topic: Topic,
     partition: u32,
     messages: &[JournalMessage],
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     if messages.is_empty() {
         return Ok(());
     }
     let mut delay = Duration::from_millis(100);
+    let mut attempts: u32 = 0;
     loop {
         match ctx.journal.append(topic, partition, messages).await {
             Ok(_) => return Ok(()),
             Err(error) => {
-                warn!(topic = %topic, partition, error = %error, "append failed; retrying");
-                sleep(delay).await;
+                attempts += 1;
+                warn!(
+                    topic = %topic,
+                    partition,
+                    attempt = attempts,
+                    error = %error,
+                    "append failed; retrying"
+                );
+                if attempts >= APPEND_MAX_ATTEMPTS {
+                    anyhow::bail!(
+                        "{topic} append failed {attempts} times on partition {partition}: {error}"
+                    );
+                }
+                tokio::select! {
+                    _ = shutdown.changed() => {
+                        anyhow::bail!("shutdown while retrying a {topic} append");
+                    }
+                    _ = sleep(delay) => {}
+                }
                 delay = (delay * 2).min(Duration::from_secs(2));
             }
         }

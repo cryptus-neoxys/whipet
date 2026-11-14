@@ -19,13 +19,14 @@
 //! connecting.
 
 use std::io::ErrorKind;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 use whippet_core::ids::Symbol;
@@ -34,7 +35,7 @@ use whippet_core::tcp::{TCP_BATCH_MAX, TcpErrorCode, TcpRequest, TcpResponse, bo
 use whippet_journal::{GroupCommit, Topic};
 
 use crate::context::NodeContext;
-use crate::gateway::{journal_message_for_command, token_matches};
+use crate::gateway::{RateLimiter, journal_message_for_command, token_matches};
 
 /// Idle connections are dropped after this long without a complete frame.
 /// A client that wants to keep a connection warm can send a `Ping`.
@@ -42,6 +43,12 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// A failed `accept` (for example EMFILE) must not spin the loop hot.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Concurrent connections. Each one holds a task and two small buffers.
+const MAX_TCP_CONNECTIONS: usize = 1_024;
+
+/// A client that stops reading acks must not hold a connection forever.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Serve binary order ingress until the task is cancelled.
 ///
@@ -59,6 +66,11 @@ pub async fn serve(ctx: Arc<NodeContext>, addr: SocketAddr) -> anyhow::Result<()
         "tcp ingress listening"
     );
 
+    // Same per-IP token bucket as HTTP ingress; the binary path is not a way
+    // around the rate limit. A semaphore bounds concurrent connections.
+    let limiter = Arc::new(RateLimiter::new(ctx.config.rate_limit_per_sec));
+    let connections = Arc::new(Semaphore::new(MAX_TCP_CONNECTIONS));
+
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -68,10 +80,22 @@ pub async fn serve(ctx: Arc<NodeContext>, addr: SocketAddr) -> anyhow::Result<()
                 continue;
             }
         };
+        let permit = match Arc::clone(&connections).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                warn!(peer = %peer, "tcp ingress connection cap reached; refusing");
+                drop(stream);
+                continue;
+            }
+        };
         let connection_ctx = Arc::clone(&ctx);
+        let connection_limiter = Arc::clone(&limiter);
         tokio::spawn(async move {
             // A connection error is per-client: the listener keeps serving.
-            if let Err(error) = serve_connection(connection_ctx, stream).await {
+            let _permit = permit;
+            if let Err(error) =
+                serve_connection(connection_ctx, stream, peer.ip(), connection_limiter).await
+            {
                 debug!(peer = %peer, error = %error, "tcp ingress connection ended");
             }
         });
@@ -81,24 +105,43 @@ pub async fn serve(ctx: Arc<NodeContext>, addr: SocketAddr) -> anyhow::Result<()
 /// Per-connection state that outlives a single request.
 struct ConnectionState {
     authorized: bool,
+    peer: IpAddr,
+    limiter: Arc<RateLimiter>,
 }
 
 impl ConnectionState {
+    /// Test/default form: localhost and the limiter disabled.
+    #[cfg(test)]
     fn new(ctx: &NodeContext) -> Self {
+        Self::with_peer(
+            ctx,
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::new(RateLimiter::new(0)),
+        )
+    }
+
+    fn with_peer(ctx: &NodeContext, peer: IpAddr, limiter: Arc<RateLimiter>) -> Self {
         Self {
             // Anonymous ingress is only possible when no token is configured.
             authorized: !ctx.config.auth_required(),
+            peer,
+            limiter,
         }
     }
 }
 
 /// Read frames, answer them in order, and reuse both buffers for the life of
 /// the connection.
-async fn serve_connection(ctx: Arc<NodeContext>, mut stream: TcpStream) -> std::io::Result<()> {
+async fn serve_connection(
+    ctx: Arc<NodeContext>,
+    mut stream: TcpStream,
+    peer: IpAddr,
+    limiter: Arc<RateLimiter>,
+) -> std::io::Result<()> {
     // Small request/response frames: do not let Nagle/delayed-ACK add latency.
     let _ = stream.set_nodelay(true);
 
-    let mut state = ConnectionState::new(&ctx);
+    let mut state = ConnectionState::with_peer(&ctx, peer, limiter);
     let mut read_buf: Vec<u8> = Vec::with_capacity(1024);
     let mut write_buf: Vec<u8> = Vec::with_capacity(64);
     let mut prefix = [0u8; 4];
@@ -212,6 +255,16 @@ async fn handle_submit(
                 "hello with a valid token is required before submit",
             ),
             true,
+        );
+    }
+
+    if !state.limiter.check(state.peer) {
+        return (
+            error_response(
+                TcpErrorCode::RateLimited,
+                "ingress rate limit exceeded; retry shortly",
+            ),
+            false,
         );
     }
 
@@ -331,7 +384,13 @@ async fn write_response(
     // `encode_into(&mut Vec<u8>)` in `whippet-core` would remove the copy too.
     buffer.clear();
     buffer.extend_from_slice(&response.encode());
-    stream.write_all(buffer).await
+    match timeout(WRITE_TIMEOUT, stream.write_all(buffer)).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            ErrorKind::TimedOut,
+            "client did not read the ack within the write timeout",
+        )),
+    }
 }
 
 fn now_ns() -> u64 {
