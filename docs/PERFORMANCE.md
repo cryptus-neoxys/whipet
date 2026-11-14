@@ -141,6 +141,52 @@ roughly `p50 / batch`. Batch 10 at 5,000/s is the useful dev-loop result:
 one-repetition Docker Desktop numbers, not headline results.
 
 
+### Sprint A tranche (measured)
+
+The next tranche attacks the remaining per-order wait and the warm paths:
+
+| Change | Where | Expected effect | Status |
+|---|---|---|---|
+| Per-partition group commit | `whippet-journal::group`, gateway single-order and cancel, TCP submit | Concurrent single-order appends become one Iggy append per partition; removes the one-RTT-per-order wait at moderate concurrency | Measured below |
+| Binary TCP ingress | `whippet-core::tcp`, `whippet::tcp` | Removes JSON parse and HTTP framing from the throughput path; fixed 78-byte commands | Measured below |
+| MD batch apply | `MdHub::apply_batch` | One hub lock and one clock read per poll batch instead of per event | 2.49× batch apply in the criterion bench (loaded host) |
+| WS serialize once | gateway `FrameCache`, `Subscribe`, `?trades=N` | One serialization per `(filter, tick)` instead of per subscriber; smaller tape | Implemented; fanout benchmark pending |
+| Routing headers | `MessageMeta::routing_pairs` | Executions/MD carry four header pairs instead of seven | Implemented |
+| Snapshot writer pipeline | `SnapshotWriter`, sequenced snapshots | Snapshot serialization/fsync leaves the shard loop; stale writes rejected | Implemented; 5 s cadence, soak pending |
+| Decoupled offset commit | `CommitWatermark` | Commit no longer blocks every poll; window is 256 records or 100 ms | Replay proof rerun below |
+
+Final sweep on the new tree (dev-loop, Docker Desktop, simulator stopped, one
+repetition, 8 s measured, 2 s warmup). Every row has 0 errors.
+
+| Rate | Batch | p50 | p99 | p99.9 | Before (p50) |
+|---:|---:|---:|---:|---:|---:|
+| 1,000/s | 1 | 538 µs | 9,567 µs | 20,335 µs | 543 µs |
+| 1,000/s | 10 | 3,509 µs | 16,831 µs | 36,447 µs | 2,501 µs |
+| 1,000/s | 100 | 9,839 µs | 17,695 µs | 17,855 µs | 15,295 µs |
+| 1,000/s | 256 | 13,127 µs | 20,511 µs | 22,655 µs | 54,175 µs |
+| 5,000/s | 1 | 2,030 µs | 28,159 µs | 67,647 µs | 838,143 µs |
+| 5,000/s | 10 | 1,054 µs | 9,799 µs | 27,487 µs | 1,762 µs |
+| 5,000/s | 100 | 4,363 µs | 246,399 µs | 325,375 µs | 8,231 µs |
+| 5,000/s | 256 | 7,779 µs | 14,671 µs | 19,519 µs | 19,407 µs |
+
+The `5,000/s batch 100` p99 is a one-repetition outlier, not a trend. TCP
+(same host, `--transport tcp`):
+
+| Path | p50 | p99 | Errors |
+|---|---:|---:|---:|
+| Batch 1, 5,000/s, 32 connections | 1,722 µs | 49,311 µs | 0 |
+| Batch 10, 5,000/s | 799 µs | 17,103 µs | 0 |
+| Batch 10, 10,000/s | 598 µs | 10,647 µs | 0 |
+
+Group commit coalesced up to 78 messages per append in the 5,000/s
+single-order run (62,155 messages in 33,240 appends). The 5,000/s
+single-order path was p50 838 ms with 40k errors before the tranche.
+
+The 5,000/s single-order path was p50 838 ms with 40k errors before group
+commit. The replay proof was rerun after the tranche: full and snapshot-seeded
+replay both end at `3a3228b97499304802aac091e369dc363f9546c2e2684488040b39e6fbf87f27`
+from snapshot offset 109005 (tail 7547).
+
 ## Stage budget
 
 Status legend:

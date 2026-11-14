@@ -10,6 +10,17 @@ Whippet is pre-1.0; minor releases may change internal APIs.
 
 ### Added
 
+- Binary TCP ingress on `WHIPPET_TCP_ADDR` (default `0.0.0.0:8081`) with a
+  length-prefixed fixed-layout frame, optional token handshake, and the same
+  one-append-per-batch semantics as HTTP.
+- Per-partition group commit for Orders ingress; every route (single order,
+  batch, cancel, TCP) shares one writer per partition.
+- `MdHub::apply_batch`, `latest_for`, and cached depth totals.
+- `MessageMeta::routing_pairs` (symbol/seq/type/schema) for executions and MD.
+- Sequenced snapshot writer off the shard task; commit watermark (256 records
+  or 100 ms) with retry backoff.
+- WS frame cache: one serialized frame per `(filter, tick)`, `Subscribe`, and
+  `?trades=N`.
 - `POST /api/orders/batch` for up to 256 orders of one symbol in a single Iggy
   append, with optional `?acks=none`.
 - Optional bearer-token ingress (`WHIPPET_API_TOKEN`), participant ownership,
@@ -19,6 +30,8 @@ Whippet is pre-1.0; minor releases may change internal APIs.
 
 ### Changed
 
+- The shard loop joins the executions and MD appends instead of awaiting them
+  in sequence.
 - Hot path: cached best bid/ask indices, `FxHashMap` order/dedup maps,
   payload-only journal reads, cached header keys and topic identifiers, owned
   append, 256-message append chunking, parallel executions/MD appends, and

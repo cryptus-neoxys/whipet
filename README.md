@@ -288,7 +288,7 @@ are in [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Durable order ingress | Implemented on one node. The gateway returns after the Iggy append confirmation. `persisted` protects against a process restart, not disk or host loss. |
 | Executions and market data through Iggy | Implemented. Both are published to the log; the MD hub consumes the MD topic. Executions have no Phase 1 consumer. |
 | Snapshot restore with a state hash | Implemented. `whippet verify` recomputes each snapshot hash. |
-| Replay reproduces the state hash | Implemented. `whippet replay` rebuilds an engine from the order log. One local dev-loop check: full replay from offset 0 and snapshot-seeded replay from a snapshot at offset 22111 both ended at `46d249d1...b9b9d`. One run, not a benchmark. |
+| Replay reproduces the state hash | Implemented. `whippet replay` rebuilds an engine from the order log. One local dev-loop check: full replay from offset 0 and snapshot-seeded replay from a snapshot at offset 109005 both ended at `3a3228b9...7f27`. One run, not a benchmark. |
 | Sub-millisecond matching | Not published. It is a design target and a live in-process metric only. No benchmark result exists. |
 | Low-single-digit-millisecond durable path on Linux | Not measured. No headline numbers yet. |
 | No acknowledged loss across one node failure | Not implemented. Single node, no failover. |
@@ -313,15 +313,15 @@ whippet replay --iggy-addr 127.0.0.1:8090 --partition 1 --snapshot-dir data/snap
 ```
 
 On a local single-node run (M4, Docker Desktop, dev-loop), the snapshot was
-written at offset 22111 and both replays ended with:
+written at offset 109005 and both replays ended with:
 
 ```text
-state_hash = 46d249d1051f359c8e77146724ddb6fb26fb6c7f3f5d056d7e0ba552c24b9b9d
+state_hash = 3a3228b97499304802aac091e369dc363f9546c2e2684488040b39e6fbf87f27
 ```
 
 The first replay reports `"seeded_from_snapshot": false` and `"from": 0`. The
-second reports `"seeded_from_snapshot": true`, `"snapshot_offset": 22111`, and
-`"from": 22112`. Equal hashes mean the snapshot state plus the replayed tail is
+second reports `"seeded_from_snapshot": true`, `"snapshot_offset": 109005`, and
+`"from": 109006`. Equal hashes mean the snapshot state plus the replayed tail is
 the same state as replaying the whole log. That is a determinism check for
 this log and this build. It is not a crash test, not an audit proof, and not a
 benchmark.
@@ -337,18 +337,25 @@ container with `docker compose -f deploy/compose.yaml exec node whippet ...`.
 
 ## Current dev-loop reading
 
-Fresh stack, simulator stopped, mixed limit/IOC/cancel L1 flow, 10 s measured,
-3 s warmup, one repetition, Docker Desktop on M4, default snapshots:
+Fresh stack, simulator stopped, mixed limit/IOC/cancel L1 flow, 8 s measured,
+2 s warmup, one repetition, Docker Desktop on M4, default snapshots:
 
 | Path | p50 | p99 | Errors |
 |---|---:|---:|---:|
-| Batch 1 at 1,000 orders/s | 543 µs | 1,027 µs | 0 |
-| Batch 10 at 5,000 orders/s | 1,762 µs | 4,695 µs | 0 |
+| HTTP single order, 1,000 orders/s | 538 µs | 9,567 µs | 0 |
+| HTTP single order, 5,000 orders/s (group commit) | 2,030 µs | 28,159 µs | 0 |
+| HTTP batch 10, 5,000 orders/s | 1,054 µs | 9,799 µs | 0 |
+| HTTP batch 256, 5,000 orders/s | 7,779 µs | 14,671 µs | 0 |
+| TCP batch 1, 5,000 orders/s, 32 connections | 1,722 µs | 49,311 µs | 0 |
+| TCP batch 10, 10,000 orders/s | 598 µs | 10,647 µs | 0 |
 
-Batch p50 includes waiting for the batch to fill; per-order amortized p50 is
-roughly `p50 / batch`. These are **dev-loop**, one-repetition numbers on a
-shared laptop. They are not headline results and do not support a
-sub-millisecond durable claim. The Linux matrix is the publishable artifact.
+The 5,000 orders/s single-order row used to queue at p50 838 ms with tens of
+thousands of errors; per-partition group commit coalesced up to 78 messages per
+append and removed the queue. Batch p50 includes waiting for the batch to fill;
+per-order amortized p50 is roughly `p50 / batch`. These are **dev-loop**,
+one-repetition numbers on a shared laptop. They are not headline results and do
+not support a sub-millisecond durable claim. The Linux matrix is the publishable
+artifact.
 
 ## Measured-numbers policy
 

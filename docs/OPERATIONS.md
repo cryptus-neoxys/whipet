@@ -13,6 +13,7 @@ credentials explicitly.
 | Variable | Default | Meaning |
 |---|---|---|
 | `WHIPPET_HTTP_ADDR` | `0.0.0.0:8080` | HTTP and WebSocket listen address. |
+| `WHIPPET_TCP_ADDR` | `0.0.0.0:8081` | Binary ingress listen address. Set `off` to disable. |
 | `WHIPPET_IGGY_ADDR` | `127.0.0.1:8090` | Iggy TCP address. |
 | `WHIPPET_IGGY_USER` | `iggy` | Iggy username. Compose must pass a non-default account. |
 | `WHIPPET_IGGY_PASSWORD` | `iggy` | Iggy password. Compose must pass a non-default secret. |
@@ -27,6 +28,12 @@ credentials explicitly.
 | `WHIPPET_SNAPSHOT_DIR` | `data/snapshots` | Directory for `partition-<N>.snapshot` files. |
 | `WHIPPET_SNAPSHOT_EVERY` | `10000` | Commands per symbol between state snapshots. The node also enforces a 5-second minimum interval, so a high-throughput run snapshots at most once per 5 s. Values below 1 are clamped to 1. |
 | `WHIPPET_HTTP_TRACE` | unset | Set to `1` to enable per-request `tower-http` trace spans; off by default for throughput. |
+
+Concurrent single-order submissions on one partition are coalesced into one
+Iggy append by a per-partition group-commit writer (up to 256 messages). The
+writer does not add a fixed linger; it drains what is queued when it wakes. The
+effect is visible in `/metrics` as `whippet_group_commit_batches_total` versus
+`whippet_group_commit_messages_total`.
 
 `POST /api/orders/batch` accepts up to 256 orders of one symbol and performs one
 Iggy append. Mixed-symbol batches are rejected with `mixed_symbols`; an invalid

@@ -53,7 +53,9 @@ export function useExchangeFeed(): ExchangeFeed {
       if (closed) return;
       setConnection(retry === 0 ? 'connecting' : opened ? 'reconnecting' : 'offline');
       const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-      socket = new WebSocket(`${protocol}://${window.location.host}/ws`);
+      // The tape only renders 60 rows. Ask the server for a 60-trade frame so the
+      // 20 Hz payload is not 250 trades of unused JSON.
+      socket = new WebSocket(`${protocol}://${window.location.host}/ws?trades=60`);
       socket.onopen = () => {
         opened = true;
         retry = 0;

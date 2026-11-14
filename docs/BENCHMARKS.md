@@ -26,36 +26,52 @@ per request). The dev-loop results are below; the native Linux sweep is still
 pending. The gateway caps a batch at 256 because one batch is one Iggy append
 and Iggy 0.10's default `message_bus.max_batch` is 256.
 
-The transport is still HTTP JSON. Fanout, replay, failover, and soak workloads
-are in the matrix but not implemented. The run-matrix table says which rows the
-harness can execute today.
+HTTP JSON is still the default transport. `--transport tcp` drives the binary
+length-prefixed ingress instead, with per-frame stage timestamps. A dev-loop
+group-commit and TCP measurement is recorded below; there are still no headline
+TCP numbers. Fanout, replay, failover, and soak workloads are in the matrix but
+not implemented. The run-matrix table says which rows the harness can execute
+today.
 
-## Dev-loop result after the first optimization tranche
+## Dev-loop result: final batch-size sweep (after)
 
-Fresh stack, simulator stopped, mixed limit/IOC/cancel flow, 10 s measured, 3 s
-warmup, one repetition, Docker Desktop on M4, default snapshots. `n` is orders;
-each batch's completion time is recorded once per order, so p50 includes the
-wait for the batch to fill. Per-order amortized p50 is roughly `p50 / batch`.
+Fresh stack, simulator stopped, mixed limit/IOC/cancel flow, `make bench-sweep`
+at 1,000 and 5,000 orders/s, batches 1 / 10 / 100 / 256, 8 s measured, 2 s
+warmup, one repetition, Docker Desktop on M4. All runs reported 0 errors. Each
+batch's completion is recorded once per order, so p50 includes the wait for the
+batch to fill.
 
-| Rate | Batch | p50 | p99 | Samples | Errors | Per-order p50 |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1,000/s | 1 | 543 µs | 1,027 µs | 10,000 | 0 | 543 µs |
-| 1,000/s | 10 | 2,501 µs | 4,875 µs | 10,000 | 0 | 250 µs |
-| 1,000/s | 100 | 15,295 µs | 27,887 µs | 10,000 | 0 | 153 µs |
-| 1,000/s | 256 | 54,175 µs | 70,399 µs | 10,184 | 0 | 212 µs |
-| 5,000/s | 1 | 838,143 µs | 1,008,639 µs | 47,811 | 0 | 838 ms (queue) |
-| 5,000/s | 10 | 1,762 µs | 4,695 µs | 50,000 | 0 | 179 µs |
-| 5,000/s | 100 | 8,231 µs | 24,351 µs | 50,000 | 0 | 82 µs |
-| 5,000/s | 256 | 19,407 µs | 44,991 µs | 50,152 | 0 | 76 µs |
+| Rate | Batch | p50 | p99 | p99.9 |
+|---:|---:|---:|---:|---:|
+| 1,000/s | 1 | 538 µs | 9,567 µs | 20,335 µs |
+| 1,000/s | 10 | 3,509 µs | 16,831 µs | 36,447 µs |
+| 1,000/s | 100 | 9,839 µs | 17,695 µs | 17,855 µs |
+| 1,000/s | 256 | 13,127 µs | 20,511 µs | 22,655 µs |
+| 5,000/s | 1 | 2,030 µs | 28,159 µs | 67,647 µs |
+| 5,000/s | 10 | 1,054 µs | 9,799 µs | 27,487 µs |
+| 5,000/s | 100 | 4,363 µs | 246,399 µs | 325,375 µs |
+| 5,000/s | 256 | 7,779 µs | 14,671 µs | 19,519 µs |
 
-The useful dev-loop result is **batch 10 at 5,000 orders/s: p50 1.76 ms,
-p99 4.70 ms, 0 errors**, versus batch 1 at 5,000/s, which queues (p50 838 ms)
-and previously failed. Batch 256 lowers per-order CPU further but raises
-per-order wall latency because each client waits for a full batch.
+This sweep supersedes the earlier 10 s / 3 s warmup table. The key before/after
+changes:
+
+- **5,000/s, batch 1:** p50 838,143 µs with roughly 40k errors before group
+  commit; now p50 2,030 µs, p99 28,159 µs, 0 errors.
+- **5,000/s, batch 10:** p50 1,762 µs → 1,054 µs.
+- **5,000/s, batch 256:** p50 19,407 µs → 7,779 µs.
+
+At 1,000/s the single-order path is still the best p50 (538 µs), and p50 rises
+with batch size because each order waits for a full batch. At 5,000/s batch 10
+is the best p50 (1,054 µs); batch 256 trades a higher p50 (7,779 µs) for fewer
+requests and lower per-order CPU.
+
+The `5,000/s, batch 100` row has p99 246,399 µs and p99.9 325,375 µs while its
+p50 is 4,363 µs. Treat that tail as a one-repetition outlier, likely snapshot
+I/O or host noise on Docker Desktop, not a trend. An 8-second run cannot
+resolve a p99 difference; the native Linux L1 run is the publishable artifact.
 
 These are one-repetition dev-loop numbers on a shared laptop. They are not
-headline results. They exist to show the batch path and the measurement
-harness work; the Linux matrix is still the publishable artifact.
+headline results.
 
 ## Method
 
@@ -97,6 +113,62 @@ orders is counted as `N` errors, not `N` successes.
 Cancels remain individual `POST /api/cancel` requests because the batch
 endpoint accepts orders only. A slot's samples always add up to `N` order
 events: orders go in the batch, cancels go as single requests.
+
+**Binary TCP ingress.** `--transport tcp --tcp-addr HOST:PORT` (default address
+`127.0.0.1:8081`) sends the same generated commands over the length-prefixed
+binary frame instead of HTTP JSON. The frame layout is
+`[u32 body_len][u8 kind][body]`; a `Submit` body is a `u16` command count
+followed by fixed-layout `Command` records. The HTTP path is unchanged and
+stays the default.
+
+- One persistent `TcpStream` per worker connection with `TCP_NODELAY`, not one
+  connection per request. The default pool is four connections; set
+  `WHIPPET_BENCH_TCP_CONNECTIONS` to change it. Batches are round-robined across
+  the pool.
+- `--batch-size N` maps to up to `N` commands in one `TcpRequest::Submit`
+  frame. All commands in a frame share one symbol. Orders and cancels both fit
+  the command layout, so a slot's cancels travel in the same frame and the
+  tracked-open-id logic is identical to HTTP.
+- The server handles one frame at a time per connection (read, append, write
+  the ack, then read the next). The harness therefore does **not** write a long
+  train of frames ahead. Each connection keeps at most
+  `64 KiB / frame_bytes` Submit frames outstanding (8 frames at batch 100, 3 at
+  batch 256) and a dedicated reader task drains acks continuously. Acks are
+  matched FIFO; TCP preserves order and the server processes frames in order.
+- On a `SubmitAck` the harness records one latency sample per order in the
+  frame: `ack_received - scheduled_deadline`. A `count` that does not match the
+  frame's command count is an error for every order in the frame. An `Error`
+  response is an error for every order in the frame and the run continues.
+- If `WHIPPET_API_TOKEN` is set, each connection sends `Hello` first and
+  requires a successful `HelloAck`.
+
+**TCP stage timestamps.** Every TCP frame carries four stamps:
+
+| Stamp | Meaning |
+|---|---|
+| T0 | scheduled deadline |
+| T1 | frame written (`write_all` returned) |
+| T2 | ack bytes read from the socket |
+| T3 | ack body decoded |
+
+The manifest `stages` array (top-level and per repetition) holds one
+`StageLatency` per non-empty stage:
+
+| Stage | Definition | Units |
+|---|---|---|
+| `send_us` | T1 - T0 | microseconds |
+| `wire_us` | T2 - T1 | microseconds |
+| `parse_us` | T3 - T2 | microseconds |
+| `server_offset_ns` | ack `server_ns` - client wall clock at T2 | nanoseconds |
+
+`send_us` includes generator handoff and queueing before the write, not just
+the syscall. `wire_us` is the client-observed round trip from write return to
+ack read; it includes the server's append and any queueing on the connection.
+`server_offset_ns` is a best-effort clock comparison: it includes the clock
+offset between the two hosts **and** the one-way network delay, so it is not a
+one-way latency and must not be reported as one. Stage summaries are recorded
+once per frame, not once per order; the latency summary is still recorded once
+per order.
 
 **Scheduler slip.** The generator records `wake_time - deadline` separately.
 Slip is a first-class result and is also written to the manifest's
@@ -172,6 +244,9 @@ cgroup), whatever `WHIPPET_VIRTUALIZATION` says.
 
 - Sends HTTP JSON orders to `--gateway` (default `http://127.0.0.1:8080`),
   either one order per request or `--batch-size` orders per request.
+- Sends the same workload over the binary TCP ingress with `--transport tcp`,
+  pipelined over a small persistent connection pool, and records per-frame
+  stage timestamps.
 - Mixes resting limit orders, IOC orders, and cancels of tracked open ids.
 - Bounds the tracked open-order working set per symbol.
 - Rotates symbols in the configured list. The default is the three-symbol demo
@@ -190,12 +265,12 @@ cgroup), whatever `WHIPPET_VIRTUALIZATION` says.
 
 What it does not do:
 
-- No TCP, QUIC, or FIX ingress. The transport is HTTP JSON.
+- No QUIC or FIX ingress. HTTP JSON is the default; binary TCP is opt-in.
 - No binary payload sizing. `payload_bytes` is a fixed 96 in the manifest, not
-  a measured request size; the JSON body is larger and a batch body is larger
+  a measured request size; the JSON body is larger and a TCP frame is larger
   still. Treat it as a label, not a measurement.
-- No stage timestamps. The `stages` array is always empty in this build; there
-  are no T0/T1/T2/T3 stamps.
+- No HTTP stage timestamps. The TCP path fills `stages`; an HTTP run leaves it
+  empty because reqwest does not expose the frame-write and ack-read instants.
 - No confidence intervals. `p50_ci95` and `p99_ci95` are null.
 - No raw `.hdr` files. The manifest's summaries are the raw artifact.
 - No fill notifications. A cancel can race a fill and be rejected; those
@@ -213,7 +288,7 @@ is the honest status of this harness.
 
 | ID | Workload | Vary | Duration | Harness support today |
 |---|---|---|---|---|
-| L1 | 64 B orders, 1 symbol | 1k / 5k / 10k / 25k / 50k / 100k orders/s | 5 min x 5 | Partial. HTTP JSON, mixed limit/IOC/cancel flow, optional batching. Payload size is not 64 B on the wire. |
+| L1 | 64 B orders, 1 symbol | 1k / 5k / 10k / 25k / 50k / 100k orders/s | 5 min x 5 | Partial. HTTP JSON by default, binary TCP with `--transport tcp`, mixed limit/IOC/cancel flow, optional batching, TCP stage timestamps. Payload size is not 64 B on the wire. |
 | L2 | 256 B, 10 symbols | 10k / 50k orders/s | 5 min x 5 | Partial. Only three instruments exist; the runner labels the row `L2-3sym`. |
 | F1 | 10k orders/s | 1 / 10 / 100 / 1000 subscribers | 5 min x 5 | No. `subscribers` is always 0; there is no fanout workload. |
 | F2 | Fixed 100k egress/s | 10 / 100 subscribers | 5 min x 5 | No. |
@@ -287,6 +362,7 @@ append. Two entry points exist:
 make bench-sweep            # scripts/bench-sweep.sh: rates x batch sizes
 scripts/bench-sweep.sh      # default rates 1k/2k/5k, batches 1/10/100/256
 scripts/bench.sh sweep      # single rate (1k/s), batches 1/10/100/256
+scripts/bench-tcp.sh        # TCP ingress: rates 1k/5k/10k, batches 1/10/100
 ```
 
 `scripts/bench-sweep.sh` reads `WHIPPET_SWEEP_RATES`,
@@ -344,40 +420,160 @@ What to compare, per batch size:
 
 ### Measured dev-loop sweep
 
-Fresh stack, simulator stopped, snapshots disabled
-(`WHIPPET_SNAPSHOT_EVERY=0`), 1,000 orders/s, 8 s measured, 2 s warmup, one
-repetition, fixed seed `0x5eed0001`. **`dev-loop`, not a result.**
+The primary after table at the top of this document is the current measured
+sweep (1,000 and 5,000 orders/s, batches 1 / 10 / 100 / 256, 8 s measured, 2 s
+warmup, one repetition, 0 errors). It supersedes the earlier 1,000/s-only table
+from the previous tranche. What the table does and does not say:
 
-| Batch | Request rate | p50 | p99 | Samples | Errors | Labels |
-|---|---|---|---|---|---|---|
-| 1 | 1,000 /s | 569 µs | 66,111 µs | 8,000 | 0 | `dev-loop` |
-| 10 | 100 /s | 2,503 µs | 62,623 µs | 8,000 | 0 | `dev-loop` |
-| 100 | 10 /s | 16,671 µs | 29,391 µs | 8,000 | 0 | `dev-loop`, `generator-bound` |
-| 256 | 3.9 /s | 43,807 µs | 99,391 µs | 8,208 | 0 | `dev-loop` |
-
-What the table does and does not say:
-
-- Achieved throughput is 1,000 orders/s at every batch size. Batching changes
+- Achieved throughput is the offered rate at every batch size. Batching changes
   the request count, not the offered load.
-- p50 rises with batch size because every order in a batch inherits the
-  completion of the whole durable append. That is the coordinated-omission
+- p50 rises with batch size at 1,000/s because every order in a batch inherits
+  the completion of the whole durable append. That is the coordinated-omission
   corrected batch latency, not a single-order median regression.
 - p99 is dominated by Docker Desktop stalls and is not monotonic across batch
   sizes. An 8-second run cannot resolve a p99 difference; the 5-minute native
-  Linux L1 run is the measurement for the tail.
-- The batch-100 run is labelled `generator-bound` (slip p99 2,341 µs is 8% of
-  latency p99). Its tail is partly the pacer.
-- The batch-256 run has 8,208 measured samples because warmup is trimmed to
-  whole batches (7 batches, 1,792 orders), so its measured span is 8.208 s.
-  `achieved_per_sec` uses that real span.
+  Linux L1 run is the measurement for the tail. The `5,000/s, batch 100` tail
+  (p99 246 ms) is a one-repetition outlier, not a trend.
+- Warmup is trimmed to whole batches, so a batch-256 run's measured sample
+  count can exceed `rate x duration`. `achieved_per_sec` uses the real measured
+  span.
 
 The same sweep with the default snapshot interval (every 1,000 commands)
-produced p50 of 7-48 ms and p99 up to 1.1 s. That is snapshot I/O of the order
-book, not ingress, and it makes the batch sizes indistinguishable. Always
-record the snapshot setting next to the manifest.
+produced p50 of 7-48 ms and p99 up to 1.1 s in an earlier tranche. That is
+snapshot I/O of the order book, not ingress, and it makes the batch sizes
+indistinguishable. Always record the snapshot setting next to the manifest.
 
 The batch sweep is only meaningful on the same host with the same commit. A
 Docker Desktop sweep is `dev-loop` and cannot be a headline.
+
+## Dev-loop result: group commit and TCP ingress
+
+**`dev-loop`, not a result.** Fresh stack, simulator stopped, Docker Desktop on
+an M4, 8 s measured, 2 s warmup, one repetition. The numbers exist to show the
+shape of the group-commit and binary-ingress paths and to catch regressions.
+They are not headline results and must not be quoted as transport wins.
+
+### Group commit (HTTP, single order)
+
+`--batch-size 1`, so the client sends one order per request and the node's group
+commit decides how many requests share one durable append.
+
+| Rate | p50 | p99 | p99.9 | Errors | Achieved | `group_commit_max_batch` | Appends |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1,000/s | 572 µs | 1,167 µs | — | 0 | 1,000/s | 1 | — |
+| 5,000/s | 2,411 µs | 77,887 µs | 133,631 µs | 0 | 5,000/s | 78 | 33,240 appends for 62,155 messages |
+
+At 1,000/s the queue never builds, so group commit stays at one command per
+append. At 5,000/s the same single-order client shape now batches up to 78
+commands per append (62,155 messages in 33,240 appends, about 1.87 messages per
+append) and holds the offered rate with zero errors. Before group commit, the
+5,000/s single-order shape queued at p50 838 ms with roughly 40k errors; that
+was the old batch-1 failure mode, not a latency result.
+
+### Replay determinism
+
+The replay proof was rerun after the change. Full replay and snapshot-seeded
+replay both end at
+`3a3228b97499304802aac091e369dc363f9546c2e2684488040b39e6fbf87f27` from
+snapshot offset 109005 (tail 7547). This is a correctness check, not a latency
+measurement.
+
+## TCP-ingress sweep (dev-loop measured, headline pending)
+
+The TCP sweep is the binary-ingress counterpart to the HTTP batch sweep. It
+runs the same mixed workload and changes only the transport and the number of
+commands per frame:
+
+```sh
+scripts/bench-tcp.sh
+# equivalent to:
+WHIPPET_SWEEP_TRANSPORT=tcp WHIPPET_TCP_ADDR=node:8081 \
+WHIPPET_SWEEP_RATES=1000,5000,10000 WHIPPET_SWEEP_BATCHES=1,10,100 \
+WHIPPET_SWEEP_LABEL_PREFIX=dev-loop-tcp scripts/bench-sweep.sh
+```
+
+The default matrix is 3 rates (1k / 5k / 10k orders/s) x 3 batch sizes (1 / 10
+/ 100 commands per Submit frame), 10 s measured, 2 s warmup, one repetition,
+labels `dev-loop-tcp-b<N>-r<R>`. The simulator is stopped and consumer lag is
+drained between runs exactly as in the HTTP sweep. Set
+`WHIPPET_BENCH_TCP_CONNECTIONS` to change the connection pool (default 4).
+
+Manual single run against a native node:
+
+```sh
+cargo run --release -p whippet-bench --example live_bench -- \
+  --transport tcp --tcp-addr 127.0.0.1:8081 \
+  --rate 1000 --duration 8 --warmup 2 --repetitions 1 \
+  --batch-size 10 --label tcp-batch-10
+```
+
+or with the CLI:
+
+```sh
+cargo run --release -p whippet -- bench \
+  --transport tcp --tcp-addr 127.0.0.1:8081 \
+  --rate 1000 --duration 30 --warmup 5 \
+  --repetitions 5 --batch-size 10 --label L1-tcp
+```
+
+### Measured dev-loop runs
+
+Same host and shape as the group-commit table: fresh stack, simulator stopped,
+Docker Desktop on an M4, 8 s measured, 2 s warmup, one repetition. **`dev-loop`,
+not a result.**
+
+| Batch | Rate | Connections | p50 | p99 | p99.9 | Errors | Achieved |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 5,000/s | 4 | 1,284 ms | — | — | — | 3,160/s (connection-limited; do not feature) |
+| 1 | 5,000/s | 16 | 2,369 µs | 456,959 µs | — | 0 | — |
+| 1 | 5,000/s | 32 | 1,722 µs | 49,311 µs | — | 0 | — |
+| 10 | 5,000/s | 4 (default) | 799 µs | 17,103 µs | — | 0 | — |
+| 10 | 10,000/s | 4 (default) | 598 µs | 10,647 µs | 22,095 µs | 0 | 10,000/s |
+
+TCP is one request in flight per connection by design, so batch-1 throughput
+scales with connection count. The 4-connection batch-1 row is connection-limited
+at 3,160/s and should not be featured. The 16- and 32-connection rows show the
+shape; the 16-connection p99 (457 ms) is far worse than the 32-connection p99
+(49 ms), so do not pick a connection count from p50 alone. Batch 10 amortizes
+the round trip and is the useful TCP shape: 799 µs p50 / 17.1 ms p99 at
+5,000/s, and 598 µs p50 / 10.6 ms p99 / 22.1 ms p99.9 at 10,000/s with zero
+errors and the full offered rate.
+
+Exact commands for the rows above:
+
+```sh
+docker compose -f deploy/compose.yaml --profile bench run --rm --user "$(id -u):$(id -g)" \
+  -e WHIPPET_VIRTUALIZATION=docker-desktop bench bench --gateway http://node:8080 \
+  --rate 5000 --duration 8 --warmup 2 --repetitions 1 --batch-size 1 --label gc-5000
+
+docker compose -f deploy/compose.yaml --profile bench run --rm --user "$(id -u):$(id -g)" \
+  -e WHIPPET_VIRTUALIZATION=docker-desktop -e WHIPPET_BENCH_TCP_CONNECTIONS=32 \
+  bench bench --gateway http://node:8080 --tcp-addr node:8081 --transport tcp \
+  --rate 5000 --duration 8 --warmup 2 --repetitions 1 --batch-size 1 --label tcp-b1-r5000-c32
+
+docker compose -f deploy/compose.yaml --profile bench run --rm --user "$(id -u):$(id -g)" \
+  -e WHIPPET_VIRTUALIZATION=docker-desktop bench bench --gateway http://node:8080 \
+  --tcp-addr node:8081 --transport tcp --rate 10000 --duration 8 --warmup 2 \
+  --repetitions 1 --batch-size 10 --label tcp-b10-r10000
+```
+
+The 16- and 4-connection rows use the same command with
+`WHIPPET_BENCH_TCP_CONNECTIONS=16` and `WHIPPET_BENCH_TCP_CONNECTIONS=4`.
+
+**Headline status: pending.** These are dev-loop numbers. A publishable TCP L1
+needs the native Linux runner with the simulator stopped. When it runs, report:
+
+- the latency summary (per order) and `error_count`,
+- `stages` p50/p99 for `send_us`, `wire_us`, `parse_us`, and
+  `server_offset_ns`,
+- `workload.transport` (`tcp`) and the connection-count note,
+- `scheduler_slip` and the `generator-bound` label,
+- the steady-state note (skipped for runs shorter than 20 seconds).
+
+Do not compare a TCP dev-loop run with an HTTP dev-loop run and call the delta a
+transport win. Different hosts, connection pools, and server builds change the
+result; the comparison is only meaningful on the same native host, commit, and
+snapshot setting.
 
 ## Running a benchmark
 
@@ -395,10 +591,15 @@ Workload knobs for the script:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `WHIPPET_BENCH_BATCH_SIZE` | 1 | orders per HTTP request, 1..=256 |
+| `WHIPPET_BENCH_BATCH_SIZE` | 1 | orders per request / commands per TCP frame, 1..=256 |
 | `WHIPPET_BENCH_IOC_RATIO` | 0.10 | IOC share of ingress events |
 | `WHIPPET_BENCH_CANCEL_RATIO` | 0.10 | cancel share of ingress events |
 | `WHIPPET_BENCH_SEED` | `0x5eed0001` | RNG seed; fixed so runs compare |
+| `WHIPPET_BENCH_TRANSPORT` | `http` | `http` or `tcp` (`bench.sh`) |
+| `WHIPPET_BENCH_TCP_ADDR` | `node:8081` | TCP ingress inside Compose (`bench.sh`) |
+| `WHIPPET_SWEEP_TRANSPORT` | `http` | `http` or `tcp` (`bench-sweep.sh`) |
+| `WHIPPET_TCP_ADDR` | `node:8081` | TCP ingress inside Compose (`bench-sweep.sh`) |
+| `WHIPPET_BENCH_TCP_CONNECTIONS` | 4 | persistent TCP connections per repetition |
 
 The ratios are environment knobs because the CLI does not expose them yet; the
 effective values and every override are recorded in the manifest notes.
@@ -443,6 +644,9 @@ The runner:
   `performance` / off,
 - applies `taskset` when `WHIPPET_PIN_CPUS` is set and records
   `WHIPPET_ISOLATED_CORES`,
+- passes `WHIPPET_TRANSPORT` (default `http`) and `WHIPPET_TCP_ADDR` (default
+  `127.0.0.1:8081`) through to the harness, so the same matrix can run over
+  binary TCP,
 - labels L2 as `L2-3sym` because the demo exchange has three instruments, not
   the dossier's ten.
 
@@ -475,11 +679,12 @@ Never hand-edit a manifest. If a field is wrong, fix the harness and rerun.
 ## Known gaps before a headline run
 
 - Record the real request and response sizes, not a fixed 96.
-- Add stage timestamps and populate `stages`.
 - Add bootstrap confidence intervals.
 - Add fill notifications so a cancel can distinguish "raced a fill" from a
   real rejection.
-- Add a binary transport path for the hot-path claim.
+- Run the TCP sweep on native Linux and publish it. The TCP path and its stage
+  timestamps exist, and there is a dev-loop measurement above, but no headline
+  TCP row yet.
 - Add fanout, replay, failover, and soak workloads.
 - Export raw histogram data alongside the manifest if a consumer needs it.
 - The open-order working set bounds the harness's tracked ids; aggressive

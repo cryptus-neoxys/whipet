@@ -19,6 +19,9 @@ bench:
 bench-sweep:
     make bench-sweep
 
+bench-tcp:
+    make bench-tcp
+
 verify:
     make verify
 

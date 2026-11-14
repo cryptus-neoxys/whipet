@@ -80,6 +80,43 @@ BTC-USD uses 100-cent ticks on a 40,000-90,000 tick ladder, ETH-USD uses
 10-cent ticks, SOL-USD uses 1-cent ticks. The browser formats cents; the engine
 never sees a float.
 
+## Transport
+
+There are two ingress transports with the same durable semantics:
+
+| Transport | Port | Use | Cost per order |
+|---|---|---|---|
+| HTTP/JSON (`POST /api/orders`, `/api/orders/batch`) | `8080` | Dashboard, simulator, curl, control plane | JSON parse + one Iggy append per request or batch |
+| Binary TCP | `8081` (`WHIPPET_TCP_ADDR`) | Throughput clients, benchmark | Fixed 78-byte command frames, one Iggy append per batch |
+
+The TCP frame is `[u32 body_len][u8 kind][body]`. `Submit` carries up to 256
+fixed-layout `Command` payloads of one symbol; `Hello` carries an optional
+bearer token when the node requires one; `Ping` measures liveness. A `Submit`
+is answered with one ack carrying `partition`, `base_offset`, and `count`; order
+`i` has offset `base_offset + i` because the whole batch is one append. The
+wire types live in `crates/whippet-core/src/tcp.rs`.
+
+Both transports call the same encoding and append path, so the engine cannot
+tell how an order arrived. TCP does not change durability: the ack is sent
+after the Iggy append confirms. TLS is not terminated in-process in Phase 1;
+put a proxy in front of the TCP port if the network is untrusted.
+
+### Group commit
+
+A single-order client still sends one command per request. The gateway and the
+TCP listener therefore run a per-partition **group commit**: concurrent
+submissions for the same `(topic, partition)` are queued to one writer task,
+drained into one Iggy append of up to 256 messages, and answered with
+`base_offset + i` per submission. The writer drains whatever is already queued
+when it wakes and does not add a fixed linger, so a lone order at a low rate is
+flushed immediately while a burst is coalesced by arrival concurrency.
+
+Ordering is preserved because there is exactly one writer per partition. A
+failed append is retried as a whole; the engine deduplicates order ids, so an
+at-least-once retry cannot double-apply a command. `/metrics` exposes
+`whippet_group_commit_batches_total`, `..._messages_total`, `..._max_batch`, and
+`..._partitions`.
+
 ## Topics
 
 Three streams separate trust domains. The layout is pinned in
@@ -260,11 +297,11 @@ replays the tail after the snapshot's maximum `last_offset`. `--to` is
 inclusive. `--expect-hash` turns a hash mismatch into a non-zero exit.
 
 On a local single-node run (M4, Docker Desktop, dev-loop), partition 1 had a
-snapshot at offset 22111. Full replay from offset 0 and snapshot-seeded replay
-from offset 22112 both produced:
+snapshot at offset 109005. Full replay from offset 0 and snapshot-seeded replay
+from offset 109006 both produced:
 
 ```text
-state_hash = 46d249d1051f359c8e77146724ddb6fb26fb6c7f3f5d056d7e0ba552c24b9b9d
+state_hash = 3a3228b97499304802aac091e369dc363f9546c2e2684488040b39e6fbf87f27
 ```
 
 Equal hashes mean the snapshot state plus the replayed tail matches a replay

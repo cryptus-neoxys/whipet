@@ -77,6 +77,7 @@ private network with synthetic data only.
 | Scoped identities | None. No PATs, no per-service users, no least-privilege grants. |
 | Transport | Iggy TCP is plaintext. There is no TLS on TCP, HTTP, WebSocket, or QUIC. |
 | At rest | No stream encryption. Iggy data and Whippet snapshot files are plaintext. |
+| Binary TCP ingress | Same bearer token as HTTP when `WHIPPET_API_TOKEN` is set: the client must send a `Hello` frame with the token before `Submit`. No TLS in-process; terminate at a proxy for untrusted networks. Disable with `WHIPPET_TCP_ADDR=off`. |
 | Dashboard and API | Unauthenticated by default. `WHIPPET_HTTP_ADDR` defaults to `0.0.0.0:8080`. Set `WHIPPET_API_TOKEN` to require a bearer token on order/cancel ingress; the dashboard itself remains unauthenticated. There is no CORS wildcard; the dashboard is same-origin and Vite development proxies `/api` and `/ws`. |
 | Participant identity | With `WHIPPET_API_TOKEN` set, the gateway derives the participant from `WHIPPET_API_PARTICIPANT` and rejects a body participant that differs (403). Without a token, the body participant is accepted, so a caller can act as another participant, including triggering cancel-resting self-trade prevention. Do not expose anonymous ingress to untrusted clients. |
 | Client mTLS | Not implemented and not claimed. Apache Iggy does not currently support client mTLS. |
