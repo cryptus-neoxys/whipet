@@ -57,7 +57,7 @@ acknowledgement and the fill are two separate observations.
 | `whippet-sim` | Seeded `Simulator` and four scenarios. | Offline |
 | `whippet-bench` | Open-loop pacer, HDR histograms, manifest collection and writing. | Offline |
 | `whippet-testkit` | Deterministic command builders, golden log, and proptest strategies for engine tests. | Tests only |
-| `whippet` | Binary and library: `node`, `sim`, `bench`, `healthcheck`, `verify`, `replay`; gateway routes; engine and MD runners; snapshot store. | Yes |
+| `whippet` | Binary and library: `node`, `sim`, `bench`, `healthcheck`, `verify`, `replay`, `doctor`; gateway routes; engine and MD runners; snapshot store. | Yes |
 
 The engine crate has no dependency on Tokio, Iggy, Axum, or the wall clock. The
 journal crate is the only place that calls Iggy.
@@ -181,7 +181,12 @@ The engine emits MBO-style deltas per symbol:
 - `Remove`: the order left the book.
 - `Trade`: a fill, with the aggressor's side and the taker order id.
 - `Bbo`, `Status`: defined in the protocol, not emitted by the current engine.
-- `Snapshot`: the full resting-order set plus top-20 display levels per side and the last trade.
+- `Snapshot`: the full resting-order set plus top-20 display levels per side and the last trade. Periodic MD snapshots are coarse (every 1,000,000 commands); the hub normally rebuilds from deltas, and a startup snapshot seeds a fresh process.
+
+The gateway also exposes `POST /api/orders/batch` for up to 256 orders of one
+symbol. The batch is validated as a whole and written with one Iggy append;
+`?acks=none` returns only the batch summary. This is the throughput path. The
+single-order path remains the latency path: one request, one append, one ack.
 
 The MD consumer applies records to a `BTreeMap`-backed cache per symbol. A
 snapshot replaces the levels; a delta mutates them. The cache keeps 20 levels
@@ -255,11 +260,11 @@ replays the tail after the snapshot's maximum `last_offset`. `--to` is
 inclusive. `--expect-hash` turns a hash mismatch into a non-zero exit.
 
 On a local single-node run (M4, Docker Desktop, dev-loop), partition 1 had a
-snapshot at offset 55999. Full replay from offset 0 and snapshot-seeded replay
-from offset 56000 both produced:
+snapshot at offset 22111. Full replay from offset 0 and snapshot-seeded replay
+from offset 22112 both produced:
 
 ```text
-state_hash = 45e81a0d2dcaa8716aaa0da386563f02ed269491f972e44a7887d8e2827db73b
+state_hash = 46d249d1051f359c8e77146724ddb6fb26fb6c7f3f5d056d7e0ba552c24b9b9d
 ```
 
 Equal hashes mean the snapshot state plus the replayed tail matches a replay

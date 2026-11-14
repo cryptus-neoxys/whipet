@@ -354,7 +354,7 @@ Expected shape (the counts depend on the log; the hash is the checked value):
   "last_offset": <head offset>,
   "decoded": <number of decoded records>,
   "skipped": 0,
-  "state_hash": "45e81a0d2dcaa8716aaa0da386563f02ed269491f972e44a7887d8e2827db73b"
+  "state_hash": "46d249d1051f359c8e77146724ddb6fb26fb6c7f3f5d056d7e0ba552c24b9b9d"
 }
 ```
 
@@ -365,26 +365,26 @@ whippet replay --iggy-addr 127.0.0.1:8090 --partition 1 \
   --snapshot-dir data/snapshots
 ```
 
-Expected shape (snapshot offset 55999 is from the local check; the head offset and count depend on the log):
+Expected shape (snapshot offset 22111 is from the local check; the head offset and count depend on the log):
 
 ```text
 {
   "partition": 1,
   "seeded_from_snapshot": true,
-  "snapshot_offset": 55999,
-  "from": 56000,
+  "snapshot_offset": 22111,
+  "from": 22112,
   "to": null,
   "last_offset": <head offset>,
   "decoded": <number of decoded tail records>,
   "skipped": 0,
-  "state_hash": "45e81a0d2dcaa8716aaa0da386563f02ed269491f972e44a7887d8e2827db73b"
+  "state_hash": "46d249d1051f359c8e77146724ddb6fb26fb6c7f3f5d056d7e0ba552c24b9b9d"
 }
 ```
 
 The exact offsets and decoded counts depend on the log. The equality is the
 point: replaying the whole log and replaying the snapshot plus its tail end at
 the same state hash. On a local single-node run (M4, Docker Desktop,
-dev-loop), the snapshot was at offset 55999 and both runs ended at the hash
+dev-loop), the snapshot was at offset 22111 and both runs ended at the hash
 above. This is one determinism check, not a crash test, not an audit proof,
 and not a benchmark.
 
@@ -481,6 +481,13 @@ Compose stack is expected to create a non-default root account and pass
 `WHIPPET_IGGY_USER` and `WHIPPET_IGGY_PASSWORD`. If the node logs an
 authentication error, the two sides disagree. Do not "fix" it by enabling
 default root credentials.
+
+### Orders return 401 or 403
+
+If `WHIPPET_API_TOKEN` is set, every order/cancel request needs
+`Authorization: Bearer <token>`. A body `participant` that differs from
+`WHIPPET_API_PARTICIPANT` returns 403. The dashboard has no token input yet;
+use curl for authenticated demos.
 
 ### Orders return 503
 

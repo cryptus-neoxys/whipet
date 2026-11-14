@@ -8,6 +8,28 @@ Whippet is pre-1.0; minor releases may change internal APIs.
 
 ## [Unreleased]
 
+### Added
+
+- `POST /api/orders/batch` for up to 256 orders of one symbol in a single Iggy
+  append, with optional `?acks=none`.
+- Optional bearer-token ingress (`WHIPPET_API_TOKEN`), participant ownership,
+  per-IP rate limiting, `GET /readyz`, and `whippet doctor`.
+- `make bench-sweep` / `scripts/bench-sweep.sh` for batch-size sweeps.
+- `docs/PERFORMANCE.md` and ADR 0009.
+
+### Changed
+
+- Hot path: cached best bid/ask indices, `FxHashMap` order/dedup maps,
+  payload-only journal reads, cached header keys and topic identifiers, owned
+  append, 256-message append chunking, parallel executions/MD appends, and
+  coarser state/MD snapshot cadence.
+- Recovery: uncertain Iggy lanes are resolved or abandoned and retried once;
+  offset commits no longer re-apply a batch.
+- The benchmark labels container runs `dev-loop` and records git/image
+  provenance; the pacer and in-flight handling are being hardened for validity.
+- The default Compose stack keeps Iggy defaults after a measured regression with
+  the 1 GiB/4-shard/136 MiB-WAL profile.
+
 ## [0.1.0] - 2026-11-14
 
 The Phase 1 durable slice: gateway -> Iggy `orders` -> deterministic matcher ->

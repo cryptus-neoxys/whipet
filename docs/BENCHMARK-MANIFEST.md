@@ -86,7 +86,7 @@ The label is written into `labels`, but the rule lives in code. A manifest with
 | `seed` | integer | Generator seed. |
 | `durability` | string | Topic durability, for example `persisted`. |
 | `consumer_offset_durability` | string | Consumer-offset durability. |
-| `batch_size` | integer | Producer batch size. 1 today. |
+| `batch_size` | integer | HTTP orders per request, 1–256. The gateway maps one batch to one Iggy append. |
 | `encryption` | boolean | Stream encryption requested. False today. |
 
 ## ThroughputSummary
@@ -321,7 +321,7 @@ schema does not know is rejected. That is intentional.
 | `payload_bytes` | `96` | Nominal, not measured. |
 | `subscribers` | `0` | No fanout workload. |
 | `encryption` | `false` | No stream encryption. |
-| `batch_size` | `1` | One HTTP order per request. |
+| `batch_size` | `1` | One HTTP order per request in the smoke run; the sweep uses 1/10/100/256. |
 | `physical_cores` | equal to `logical_cores` | The harness does not read the physical topology. |
 | `smt_enabled` | `null` | Not detected. |
 | `labels` | one scope label | The array is free-form. |

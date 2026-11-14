@@ -22,6 +22,17 @@ backed by artifacts.
 - Bench: open-loop pacer, coordinated-omission correction, HDR histograms, 5-rep manifest.
 - One-command Docker demo; Prometheus endpoint; replay/verify CLI.
 
+## Phase 1.5 — hardening and measured optimization (in progress)
+
+- Batch ingress, optional bearer auth, per-IP rate limits, readiness, `doctor`.
+- Journal fast path: payload-only reads, cached header keys/identifiers, owned
+  append, 256-message chunking, uncertain-lane recovery.
+- Engine hot path: cached best bid/ask, `FxHashMap`, snapshot cadence, dedup
+  eviction, snapshot/hash cost.
+- MD warm path: latest-frame reads, batch apply, smaller frames.
+- Bench validity: batch-size sweep, cancel/IOC mix, pacer/slip, provenance.
+- Linux headline benchmark and the full L1/L2/F1/F2/R1/R2 matrix.
+
 ## Phase 2 — depth
 
 - `turbo` mode: local sequencer, direct fanout, Iggy write-behind, visible uncommitted window.

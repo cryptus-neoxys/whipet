@@ -14,6 +14,7 @@ supersedes an earlier one.
 | [0006](0006-benchmark-protocol.md) | Benchmark protocol | Accepted |
 | [0007](0007-single-node-v1-cluster-phase-3.md) | Single-node v1, cluster Phase 3 | Accepted |
 | [0008](0008-security-model-and-scoped-identities.md) | Security model and scoped identities | Accepted for Phase 1 demo posture; Phase 2 target proposed |
+| [0009](0009-performance-budget-and-optimization-order.md) | Performance budget and optimization order | Accepted |
 
 Template:
 

@@ -19,6 +19,8 @@ and market data back to it.
   frame at 20 Hz.
 - A React/TanStack dashboard, a seeded simulator, an open-loop bench harness,
   snapshot verification, and a replay CLI.
+- Batch ingress (`POST /api/orders/batch`, up to 256 orders per Iggy append),
+  optional bearer auth, per-IP rate limiting, readiness, and `whippet doctor`.
 - A Prometheus text endpoint at `GET /metrics`.
 
 What is **not** in this build: turbo mode, 3-node VSR/HA, surveillance, the
@@ -43,7 +45,9 @@ Open <http://localhost:8080>.
 ```sh
 make demo     # scripted crossing order and trade
 make bench    # open-loop benchmark; longer than the quickstart
+make bench-sweep  # batch-size sweep: 1/10/100/256 orders per HTTP request
 make verify   # verify snapshot state hashes
+make doctor   # read-only preflight: Iggy topics, snapshots, health
 make down     # stop the stack
 make reset    # stop and delete named volumes; keeps secrets and local artifacts
 ```
@@ -64,6 +68,10 @@ volumes. Raw form:
 docker compose -f deploy/compose.yaml down -v
 scripts/reset.sh --data   # optional: also remove data/ and artifacts/bench
 ```
+
+The API is unauthenticated by default and intended for localhost. Set
+`WHIPPET_API_TOKEN` and `WHIPPET_RATE_LIMIT_PER_SEC` before exposing it beyond
+your machine; see [SECURITY.md](SECURITY.md).
 
 Two Iggy 0.10 details are handled by `deploy/compose.yaml`, not by the app:
 Iggy needs `io_uring`, so the container runs with
@@ -112,6 +120,10 @@ Expected shape:
 
 `accepted_by_log` means the record is in Iggy. It does not mean the order has
 been matched. Matching happens after the engine consumes the record.
+
+For throughput, `POST /api/orders/batch` accepts up to 256 orders of one symbol
+and performs one Iggy append. `?acks=none` returns only the batch summary. See
+[DEMO.md](docs/DEMO.md#batch-ingress).
 
 ### 2. See the fill in the tape
 
@@ -276,7 +288,7 @@ are in [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Durable order ingress | Implemented on one node. The gateway returns after the Iggy append confirmation. `persisted` protects against a process restart, not disk or host loss. |
 | Executions and market data through Iggy | Implemented. Both are published to the log; the MD hub consumes the MD topic. Executions have no Phase 1 consumer. |
 | Snapshot restore with a state hash | Implemented. `whippet verify` recomputes each snapshot hash. |
-| Replay reproduces the state hash | Implemented. `whippet replay` rebuilds an engine from the order log. One local dev-loop check: full replay from offset 0 and snapshot-seeded replay from a snapshot at offset 55999 both ended at `45e81a0d...b73b`. One run, not a benchmark. |
+| Replay reproduces the state hash | Implemented. `whippet replay` rebuilds an engine from the order log. One local dev-loop check: full replay from offset 0 and snapshot-seeded replay from a snapshot at offset 22111 both ended at `46d249d1...b9b9d`. One run, not a benchmark. |
 | Sub-millisecond matching | Not published. It is a design target and a live in-process metric only. No benchmark result exists. |
 | Low-single-digit-millisecond durable path on Linux | Not measured. No headline numbers yet. |
 | No acknowledged loss across one node failure | Not implemented. Single node, no failover. |
@@ -301,15 +313,15 @@ whippet replay --iggy-addr 127.0.0.1:8090 --partition 1 --snapshot-dir data/snap
 ```
 
 On a local single-node run (M4, Docker Desktop, dev-loop), the snapshot was
-written at offset 55999 and both replays ended with:
+written at offset 22111 and both replays ended with:
 
 ```text
-state_hash = 45e81a0d2dcaa8716aaa0da386563f02ed269491f972e44a7887d8e2827db73b
+state_hash = 46d249d1051f359c8e77146724ddb6fb26fb6c7f3f5d056d7e0ba552c24b9b9d
 ```
 
 The first replay reports `"seeded_from_snapshot": false` and `"from": 0`. The
-second reports `"seeded_from_snapshot": true`, `"snapshot_offset": 55999`, and
-`"from": 56000`. Equal hashes mean the snapshot state plus the replayed tail is
+second reports `"seeded_from_snapshot": true`, `"snapshot_offset": 22111`, and
+`"from": 22112`. Equal hashes mean the snapshot state plus the replayed tail is
 the same state as replaying the whole log. That is a determinism check for
 this log and this build. It is not a crash test, not an audit proof, and not a
 benchmark.
@@ -322,6 +334,21 @@ consumers.
 The examples assume `whippet` is on your `PATH`. Without it, use
 `cargo run --release -p whippet -- replay ...`, or run the binary in the node
 container with `docker compose -f deploy/compose.yaml exec node whippet ...`.
+
+## Current dev-loop reading
+
+Fresh stack, simulator stopped, mixed limit/IOC/cancel L1 flow, 10 s measured,
+3 s warmup, one repetition, Docker Desktop on M4, default snapshots:
+
+| Path | p50 | p99 | Errors |
+|---|---:|---:|---:|
+| Batch 1 at 1,000 orders/s | 543 µs | 1,027 µs | 0 |
+| Batch 10 at 5,000 orders/s | 1,762 µs | 4,695 µs | 0 |
+
+Batch p50 includes waiting for the batch to fill; per-order amortized p50 is
+roughly `p50 / batch`. These are **dev-loop**, one-repetition numbers on a
+shared laptop. They are not headline results and do not support a
+sub-millisecond durable claim. The Linux matrix is the publishable artifact.
 
 ## Measured-numbers policy
 
@@ -346,7 +373,7 @@ container with `docker compose -f deploy/compose.yaml exec node whippet ...`.
 | `crates/whippet-sim/` | Seeded market simulator with four scenarios. |
 | `crates/whippet-bench/` | Open-loop absolute-deadline harness, HDR histograms, manifest writer. |
 | `crates/whippet-testkit/` | Deterministic test helpers for the engine. No runtime code. |
-| `crates/whippet/` | The `whippet` binary: `node`, `sim`, `bench`, `healthcheck`, `verify`, `replay`. |
+| `crates/whippet/` | The `whippet` binary: `node`, `sim`, `bench`, `healthcheck`, `verify`, `replay`, `doctor`. |
 | `apps/dashboard/` | React 19, TanStack Router, uPlot, Vite. Built to `apps/dashboard/dist`. |
 | `deploy/compose.yaml` | Single-node stack: Iggy, node, dashboard. The `obs` profile adds Prometheus. |
 | `schemas/bench-manifest.schema.json` | JSON Schema for the benchmark manifest. |
@@ -365,6 +392,8 @@ container with `docker compose -f deploy/compose.yaml exec node whippet ...`.
   component fails, and what is only planned.
 - [BENCHMARKS.md](docs/BENCHMARKS.md): method, run matrix, scope labels, the
   smoke run.
+- [PERFORMANCE.md](docs/PERFORMANCE.md): stage budget, measured baseline,
+  ranked bottlenecks, and the before/after experiment matrix.
 - [BENCHMARK-MANIFEST.md](docs/BENCHMARK-MANIFEST.md): every manifest field and
   the JSON Schema.
 - [docs/benchmarks/README.md](docs/benchmarks/README.md): how to add a run

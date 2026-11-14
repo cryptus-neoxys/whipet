@@ -17,12 +17,22 @@ credentials explicitly.
 | `WHIPPET_IGGY_USER` | `iggy` | Iggy username. Compose must pass a non-default account. |
 | `WHIPPET_IGGY_PASSWORD` | `iggy` | Iggy password. Compose must pass a non-default secret. |
 | `WHIPPET_IGGY_PASSWORD_FILE` | unset | Read the Iggy password from a file instead of the environment. Compose points this at `/run/secrets/iggy_root_password`; the container entrypoint also exports the value. |
+| `WHIPPET_API_TOKEN` | unset | Optional bearer token for `/api/orders`, `/api/orders/batch`, and `/api/cancel`. |
+| `WHIPPET_API_PARTICIPANT` | `api` | Participant identity used when a bearer token is configured. |
+| `WHIPPET_RATE_LIMIT_PER_SEC` | `0` | Optional per-IP request limit; `0` disables. |
 | `WHIPPET_JOURNAL` | `iggy` | `iggy` for the demo, `memory` for tests and brokerless development. |
 | `WHIPPET_MODE` | `durable` | Only `durable` is enabled. `turbo` is rejected at startup with a Phase 2 message. |
 | `WHIPPET_SYMBOLS` | `BTC-USD,ETH-USD,SOL-USD` | Comma-separated subset of the built-in instruments. Unknown symbols are rejected. |
 | `WHIPPET_PARTITIONS` | `16` | Trading partitions, 1-256. This is a create-time contract; see below. |
 | `WHIPPET_SNAPSHOT_DIR` | `data/snapshots` | Directory for `partition-<N>.snapshot` files. |
-| `WHIPPET_SNAPSHOT_EVERY` | `10000` | Commands per symbol between snapshots. Values below 1 are clamped to 1. |
+| `WHIPPET_SNAPSHOT_EVERY` | `10000` | Commands per symbol between state snapshots. The node also enforces a 5-second minimum interval, so a high-throughput run snapshots at most once per 5 s. Values below 1 are clamped to 1. |
+| `WHIPPET_HTTP_TRACE` | unset | Set to `1` to enable per-request `tower-http` trace spans; off by default for throughput. |
+
+`POST /api/orders/batch` accepts up to 256 orders of one symbol and performs one
+Iggy append. Mixed-symbol batches are rejected with `mixed_symbols`; an invalid
+order rejects the whole batch. `?acks=none` returns only the batch summary
+(partition, base offset, count) and is intended for the bench and fire-and-forget
+clients.
 | `WHIPPET_DASHBOARD_DIR` | `apps/dashboard/dist` | Static dashboard assets. If `index.html` is missing, the API serves a build-instructions page. |
 | `WHIPPET_VENUE` | `whippet` | Venue name in the state view and headers. |
 | `WHIPPET_BUILD` | `dev` | Build label shown on the dashboard. |
@@ -87,9 +97,23 @@ Rough sizing, not a measurement:
 - A snapshot is proportional to resting orders plus dedup entries. The dedup
   table can hold up to 500,000 entries per symbol. Measure the files with
   `du -h data/snapshots`; do not assume a fixed size.
+- Full MD snapshots are deliberately coarse (every 1,000,000 commands, plus
+  startup). The MD hub normally rebuilds from the delta stream; periodic full
+  snapshots exist for recovery, not for every UI frame.
 
 On macOS, keep Iggy data in a named Docker volume, not a bind mount to the host
 filesystem. Bind-mounted I/O is slow and changes the failure behavior.
+
+## Iggy tuning
+
+The default stack keeps Iggy's 0.10 defaults. We tested a smaller profile
+(`IGGY_MEMORY_POOL_SIZE=1GiB`, four shards, no core pinning,
+`partition_io_capacity=32`, 136 MiB WAL) and it regressed durable-ingress
+latency on a 16 GB Docker Desktop VM, especially after a broker restart. The
+defaults are the measured-better configuration here. `deploy/iggy/iggy.toml`
+contains the alternative as a documented example for a memory-constrained
+3-node VM; do not treat it as a benchmark-tuned profile without measuring it on
+the target host.
 
 ## Reset
 
@@ -108,6 +132,19 @@ scripts/reset.sh --data   # optional: also remove host data/ and artifacts/bench
 snapshots in the named volume. It keeps host `data/`, `artifacts/`, and secrets
 unless you pass `--data`/`--all` to `scripts/reset.sh`. It does not touch the
 source tree or the dashboard build.
+
+## Preflight
+
+`whippet doctor` is read-only. It connects to Iggy with the node credentials,
+checks all six topics and their partition counts, prints partition heads,
+verifies snapshot files and state hashes when present, and checks the node
+health endpoint. Run it before a demo or after a restart:
+
+```sh
+make doctor
+# or, with an explicit gateway:
+whippet doctor --gateway http://127.0.0.1:8080 --iggy-addr 127.0.0.1:8090
+```
 
 ## Logs
 
@@ -131,7 +168,9 @@ There are no per-order log lines on the hot path.
 
 ## Health and metrics
 
-`GET /api/health` returns HTTP 200 with `status: "ok"` or `"degraded"`. It is
+`GET /readyz` returns 200 only when the journal is reachable and every shard
+task is alive; otherwise 503. Use it for container readiness. `GET /api/health`
+returns HTTP 200 with `status: "ok"` or `"degraded"`. It is
 `ok` only when the journal is reachable (or the in-memory journal is selected)
 and every shard task is alive; `shards_ok` reports the latter. A corrupt
 snapshot or a shard task panic therefore degrades health instead of leaving a

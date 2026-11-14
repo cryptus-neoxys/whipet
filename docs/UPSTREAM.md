@@ -578,3 +578,66 @@ operations notes when those notes are written.
 5. Will an idempotent ensure-topic-with-options API land near the high-level
    producer work, or should U-006/U-007 be split into a server-side and an
    SDK-side change? (U-006, U-007, U-013)
+
+---
+
+## U-016: `message_bus.max_batch` caps batch ingress at 256 and the env override is undocumented
+
+- **Date:** 2026-11-14
+- **Version:** server `0.10.0`, SDK `0.12.0`
+- **Status:** open — docs/validation
+
+**Symptom.** The 0.10 default config reports `message_bus.max_batch: 256`. A
+batch-ingress path wants 1,000 orders per Iggy append. Setting
+`IGGY_MESSAGE_BUS_MAX_BATCH=1024` made the server refuse to load its config
+(`Provided configuration value is invalid`) without naming the key, the allowed
+range, or the accepted spelling.
+
+**Minimal repro.** Start `apache/iggy:0.10.0` with
+`IGGY_MESSAGE_BUS_MAX_BATCH=1024`; the server exits during config load. Remove
+the variable and it starts with `max_batch: 256`.
+
+**Impact.** Batch ingress is capped at 256 messages per append. That is still
+enough to remove the one-request/one-append bottleneck, but a documented limit
+and a supported override would let operators tune for throughput.
+
+**Proposed action.** Document `message_bus.max_batch`, its valid range, and the
+env spelling; or accept a larger value with a clear error when it is out of
+range. Whippet caps the gateway batch at 256 in the meantime and does not split
+silently.
+
+**Workaround.** Gateway `POST /api/orders/batch` rejects more than 256 orders
+with a clear error; the bench sweep uses 1/10/100/256.
+
+---
+
+## U-017: A broker restart under load leaves SDK mutation lanes blocked until the app resolves or abandons the operation
+
+- **Date:** 2026-11-14
+- **Version:** server `0.10.0`, SDK `0.12.0`
+- **Status:** open — docs/example/ergonomics
+
+**Symptom.** After recreating the Iggy container while the node was appending
+and committing, consumer-offset commits failed forever with
+`iggy error: Lane blocked by operation <op> with an unknown outcome`. Retrying
+the same commit does not clear the lane. The SDK requires
+`resolve_operation(op, deadline)` or `abandon_operation(op)` before the lane
+can make progress. The error text names the operation but not the required
+recovery call.
+
+**Minimal repro.** Run a consumer with manual commits, restart the server under
+load, and keep retrying `store_consumer_offset`. The lane stays blocked.
+
+**Impact.** A single broker restart can stall a consumer indefinitely even
+after the broker is healthy again. For a trading path this looks like "up but
+not matching." An app that does not know the retained-operation API has no
+obvious way out except restarting the client.
+
+**Proposed action.** Document the recovery pattern next to the manual-commit
+example, and consider a high-level `commit_with_recovery` helper or an error
+message that says "call resolve_operation/abandon_operation". Whippet now
+resolves the named operation with a short deadline, then abandons it if the
+outcome cannot be proved, and retries the operation once.
+
+**Workaround.** `whippet-journal` recovers the operation and retries once; see
+`IggyJournal::recover_operation`.
