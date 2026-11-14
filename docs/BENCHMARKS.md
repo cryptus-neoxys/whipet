@@ -27,11 +27,11 @@ pending. The gateway caps a batch at 256 because one batch is one Iggy append
 and Iggy 0.10's default `message_bus.max_batch` is 256.
 
 HTTP JSON is still the default transport. `--transport tcp` drives the binary
-length-prefixed ingress instead, with per-frame stage timestamps. A dev-loop
-group-commit and TCP measurement is recorded below; there are still no headline
-TCP numbers. Fanout, replay, failover, and soak workloads are in the matrix but
-not implemented. The run-matrix table says which rows the harness can execute
-today.
+length-prefixed ingress instead, with per-frame stage timestamps. A final
+dev-loop batch-size sweep, a group-commit measurement, and a TCP measurement
+are recorded below; there are still no headline numbers. Fanout, replay,
+failover, and soak workloads are in the matrix but not implemented. The
+run-matrix table says which rows the harness can execute today.
 
 ## Dev-loop result: final batch-size sweep (after)
 
@@ -40,6 +40,12 @@ at 1,000 and 5,000 orders/s, batches 1 / 10 / 100 / 256, 8 s measured, 2 s
 warmup, one repetition, Docker Desktop on M4. All runs reported 0 errors. Each
 batch's completion is recorded once per order, so p50 includes the wait for the
 batch to fill.
+
+```sh
+WHIPPET_SWEEP_RATES=1000,5000 WHIPPET_SWEEP_BATCHES=1,10,100,256 \
+WHIPPET_SWEEP_DURATION=8 WHIPPET_SWEEP_WARMUP=2 WHIPPET_SWEEP_REPETITIONS=1 \
+make bench-sweep
+```
 
 | Rate | Batch | p50 | p99 | p99.9 |
 |---:|---:|---:|---:|---:|
@@ -466,9 +472,12 @@ commit decides how many requests share one durable append.
 At 1,000/s the queue never builds, so group commit stays at one command per
 append. At 5,000/s the same single-order client shape now batches up to 78
 commands per append (62,155 messages in 33,240 appends, about 1.87 messages per
-append) and holds the offered rate with zero errors. Before group commit, the
-5,000/s single-order shape queued at p50 838 ms with roughly 40k errors; that
-was the old batch-1 failure mode, not a latency result.
+append) and holds the offered rate with zero errors. The final batch-size sweep
+above measured the same 5,000/s single-order shape at p50 2,030 µs and p99
+28,159 µs; this table is the run that also captured
+`group_commit_max_batch`. Before group commit, the 5,000/s single-order shape
+queued at p50 838 ms with roughly 40k errors; that was the old batch-1 failure
+mode, not a latency result.
 
 ### Replay determinism
 
