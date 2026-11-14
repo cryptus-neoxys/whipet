@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::Router;
+use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Extension, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -22,8 +23,8 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing::warn;
 use whippet_core::api::{
-    ApiError, BatchOrderAck, BatchOrderRequest, CancelAck, CancelRequest, HealthView,
-    MAX_BATCH_ORDERS, OrderAck, OrderRequest, StateView, TradeView, WsClientMessage,
+    ApiError, BatchOrderAck, BatchOrderRequestRef, CancelAck, CancelRequest, HealthView,
+    MAX_BATCH_ORDERS, OrderAck, OrderRequestRef, StateView, TradeView, WsClientMessage,
     WsServerMessage,
 };
 use whippet_core::headers::{MessageMeta, SCHEMA_ORDER};
@@ -46,6 +47,7 @@ const BUCKET_IDLE: Duration = Duration::from_secs(60);
 pub fn router(ctx: Arc<NodeContext>) -> Router {
     let limiter = Arc::new(RateLimiter::new(ctx.config.rate_limit_per_sec));
     let frames = Arc::new(FrameCache::default());
+    let participants = Arc::new(ParticipantCache::default());
     let ingress = Router::new()
         .route("/api/orders", post(submit_order))
         .route("/api/orders/batch", post(submit_orders))
@@ -72,7 +74,8 @@ pub fn router(ctx: Arc<NodeContext>) -> Router {
 
     let api = api
         .layer(CompressionLayer::new().compress_when(NotForContentType::new("application/json")))
-        .layer(Extension(frames));
+        .layer(Extension(frames))
+        .layer(Extension(participants));
     let api = if http_trace_enabled() {
         api.layer(TraceLayer::new_for_http())
     } else {
@@ -91,7 +94,7 @@ fn http_trace_enabled() -> bool {
 
 /// A per-IP token bucket. One second of burst, refilled continuously. This is
 /// deliberately small: it is an ingress guard, not a quota system.
-struct RateLimiter {
+pub(crate) struct RateLimiter {
     per_sec: u32,
     buckets: Mutex<HashMap<IpAddr, Bucket>>,
 }
@@ -102,7 +105,7 @@ struct Bucket {
 }
 
 impl RateLimiter {
-    fn new(per_sec: u32) -> Self {
+    pub(crate) fn new(per_sec: u32) -> Self {
         Self {
             per_sec,
             buckets: Mutex::new(HashMap::new()),
@@ -110,7 +113,7 @@ impl RateLimiter {
     }
 
     /// `true` when the request may proceed.
-    fn check(&self, ip: IpAddr) -> bool {
+    pub(crate) fn check(&self, ip: IpAddr) -> bool {
         if self.per_sec == 0 {
             return true;
         }
@@ -172,14 +175,102 @@ async fn rate_limit(
     next.run(request).await
 }
 
+/// Upper bound on cached anonymous participant derivations. The table never
+/// grows past this: on a full cache it is cleared, so a flood of distinct
+/// names costs re-derivation, not memory.
+const PARTICIPANT_CACHE_CAP: usize = 4_096;
+
+/// Bounded cache from anonymous participant name to derived id. Deriving is a
+/// BLAKE3 hash; caching it keeps the per-order hot path to one hash-map
+/// lookup for repeat participants. The authenticated path never touches this:
+/// it acts as the single configured participant.
+#[derive(Default)]
+struct ParticipantCache {
+    inner: Mutex<HashMap<String, ParticipantId>>,
+}
+
+impl ParticipantCache {
+    fn get_or_derive(&self, name: &str) -> ParticipantId {
+        if let Some(id) = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(name)
+        {
+            return *id;
+        }
+        let derived = ParticipantId::derive(name);
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A concurrent insert may have won the race; reuse it.
+        if let Some(existing) = inner.get(name) {
+            return *existing;
+        }
+        if inner.len() >= PARTICIPANT_CACHE_CAP {
+            inner.clear();
+        }
+        inner.insert(name.to_owned(), derived);
+        derived
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+}
+
+/// axum 0.8's `Json` extractor needs `DeserializeOwned`, which rules out the
+/// borrowed ingress DTOs. Buffer the body (same 2 MiB cap) and parse with
+/// `serde_json::from_slice` so `&str` fields borrow from this buffer.
+const JSON_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
+async fn read_json_body(
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<axum::body::Bytes, (StatusCode, Json<ApiError>)> {
+    // Mirrors axum's `Json` extractor: only JSON bodies are accepted.
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if !content_type.starts_with("application/json") {
+        return Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(ApiError::new(
+                "unsupported_media_type",
+                "content-type must be application/json",
+            )),
+        ));
+    }
+    axum::body::to_bytes(body, JSON_BODY_LIMIT)
+        .await
+        .map_err(|_| bad_request("invalid_body", "failed to buffer the request body"))
+}
+
+fn invalid_json(error: serde_json::Error) -> (StatusCode, Json<ApiError>) {
+    // Mirrors axum's `Json` rejection status for an unparsable JSON body.
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(ApiError::new("invalid_json", error.to_string())),
+    )
+}
+
 async fn submit_order(
     State(ctx): State<Arc<NodeContext>>,
+    Extension(participants): Extension<Arc<ParticipantCache>>,
     headers: HeaderMap,
-    Json(request): Json<OrderRequest>,
+    body: Body,
 ) -> ApiResult<OrderAck> {
     let started = Instant::now();
     let caller = authenticate(&ctx, &headers)?;
-    let validated = validate_order(&ctx, &request, caller)?;
+    let bytes = read_json_body(&headers, body).await?;
+    let request: OrderRequestRef<'_> = serde_json::from_slice(&bytes).map_err(invalid_json)?;
+    let validated = validate_order_ref(&ctx, &request, caller, &participants)?;
     let timestamp_ns = now_ns();
     let (order_id, message) = build_order(&validated, timestamp_ns);
     let partition = validated.symbol.partition(ctx.exchange().partitions);
@@ -215,15 +306,18 @@ async fn submit_order(
 /// remain the default for compatibility.
 async fn submit_orders(
     State(ctx): State<Arc<NodeContext>>,
+    Extension(participants): Extension<Arc<ParticipantCache>>,
     headers: HeaderMap,
     Query(query): Query<BatchQuery>,
-    Json(request): Json<BatchOrderRequest>,
+    body: Body,
 ) -> ApiResult<BatchOrderAck> {
     let include_acks = query.acks.as_deref().is_none_or(|value| {
         !(value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("false"))
     });
     let started = Instant::now();
     let caller = authenticate(&ctx, &headers)?;
+    let bytes = read_json_body(&headers, body).await?;
+    let request: BatchOrderRequestRef<'_> = serde_json::from_slice(&bytes).map_err(invalid_json)?;
     if request.orders.is_empty() {
         return Err(bad_request(
             "empty_batch",
@@ -236,7 +330,12 @@ async fn submit_orders(
             format!("at most {MAX_BATCH_ORDERS} orders per batch"),
         ));
     }
-    let symbol = request.orders[0].symbol;
+    let symbol = Symbol::new(request.orders[0].symbol).map_err(|_| {
+        bad_request(
+            "unknown_symbol",
+            format!("unknown symbol {}", request.orders[0].symbol),
+        )
+    })?;
     let partition = symbol.partition(ctx.exchange().partitions);
 
     // Pass 1: reject mixed symbols, authenticate every participant, and
@@ -244,17 +343,22 @@ async fn submit_orders(
     // acceptable.
     let mut validated = Vec::with_capacity(request.orders.len());
     for (index, order) in request.orders.iter().enumerate() {
-        if order.symbol != symbol {
+        let order_symbol = Symbol::new(order.symbol).map_err(|_| {
+            with_index(
+                index,
+                bad_request("unknown_symbol", format!("unknown symbol {}", order.symbol)),
+            )
+        })?;
+        if order_symbol != symbol {
             return Err(bad_request(
                 "mixed_symbols",
                 format!(
-                    "order {index} uses {} but the batch started with {symbol}; split the batch by symbol",
-                    order.symbol
+                    "order {index} uses {order_symbol} but the batch started with {symbol}; split the batch by symbol",
                 ),
             ));
         }
-        let order =
-            validate_order(&ctx, order, caller).map_err(|error| with_index(index, error))?;
+        let order = validate_order_ref(&ctx, order, caller, &participants)
+            .map_err(|error| with_index(index, error))?;
         validated.push(order);
     }
 
@@ -329,25 +433,59 @@ struct ValidatedOrder {
     participant: ParticipantId,
 }
 
-fn validate_order(
+fn validate_order_ref(
     ctx: &NodeContext,
-    request: &OrderRequest,
+    request: &OrderRequestRef<'_>,
     caller: Option<&str>,
+    participants: &ParticipantCache,
 ) -> Result<ValidatedOrder, (StatusCode, Json<ApiError>)> {
-    let instrument = ctx.exchange().instrument(request.symbol).ok_or_else(|| {
+    // `Symbol::new` copies at most 16 bytes and never allocates on success;
+    // only the error path formats.
+    let symbol = Symbol::new(request.symbol).map_err(|_| {
         bad_request(
             "unknown_symbol",
             format!("unknown symbol {}", request.symbol),
         )
     })?;
-    if request.qty == 0 {
+    validate_fields(
+        ctx,
+        symbol,
+        request.side,
+        request.order_type,
+        request.price_cents,
+        request.qty,
+        request.client_order_id,
+        request.participant,
+        caller,
+        Some(participants),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_fields(
+    ctx: &NodeContext,
+    symbol: Symbol,
+    side: Side,
+    order_type: OrderType,
+    price_cents: Option<i64>,
+    qty: u64,
+    client_order_id: Option<&str>,
+    participant: Option<&str>,
+    caller: Option<&str>,
+    participants: Option<&ParticipantCache>,
+) -> Result<ValidatedOrder, (StatusCode, Json<ApiError>)> {
+    let instrument = ctx
+        .exchange()
+        .instrument(symbol)
+        .ok_or_else(|| bad_request("unknown_symbol", format!("unknown symbol {symbol}")))?;
+    if qty == 0 {
         return Err(bad_request("invalid_qty", "qty must be greater than zero"));
     }
-    if request.qty > 1_000_000_000 {
+    if qty > 1_000_000_000 {
         return Err(bad_request("invalid_qty", "qty is unreasonably large"));
     }
-    let price = if request.order_type.requires_price() {
-        let cents = request.price_cents.ok_or_else(|| {
+    let price = if order_type.requires_price() {
+        let cents = price_cents.ok_or_else(|| {
             bad_request(
                 "missing_price",
                 "price_cents is required for this order type",
@@ -359,27 +497,30 @@ fn validate_order(
     } else {
         Price::ZERO
     };
-    let client_order_id = request
-        .client_order_id
-        .clone()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    if client_order_id.len() > 128 {
-        return Err(bad_request(
-            "invalid_client_order_id",
-            "client_order_id must be at most 128 bytes",
-        ));
-    }
-    let order_id = OrderId::derive(request.symbol, &client_order_id);
-    let participant_name = resolve_participant(caller, request.participant.as_deref())?;
+    // Derive from the borrowed key before any owned conversion: a supplied
+    // idempotency key never touches the allocator. Only a missing key mints
+    // (and owns) a fresh UUID.
+    let order_id = match client_order_id.filter(|value| !value.is_empty()) {
+        Some(key) => {
+            if key.len() > 128 {
+                return Err(bad_request(
+                    "invalid_client_order_id",
+                    "client_order_id must be at most 128 bytes",
+                ));
+            }
+            OrderId::derive(symbol, key)
+        }
+        None => OrderId::derive(symbol, &uuid::Uuid::new_v4().to_string()),
+    };
+    let participant = resolve_participant_id(caller, participant, participants)?;
     Ok(ValidatedOrder {
-        symbol: request.symbol,
-        side: request.side,
-        order_type: request.order_type,
+        symbol,
+        side,
+        order_type,
         price,
-        qty: Qty(request.qty),
+        qty: Qty(qty),
         order_id,
-        participant: ParticipantId::derive(&participant_name),
+        participant,
     })
 }
 
@@ -428,6 +569,7 @@ pub(crate) fn token_matches(expected: &str, presented: &str) -> bool {
 
 async fn cancel_order(
     State(ctx): State<Arc<NodeContext>>,
+    Extension(participants): Extension<Arc<ParticipantCache>>,
     headers: HeaderMap,
     Json(request): Json<CancelRequest>,
 ) -> ApiResult<CancelAck> {
@@ -438,8 +580,8 @@ async fn cancel_order(
             format!("unknown symbol {}", request.symbol),
         )
     })?;
-    let participant_name = resolve_participant(caller, request.participant.as_deref())?;
-    let participant = ParticipantId::derive(&participant_name);
+    let participant =
+        resolve_participant_id(caller, request.participant.as_deref(), Some(&participants))?;
     let timestamp_ns = now_ns();
     let command = Command::cancel(request.symbol, request.order_id, participant, timestamp_ns);
     let partition = request.symbol.partition(ctx.exchange().partitions);
@@ -515,12 +657,13 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
-/// Authenticated callers always act as the configured participant. Supplying a
-/// different name is an error, never a silent override.
-fn resolve_participant(
-    caller: Option<&str>,
-    requested: Option<&str>,
-) -> Result<String, (StatusCode, Json<ApiError>)> {
+/// Shared participant check for the HTTP ingress paths. Returns the name
+/// borrowed from the caller config, the request, or the anonymous fallback:
+/// no allocation on any path.
+fn check_participant<'a>(
+    caller: Option<&'a str>,
+    requested: Option<&'a str>,
+) -> Result<&'a str, (StatusCode, Json<ApiError>)> {
     let requested = requested.filter(|value| !value.is_empty());
     let name = match caller {
         Some(configured) => {
@@ -537,9 +680,9 @@ fn resolve_participant(
                     )),
                 ));
             }
-            configured.to_string()
+            configured
         }
-        None => requested.unwrap_or("anonymous").to_string(),
+        None => requested.unwrap_or("anonymous"),
     };
     if name.len() > 64 {
         return Err(bad_request(
@@ -548,6 +691,21 @@ fn resolve_participant(
         ));
     }
     Ok(name)
+}
+
+/// Authenticated callers act as the configured participant (derived directly:
+/// the name is fixed, so no cache is needed). Anonymous body participants go
+/// through the bounded derivation cache when one is supplied.
+fn resolve_participant_id(
+    caller: Option<&str>,
+    requested: Option<&str>,
+    participants: Option<&ParticipantCache>,
+) -> Result<ParticipantId, (StatusCode, Json<ApiError>)> {
+    let name = check_participant(caller, requested)?;
+    Ok(match (caller, participants) {
+        (None, Some(cache)) => cache.get_or_derive(name),
+        _ => ParticipantId::derive(name),
+    })
 }
 
 fn with_index(
@@ -819,6 +977,11 @@ struct FrameCacheInner {
     frames: HashMap<(Vec<Symbol>, usize), axum::extract::ws::Utf8Bytes>,
 }
 
+/// Distinct `(symbols, trade limit)` frames kept per tick. A client can send
+/// many `Subscribe` messages; without a bound the per-tick map would grow with
+/// the number of distinct filters.
+const MAX_CACHED_FRAMES: usize = 16;
+
 impl FrameCache {
     fn frame(
         &self,
@@ -853,6 +1016,11 @@ impl FrameCache {
             "{\"type\":\"notice\",\"level\":\"error\",\"message\":\"encode failed\"}".into()
         });
         let frame = axum::extract::ws::Utf8Bytes::from(text);
+        if inner.frames.len() >= MAX_CACHED_FRAMES {
+            // Bounded: a burst of distinct subscriptions evicts the cache for
+            // this tick instead of growing it without limit.
+            inner.frames.clear();
+        }
         inner.frames.insert(key, frame.clone());
         frame
     }
@@ -1077,6 +1245,32 @@ mod tests {
         next.sequence += 1;
         let third = cache.frame(&next, &[], 60);
         assert_ne!(first, third);
+    }
+
+    #[test]
+    fn participant_cache_matches_derive_and_reuses_entries() {
+        let cache = ParticipantCache::default();
+        assert_eq!(cache.get_or_derive("alice"), ParticipantId::derive("alice"));
+        assert_eq!(cache.len(), 1);
+        // A repeat lookup hits the cache instead of growing it.
+        assert_eq!(cache.get_or_derive("alice"), ParticipantId::derive("alice"));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get_or_derive("bob"), ParticipantId::derive("bob"));
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn participant_cache_is_bounded() {
+        let cache = ParticipantCache::default();
+        for index in 0..PARTICIPANT_CACHE_CAP + 100 {
+            let name = format!("participant-{index}");
+            assert_eq!(cache.get_or_derive(&name), ParticipantId::derive(&name));
+        }
+        assert!(
+            cache.len() <= PARTICIPANT_CACHE_CAP,
+            "cache must never exceed the cap, len = {}",
+            cache.len()
+        );
     }
 
     #[test]

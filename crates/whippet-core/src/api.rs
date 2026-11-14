@@ -34,6 +34,42 @@ fn default_order_type() -> OrderType {
     OrderType::Limit
 }
 
+/// Borrowed ingress DTO for the single-order hot path. Same JSON shape as
+/// [`OrderRequest`], but `symbol`, `client_order_id`, and `participant` borrow
+/// from the request body instead of allocating a `String` each.
+///
+/// `serde_json` borrows `&str` directly for unescaped input; input with string
+/// escapes cannot borrow and is rejected at extraction time, so producers
+/// should send plain idempotency keys and participant names (the hot-path
+/// norm). The gateway validates a `OrderRequestRef` into the same
+/// `ValidatedOrder` as the owned form, so the JSON contract is unchanged.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct OrderRequestRef<'a> {
+    pub symbol: &'a str,
+    pub side: Side,
+    #[serde(default = "default_order_type")]
+    pub order_type: OrderType,
+    /// Required for every order type except `market`.
+    #[serde(default)]
+    pub price_cents: Option<i64>,
+    pub qty: u64,
+    /// Client-supplied idempotency key. The order id is derived from this
+    /// slice before any owned conversion, so present keys never allocate.
+    #[serde(default)]
+    pub client_order_id: Option<&'a str>,
+    /// Stable participant name. Hashed to the engine's integer participant id.
+    #[serde(default)]
+    pub participant: Option<&'a str>,
+}
+
+/// Borrowed ingress DTO for the batch hot path. Same JSON shape as
+/// [`BatchOrderRequest`]; only the per-order strings borrow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchOrderRequestRef<'a> {
+    #[serde(borrow)]
+    pub orders: Vec<OrderRequestRef<'a>>,
+}
+
 /// Iggy 0.10's default `message_bus.max_batch`; the gateway and bench use the
 /// same cap so a batch is one append, not a silent split.
 pub const MAX_BATCH_ORDERS: usize = 256;
@@ -261,5 +297,51 @@ mod tests {
         };
         let json = serde_json::to_string(&message).unwrap();
         assert!(json.contains("\"type\":\"notice\""));
+    }
+
+    #[test]
+    fn borrowed_request_matches_owned_for_the_same_json() {
+        let json = r#"{"symbol":"BTC-USD","side":"buy","order_type":"limit","price_cents":6500000,"qty":10,"client_order_id":"abc-1","participant":"alice"}"#;
+        let owned: OrderRequest = serde_json::from_str(json).unwrap();
+        let borrowed: OrderRequestRef<'_> = serde_json::from_str(json).unwrap();
+        assert_eq!(borrowed.symbol, owned.symbol.as_str());
+        assert_eq!(borrowed.side, owned.side);
+        assert_eq!(borrowed.order_type, owned.order_type);
+        assert_eq!(borrowed.price_cents, owned.price_cents);
+        assert_eq!(borrowed.qty, owned.qty);
+        assert_eq!(borrowed.client_order_id, owned.client_order_id.as_deref());
+        assert_eq!(borrowed.participant, owned.participant.as_deref());
+    }
+
+    #[test]
+    fn borrowed_request_applies_the_same_defaults_as_owned() {
+        let json = r#"{"symbol":"BTC-USD","side":"sell","price_cents":6500100,"qty":4}"#;
+        let owned: OrderRequest = serde_json::from_str(json).unwrap();
+        let borrowed: OrderRequestRef<'_> = serde_json::from_str(json).unwrap();
+        assert_eq!(owned.order_type, OrderType::Limit);
+        assert_eq!(borrowed.order_type, OrderType::Limit);
+        assert_eq!(borrowed.client_order_id, None);
+        assert_eq!(borrowed.participant, None);
+        assert_eq!(borrowed.price_cents, owned.price_cents);
+    }
+
+    #[test]
+    fn borrowed_batch_matches_owned_for_the_same_json() {
+        let json = r#"{"orders":[
+            {"symbol":"BTC-USD","side":"buy","price_cents":6500000,"qty":10,"client_order_id":"b-1","participant":"alice"},
+            {"symbol":"BTC-USD","side":"sell","price_cents":6500100,"qty":4}
+        ]}"#;
+        let owned: BatchOrderRequest = serde_json::from_str(json).unwrap();
+        let borrowed: BatchOrderRequestRef<'_> = serde_json::from_str(json).unwrap();
+        assert_eq!(borrowed.orders.len(), owned.orders.len());
+        for (borrowed, owned) in borrowed.orders.iter().zip(owned.orders.iter()) {
+            assert_eq!(borrowed.symbol, owned.symbol.as_str());
+            assert_eq!(borrowed.side, owned.side);
+            assert_eq!(borrowed.order_type, owned.order_type);
+            assert_eq!(borrowed.price_cents, owned.price_cents);
+            assert_eq!(borrowed.qty, owned.qty);
+            assert_eq!(borrowed.client_order_id, owned.client_order_id.as_deref());
+            assert_eq!(borrowed.participant, owned.participant.as_deref());
+        }
     }
 }

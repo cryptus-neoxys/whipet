@@ -27,7 +27,8 @@ use whippet::config::NodeConfig;
 use whippet::context::NodeContext;
 use whippet::gateway;
 use whippet_core::api::{
-    BatchOrderAck, CancelAck, HealthView, MAX_BATCH_ORDERS, OrderAck, StateView,
+    BatchOrderAck, BatchOrderRequest, BatchOrderRequestRef, CancelAck, HealthView,
+    MAX_BATCH_ORDERS, OrderAck, OrderRequest, OrderRequestRef, StateView,
 };
 use whippet_core::config::Mode;
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Symbol};
@@ -827,4 +828,131 @@ async fn batches_above_the_iggy_message_cap_are_rejected() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "batch_too_large");
     assert!(node.orders(symbol()).is_empty());
+}
+
+#[test]
+fn borrowed_dtos_deserialize_the_same_json_as_owned() {
+    // The borrowed hot-path DTOs accept exactly the same JSON (including
+    // defaults) as the owned DTOs; they only borrow the strings.
+    let json = r#"{"orders":[
+        {"symbol":"BTC-USD","side":"buy","order_type":"limit","price_cents":6500000,"qty":10,"client_order_id":"ref-1","participant":"alice"},
+        {"symbol":"BTC-USD","side":"sell","price_cents":6500100,"qty":4}
+    ]}"#;
+    let owned: BatchOrderRequest = serde_json::from_str(json).unwrap();
+    let borrowed: BatchOrderRequestRef<'_> = serde_json::from_str(json).unwrap();
+    assert_eq!(borrowed.orders.len(), owned.orders.len());
+    for (borrowed, owned) in borrowed.orders.iter().zip(owned.orders.iter()) {
+        let expected: OrderRequest =
+            serde_json::from_value(serde_json::to_value(borrowed).expect("borrowed serializes"))
+                .expect("borrowed round-trips through the owned DTO");
+        assert_eq!(expected.symbol, owned.symbol);
+        assert_eq!(expected.side, owned.side);
+        assert_eq!(expected.order_type, owned.order_type);
+        assert_eq!(expected.price_cents, owned.price_cents);
+        assert_eq!(expected.qty, owned.qty);
+        assert_eq!(expected.client_order_id, owned.client_order_id);
+        assert_eq!(expected.participant, owned.participant);
+    }
+
+    // Defaults match when optional fields are omitted.
+    let single = r#"{"symbol":"BTC-USD","side":"buy","price_cents":6500000,"qty":1}"#;
+    let owned: OrderRequest = serde_json::from_str(single).unwrap();
+    let borrowed: OrderRequestRef<'_> = serde_json::from_str(single).unwrap();
+    assert_eq!(borrowed.order_type, owned.order_type);
+    assert_eq!(borrowed.client_order_id, owned.client_order_id.as_deref());
+    assert_eq!(borrowed.participant, owned.participant.as_deref());
+}
+
+#[tokio::test]
+async fn borrowed_ingress_matches_owned_validation_results() {
+    // The borrowed ingress path validates to the same acks and the same error
+    // codes as the owned contract.
+    let node = TestNode::new();
+    let app = gateway::router(Arc::clone(&node.ctx));
+
+    let (status, body) = post(
+        &app,
+        "/api/orders",
+        json!({
+            "symbol": "BTC-USD",
+            "side": "buy",
+            "order_type": "limit",
+            "price_cents": 6_500_000,
+            "qty": 10,
+            "client_order_id": "ref-ok-1",
+            "participant": "bob",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ack: OrderAck = serde_json::from_value(body).expect("order ack");
+    assert_eq!(ack.order_id, OrderId::derive(symbol(), "ref-ok-1"));
+    let records = node.orders(symbol());
+    assert_eq!(records.len(), 1);
+    let command = Command::decode(&records[0].payload).expect("command payload");
+    assert_eq!(command.participant, ParticipantId::derive("bob"));
+
+    // Repeating the same anonymous participant resolves to the same id
+    // through the bounded derivation cache.
+    let (status, body) = post(
+        &app,
+        "/api/orders",
+        json!({
+            "symbol": "BTC-USD",
+            "side": "buy",
+            "price_cents": 6_500_000,
+            "qty": 1,
+            "client_order_id": "ref-ok-2",
+            "participant": "bob",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let records = node.orders(symbol());
+    assert_eq!(records.len(), 2);
+    let second = Command::decode(&records[1].payload).expect("command payload");
+    assert_eq!(second.participant, command.participant);
+
+    let cases = [
+        (
+            json!({"symbol": "BTC-USD", "side": "buy", "price_cents": 6_500_000, "qty": 0}),
+            "invalid_qty",
+        ),
+        (
+            json!({"symbol": "BTC-USD", "side": "buy", "qty": 1}),
+            "missing_price",
+        ),
+        (
+            json!({"symbol": "NOPE-USD", "side": "buy", "price_cents": 6_500_000, "qty": 1}),
+            "unknown_symbol",
+        ),
+        (
+            json!({
+                "symbol": "BTC-USD", "side": "buy", "price_cents": 6_500_000, "qty": 1,
+                "client_order_id": "x".repeat(129),
+            }),
+            "invalid_client_order_id",
+        ),
+        (
+            json!({
+                "symbol": "BTC-USD", "side": "buy", "price_cents": 6_500_000, "qty": 1,
+                "participant": "p".repeat(65),
+            }),
+            "invalid_participant",
+        ),
+    ];
+    for (request, expected_code) in cases {
+        let (status, body) = post(&app, "/api/orders", request).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "expected 400 for {expected_code}: {body}"
+        );
+        assert_eq!(body["code"], expected_code);
+    }
+    assert_eq!(
+        node.orders(symbol()).len(),
+        2,
+        "rejected requests must not reach the journal"
+    );
 }
