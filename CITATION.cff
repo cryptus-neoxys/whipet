@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use Whippet in research or teaching, cite this repository."
+title: "Whippet: a sub-millisecond matching engine with millisecond-durable streaming on Apache Iggy"
+abstract: >-
+  Whippet is an independent Apache-2.0 showcase that demonstrates Apache Iggy
+  as the durable log, replay source, and fan-out backbone of an electronic
+  exchange. It includes a deterministic symbol-sharded matcher, a durable
+  gateway, market-data snapshots and deltas, a seeded simulator, an open-loop
+  benchmark harness, and a live dashboard.
+authors:
+  - name: "The Whippet Authors"
+repository-code: "https://github.com/cryptus-neoxys/whippet"
+license: Apache-2.0
+version: "0.1.0"
+date-released: "2026-11-14"
+keywords:
+  - matching engine
+  - electronic exchange
+  - Apache Iggy
+  - message streaming
+  - low latency
+  - deterministic simulation

@@ -1,0 +1,72 @@
+# Failure modes
+
+What the Phase 1 build does when something fails. This is a behavior map, not
+a claim that every path has been fault-injected. The proof column distinguishes
+three things:
+
+- **Tested**: an automated unit, property, or integration test covers the
+  mechanism.
+- **Implemented, untested**: the code path exists and is exercised in normal
+  operation, but there is no crash or fault-injection test.
+- **Planned**: not implemented in this build.
+
+No failure test results are invented here. The only replay evidence quoted is
+the single local determinism check in [DEMO.md](DEMO.md#replay-the-log).
+
+## Matrix
+
+| Failure | Current behavior | Guarantee today | Proof |
+|---|---|---|---|
+| **Gateway process crash** | In-flight HTTP requests fail. If the append completed but the response was lost, the order is in the log and the client saw an error. A retry with the same `client_order_id` derives the same `OrderId`; the engine rejects it as a duplicate, so there is no second effect. | At-most-one business effect per `client_order_id` while the dedup entry is retained. The client must reconcile an ambiguous acknowledgement; there is no client-side once-only response. | Implemented. Duplicate-id rejection is unit-tested (`duplicate_order_id_is_rejected`). No gateway crash test. |
+| **Engine crash after publishing executions/MD, before committing the input offset** | The batch is replayed from the last durable point. Executions and MD records from the replayed batch can be appended a second time. The engine state converges because replay is deterministic. The MD hub ignores duplicate MD sequences; executions have no Phase 1 consumer. | At-least-once output. Engine state is deterministic; downstream consumers must deduplicate by `(symbol, cause_offset, seq)`. No end-to-end once-only guarantee. | Implemented error path. `replay_is_deterministic` and `snapshot_restores_exact_state_hash` cover determinism. No kill-between-publish-and-commit test. |
+| **Engine restart from a snapshot older than the committed offset** | The engine prefers the snapshot's maximum `last_offset` over the committed offset, so the tail after the snapshot is replayed. Outputs after the snapshot can be published twice. This is the normal crash window when the last snapshot is older than the last commit. | Same as above: deterministic state, at-least-once output, downstream dedup required. | Implemented by design. No crash test. |
+| **Duplicate input** | The engine's dedup table, keyed by the derived `OrderId`, rejects the second command with `duplicate_order_id` and emits no fill. Capacity is `2 * max_orders` per symbol (500,000 by default). Eviction prefers terminal entries; active resting orders are protected. The window is still count-based, so a very old filled id can be re-accepted after eviction. | One effect per order id inside the retained window. An id older than the window can be accepted again. | Tested (`duplicate_order_id_is_rejected`, `capacity_evicts_oldest`). |
+| **Stale input** | There is no epoch, session sequence, or wall-clock staleness check. A command with a new `client_order_id` is accepted and matched in log order even if its `timestamp_ns` is old. The timestamp is informational. Price validation still applies: tick multiple, ladder bounds, and the 500 bps market collar. | Ordering is the log order, not the timestamp. Stale commands are not rejected in Phase 1. | Not implemented by design. No test because there is no mechanism. |
+| **MD consumer commit failure** | The runner retries the offset commit only; it does not re-apply the batch. If the process dies before the commit, the batch is replayed, but the hub ignores records with `seq <=` the last applied sequence, so levels, the tape, and metrics do not double-count. | The view converges without duplicate effects. A snapshot is still the recovery point. | Implemented. Duplicate delta/trade and stale-snapshot tests. |
+| **MD client slow or disconnected (browser)** | The node publishes one full state frame over a `watch` channel at 20 Hz. A slow client misses intermediate frames; it does not block the engine or other clients. On reconnect the client fetches `/api/state` and opens the socket again. There is no sequence-gap detection or per-client resync protocol. | The client sees the latest full state, not every event. The dashboard shows `STALE` after three seconds without a frame. | Implemented. No automated slow-client or reconnect test. |
+| **Iggy down** | Gateway appends fail; the order is not accepted and the client gets HTTP 503 `journal_unavailable`. Engine and MD polls log a warning and retry after 250 ms. Engine output appends retry forever with 100 ms to 2 s backoff, so that shard blocks instead of skipping. The health monitor marks `degraded` on the next five-second check. The dashboard keeps the last state and shows a stale banner. There is no local retry queue. | No silent acceptance while the broker is unavailable. No loss of an acknowledged order caused by a broker outage, because the gateway does not acknowledge. Recovery depends on the Iggy client reconnecting; restart the node if it does not. | Implemented error paths. No broker-outage fault-injection test. |
+| **Log gap / retention truncation** | The runner compares the first returned offset with the requested offset. If the broker has already dropped the requested range, the shard halts with a clear gap error and health becomes degraded; it does not apply a partial log to the book. | No silent partial state. Recovery requires a snapshot or a reset. | Implemented guard; no Docker retention test. |
+| **Iggy disk or volume loss** | The log and the consumer offsets are gone. Snapshots alone do not contain the missing tail. | No protection. `persisted` is a local-disk promise, not a backup. | Not protected. Use a cold volume copy if you need one. |
+| **Snapshot corruption** | `ShardEngine::from_snapshot` recomputes the hash and returns an error on mismatch. The shard task exits with that error, marks the node unhealthy, and the file is not used. `whippet verify` reports the failure. | A corrupt snapshot is never silently applied; the node reports degraded health instead of claiming to match. | Tested (`snapshot_round_trip_and_hash_verification`, `snapshot_restores_exact_state_hash`). |
+| **Simulator crash** | The simulator has counters for sent, errors, and dropped, but no acknowledged ledger. Unacknowledged actions are simply not counted. Restarting with the same seed regenerates the same order ids; the engine rejects them as duplicates. | No loss claim is made from simulator counters. Use a new seed for a new flow. | Implemented. Determinism is tested (`same_seed_same_actions`). No crash test. |
+| **Dashboard stale** | `freshness_ms` is the age of the newest MD event. Above 3,000 ms the Live page shows a stale banner and the connection pill shows `STALE`. The dashboard does not fake a live state. | The operator can see staleness. | Implemented. No automated browser test. |
+| **Partition count changed after topics exist** | `ensure_topics` leaves existing topics alone. The symbol-to-partition hash changes, so new orders land on different partitions than the existing data. | Nothing is migrated. This requires a reset or an explicit migration. | Implemented behavior, operational caveat. No test. |
+
+## What is deliberately not claimed
+
+- Once-only delivery, or once-only client responses.
+- Zero loss for an unacknowledged in-flight request.
+- Zero RTO.
+- Survival of two failures, or of any failure on a single node.
+- Contiguous offsets.
+- Cross-partition transactions.
+- Linearizable reads.
+- That a snapshot is a backup.
+
+## Proof that would be needed
+
+These are the artifacts Phase 2 should produce before the corresponding rows
+can move from "implemented, untested" to "proven":
+
+- **Gateway crash:** kill -9 the gateway under load, retry every ambiguous
+  request with the same client id, and compare the acknowledged-offset ledger
+  with the readable log. Assert one effect per id.
+- **Engine crash window:** kill the engine between the output append and the
+  offset commit. Restart. Compare the state hash with a clean replay, count
+  duplicate execution records by `(symbol, cause_offset, seq)`, and show that
+  the MD levels converge.
+- **Duplicate replay:** replay the same batch ten times and assert one trade
+  per order and an unchanged state hash.
+- **Slow MD client:** throttle a subscriber, disconnect it, reconnect, and
+  show that the node's publish rate and the engine are unaffected and that the
+  client resyncs to the latest state.
+- **Iggy outage:** stop the broker, submit orders, assert 503 and no
+  acknowledgement, restart the broker, and show that the node resumes without
+  restarting or losing committed state.
+- **Disk loss:** delete the Iggy volume, restart, and document exactly what is
+  lost. This is a negative control, not a recovery demo.
+
+The existing tests live in `crates/whippet-engine/tests/properties.rs`, the
+engine unit tests, the journal tests, and the snapshot tests. They prove
+matching invariants, dedup behavior, deterministic replay, and snapshot hash
+restoration. They do not prove crash safety.

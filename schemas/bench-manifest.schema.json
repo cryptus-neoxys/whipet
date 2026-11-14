@@ -1,0 +1,418 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Whippet benchmark manifest",
+  "description": "Machine-written manifest for one Whippet benchmark run. Schema version 1 matches whippet_core::manifest::BenchManifest. Latency values are microseconds; throughput values are per second; durations are seconds; memory is bytes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "created_at",
+    "git_sha",
+    "git_dirty",
+    "image_digest",
+    "host",
+    "workload",
+    "throughput",
+    "latency",
+    "stages",
+    "repetitions",
+    "notes",
+    "labels"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Manifest schema version. Matches MANIFEST_SCHEMA_VERSION."
+    },
+    "run_id": {
+      "type": "string",
+      "description": "UUID for the run. Also the manifest filename."
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339 timestamp when the manifest was written."
+    },
+    "git_sha": {
+      "type": "string",
+      "description": "git rev-parse HEAD, or 'unknown'."
+    },
+    "git_dirty": {
+      "type": "boolean",
+      "description": "True when git status --porcelain was non-empty."
+    },
+    "image_digest": {
+      "type": ["string", "null"],
+      "description": "Container image digest from WHIPPET_IMAGE_DIGEST, or null."
+    },
+    "host": {
+      "$ref": "#/$defs/HostInfo"
+    },
+    "workload": {
+      "$ref": "#/$defs/WorkloadSpec"
+    },
+    "throughput": {
+      "$ref": "#/$defs/ThroughputSummary"
+    },
+    "latency": {
+      "$ref": "#/$defs/LatencySummary"
+    },
+    "stages": {
+      "type": "array",
+      "description": "Per-stage latency breakdown. Empty in the current harness.",
+      "items": {
+        "$ref": "#/$defs/StageLatency"
+      }
+    },
+    "repetitions": {
+      "type": "array",
+      "description": "Every repetition, in execution order. The top-level throughput and latency are copied from the repetition with the median p99.",
+      "items": {
+        "$ref": "#/$defs/RepetitionResult"
+      }
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Free-form run notes written by the harness."
+    },
+    "labels": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Free-form labels. The current harness writes one scope label: headline or dev-loop."
+    }
+  },
+  "$defs": {
+    "U64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "U32": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "NonNegativeNumber": {
+      "type": "number",
+      "minimum": 0
+    },
+    "HostInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hostname",
+        "os",
+        "kernel",
+        "cpu_model",
+        "physical_cores",
+        "logical_cores",
+        "memory_bytes",
+        "virtualization",
+        "docker_version",
+        "governor",
+        "smt_enabled",
+        "isolated_cores"
+      ],
+      "properties": {
+        "hostname": {
+          "type": "string"
+        },
+        "os": {
+          "type": "string",
+          "description": "uname -s, for example Darwin or Linux."
+        },
+        "kernel": {
+          "type": "string",
+          "description": "uname -r."
+        },
+        "cpu_model": {
+          "type": "string"
+        },
+        "physical_cores": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615,
+          "description": "Physical core count. The current harness sets this equal to logical_cores."
+        },
+        "logical_cores": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "memory_bytes": {
+          "$ref": "#/$defs/U64"
+        },
+        "virtualization": {
+          "type": "string",
+          "description": "native, docker-desktop, orbstack, linux-vm, dev-loop, or a value from WHIPPET_VIRTUALIZATION."
+        },
+        "docker_version": {
+          "type": ["string", "null"]
+        },
+        "governor": {
+          "type": ["string", "null"],
+          "description": "Linux CPU governor, when readable."
+        },
+        "smt_enabled": {
+          "type": ["boolean", "null"],
+          "description": "Always null in the current harness."
+        },
+        "isolated_cores": {
+          "type": ["string", "null"],
+          "description": "From WHIPPET_ISOLATED_CORES, or null."
+        }
+      }
+    },
+    "WorkloadSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "mode",
+        "transport",
+        "payload_bytes",
+        "symbols",
+        "partitions",
+        "rate_per_sec",
+        "duration_secs",
+        "warmup_secs",
+        "repetitions",
+        "subscribers",
+        "seed",
+        "durability",
+        "consumer_offset_durability",
+        "batch_size",
+        "encryption"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Run label, for example L1 or smoke."
+        },
+        "mode": {
+          "type": "string",
+          "description": "durable or turbo."
+        },
+        "transport": {
+          "type": "string",
+          "description": "Current harness writes http."
+        },
+        "payload_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615,
+          "description": "Nominal payload size. The current harness writes a fixed 96, not a measured request size."
+        },
+        "symbols": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "partitions": {
+          "$ref": "#/$defs/U32"
+        },
+        "rate_per_sec": {
+          "$ref": "#/$defs/U64"
+        },
+        "duration_secs": {
+          "$ref": "#/$defs/U64"
+        },
+        "warmup_secs": {
+          "$ref": "#/$defs/U64"
+        },
+        "repetitions": {
+          "$ref": "#/$defs/U32"
+        },
+        "subscribers": {
+          "$ref": "#/$defs/U32"
+        },
+        "seed": {
+          "$ref": "#/$defs/U64"
+        },
+        "durability": {
+          "type": "string",
+          "description": "Iggy topic durability, for example persisted."
+        },
+        "consumer_offset_durability": {
+          "type": "string"
+        },
+        "batch_size": {
+          "$ref": "#/$defs/U32"
+        },
+        "encryption": {
+          "type": "boolean"
+        }
+      }
+    },
+    "LatencySummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "count",
+        "min",
+        "mean",
+        "p50",
+        "p90",
+        "p99",
+        "p999",
+        "p9999",
+        "max",
+        "p50_ci95",
+        "p99_ci95"
+      ],
+      "properties": {
+        "count": {
+          "$ref": "#/$defs/U64",
+          "description": "Number of samples in the histogram."
+        },
+        "min": {
+          "$ref": "#/$defs/NonNegativeNumber"
+        },
+        "mean": {
+          "$ref": "#/$defs/NonNegativeNumber"
+        },
+        "p50": {
+          "$ref": "#/$defs/NonNegativeNumber"
+        },
+        "p90": {
+          "$ref": "#/$defs/NonNegativeNumber"
+        },
+        "p99": {
+          "$ref": "#/$defs/NonNegativeNumber"
+        },
+        "p999": {
+          "$ref": "#/$defs/NonNegativeNumber"
+        },
+        "p9999": {
+          "$ref": "#/$defs/NonNegativeNumber"
+        },
+        "max": {
+          "$ref": "#/$defs/NonNegativeNumber"
+        },
+        "p50_ci95": {
+          "type": ["array", "null"],
+          "items": {
+            "type": "number"
+          },
+          "minItems": 2,
+          "maxItems": 2,
+          "description": "Lower and upper 95% bootstrap interval for p50, or null. Always null in the current harness."
+        },
+        "p99_ci95": {
+          "type": ["array", "null"],
+          "items": {
+            "type": "number"
+          },
+          "minItems": 2,
+          "maxItems": 2,
+          "description": "Lower and upper 95% bootstrap interval for p99, or null. Always null in the current harness."
+        }
+      }
+    },
+    "StageLatency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stage",
+        "latency"
+      ],
+      "properties": {
+        "stage": {
+          "type": "string",
+          "description": "Stage name, for example gateway, match, publish, or fanout."
+        },
+        "latency": {
+          "$ref": "#/$defs/LatencySummary"
+        }
+      }
+    },
+    "ThroughputSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_per_sec",
+        "achieved_per_sec",
+        "goodput_per_sec",
+        "error_count",
+        "scheduled_samples",
+        "completed_samples",
+        "scheduler_slip"
+      ],
+      "properties": {
+        "target_per_sec": {
+          "$ref": "#/$defs/U64"
+        },
+        "achieved_per_sec": {
+          "$ref": "#/$defs/NonNegativeNumber",
+          "description": "Completed samples divided by measured seconds. Includes failed requests."
+        },
+        "goodput_per_sec": {
+          "$ref": "#/$defs/NonNegativeNumber",
+          "description": "(completed minus errors) divided by measured seconds."
+        },
+        "error_count": {
+          "$ref": "#/$defs/U64",
+          "description": "Failed requests plus samples skipped because the in-flight cap was full."
+        },
+        "scheduled_samples": {
+          "$ref": "#/$defs/U64",
+          "description": "Samples scheduled after warmup."
+        },
+        "completed_samples": {
+          "$ref": "#/$defs/U64",
+          "description": "Samples that reached the collector, including errors."
+        },
+        "scheduler_slip": {
+          "$ref": "#/$defs/LatencySummary",
+          "description": "Generator wake time minus scheduled deadline, in microseconds."
+        }
+      }
+    },
+    "RepetitionResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "index",
+        "started_at",
+        "duration_secs",
+        "throughput",
+        "latency",
+        "stages"
+      ],
+      "properties": {
+        "index": {
+          "$ref": "#/$defs/U32",
+          "description": "Zero-based repetition index."
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "duration_secs": {
+          "$ref": "#/$defs/NonNegativeNumber",
+          "description": "Measured duration in seconds."
+        },
+        "throughput": {
+          "$ref": "#/$defs/ThroughputSummary"
+        },
+        "latency": {
+          "$ref": "#/$defs/LatencySummary"
+        },
+        "stages": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/StageLatency"
+          }
+        }
+      }
+    }
+  }
+}
