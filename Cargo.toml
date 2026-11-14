@@ -1,0 +1,77 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/whippet",
+    "crates/whippet-bench",
+    "crates/whippet-core",
+    "crates/whippet-engine",
+    "crates/whippet-journal",
+    "crates/whippet-marketdata",
+    "crates/whippet-sim",
+    "crates/whippet-testkit",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+authors = ["The Whippet Authors"]
+repository = "https://github.com/cryptus-neoxys/whippet"
+homepage = "https://github.com/cryptus-neoxys/whippet"
+keywords = ["exchange", "matching-engine", "iggy", "streaming", "low-latency"]
+categories = ["finance", "network-programming"]
+
+[workspace.dependencies]
+# Local crates
+whippet-bench = { path = "crates/whippet-bench" }
+whippet-core = { path = "crates/whippet-core" }
+whippet-engine = { path = "crates/whippet-engine" }
+whippet-journal = { path = "crates/whippet-journal" }
+whippet-marketdata = { path = "crates/whippet-marketdata" }
+whippet-sim = { path = "crates/whippet-sim" }
+whippet-testkit = { path = "crates/whippet-testkit" }
+
+# Pinned upstream. Never `latest`/`edge` in the demo.
+iggy = "=0.12.0"
+
+# Runtime
+axum = { version = "0.8", features = ["ws", "macros"] }
+blake3 = "1"
+bincode = "1.3"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+crossbeam-channel = "0.5"
+futures-util = "0.3"
+hdrhistogram = "7.5"
+rand = "0.8"
+rand_chacha = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "trace", "compression-gzip"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Dev
+proptest = "1"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+debug = 1
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+[profile.dev]
+# The matcher is unusably slow without optimizations even in dev.
+opt-level = 1

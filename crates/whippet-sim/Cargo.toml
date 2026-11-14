@@ -1,0 +1,15 @@
+[package]
+name = "whippet-sim"
+description = "Deterministic market simulator for Whippet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+rand.workspace = true
+rand_chacha.workspace = true
+serde.workspace = true
+whippet-core.workspace = true

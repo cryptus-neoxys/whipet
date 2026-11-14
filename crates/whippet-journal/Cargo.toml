@@ -1,0 +1,18 @@
+[package]
+name = "whippet-journal"
+description = "Apache Iggy journal adapter for Whippet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes.workspace = true
+iggy.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+whippet-core.workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "whippet-engine"
+description = "Deterministic symbol-sharded matching engine for Whippet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+bincode.workspace = true
+blake3.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+whippet-core.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
