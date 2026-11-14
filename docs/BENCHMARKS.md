@@ -538,6 +538,7 @@ not a result.**
 | 1 | 5,000/s | 32 | 1,722 µs | 49,311 µs | — | 0 | — |
 | 10 | 5,000/s | 4 (default) | 799 µs | 17,103 µs | — | 0 | — |
 | 10 | 10,000/s | 4 (default) | 598 µs | 10,647 µs | 22,095 µs | 0 | 10,000/s |
+| 10 | 10,000/s | 4 (default, later run) | 473 µs | 24,079 µs | 56,159 µs | 0 | 10,000/s |
 
 TCP is one request in flight per connection by design, so batch-1 throughput
 scales with connection count. The 4-connection batch-1 row is connection-limited
@@ -546,7 +547,8 @@ shape; the 16-connection p99 (457 ms) is far worse than the 32-connection p99
 (49 ms), so do not pick a connection count from p50 alone. Batch 10 amortizes
 the round trip and is the useful TCP shape: 799 µs p50 / 17.1 ms p99 at
 5,000/s, and 598 µs p50 / 10.6 ms p99 / 22.1 ms p99.9 at 10,000/s with zero
-errors and the full offered rate.
+errors and the full offered rate. A later run on the same tree measured 473 µs
+p50 / 24.1 ms p99 at 10,000/s; the spread between repetitions is host noise.
 
 Exact commands for the rows above:
 

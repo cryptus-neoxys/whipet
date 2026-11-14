@@ -193,6 +193,10 @@ TCP (same host, `--transport tcp`):
 | Batch 10, 5,000/s | 799 µs | 17,103 µs | 0 |
 | Batch 10, 10,000/s | 598 µs | 10,647 µs | 0 |
 
+A later run on the same tree measured TCP batch 10 at 10,000/s at p50 473 µs
+and p99 24,079 µs; the spread between repetitions is host noise, not a code
+change.
+
 Group commit coalesced up to 78 messages per append in the 5,000/s
 single-order run (62,155 messages in 33,240 appends). The 5,000/s
 single-order path was p50 838 ms with 40k errors before the tranche.
