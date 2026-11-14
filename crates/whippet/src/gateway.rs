@@ -7,7 +7,7 @@ use axum::Json;
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use futures_util::StreamExt;
@@ -39,6 +39,7 @@ pub fn router(ctx: Arc<NodeContext>) -> Router {
         .route("/api/health", get(health))
         .route("/api/instruments", get(instruments))
         .route("/api/trades", get(trades))
+        .route("/metrics", get(prometheus))
         .route("/ws", get(ws_upgrade));
 
     let dashboard_dir = ctx.config.dashboard_dir.clone();
@@ -202,6 +203,124 @@ async fn instruments(
     Json(ctx.exchange().clone())
 }
 
+async fn prometheus(State(ctx): State<Arc<NodeContext>>) -> impl IntoResponse {
+    let state = ctx.hub.state();
+    let body = prometheus_text(&state.metrics, state.freshness_ms, state.sequence);
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+}
+
+/// Prometheus exposition. Counters are monotonic; percentiles are gauges
+/// because they describe the recent process window, not a cumulative sum.
+pub(crate) fn prometheus_text(
+    metrics: &whippet_core::api::MetricsView,
+    freshness_ms: u64,
+    sequence: u64,
+) -> String {
+    let mut out = String::with_capacity(2_048);
+    out.push_str(
+        "# HELP whippet_orders_ingressed_total Orders accepted by the gateway and appended to Iggy.\n",
+    );
+    out.push_str("# TYPE whippet_orders_ingressed_total counter\n");
+    out.push_str(&format!(
+        "whippet_orders_ingressed_total {}\n",
+        metrics.orders_ingressed
+    ));
+    out.push_str("# HELP whippet_orders_matched_total Orders accepted by the matcher.\n");
+    out.push_str("# TYPE whippet_orders_matched_total counter\n");
+    out.push_str(&format!(
+        "whippet_orders_matched_total {}\n",
+        metrics.orders_matched
+    ));
+    out.push_str(
+        "# HELP whippet_orders_rejected_total Orders rejected by validation or matching.\n",
+    );
+    out.push_str("# TYPE whippet_orders_rejected_total counter\n");
+    out.push_str(&format!(
+        "whippet_orders_rejected_total {}\n",
+        metrics.orders_rejected
+    ));
+    out.push_str("# HELP whippet_executions_total Execution reports produced.\n");
+    out.push_str("# TYPE whippet_executions_total counter\n");
+    out.push_str(&format!(
+        "whippet_executions_total {}\n",
+        metrics.executions
+    ));
+    out.push_str("# HELP whippet_trades_total Trades observed by the MD consumer.\n");
+    out.push_str("# TYPE whippet_trades_total counter\n");
+    out.push_str(&format!("whippet_trades_total {}\n", metrics.trades));
+    out.push_str("# HELP whippet_md_events_total Market-data records applied by the hub.\n");
+    out.push_str("# TYPE whippet_md_events_total counter\n");
+    out.push_str(&format!("whippet_md_events_total {}\n", metrics.md_events));
+    out.push_str("# HELP whippet_engine_commands_total Input commands applied by the matcher.\n");
+    out.push_str("# TYPE whippet_engine_commands_total counter\n");
+    out.push_str(&format!(
+        "whippet_engine_commands_total {}\n",
+        metrics.engine_commands
+    ));
+    out.push_str("# HELP whippet_consumer_lag Records waiting behind the engine consumer.\n");
+    out.push_str("# TYPE whippet_consumer_lag gauge\n");
+    out.push_str(&format!("whippet_consumer_lag {}\n", metrics.consumer_lag));
+    out.push_str("# HELP whippet_ingress_latency_microseconds Gateway append latency.\n");
+    out.push_str("# TYPE whippet_ingress_latency_microseconds gauge\n");
+    out.push_str(&format!(
+        "whippet_ingress_latency_microseconds{{quantile=\"0.5\"}} {}\n",
+        metrics.ingress_p50_us
+    ));
+    out.push_str(&format!(
+        "whippet_ingress_latency_microseconds{{quantile=\"0.99\"}} {}\n",
+        metrics.ingress_p99_us
+    ));
+    out.push_str("# HELP whippet_match_latency_microseconds Engine dequeue to execution events.\n");
+    out.push_str("# TYPE whippet_match_latency_microseconds gauge\n");
+    out.push_str(&format!(
+        "whippet_match_latency_microseconds{{quantile=\"0.5\"}} {}\n",
+        metrics.match_p50_us
+    ));
+    out.push_str(&format!(
+        "whippet_match_latency_microseconds{{quantile=\"0.99\"}} {}\n",
+        metrics.match_p99_us
+    ));
+    out.push_str("# HELP whippet_throughput_orders_per_second Accepted orders per second.\n");
+    out.push_str("# TYPE whippet_throughput_orders_per_second gauge\n");
+    out.push_str(&format!(
+        "whippet_throughput_orders_per_second {}\n",
+        metrics.throughput_orders_s
+    ));
+    out.push_str("# HELP whippet_uptime_seconds Node uptime.\n");
+    out.push_str("# TYPE whippet_uptime_seconds counter\n");
+    out.push_str(&format!("whippet_uptime_seconds {}\n", metrics.uptime_s));
+    out.push_str("# HELP whippet_iggy_connected Whether the last Iggy health check succeeded.\n");
+    out.push_str("# TYPE whippet_iggy_connected gauge\n");
+    out.push_str(&format!(
+        "whippet_iggy_connected {}\n",
+        u8::from(metrics.iggy_connected)
+    ));
+    out.push_str("# HELP whippet_partitions Configured trading partitions.\n");
+    out.push_str("# TYPE whippet_partitions gauge\n");
+    out.push_str(&format!("whippet_partitions {}\n", metrics.partition_count));
+    out.push_str("# HELP whippet_mode Operating mode (one-hot).\n");
+    out.push_str("# TYPE whippet_mode gauge\n");
+    out.push_str(&format!(
+        "whippet_mode{{mode=\"{}\"}} 1\n",
+        metrics.mode.as_str()
+    ));
+    out.push_str("# HELP whippet_md_freshness_milliseconds Age of the newest MD event.\n");
+    out.push_str("# TYPE whippet_md_freshness_milliseconds gauge\n");
+    out.push_str(&format!(
+        "whippet_md_freshness_milliseconds {freshness_ms}\n"
+    ));
+    out.push_str("# HELP whippet_md_sequence Newest per-symbol MD sequence observed.\n");
+    out.push_str("# TYPE whippet_md_sequence gauge\n");
+    out.push_str(&format!("whippet_md_sequence {sequence}\n"));
+    out
+}
+
 #[derive(Debug, Deserialize)]
 struct TradesQuery {
     #[serde(default = "default_trade_limit")]
@@ -320,4 +439,22 @@ fn now_ns() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use whippet_core::api::MetricsView;
+    use whippet_core::config::Mode;
+
+    #[test]
+    fn prometheus_text_contains_core_series() {
+        let metrics = MetricsView::empty(Mode::Durable, 16);
+        let text = prometheus_text(&metrics, 42, 7);
+        assert!(text.contains("whippet_orders_ingressed_total 0"));
+        assert!(text.contains("whippet_mode{mode=\"durable\"} 1"));
+        assert!(text.contains("whippet_md_freshness_milliseconds 42"));
+        assert!(text.contains("whippet_md_sequence 7"));
+        assert!(text.contains("# TYPE whippet_ingress_latency_microseconds gauge"));
+    }
 }

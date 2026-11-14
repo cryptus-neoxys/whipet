@@ -27,6 +27,8 @@ enum Commands {
     Healthcheck(whippet::cli::HealthArgs),
     /// Verify snapshot state hashes on disk.
     Verify(whippet::cli::VerifyArgs),
+    /// Replay the order log for one partition and print the deterministic state hash.
+    Replay(whippet::cli::ReplayArgs),
 }
 
 #[tokio::main]
@@ -49,5 +51,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Bench(args) => whippet::cli::run_bench(args).await,
         Commands::Healthcheck(args) => whippet::cli::run_health(args).await,
         Commands::Verify(args) => whippet::cli::run_verify(args),
+        Commands::Replay(args) => whippet::cli::run_replay(args).await,
     }
 }

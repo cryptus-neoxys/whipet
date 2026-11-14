@@ -7,7 +7,9 @@ use clap::Args;
 use reqwest::Client;
 use whippet_bench::BenchConfig;
 use whippet_core::config::ExchangeConfig;
+use whippet_core::protocol::Command;
 use whippet_engine::ShardEngine;
+use whippet_journal::{IggyJournal, Journal, Topic};
 
 use crate::snapshot::SnapshotStore;
 
@@ -166,4 +168,131 @@ fn hex(bytes: &[u8; 32]) -> String {
         let _ = write!(output, "{byte:02x}");
     }
     output
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ReplayArgs {
+    #[arg(long, env = "WHIPPET_IGGY_ADDR", default_value = "127.0.0.1:8090")]
+    pub iggy_addr: String,
+    #[arg(long, env = "WHIPPET_IGGY_USER", default_value = "iggy")]
+    pub iggy_user: String,
+    #[arg(long, env = "WHIPPET_IGGY_PASSWORD", default_value = "iggy")]
+    pub iggy_password: String,
+    /// Partition to replay. BTC-USD hashes to 1 with 16 partitions.
+    #[arg(long, default_value_t = 1)]
+    pub partition: u32,
+    /// Start offset. Omit to replay from a snapshot tail when one exists, else 0.
+    #[arg(long)]
+    pub from: Option<u64>,
+    /// Inclusive stop offset. Omit to replay to the current end.
+    #[arg(long)]
+    pub to: Option<u64>,
+    #[arg(long, default_value = "data/snapshots")]
+    pub snapshot_dir: PathBuf,
+    #[arg(long, default_value_t = 16)]
+    pub exchange_partitions: u32,
+    /// Fail unless the final state hash equals this value.
+    #[arg(long)]
+    pub expect_hash: Option<String>,
+}
+
+pub async fn run_replay(args: ReplayArgs) -> Result<()> {
+    let exchange = ExchangeConfig {
+        partitions: args.exchange_partitions,
+        ..ExchangeConfig::default()
+    };
+    let store = SnapshotStore::new(args.snapshot_dir.clone());
+    let snapshot = store.load(args.partition)?;
+    let (mut engine, snapshot_offset, seeded) = match &snapshot {
+        Some(snapshot) => {
+            let mut engine = ShardEngine::from_snapshot(&exchange, snapshot.clone())
+                .with_context(|| format!("restoring shard {}", args.partition))?;
+            engine.set_snapshot_interval(u64::MAX);
+            let offset = snapshot
+                .symbols
+                .iter()
+                .map(|symbol| symbol.last_offset)
+                .max()
+                .unwrap_or(0);
+            (engine, Some(offset), true)
+        }
+        None => (
+            ShardEngine::new_with_snapshot_interval(args.partition, &exchange, u64::MAX),
+            None,
+            false,
+        ),
+    };
+
+    let start = args
+        .from
+        .unwrap_or_else(|| snapshot_offset.map_or(0, |offset| offset.saturating_add(1)));
+    let journal = Journal::Iggy(
+        IggyJournal::connect(&args.iggy_addr, &args.iggy_user, &args.iggy_password)
+            .await
+            .with_context(|| format!("connecting to Iggy at {}", args.iggy_addr))?,
+    );
+    let consumer = format!("whippet-replay-p{}", args.partition);
+    let mut offset = start;
+    let mut decoded = 0u64;
+    let mut skipped = 0u64;
+    let mut last_offset = start.saturating_sub(1);
+    let mut out = whippet_engine::EngineOutput::with_capacity(16, 16);
+
+    loop {
+        if let Some(to) = args.to
+            && offset > to
+        {
+            break;
+        }
+        let records = journal
+            .read(Topic::Orders, args.partition, &consumer, offset, 1_000, 0)
+            .await
+            .with_context(|| format!("reading orders from offset {offset}"))?;
+        if records.is_empty() {
+            break;
+        }
+        for record in records {
+            if let Some(to) = args.to
+                && record.offset > to
+            {
+                break;
+            }
+            match Command::decode(&record.payload) {
+                Ok(command) => {
+                    engine
+                        .process(&command, record.offset, &mut out)
+                        .with_context(|| format!("applying offset {}", record.offset))?;
+                    decoded += 1;
+                }
+                Err(error) => {
+                    skipped += 1;
+                    eprintln!("skip offset {}: {error}", record.offset);
+                }
+            }
+            last_offset = record.offset;
+            offset = record.offset.saturating_add(1);
+        }
+    }
+
+    let hash = hex(&engine.state_hash());
+    let summary = serde_json::json!({
+        "partition": args.partition,
+        "seeded_from_snapshot": seeded,
+        "snapshot_offset": snapshot_offset,
+        "from": start,
+        "to": args.to,
+        "last_offset": last_offset,
+        "decoded": decoded,
+        "skipped": skipped,
+        "state_hash": hash,
+    });
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    if let Some(expected) = args.expect_hash {
+        let expected = expected.trim().to_ascii_lowercase();
+        if expected != hash {
+            bail!("state hash mismatch: expected {expected}, got {hash}");
+        }
+        println!("state hash matches expectation");
+    }
+    Ok(())
 }
