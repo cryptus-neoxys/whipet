@@ -25,7 +25,7 @@ jobs:
         run: make bench
       - name: upload benchmark manifests
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: whippet-bench-${{ github.run_id }}
           path: artifacts/bench/*.json
