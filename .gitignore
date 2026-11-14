@@ -1,0 +1,25 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Dashboard
+/apps/dashboard/node_modules
+/apps/dashboard/dist
+/apps/dashboard/target
+
+# Secrets and local environment
+/secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data and benchmark artifacts
+/data
+/artifacts
+/bench-results
+*.hdr
+
+# OS / editor
+.DS_Store
+.idea
+.vscode
