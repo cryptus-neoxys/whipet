@@ -20,12 +20,19 @@
 //! one request to `/api/orders/batch` and records the batch completion time
 //! once per order. That is the coordinated-omission-corrected batch latency:
 //! every order inherits the lateness of the request that carried it.
+//!
+//! With `transport = "tcp"` the same workload goes over the binary
+//! length-prefixed ingress instead: one persistent connection per worker,
+//! `batch_size` commands per [`TcpRequest::Submit`], pipelined up to
+//! `max_in_flight` frames. Each frame carries a stage sample (T0 scheduled
+//! deadline, T1 frame written, T2 ack received, T3 ack parsed) so the manifest
+//! can say where the latency sits rather than only how large it is.
 
 #![forbid(unsafe_code)]
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -37,17 +44,20 @@ use rand_chacha::ChaCha20Rng;
 use reqwest::Client;
 use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use whippet_core::api::{
     BatchOrderAck, BatchOrderRequest, CancelRequest, MAX_BATCH_ORDERS, OrderRequest,
 };
 use whippet_core::config::{ExchangeConfig, InstrumentConfig};
-use whippet_core::ids::{OrderId, Symbol};
+use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Symbol};
 use whippet_core::manifest::{
     BenchManifest, HostInfo, LatencySummary, MANIFEST_SCHEMA_VERSION, RepetitionResult,
-    ThroughputSummary, WorkloadSpec,
+    StageLatency, ThroughputSummary, WorkloadSpec,
 };
-use whippet_core::protocol::{OrderType, Side};
+use whippet_core::protocol::{COMMAND_ENCODED_LEN, Command, OrderType, Side};
+use whippet_core::tcp::{TcpRequest, TcpResponse, body_len};
 
 /// A one-second window shorter than this many windows cannot be split into a
 /// first and last ten, so the steady-state check is skipped and reported as
@@ -73,6 +83,24 @@ const HISTOGRAM_SIG_DIGITS: u8 = 3;
 /// channel blocks the pacer, which shows up as scheduler slip instead of a
 /// silent schedule change.
 const TICK_CHANNEL_CAPACITY: usize = 4_096;
+/// Signed clock offsets do not fit an unsigned HDR histogram, so negative and
+/// positive offsets go into two histograms. Values below the sub-bucket count
+/// are recorded exactly; larger magnitudes carry HDR's relative precision,
+/// which is finer than the network delay inside the offset. One minute of
+/// headroom on each side is far more than any sane pair of NTP-synced hosts.
+const OFFSET_HIST_MAX_NS: u64 = 60_000_000_000;
+/// Upper bound on TCP connections per repetition. More connections add
+/// generator work and concurrency; four is enough to keep a serial server busy
+/// without turning the generator into the bottleneck.
+const MAX_TCP_CONNECTIONS: usize = 64;
+/// Default TCP connection pool. The server processes one frame at a time per
+/// connection, so a small pool avoids head-of-line blocking on a single socket.
+const DEFAULT_TCP_CONNECTIONS: usize = 4;
+/// Bytes a connection may have outstanding before the writer stops sending.
+/// The server reads one frame, appends, writes the ack, and only then reads the
+/// next frame, so writing far ahead only fills socket buffers. 64 KiB per
+/// connection times four connections stays under 256 KiB.
+const TCP_INFLIGHT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BenchError {
@@ -84,8 +112,51 @@ pub enum BenchError {
     Json(#[from] serde_json::Error),
     #[error("histogram error: {0}")]
     Histogram(String),
+    #[error("protocol error: {0}")]
+    Protocol(String),
     #[error("invalid config: {0}")]
     Config(String),
+}
+
+impl From<whippet_core::error::CoreError> for BenchError {
+    fn from(error: whippet_core::error::CoreError) -> Self {
+        BenchError::Protocol(error.to_string())
+    }
+}
+
+/// Ingress transport. The HTTP/JSON path stays the default so existing scripts
+/// and manifests keep their meaning; TCP is opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    Http,
+    Tcp,
+}
+
+impl Transport {
+    fn as_str(self) -> &'static str {
+        match self {
+            Transport::Http => "http",
+            Transport::Tcp => "tcp",
+        }
+    }
+}
+
+fn parse_transport(value: &str) -> Result<Transport> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "http" => Ok(Transport::Http),
+        "tcp" => Ok(Transport::Tcp),
+        other => Err(BenchError::Config(format!(
+            "transport must be http or tcp, got {other:?}"
+        ))),
+    }
+}
+
+fn default_transport() -> String {
+    "http".into()
+}
+
+fn default_tcp_addr() -> String {
+    "127.0.0.1:8081".into()
 }
 
 pub type Result<T> = std::result::Result<T, BenchError>;
@@ -112,6 +183,12 @@ pub struct BenchConfig {
     pub ioc_ratio: f64,
     /// Share of ingress events that cancel a tracked open order.
     pub cancel_ratio: f64,
+    /// Ingress transport: `http` (default) or `tcp`.
+    #[serde(default = "default_transport")]
+    pub transport: String,
+    /// Binary TCP ingress address, used only when `transport = "tcp"`.
+    #[serde(default = "default_tcp_addr")]
+    pub tcp_addr: String,
 }
 
 impl Default for BenchConfig {
@@ -132,8 +209,25 @@ impl Default for BenchConfig {
             batch_size: 1,
             ioc_ratio: DEFAULT_IOC_RATIO,
             cancel_ratio: DEFAULT_CANCEL_RATIO,
+            transport: default_transport(),
+            tcp_addr: default_tcp_addr(),
         }
     }
+}
+
+/// Stage timestamps for one TCP Submit frame. T0 is the scheduled deadline,
+/// T1 is when the frame was written, T2 is when the ack bytes were read, and
+/// T3 is when the ack was decoded.
+///
+/// `server_offset_ns` is the server's ack timestamp minus the client's wall
+/// clock at T2. It includes the clock offset between the two hosts, so it is a
+/// best-effort offset estimate, not a one-way delay.
+#[derive(Debug, Clone, Copy)]
+struct StageSample {
+    send_us: u64,
+    wire_us: u64,
+    parse_us: u64,
+    server_offset_ns: Option<i64>,
 }
 
 /// One latency observation. `weight` is the number of orders the request
@@ -147,6 +241,8 @@ struct Sample {
     weight: u32,
     /// One-second bucket, indexed from the start of the measured window.
     window: u64,
+    /// Present only on transports that can stamp their stages (TCP today).
+    stages: Option<StageSample>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,6 +375,7 @@ impl SteadyState {
 struct RepStats {
     throughput: ThroughputSummary,
     latency: LatencySummary,
+    stages: Vec<StageLatency>,
     measured_secs: f64,
     steady: SteadyState,
     mix: MixCounts,
@@ -403,6 +500,10 @@ struct GeneratedOrder {
     request: OrderRequest,
     order_id: OrderId,
     participant: String,
+    /// Price in instrument ticks. The HTTP path re-derives this at the
+    /// gateway; the TCP path needs the exact tick value for the fixed-layout
+    /// command, so it is kept here.
+    price: Price,
     /// A passive limit may rest; an aggressive limit or an IOC may trade
     /// instead, so it is not tracked as an open order.
     passive: bool,
@@ -425,6 +526,7 @@ pub async fn run(config: BenchConfig) -> Result<BenchManifest> {
     apply_env_overrides(&mut config, &mut config_notes)?;
     validate_config(&config)?;
 
+    let transport = parse_transport(&config.transport)?;
     let exchange = ExchangeConfig::default();
     let client = Client::builder()
         .pool_max_idle_per_host(config.max_in_flight.max(1_024))
@@ -463,7 +565,7 @@ pub async fn run(config: BenchConfig) -> Result<BenchManifest> {
             duration_secs: stats.measured_secs,
             throughput: stats.throughput.clone(),
             latency: stats.latency.clone(),
-            stages: Vec::new(),
+            stages: stats.stages.clone(),
         });
     }
 
@@ -472,34 +574,23 @@ pub async fn run(config: BenchConfig) -> Result<BenchManifest> {
     ordered.sort_by(|a, b| a.latency.p99.partial_cmp(&b.latency.p99).unwrap());
     let median = ordered[ordered.len() / 2];
 
-    let workload = WorkloadSpec {
-        name: config.label.clone(),
-        mode: config.mode.clone(),
-        transport: "http".into(),
-        payload_bytes: 96,
-        symbols: config.symbols.clone(),
-        partitions: exchange.partitions,
-        rate_per_sec: config.rate_per_sec,
-        duration_secs: config.duration_secs,
-        warmup_secs: config.warmup_secs,
-        repetitions: config.repetitions.max(1),
-        subscribers: 0,
-        seed: config.seed,
-        durability: "persisted".into(),
-        consumer_offset_durability: "persisted".into(),
-        batch_size: config.batch_size as u32,
-        encryption: false,
-    };
+    let workload = workload_spec(&config, &exchange, transport);
 
     let host = host_info();
     let mut labels = vec![scope_label(&host)];
     let mut notes = vec![
         "Open-loop absolute-deadline pacing; latency measured from the scheduled deadline.".into(),
         "M4/Docker Desktop is a dev-loop measurement, not a headline claim.".into(),
-        "HTTP ingress is a convenience path; the Linux headline uses TCP on a native host.".into(),
         "payload_bytes is a nominal label, not a measured request size; a batch body is larger."
             .into(),
     ];
+    notes.push(match transport {
+        Transport::Http => {
+            "HTTP ingress is a convenience path; the Linux headline uses TCP on a native host."
+                .into()
+        }
+        Transport::Tcp => tcp_note(&config),
+    });
     notes.extend(config_notes);
     if let Some(value) = env_value("WHIPPET_SNAPSHOT_EVERY") {
         notes.push(format!(
@@ -571,7 +662,7 @@ pub async fn run(config: BenchConfig) -> Result<BenchManifest> {
         workload,
         throughput: median.throughput.clone(),
         latency: median.latency.clone(),
-        stages: Vec::new(),
+        stages: median.stages.clone(),
         repetitions,
         notes,
         labels,
@@ -618,6 +709,12 @@ fn validate_config(config: &BenchConfig) -> Result<()> {
             "max_in_flight ({}) must be at least batch_size ({}) so one slot can be in flight",
             config.max_in_flight, config.batch_size
         )));
+    }
+    let transport = parse_transport(&config.transport)?;
+    if transport == Transport::Tcp && config.tcp_addr.trim().is_empty() {
+        return Err(BenchError::Config(
+            "tcp_addr must not be empty when transport = tcp".into(),
+        ));
     }
     Ok(())
 }
@@ -720,17 +817,104 @@ fn working_set_note(config: &BenchConfig) -> String {
 }
 
 fn batch_note(config: &BenchConfig) -> String {
+    match parse_transport(&config.transport) {
+        Ok(Transport::Tcp) => format!(
+            "TCP batch mode: up to {} commands per Submit frame, paced at {:.2} frames/s ({} \
+             orders/s). One frame carries one symbol and includes that slot's orders and cancels. \
+             Latency is ack receipt minus the slot deadline, recorded once per order, so a frame \
+             of {} orders contributes {} samples.",
+            config.batch_size,
+            config.rate_per_sec as f64 / config.batch_size as f64,
+            config.rate_per_sec,
+            config.batch_size,
+            config.batch_size,
+        ),
+        _ => format!(
+            "Batch mode: up to {} orders per POST /api/orders/batch, paced at {:.2} batch slots/s \
+             ({} orders/s). Latency is batch completion minus the slot deadline, recorded once per \
+             order, so a batch of {} orders contributes {} samples. Cancels stay individual \
+             POST /api/cancel requests because the batch endpoint accepts orders only.",
+            config.batch_size,
+            config.rate_per_sec as f64 / config.batch_size as f64,
+            config.rate_per_sec,
+            config.batch_size,
+            config.batch_size,
+        ),
+    }
+}
+
+/// Transport note for a TCP run: connection shape, pipelining, and exactly what
+/// each stage field means. The clock-offset caveat is part of the field
+/// definition, not a footnote.
+fn tcp_note(config: &BenchConfig) -> String {
+    let frame_bytes = tcp_frame_bytes(config.batch_size);
+    let window = tcp_inflight_window(frame_bytes, config.max_in_flight);
     format!(
-        "Batch mode: up to {} orders per POST /api/orders/batch, paced at {:.2} batch slots/s \
-         ({} orders/s). Latency is batch completion minus the slot deadline, recorded once per \
-         order, so a batch of {} orders contributes {} samples. Cancels stay individual \
-         POST /api/cancel requests because the batch endpoint accepts orders only.",
-        config.batch_size,
-        config.rate_per_sec as f64 / config.batch_size as f64,
-        config.rate_per_sec,
-        config.batch_size,
+        "TCP ingress at {}: {} persistent connection(s), TCP_NODELAY, round-robin batches. The \
+         server processes one frame at a time per connection (read, append, ack, then read the \
+         next), so each connection keeps at most {window} Submit frame(s) of {frame_bytes} bytes \
+         outstanding ({} KiB budget); a reader task drains acks continuously and matches them \
+         FIFO. A Submit frame carries one symbol and up to {} commands (orders and cancels). \
+         Stage timestamps: T0 scheduled deadline, T1 frame written, T2 ack bytes read, T3 ack \
+         parsed. `send_us` = T1-T0, `wire_us` = T2-T1, `parse_us` = T3-T2, one sample per frame; \
+         the manifest `stages` array holds their p50/p99. `server_offset_ns` = ack `server_ns` - \
+         client wall clock at T2; it includes the clock offset between the hosts and is not a \
+         one-way delay.",
+        config.tcp_addr,
+        tcp_connection_count(),
+        TCP_INFLIGHT_BYTES / 1024,
         config.batch_size,
     )
+}
+
+fn tcp_connection_count() -> usize {
+    env_value("WHIPPET_BENCH_TCP_CONNECTIONS")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_TCP_CONNECTIONS)
+        .clamp(1, MAX_TCP_CONNECTIONS)
+}
+
+/// Wire size of one Submit frame with `commands` commands: the four-byte
+/// length prefix, the kind byte, the u16 command count, and the fixed-layout
+/// commands.
+fn tcp_frame_bytes(commands: usize) -> usize {
+    4 + 1 + 2 + commands * COMMAND_ENCODED_LEN
+}
+
+/// Frames a connection may have outstanding. The byte budget keeps a
+/// write-ahead client from filling the socket buffers while the server is
+/// still appending an earlier frame.
+fn tcp_inflight_window(frame_bytes: usize, max_in_flight: usize) -> usize {
+    (TCP_INFLIGHT_BYTES / frame_bytes.max(1)).clamp(1, max_in_flight.max(1))
+}
+
+fn tcp_token() -> Option<String> {
+    env_value("WHIPPET_API_TOKEN")
+}
+
+fn workload_spec(
+    config: &BenchConfig,
+    exchange: &ExchangeConfig,
+    transport: Transport,
+) -> WorkloadSpec {
+    WorkloadSpec {
+        name: config.label.clone(),
+        mode: config.mode.clone(),
+        transport: transport.as_str().into(),
+        payload_bytes: 96,
+        symbols: config.symbols.clone(),
+        partitions: exchange.partitions,
+        rate_per_sec: config.rate_per_sec,
+        duration_secs: config.duration_secs,
+        warmup_secs: config.warmup_secs,
+        repetitions: config.repetitions.max(1),
+        subscribers: 0,
+        seed: config.seed,
+        durability: "persisted".into(),
+        consumer_offset_durability: "persisted".into(),
+        batch_size: config.batch_size as u32,
+        encryption: false,
+    }
 }
 
 async fn run_repetition(
@@ -783,10 +967,37 @@ async fn run_repetition(
     let mut open = OpenOrders::new(symbols.len(), open_cap);
     let mut mix = MixCounts::default();
     let batching = config.batch_size > 1;
-    let start = Instant::now();
-    let measure_start = start + Duration::from_secs(config.warmup_secs);
     let mut scheduled = 0u64;
     let mut order_seq = 0u64;
+
+    // TCP connections are established before the pacer starts, so a bad
+    // address or a rejected hello fails the repetition instead of silently
+    // queueing jobs into a dead worker.
+    let transport = parse_transport(&config.transport)?;
+    let tcp_window = tcp_inflight_window(tcp_frame_bytes(config.batch_size), config.max_in_flight);
+    let mut tcp_senders: Vec<mpsc::UnboundedSender<TcpJob>> = Vec::new();
+    let mut tcp_workers = Vec::new();
+    if transport == Transport::Tcp {
+        let token = tcp_token();
+        for _ in 0..tcp_connection_count() {
+            let stream = connect_tcp(&config.tcp_addr, token.as_deref()).await?;
+            let (job_tx, job_rx) = mpsc::unbounded_channel::<TcpJob>();
+            tcp_senders.push(job_tx);
+            tcp_workers.push(tokio::spawn(tcp_worker(
+                stream,
+                tcp_window,
+                Duration::from_millis(config.timeout_ms),
+                job_rx,
+                tx.clone(),
+            )));
+        }
+    }
+    let mut dispatch_error: Option<BenchError> = None;
+
+    // Start the deadline clock only after the connections are ready, so the
+    // warmup is not eaten by connection setup.
+    let start = Instant::now();
+    let measure_start = start + Duration::from_secs(config.warmup_secs);
 
     // The pacer owns the absolute-deadline clock on its own OS thread. The
     // final spin before a deadline therefore never competes with request tasks
@@ -825,7 +1036,7 @@ async fn run_repetition(
             .instrument(symbol)
             .expect("symbols were validated above");
 
-        let mut orders: Vec<OrderRequest> = Vec::with_capacity(slot_orders);
+        let mut orders: Vec<GeneratedOrder> = Vec::with_capacity(slot_orders);
         let mut cancels: Vec<CancelRequest> = Vec::new();
         for _ in 0..slot_orders {
             let roll: f64 = rng.gen_range(0.0..1.0);
@@ -865,11 +1076,15 @@ async fn run_repetition(
                         OrderType::Limit,
                     );
                     if generated.passive
-                        && open.record(symbol_index, generated.order_id, generated.participant)
+                        && open.record(
+                            symbol_index,
+                            generated.order_id,
+                            generated.participant.clone(),
+                        )
                     {
                         mix.evicted += 1;
                     }
-                    orders.push(generated.request);
+                    orders.push(generated);
                 }
                 EventPlan::ForcedIoc => {
                     mix.forced_ioc += 1;
@@ -883,7 +1098,7 @@ async fn run_repetition(
                         &mut order_seq,
                         OrderType::Ioc,
                     );
-                    orders.push(generated.request);
+                    orders.push(generated);
                 }
                 EventPlan::Ioc => {
                     mix.ioc += 1;
@@ -896,7 +1111,7 @@ async fn run_repetition(
                         &mut order_seq,
                         OrderType::Ioc,
                     );
-                    orders.push(generated.request);
+                    orders.push(generated);
                 }
                 EventPlan::Limit => {
                     mix.limit += 1;
@@ -910,87 +1125,166 @@ async fn run_repetition(
                         OrderType::Limit,
                     );
                     if generated.passive
-                        && open.record(symbol_index, generated.order_id, generated.participant)
+                        && open.record(
+                            symbol_index,
+                            generated.order_id,
+                            generated.participant.clone(),
+                        )
                     {
                         mix.evicted += 1;
                     }
-                    orders.push(generated.request);
+                    orders.push(generated);
                 }
             }
         }
 
-        // Serialize each body once, before it reaches a request task, so the
-        // measurement does not include serde work on the request path.
-        let mut requests: Vec<PreparedRequest> =
-            Vec::with_capacity(orders.len().min(1) + cancels.len());
-        if !orders.is_empty() {
-            mix.requests += 1;
-            if batching {
-                mix.batch_requests += 1;
-                let weight = orders.len() as u32;
-                requests.push(PreparedRequest {
-                    url: batch_url.clone(),
-                    body: serde_json::to_vec(&BatchOrderRequest { orders })?,
+        match transport {
+            Transport::Tcp => {
+                if orders.is_empty() && cancels.is_empty() {
+                    continue;
+                }
+                // All commands in one frame share one symbol and one append.
+                // Orders and cancels both fit the fixed-layout command, so the
+                // tracked-open-id logic is identical to the HTTP path.
+                let timestamp_ns = now_ns();
+                let mut commands = Vec::with_capacity(orders.len() + cancels.len());
+                for order in &orders {
+                    commands.push(command_from_generated(order, timestamp_ns));
+                }
+                for cancel in &cancels {
+                    commands.push(command_from_cancel(cancel, timestamp_ns));
+                }
+                mix.requests += 1;
+                if commands.len() > 1 {
+                    mix.batch_requests += 1;
+                }
+                let weight = commands.len() as u32;
+                // Encode before the frame reaches the writer, so `send_us`
+                // measures the write path rather than encoder work.
+                let frame = TcpRequest::Submit { commands }.encode();
+                let permit = match Arc::clone(&semaphore).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        mix.overloaded_slots += 1;
+                        mix.overloaded_orders += slot_orders as u64;
+                        continue;
+                    }
+                };
+                let worker = (slot as usize) % tcp_senders.len();
+                let job = TcpJob {
+                    frame,
                     weight,
-                    check_batch_ack: true,
-                });
-            } else {
-                for order in orders {
+                    deadline,
+                    slip_us,
+                    window,
+                    measured,
+                    permit,
+                };
+                if tcp_senders[worker].send(job).is_err() {
+                    dispatch_error = Some(BenchError::Config(
+                        "a TCP worker stopped accepting frames".into(),
+                    ));
+                    break;
+                }
+            }
+            Transport::Http => {
+                // Serialize each body once, before it reaches a request task,
+                // so the measurement does not include serde work on the
+                // request path.
+                let mut requests: Vec<PreparedRequest> =
+                    Vec::with_capacity(orders.len().min(1) + cancels.len());
+                if !orders.is_empty() {
+                    mix.requests += 1;
+                    if batching {
+                        mix.batch_requests += 1;
+                        let weight = orders.len() as u32;
+                        let orders: Vec<OrderRequest> =
+                            orders.into_iter().map(|order| order.request).collect();
+                        requests.push(PreparedRequest {
+                            url: batch_url.clone(),
+                            body: serde_json::to_vec(&BatchOrderRequest { orders })?,
+                            weight,
+                            check_batch_ack: true,
+                        });
+                    } else {
+                        for order in orders {
+                            requests.push(PreparedRequest {
+                                url: order_url.clone(),
+                                body: serde_json::to_vec(&order.request)?,
+                                weight: 1,
+                                check_batch_ack: false,
+                            });
+                        }
+                    }
+                }
+                for cancel in cancels {
+                    mix.requests += 1;
                     requests.push(PreparedRequest {
-                        url: order_url.clone(),
-                        body: serde_json::to_vec(&order)?,
+                        url: cancel_url.clone(),
+                        body: serde_json::to_vec(&cancel)?,
                         weight: 1,
                         check_batch_ack: false,
                     });
                 }
-            }
-        }
-        for cancel in cancels {
-            mix.requests += 1;
-            requests.push(PreparedRequest {
-                url: cancel_url.clone(),
-                body: serde_json::to_vec(&cancel)?,
-                weight: 1,
-                check_batch_ack: false,
-            });
-        }
 
-        // One permit per request. If the in-flight cap is saturated the whole
-        // slot is dropped as overload: no fake latency sample, no error, just
-        // an explicit gap between scheduled and completed samples.
-        let mut permits: Vec<OwnedSemaphorePermit> = Vec::with_capacity(requests.len());
-        let mut denied = false;
-        for _ in 0..requests.len() {
-            match Arc::clone(&semaphore).try_acquire_owned() {
-                Ok(permit) => permits.push(permit),
-                Err(_) => {
-                    denied = true;
-                    break;
+                // One permit per request. If the in-flight cap is saturated
+                // the whole slot is dropped as overload: no fake latency
+                // sample, no error, just an explicit gap between scheduled and
+                // completed samples.
+                let mut permits: Vec<OwnedSemaphorePermit> = Vec::with_capacity(requests.len());
+                let mut denied = false;
+                for _ in 0..requests.len() {
+                    match Arc::clone(&semaphore).try_acquire_owned() {
+                        Ok(permit) => permits.push(permit),
+                        Err(_) => {
+                            denied = true;
+                            break;
+                        }
+                    }
+                }
+                if denied {
+                    mix.overloaded_slots += 1;
+                    mix.overloaded_orders += slot_orders as u64;
+                    continue;
+                }
+
+                for (request, permit) in requests.into_iter().zip(permits) {
+                    spawn_ingress(
+                        client.clone(),
+                        request,
+                        permit,
+                        tx.clone(),
+                        deadline,
+                        slip_us,
+                        window,
+                        measured,
+                    );
                 }
             }
-        }
-        if denied {
-            mix.overloaded_slots += 1;
-            mix.overloaded_orders += slot_orders as u64;
-            continue;
-        }
-
-        for (request, permit) in requests.into_iter().zip(permits) {
-            spawn_ingress(
-                client.clone(),
-                request,
-                permit,
-                tx.clone(),
-                deadline,
-                slip_us,
-                window,
-                measured,
-            );
         }
     }
 
     drop(tick_rx);
     let _ = pacer.join();
+    // Closing the job senders lets each worker drain its pending acks and
+    // exit; only then can every in-flight permit be released.
+    drop(tcp_senders);
+    let mut worker_error = None;
+    for worker in tcp_workers {
+        match worker.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => worker_error = Some(error),
+            Err(error) => {
+                worker_error = Some(BenchError::Config(format!(
+                    "TCP worker task failed: {error}"
+                )));
+            }
+        }
+    }
+    if let Some(error) = dispatch_error.or(worker_error) {
+        drop(tx);
+        return Err(error);
+    }
 
     // Drain in-flight requests before closing the collector.
     let _ = semaphore.acquire_many(config.max_in_flight as u32).await;
@@ -1021,6 +1315,7 @@ async fn run_repetition(
     Ok(RepStats {
         throughput,
         latency: collected.latency,
+        stages: collected.stages,
         measured_secs,
         steady,
         mix,
@@ -1078,6 +1373,7 @@ fn spawn_ingress(
                     ok,
                     weight,
                     window,
+                    stages: None,
                 })
                 .await;
         }
@@ -1085,9 +1381,296 @@ fn spawn_ingress(
     });
 }
 
+/// One Submit frame handed to a TCP worker. The frame is already encoded, so
+/// the writer only copies bytes.
+struct TcpJob {
+    frame: Vec<u8>,
+    weight: u32,
+    deadline: Instant,
+    slip_us: u64,
+    window: u64,
+    measured: bool,
+    permit: OwnedSemaphorePermit,
+}
+
+struct PendingFrame {
+    job: TcpJob,
+    written: Instant,
+}
+
+/// An ack as the reader saw it. T2 is stamped after the body bytes are read;
+/// T3 after the body is decoded. `received_ns` is the wall clock at T2, used
+/// only for the best-effort server clock offset.
+struct AckEvent {
+    received: Instant,
+    received_ns: u64,
+    parsed: Instant,
+    response: TcpResponse,
+}
+
+async fn connect_tcp(addr: &str, token: Option<&str>) -> Result<TcpStream> {
+    let mut stream = TcpStream::connect(addr).await?;
+    stream.set_nodelay(true)?;
+    if let Some(token) = token {
+        let frame = TcpRequest::Hello {
+            token: token.to_string(),
+        }
+        .encode();
+        stream.write_all(&frame).await?;
+        match read_tcp_response(&mut stream).await? {
+            TcpResponse::HelloAck { ok: true, .. } => {}
+            TcpResponse::HelloAck { message, .. } => {
+                return Err(BenchError::Config(format!("TCP hello rejected: {message}")));
+            }
+            other => {
+                return Err(BenchError::Config(format!(
+                    "unexpected TCP hello response: {other:?}"
+                )));
+            }
+        }
+    }
+    Ok(stream)
+}
+
+async fn read_tcp_response<R: AsyncRead + Unpin>(reader: &mut R) -> Result<TcpResponse> {
+    let mut prefix = [0u8; 4];
+    reader.read_exact(&mut prefix).await?;
+    let len = body_len(prefix)?;
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body).await?;
+    Ok(TcpResponse::decode_body(&body)?)
+}
+
+/// Reads acks continuously on one connection. Keeping the read side in its own
+/// task is what lets the writer send the next frame without ever blocking on
+/// the ack for the previous one.
+async fn tcp_reader<R: AsyncRead + Unpin>(reader: &mut R, tx: mpsc::Sender<AckEvent>) {
+    loop {
+        let mut prefix = [0u8; 4];
+        if reader.read_exact(&mut prefix).await.is_err() {
+            break;
+        }
+        let Ok(len) = body_len(prefix) else {
+            break;
+        };
+        let mut body = vec![0u8; len];
+        if reader.read_exact(&mut body).await.is_err() {
+            break;
+        }
+        let received = Instant::now();
+        let received_ns = now_ns();
+        let Ok(response) = TcpResponse::decode_body(&body) else {
+            break;
+        };
+        let parsed = Instant::now();
+        if tx
+            .send(AckEvent {
+                received,
+                received_ns,
+                parsed,
+                response,
+            })
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+/// Wait for the next ack, bounded by the configured request timeout. Both
+/// `timeout` and `Receiver::recv` are cancel-safe, so the select in the writer
+/// can cancel this future when a new job arrives without losing an ack.
+async fn next_ack(
+    ack_rx: &mut mpsc::Receiver<AckEvent>,
+    ack_timeout: Duration,
+) -> Option<AckEvent> {
+    tokio::time::timeout(ack_timeout, ack_rx.recv())
+        .await
+        .ok()
+        .flatten()
+}
+
+/// One connection's writer. The server handles one frame at a time per
+/// connection, so the writer only keeps `window` frames outstanding and the
+/// reader task drains acks. Acks are matched FIFO: TCP preserves order and the
+/// server processes frames in order.
+async fn tcp_worker(
+    stream: TcpStream,
+    window: usize,
+    ack_timeout: Duration,
+    mut rx: mpsc::UnboundedReceiver<TcpJob>,
+    tx: mpsc::Sender<Sample>,
+) -> Result<()> {
+    let (mut reader, mut writer) = stream.into_split();
+    let (ack_tx, mut ack_rx) = mpsc::channel::<AckEvent>(window.max(1) * 2);
+    let reader_task = tokio::spawn(async move {
+        tcp_reader(&mut reader, ack_tx).await;
+    });
+
+    let mut pending: VecDeque<PendingFrame> = VecDeque::with_capacity(window.max(1));
+    let mut input_open = true;
+    loop {
+        if !input_open && pending.is_empty() {
+            break;
+        }
+        let can_send = input_open && pending.len() < window;
+        if can_send {
+            tokio::select! {
+                job = rx.recv() => {
+                    match job {
+                        Some(job) => {
+                            writer.write_all(&job.frame).await?;
+                            let written = Instant::now();
+                            pending.push_back(PendingFrame { job, written });
+                        }
+                        None => input_open = false,
+                    }
+                }
+                ack = next_ack(&mut ack_rx, ack_timeout) => {
+                    let Some(ack) = ack else {
+                        fail_pending(&mut pending, &tx).await;
+                        return Err(BenchError::Config(
+                            "TCP ack did not arrive before the timeout".into(),
+                        ));
+                    };
+                    complete_frame(pending.pop_front(), ack, &tx).await;
+                }
+            }
+        } else if !pending.is_empty() {
+            let Some(ack) = next_ack(&mut ack_rx, ack_timeout).await else {
+                fail_pending(&mut pending, &tx).await;
+                return Err(BenchError::Config(
+                    "TCP ack did not arrive before the timeout".into(),
+                ));
+            };
+            complete_frame(pending.pop_front(), ack, &tx).await;
+        } else {
+            break;
+        }
+    }
+
+    // Every outstanding frame has an ack, so there is nothing left to read.
+    // Half-close the write side and abort the reader; waiting for the server
+    // to close would hang, because the server is waiting for the next frame.
+    let _ = writer.shutdown().await;
+    reader_task.abort();
+    let _ = reader_task.await;
+    Ok(())
+}
+
+async fn complete_frame(pending: Option<PendingFrame>, ack: AckEvent, tx: &mpsc::Sender<Sample>) {
+    let Some(PendingFrame { job, written }) = pending else {
+        return;
+    };
+    let TcpJob {
+        frame: _,
+        weight,
+        deadline,
+        slip_us,
+        window,
+        measured,
+        permit,
+    } = job;
+    let (ok, server_offset_ns) = match &ack.response {
+        TcpResponse::SubmitAck {
+            count, server_ns, ..
+        } => (
+            *count == weight,
+            Some(*server_ns as i64 - ack.received_ns as i64),
+        ),
+        _ => (false, None),
+    };
+    if measured {
+        let latency_us = ack.received.saturating_duration_since(deadline).as_micros() as u64;
+        let stages = StageSample {
+            send_us: written.saturating_duration_since(deadline).as_micros() as u64,
+            wire_us: ack.received.saturating_duration_since(written).as_micros() as u64,
+            parse_us: ack
+                .parsed
+                .saturating_duration_since(ack.received)
+                .as_micros() as u64,
+            server_offset_ns,
+        };
+        let _ = tx
+            .send(Sample {
+                latency_us,
+                slip_us,
+                ok,
+                weight,
+                window,
+                stages: Some(stages),
+            })
+            .await;
+    }
+    drop(permit);
+}
+
+/// A connection died with frames still outstanding. Count them as errors
+/// rather than dropping them silently: the run should say the acks never came.
+async fn fail_pending(pending: &mut VecDeque<PendingFrame>, tx: &mpsc::Sender<Sample>) {
+    let now = Instant::now();
+    while let Some(PendingFrame { job, .. }) = pending.pop_front() {
+        let TcpJob {
+            frame: _,
+            weight,
+            deadline,
+            slip_us,
+            window,
+            measured,
+            permit,
+        } = job;
+        if measured {
+            let latency_us = now.saturating_duration_since(deadline).as_micros() as u64;
+            let _ = tx
+                .send(Sample {
+                    latency_us,
+                    slip_us,
+                    ok: false,
+                    weight,
+                    window,
+                    stages: None,
+                })
+                .await;
+        }
+        drop(permit);
+    }
+}
+
+fn command_from_generated(order: &GeneratedOrder, timestamp_ns: u64) -> Command {
+    Command::new_order(
+        order.request.symbol,
+        order.request.side,
+        order.request.order_type,
+        order.price,
+        Qty(order.request.qty),
+        order.order_id,
+        ParticipantId::derive(&order.participant),
+        timestamp_ns,
+    )
+}
+
+fn command_from_cancel(cancel: &CancelRequest, timestamp_ns: u64) -> Command {
+    let participant = cancel.participant.as_deref().unwrap_or_default();
+    Command::cancel(
+        cancel.symbol,
+        cancel.order_id,
+        ParticipantId::derive(participant),
+        timestamp_ns,
+    )
+}
+
+fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
 struct Collected {
     latency: LatencySummary,
     slip: LatencySummary,
+    stages: Vec<StageLatency>,
     completed: u64,
     errors: u64,
     windows: Vec<Histogram<u64>>,
@@ -1096,6 +1679,11 @@ struct Collected {
 async fn collect(mut rx: mpsc::Receiver<Sample>, window_count: usize) -> Collected {
     let mut latency = new_histogram();
     let mut slip = new_histogram();
+    let mut send = new_histogram();
+    let mut wire = new_histogram();
+    let mut parse = new_histogram();
+    let mut offset_negative = new_offset_histogram();
+    let mut offset_positive = new_offset_histogram();
     let mut windows: Vec<Histogram<u64>> =
         (0..window_count.max(1)).map(|_| new_histogram()).collect();
     let mut completed = 0u64;
@@ -1112,10 +1700,21 @@ async fn collect(mut rx: mpsc::Receiver<Sample>, window_count: usize) -> Collect
         if let Some(window) = windows.get_mut(sample.window as usize) {
             let _ = window.record_n(latency_us, weight);
         }
+        // Stage histograms are per frame, not per order: every order in a
+        // frame shares the frame's send/wire/parse times.
+        if let Some(stage) = sample.stages {
+            let _ = send.record(stage.send_us.min(HISTOGRAM_MAX_US - 1));
+            let _ = wire.record(stage.wire_us.min(HISTOGRAM_MAX_US - 1));
+            let _ = parse.record(stage.parse_us.min(HISTOGRAM_MAX_US - 1));
+            if let Some(offset_ns) = stage.server_offset_ns {
+                record_offset(&mut offset_negative, &mut offset_positive, offset_ns);
+            }
+        }
     }
     Collected {
         latency: summarize(&latency),
         slip: summarize(&slip),
+        stages: stage_summaries(&send, &wire, &parse, &offset_negative, &offset_positive),
         completed,
         errors,
         windows,
@@ -1125,6 +1724,108 @@ async fn collect(mut rx: mpsc::Receiver<Sample>, window_count: usize) -> Collect
 fn new_histogram() -> Histogram<u64> {
     Histogram::<u64>::new_with_max(HISTOGRAM_MAX_US, HISTOGRAM_SIG_DIGITS)
         .expect("valid histogram bounds")
+}
+
+fn new_offset_histogram() -> Histogram<u64> {
+    Histogram::<u64>::new_with_max(OFFSET_HIST_MAX_NS, HISTOGRAM_SIG_DIGITS)
+        .expect("valid offset histogram bounds")
+}
+
+fn record_offset(negative: &mut Histogram<u64>, positive: &mut Histogram<u64>, offset_ns: i64) {
+    if offset_ns < 0 {
+        let magnitude = offset_ns.unsigned_abs().min(OFFSET_HIST_MAX_NS - 1);
+        let _ = negative.record(magnitude);
+    } else {
+        let _ = positive.record((offset_ns as u64).min(OFFSET_HIST_MAX_NS - 1));
+    }
+}
+
+fn stage_summaries(
+    send: &Histogram<u64>,
+    wire: &Histogram<u64>,
+    parse: &Histogram<u64>,
+    offset_negative: &Histogram<u64>,
+    offset_positive: &Histogram<u64>,
+) -> Vec<StageLatency> {
+    let mut stages = Vec::new();
+    for (stage, histogram) in [("send_us", send), ("wire_us", wire), ("parse_us", parse)] {
+        if !histogram.is_empty() {
+            stages.push(StageLatency {
+                stage: stage.into(),
+                latency: summarize(histogram),
+            });
+        }
+    }
+    if !offset_negative.is_empty() || !offset_positive.is_empty() {
+        stages.push(StageLatency {
+            stage: "server_offset_ns".into(),
+            latency: summarize_offset(offset_negative, offset_positive),
+        });
+    }
+    stages
+}
+
+/// Merge the two one-sided histograms into ascending signed `(value, count)`
+/// pairs. Negative magnitudes are iterated smallest-first, so the signed order
+/// is reversed before the two sides are joined.
+fn offset_values(negative: &Histogram<u64>, positive: &Histogram<u64>) -> Vec<(i64, u64)> {
+    let mut values: Vec<(i64, u64)> = negative
+        .iter_recorded()
+        .map(|value| (-(value.value_iterated_to() as i64), value.count_at_value()))
+        .collect();
+    values.extend(
+        positive
+            .iter_recorded()
+            .map(|value| (value.value_iterated_to() as i64, value.count_at_value())),
+    );
+    values.sort_by_key(|(value, _)| *value);
+    values
+}
+
+fn signed_quantile(values: &[(i64, u64)], total: u64, quantile: f64) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    let rank = ((total as f64) * quantile).ceil().max(1.0) as u64;
+    let mut seen = 0u64;
+    for (value, count) in values {
+        seen += *count;
+        if seen >= rank {
+            return *value as f64;
+        }
+    }
+    values.last().map(|(value, _)| *value as f64).unwrap_or(0.0)
+}
+
+/// Summarize the two one-sided offset histograms as signed nanoseconds. Unlike
+/// the other stage summaries, this one is in nanoseconds because it describes a
+/// clock difference, not a duration.
+fn summarize_offset(negative: &Histogram<u64>, positive: &Histogram<u64>) -> LatencySummary {
+    let total = negative.len() + positive.len();
+    if total == 0 {
+        return empty_latency();
+    }
+    let values = offset_values(negative, positive);
+    let sum: i128 = values
+        .iter()
+        .map(|(value, count)| i128::from(*value) * i128::from(*count))
+        .sum();
+    LatencySummary {
+        count: total,
+        min: values
+            .first()
+            .map(|(value, _)| *value as f64)
+            .unwrap_or(0.0),
+        mean: sum as f64 / total as f64,
+        p50: signed_quantile(&values, total, 0.50),
+        p90: signed_quantile(&values, total, 0.90),
+        p99: signed_quantile(&values, total, 0.99),
+        p999: signed_quantile(&values, total, 0.999),
+        p9999: signed_quantile(&values, total, 0.9999),
+        max: values.last().map(|(value, _)| *value as f64).unwrap_or(0.0),
+        p50_ci95: None,
+        p99_ci95: None,
+    }
 }
 
 /// Compare the pooled p99 of the first and last ten one-second windows.
@@ -1164,21 +1865,25 @@ fn merge(histograms: &[&Histogram<u64>]) -> Histogram<u64> {
     merged
 }
 
+fn empty_latency() -> LatencySummary {
+    LatencySummary {
+        count: 0,
+        min: 0.0,
+        mean: 0.0,
+        p50: 0.0,
+        p90: 0.0,
+        p99: 0.0,
+        p999: 0.0,
+        p9999: 0.0,
+        max: 0.0,
+        p50_ci95: None,
+        p99_ci95: None,
+    }
+}
+
 fn summarize(histogram: &Histogram<u64>) -> LatencySummary {
     if histogram.is_empty() {
-        return LatencySummary {
-            count: 0,
-            min: 0.0,
-            mean: 0.0,
-            p50: 0.0,
-            p90: 0.0,
-            p99: 0.0,
-            p999: 0.0,
-            p9999: 0.0,
-            max: 0.0,
-            p50_ci95: None,
-            p99_ci95: None,
-        };
+        return empty_latency();
     }
     LatencySummary {
         count: histogram.len(),
@@ -1272,6 +1977,7 @@ fn generate_order(
         request,
         order_id,
         participant,
+        price: Price(price_ticks),
         passive: offset > 0 && order_type == OrderType::Limit,
     }
 }
@@ -1382,7 +2088,7 @@ fn platform_cpu() -> (String, usize, u64) {
 }
 
 fn command(program: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(program).args(args).output().ok()?;
+    let output = ProcessCommand::new(program).args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1623,6 +2329,373 @@ mod tests {
         assert_eq!(steady.drift_pct, None);
         assert!(!steady.flagged);
         assert_eq!(steady.windows, 10);
+    }
+
+    #[test]
+    fn tcp_submit_frame_round_trips_without_a_server() {
+        let exchange = ExchangeConfig::default();
+        let symbol = Symbol::new("BTC-USD").unwrap();
+        let instrument = exchange.instrument(symbol).unwrap();
+        let mut rng = ChaCha20Rng::seed_from_u64(11);
+        let mut seq = 0u64;
+        let mut commands = Vec::new();
+        for _ in 0..3 {
+            let generated = generate_order(
+                symbol,
+                instrument,
+                &mut rng,
+                "run",
+                0,
+                &mut seq,
+                OrderType::Limit,
+            );
+            commands.push(command_from_generated(&generated, 42));
+        }
+        commands.push(command_from_cancel(
+            &CancelRequest {
+                symbol,
+                order_id: OrderId(7),
+                participant: Some("bench-0-7".into()),
+            },
+            42,
+        ));
+
+        let frame = TcpRequest::Submit {
+            commands: commands.clone(),
+        }
+        .encode();
+        let len = body_len(frame[..4].try_into().unwrap()).unwrap();
+        assert_eq!(len, frame.len() - 4);
+        assert_eq!(len, tcp_frame_bytes(commands.len()) - 4);
+        match TcpRequest::decode_body(&frame[4..]).unwrap() {
+            TcpRequest::Submit { commands: decoded } => {
+                assert_eq!(decoded, commands);
+                // One symbol per frame is a protocol requirement.
+                assert!(decoded.iter().all(|command| command.symbol == symbol));
+            }
+            other => panic!("unexpected decoded request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tcp_submit_ack_parses_and_keeps_the_server_clock() {
+        let ack = TcpResponse::SubmitAck {
+            partition: 3,
+            base_offset: 100,
+            count: 10,
+            server_ns: 1_700_000_000_000_000_000,
+        };
+        let frame = ack.encode();
+        let len = body_len(frame[..4].try_into().unwrap()).unwrap();
+        assert_eq!(len, frame.len() - 4);
+        match TcpResponse::decode_body(&frame[4..]).unwrap() {
+            TcpResponse::SubmitAck {
+                partition,
+                base_offset,
+                count,
+                server_ns,
+            } => {
+                assert_eq!(partition, 3);
+                assert_eq!(base_offset, 100);
+                assert_eq!(count, 10);
+                assert_eq!(server_ns, 1_700_000_000_000_000_000);
+            }
+            other => panic!("unexpected decoded response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tcp_batch_pacing_keeps_the_offer_rate() {
+        // A 100-command frame at 10k orders/s is one frame every 10 ms.
+        let pacing = plan_pacing(10_000, 30, 5, 100).unwrap();
+        assert_eq!(pacing.total_orders, 350_000);
+        assert_eq!(pacing.total_slots, 3_500);
+        assert_eq!(pacing.warmup_slots, 500);
+        assert_eq!(pacing.period_ns, 10_000_000);
+        let offered: u64 = (0..pacing.total_slots)
+            .map(|slot| pacing.orders_in_slot(slot))
+            .sum();
+        assert_eq!(offered, pacing.total_orders);
+        let measured: u64 = (pacing.warmup_slots..pacing.total_slots)
+            .map(|slot| pacing.orders_in_slot(slot))
+            .sum();
+        assert_eq!(measured, 300_000);
+    }
+
+    #[test]
+    fn tcp_inflight_window_stays_inside_the_byte_budget() {
+        for commands in [1usize, 10, 100, 256] {
+            let frame_bytes = tcp_frame_bytes(commands);
+            let window = tcp_inflight_window(frame_bytes, 4_096);
+            assert!(window >= 1);
+            assert!(window * frame_bytes <= TCP_INFLIGHT_BYTES);
+        }
+        // The cap also respects a small max_in_flight.
+        assert_eq!(tcp_inflight_window(tcp_frame_bytes(10), 2), 2);
+        // 64 KiB / 7,807-byte frame = 8; / 19,975-byte frame = 3.
+        assert_eq!(tcp_inflight_window(tcp_frame_bytes(100), 4_096), 8);
+        assert_eq!(tcp_inflight_window(tcp_frame_bytes(256), 4_096), 3);
+    }
+
+    #[test]
+    fn transport_is_recorded_in_the_workload_spec() {
+        let exchange = ExchangeConfig::default();
+        let default_config = BenchConfig::default();
+        assert_eq!(default_config.transport, "http");
+        assert_eq!(default_config.tcp_addr, "127.0.0.1:8081");
+        let http = workload_spec(&default_config, &exchange, Transport::Http);
+        assert_eq!(http.transport, "http");
+
+        let tcp_config = BenchConfig {
+            transport: "tcp".into(),
+            ..BenchConfig::default()
+        };
+        let tcp = workload_spec(&tcp_config, &exchange, Transport::Tcp);
+        assert_eq!(tcp.transport, "tcp");
+        assert_eq!(tcp.batch_size, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tcp_worker_records_one_sample_per_order_and_stages() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // Stay up until the client half-closes. Returning immediately after
+            // the last ack can race the client's read and turn a good run into
+            // an EOF, which would make this test flaky.
+            loop {
+                let mut prefix = [0u8; 4];
+                if socket.read_exact(&mut prefix).await.is_err() {
+                    return;
+                }
+                let Ok(len) = body_len(prefix) else {
+                    return;
+                };
+                let mut body = vec![0u8; len];
+                if socket.read_exact(&mut body).await.is_err() {
+                    return;
+                }
+                let Ok(TcpRequest::Submit { commands }) = TcpRequest::decode_body(&body) else {
+                    return;
+                };
+                let ack = TcpResponse::SubmitAck {
+                    partition: 1,
+                    base_offset: 0,
+                    count: commands.len() as u32,
+                    server_ns: now_ns(),
+                };
+                if socket.write_all(&ack.encode()).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        stream.set_nodelay(true).unwrap();
+        let semaphore = Arc::new(Semaphore::new(4));
+        let (job_tx, job_rx) = mpsc::unbounded_channel();
+        let (sample_tx, mut sample_rx) = mpsc::channel(8);
+        let worker = tokio::spawn(tcp_worker(
+            stream,
+            2,
+            Duration::from_secs(2),
+            job_rx,
+            sample_tx,
+        ));
+
+        let symbol = Symbol::new("BTC-USD").unwrap();
+        for weight in [2u32, 3] {
+            let commands: Vec<Command> = (0..weight)
+                .map(|index| {
+                    Command::new_order(
+                        symbol,
+                        Side::Buy,
+                        OrderType::Limit,
+                        Price(100),
+                        Qty(1),
+                        OrderId(u128::from(index)),
+                        ParticipantId(u64::from(index)),
+                        0,
+                    )
+                })
+                .collect();
+            let frame = TcpRequest::Submit { commands }.encode();
+            let permit = Arc::clone(&semaphore).try_acquire_owned().unwrap();
+            job_tx
+                .send(TcpJob {
+                    frame,
+                    weight,
+                    deadline: Instant::now(),
+                    slip_us: 0,
+                    window: 0,
+                    measured: true,
+                    permit,
+                })
+                .unwrap();
+        }
+        drop(job_tx);
+
+        worker.await.unwrap().unwrap();
+        server.await.unwrap();
+        let mut weights = Vec::new();
+        while let Some(sample) = sample_rx.recv().await {
+            assert!(sample.ok);
+            assert!(sample.stages.is_some());
+            let stages = sample.stages.unwrap();
+            assert!(stages.server_offset_ns.is_some());
+            weights.push(sample.weight);
+        }
+        assert_eq!(weights, [2, 3]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tcp_run_records_transport_and_stages_in_the_manifest() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    loop {
+                        let mut prefix = [0u8; 4];
+                        if socket.read_exact(&mut prefix).await.is_err() {
+                            return;
+                        }
+                        let Ok(len) = body_len(prefix) else {
+                            return;
+                        };
+                        let mut body = vec![0u8; len];
+                        if socket.read_exact(&mut body).await.is_err() {
+                            return;
+                        }
+                        let count = match TcpRequest::decode_body(&body) {
+                            Ok(TcpRequest::Submit { commands }) => commands.len() as u32,
+                            _ => return,
+                        };
+                        let ack = TcpResponse::SubmitAck {
+                            partition: 0,
+                            base_offset: 0,
+                            count,
+                            server_ns: now_ns(),
+                        };
+                        if socket.write_all(&ack.encode()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let output_dir =
+            std::env::temp_dir().join(format!("whippet-bench-{}", uuid::Uuid::new_v4()));
+        let config = BenchConfig {
+            transport: "tcp".into(),
+            tcp_addr: addr.to_string(),
+            rate_per_sec: 100,
+            duration_secs: 1,
+            warmup_secs: 0,
+            repetitions: 1,
+            output_dir: output_dir.clone(),
+            label: "tcp-test".into(),
+            ..BenchConfig::default()
+        };
+        let manifest = run(config).await.unwrap();
+        server.abort();
+
+        assert_eq!(manifest.workload.transport, "tcp");
+        assert!(!manifest.stages.is_empty());
+        let names: Vec<&str> = manifest
+            .stages
+            .iter()
+            .map(|stage| stage.stage.as_str())
+            .collect();
+        assert!(names.contains(&"send_us"));
+        assert!(names.contains(&"wire_us"));
+        assert!(names.contains(&"server_offset_ns"));
+        let send = manifest
+            .stages
+            .iter()
+            .find(|stage| stage.stage == "send_us")
+            .unwrap();
+        assert!(send.latency.count > 0);
+        assert!(send.latency.p99 >= send.latency.p50);
+        // The manifest itself records the transport, not only the config.
+        let written =
+            std::fs::read_to_string(output_dir.join(format!("{}.json", manifest.run_id))).unwrap();
+        assert!(written.contains("\"transport\": \"tcp\""));
+        let _ = std::fs::remove_dir_all(&output_dir);
+    }
+
+    #[test]
+    fn stage_summaries_are_empty_until_a_tcp_frame_records_one() {
+        let mut send = new_histogram();
+        let mut wire = new_histogram();
+        let mut parse = new_histogram();
+        let mut negative = new_offset_histogram();
+        let mut positive = new_offset_histogram();
+        assert!(stage_summaries(&send, &wire, &parse, &negative, &positive).is_empty());
+
+        send.record(120).unwrap();
+        wire.record(800).unwrap();
+        parse.record(3).unwrap();
+        record_offset(&mut negative, &mut positive, -4_000);
+        let stages = stage_summaries(&send, &wire, &parse, &negative, &positive);
+        let names: Vec<&str> = stages.iter().map(|stage| stage.stage.as_str()).collect();
+        assert_eq!(
+            names,
+            ["send_us", "wire_us", "parse_us", "server_offset_ns"]
+        );
+        assert_eq!(stages[0].latency.p50, 120.0);
+        assert_eq!(stages[1].latency.p50, 800.0);
+        assert_eq!(stages[2].latency.p50, 3.0);
+        assert!(stages[3].latency.p50 < 0.0);
+    }
+
+    #[test]
+    fn transport_validation_rejects_unknown_values_and_empty_tcp_addr() {
+        assert_eq!(parse_transport("HTTP").unwrap(), Transport::Http);
+        assert_eq!(parse_transport("tcp").unwrap(), Transport::Tcp);
+        assert!(parse_transport("quic").is_err());
+
+        let unknown = BenchConfig {
+            transport: "quic".into(),
+            ..BenchConfig::default()
+        };
+        assert!(validate_config(&unknown).is_err());
+
+        let empty_addr = BenchConfig {
+            transport: "tcp".into(),
+            tcp_addr: "  ".into(),
+            ..BenchConfig::default()
+        };
+        assert!(validate_config(&empty_addr).is_err());
+
+        let tcp = BenchConfig {
+            transport: "tcp".into(),
+            ..BenchConfig::default()
+        };
+        assert!(validate_config(&tcp).is_ok());
+    }
+
+    #[test]
+    fn server_offset_summary_keeps_the_sign() {
+        let mut negative = new_offset_histogram();
+        let mut positive = new_offset_histogram();
+        for offset in [-5_000i64, -1_000, 0, 2_000, 9_000] {
+            record_offset(&mut negative, &mut positive, offset);
+        }
+        let summary = summarize_offset(&negative, &positive);
+        assert_eq!(summary.count, 5);
+        // HDR is exact below the sub-bucket count (2,048 ns here); the larger
+        // magnitudes carry relative bucket precision, so allow a small band.
+        assert!((-5_100.0..=-4_900.0).contains(&summary.min));
+        assert!((8_900.0..=9_100.0).contains(&summary.max));
+        // Five samples, rank 3: the signed median is exactly zero.
+        assert_eq!(summary.p50, 0.0);
+        assert!((900.0..=1_100.0).contains(&summary.mean));
     }
 
     #[test]

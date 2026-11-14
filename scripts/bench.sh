@@ -11,6 +11,8 @@
 #   WHIPPET_BENCH_IOC_RATIO     IOC share of ingress events (default 0.10)
 #   WHIPPET_BENCH_CANCEL_RATIO  cancel share of ingress events (default 0.10)
 #   WHIPPET_BENCH_SEED          RNG seed, fixed by default so runs compare
+#   WHIPPET_BENCH_TRANSPORT     http (default) or tcp
+#   WHIPPET_BENCH_TCP_ADDR      TCP ingress inside compose (default node:8081)
 #
 # Manifests are written to ./artifacts/bench on the host. The simulator is
 # stopped for the duration of the run and restarted afterwards if it was
@@ -30,6 +32,8 @@ BATCH_SIZE="${WHIPPET_BENCH_BATCH_SIZE:-1}"
 IOC_RATIO="${WHIPPET_BENCH_IOC_RATIO:-0.10}"
 CANCEL_RATIO="${WHIPPET_BENCH_CANCEL_RATIO:-0.10}"
 SEED="${WHIPPET_BENCH_SEED:-$((0x5eed0001))}"
+TRANSPORT="${WHIPPET_BENCH_TRANSPORT:-http}"
+TCP_ADDR="${WHIPPET_BENCH_TCP_ADDR:-node:8081}"
 # Snapshots of the order book stall the shard. The demo default is every 1000
 # commands; a short ingress run includes those stalls. Set 0 to isolate
 # ingress, and the manifest note records which setting was used.
@@ -46,7 +50,8 @@ usage: scripts/bench.sh [smoke|sweep|full|all]
   all     smoke then sweep (default)
 
 Environment: WHIPPET_BENCH_BATCH_SIZE, WHIPPET_BENCH_IOC_RATIO,
-WHIPPET_BENCH_CANCEL_RATIO, WHIPPET_BENCH_SEED.
+WHIPPET_BENCH_CANCEL_RATIO, WHIPPET_BENCH_SEED, WHIPPET_BENCH_TRANSPORT,
+WHIPPET_BENCH_TCP_ADDR.
 
 Docker Desktop runs are dev-loop measurements, never headline results.
 EOF
@@ -107,7 +112,7 @@ curl -fsS --max-time 5 http://localhost:8080/api/health >/dev/null \
 run_bench() {
     local label="$1" rate="$2" duration="$3" warmup="$4" repetitions="$5"
     local batch="${6:-${BATCH_SIZE}}"
-    echo "bench: ${label} rate=${rate}/s duration=${duration}s warmup=${warmup}s reps=${repetitions} batch=${batch} ioc=${IOC_RATIO} cancel=${CANCEL_RATIO} snapshot_every=${SNAPSHOT_EVERY} seed=${SEED}"
+    echo "bench: ${label} transport=${TRANSPORT} rate=${rate}/s duration=${duration}s warmup=${warmup}s reps=${repetitions} batch=${batch} ioc=${IOC_RATIO} cancel=${CANCEL_RATIO} snapshot_every=${SNAPSHOT_EVERY} seed=${SEED}"
     # Run as the invoking user so the bind-mounted ./artifacts directory is
     # writable on Linux CI as well as Docker Desktop.
     "${COMPOSE[@]}" --profile bench run --rm --user "$(id -u):$(id -g)" \
@@ -121,6 +126,8 @@ run_bench() {
         bench \
         bench \
         --gateway http://node:8080 \
+        --transport "${TRANSPORT}" \
+        --tcp-addr "${TCP_ADDR}" \
         --rate "${rate}" \
         --duration "${duration}" \
         --warmup "${warmup}" \

@@ -10,6 +10,10 @@
 //! cargo run --release -p whippet-bench --example live_bench -- \
 //!   --gateway http://127.0.0.1:8080 --rate 1000 --duration 8 \
 //!   --warmup 2 --repetitions 1 --label batch-10 --batch-size 10
+//!
+//! cargo run --release -p whippet-bench --example live_bench -- \
+//!   --transport tcp --tcp-addr 127.0.0.1:8081 --rate 1000 \
+//!   --duration 8 --warmup 2 --repetitions 1 --label tcp-batch-10 --batch-size 10
 //! ```
 //!
 //! It writes the same manifest as the CLI, under `--output-dir`.
@@ -55,13 +59,15 @@ fn main() -> Result<(), BenchError> {
             "--batch-size" => config.batch_size = parse(&flag, &take(&mut args, &flag)?)?,
             "--ioc-ratio" => config.ioc_ratio = parse(&flag, &take(&mut args, &flag)?)?,
             "--cancel-ratio" => config.cancel_ratio = parse(&flag, &take(&mut args, &flag)?)?,
+            "--transport" => config.transport = take(&mut args, &flag)?,
+            "--tcp-addr" => config.tcp_addr = take(&mut args, &flag)?,
             "-h" | "--help" => {
                 println!(
                     "usage: live_bench [--gateway URL] [--rate N] [--duration S] [--warmup S]\n\
                      \x20      [--repetitions N] [--seed N] [--symbols A,B] [--label NAME]\n\
                      \x20      [--mode MODE] [--output-dir DIR] [--max-in-flight N]\n\
                      \x20      [--timeout-ms N] [--batch-size N] [--ioc-ratio F]\n\
-                     \x20      [--cancel-ratio F]"
+                     \x20      [--cancel-ratio F] [--transport http|tcp] [--tcp-addr HOST:PORT]"
                 );
                 return Ok(());
             }

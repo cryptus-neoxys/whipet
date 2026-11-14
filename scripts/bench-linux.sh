@@ -19,6 +19,8 @@
 #   WHIPPET_BENCH_SEED       RNG seed (fixed by default so runs compare)
 #   WHIPPET_BENCH_IOC_RATIO  IOC share of ingress events (default 0.10)
 #   WHIPPET_BENCH_CANCEL_RATIO  cancel share of ingress events (default 0.10)
+#   WHIPPET_TRANSPORT        http (default) or tcp
+#   WHIPPET_TCP_ADDR         TCP ingress address (default 127.0.0.1:8081)
 #   WHIPPET_L1_BATCH         orders per request for L1 (default 1)
 #   WHIPPET_L2_BATCH         orders per request for L2 (default 1)
 #   WHIPPET_DURATION         measured seconds (default 300)
@@ -40,6 +42,8 @@ DURATION="${WHIPPET_DURATION:-300}"
 WARMUP="${WHIPPET_WARMUP:-30}"
 REPETITIONS="${WHIPPET_REPETITIONS:-5}"
 SEED="${WHIPPET_BENCH_SEED:-$((0x5eed0001))}"
+TRANSPORT="${WHIPPET_TRANSPORT:-http}"
+TCP_ADDR="${WHIPPET_TCP_ADDR:-127.0.0.1:8081}"
 VIRTUALIZATION="native"
 VIRT_KIND=""
 
@@ -167,9 +171,11 @@ curl -fsS --max-time 5 "${GATEWAY}/api/health" >/dev/null \
 # --- matrix ------------------------------------------------------------------
 run_case() {
     local label="$1" rate="$2" symbols="$3" batch="$4"
-    log "case ${label}: ${rate}/s, ${DURATION}s measured, ${WARMUP}s warmup, ${REPETITIONS} repetitions, symbols ${symbols}, batch ${batch}"
+    log "case ${label}: transport ${TRANSPORT}, ${rate}/s, ${DURATION}s measured, ${WARMUP}s warmup, ${REPETITIONS} repetitions, symbols ${symbols}, batch ${batch}"
     "${PIN[@]}" "${BIN}" bench \
         --gateway "${GATEWAY}" \
+        --transport "${TRANSPORT}" \
+        --tcp-addr "${TCP_ADDR}" \
         --rate "${rate}" \
         --duration "${DURATION}" \
         --warmup "${WARMUP}" \
