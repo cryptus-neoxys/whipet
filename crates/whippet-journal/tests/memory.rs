@@ -162,6 +162,49 @@ async fn owned_append_and_payload_reads_match_the_borrowed_api() {
 }
 
 #[tokio::test]
+async fn payload_reads_into_a_reused_buffer_match_the_allocating_api() {
+    let journal = Journal::memory();
+    journal
+        .append(Topic::Md, 1, &[message(1), message(2), message(3)])
+        .await
+        .expect("append");
+
+    let expected = journal
+        .read_payloads(Topic::Md, 1, "md-p1", 1, 10, 0)
+        .await
+        .expect("allocating read");
+    let mut out = vec![whippet_journal::PayloadRecord {
+        offset: 42,
+        timestamp_ns: 0,
+        payload: bytes::Bytes::from_static(b"stale"),
+    }];
+    let appended = journal
+        .read_payloads_into(Topic::Md, 1, "md-p1", 1, 10, 0, &mut out)
+        .await
+        .expect("buffered read");
+    assert_eq!(appended, expected.len());
+    assert_eq!(
+        out, expected,
+        "offsets and payloads match the allocating API, and the stale entry is gone"
+    );
+
+    // The buffer is reused: capacity survives, contents are replaced.
+    let capacity = out.capacity();
+    let appended = journal
+        .read_payloads_into(Topic::Md, 1, "md-p1", 2, 10, 0, &mut out)
+        .await
+        .expect("buffered read");
+    assert_eq!(appended, 1);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].offset, 2);
+    assert_eq!(out[0].payload.as_ref(), &[3]);
+    assert!(
+        out.capacity() >= capacity,
+        "reusing the buffer keeps its capacity"
+    );
+}
+
+#[tokio::test]
 async fn journal_memory_wrapper_matches_the_sync_api() {
     let journal = Journal::memory();
     assert!(journal.ping().await);

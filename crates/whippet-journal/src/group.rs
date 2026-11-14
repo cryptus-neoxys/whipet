@@ -151,6 +151,15 @@ impl GroupCommit {
         partition: u32,
         messages: Vec<JournalMessage>,
     ) -> Result<AppendResult> {
+        // One flush is one `send_messages`, so a submission larger than the
+        // Iggy batch cap could span chunks and break the per-caller
+        // `base_offset + i` guarantee. Reject it instead of mis-acking.
+        if messages.len() > MAX_GROUP_BATCH {
+            return Err(JournalError::InvalidConfig(format!(
+                "a single group-commit submission is {} messages; the cap is {MAX_GROUP_BATCH}",
+                messages.len()
+            )));
+        }
         let (reply, response) = oneshot::channel();
         let mut pending = Some((messages, reply));
 

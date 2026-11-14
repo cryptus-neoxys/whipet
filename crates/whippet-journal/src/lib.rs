@@ -241,6 +241,75 @@ fn append_chunks<T>(messages: &mut [T]) -> impl Iterator<Item = &mut [T]> {
     messages.chunks_mut(MAX_APPEND_BATCH)
 }
 
+/// Maximum number of `Consumer` identifiers remembered per connection.
+const CONSUMER_CACHE_LIMIT: usize = 64;
+
+/// Cached `Consumer` identifiers, keyed by `(topic, partition, consumer name)`.
+///
+/// `Consumer::new(Identifier::named(name)?)` copies the name into a fresh
+/// `Vec<u8>` and hashes it. The consume path builds one on every poll and the
+/// commit path builds one for every offset read/write, so the parsed consumer
+/// is kept here and reused. A poll for a known consumer therefore allocates
+/// nothing for the identifier. The cache is bounded, and it is never touched
+/// by the append path.
+struct ConsumerCache {
+    by_partition: Mutex<ConsumerMap>,
+}
+
+/// Consumers grouped by `(topic, partition)`.
+///
+/// Nested so a lookup by `&str` does not allocate a key: `HashMap<String,
+/// _>::get` borrows the name. The outer key set is at most the topic layout's
+/// partition count.
+type ConsumerMap = HashMap<(Topic, u32), HashMap<String, Arc<Consumer>>>;
+
+impl ConsumerCache {
+    fn new() -> Self {
+        Self {
+            by_partition: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Return the cached consumer for this `(topic, partition, name)`, parsing
+    /// it once. A miss past the cache limit returns a fresh consumer without
+    /// growing the cache; behaviour is unchanged, only the reuse is lost.
+    fn get(&self, topic: Topic, partition: u32, name: &str) -> Result<Arc<Consumer>> {
+        let mut cache = self
+            .by_partition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(consumer) = cache
+            .get(&(topic, partition))
+            .and_then(|entries| entries.get(name))
+        {
+            return Ok(Arc::clone(consumer));
+        }
+        let consumer = Arc::new(Consumer::new(Identifier::named(name)?));
+        if cached_consumer_count(&cache) < CONSUMER_CACHE_LIMIT {
+            cache
+                .entry((topic, partition))
+                .or_default()
+                .insert(name.to_string(), Arc::clone(&consumer));
+        }
+        Ok(consumer)
+    }
+
+    /// Number of cached consumers. Test-only; the cache has no runtime readers
+    /// of its size.
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        let cache = self
+            .by_partition
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cached_consumer_count(&cache)
+    }
+}
+
+fn cached_consumer_count(cache: &ConsumerMap) -> usize {
+    cache.values().map(HashMap::len).sum()
+}
+
 /// Cached stream/topic identifiers.
 ///
 /// `Identifier::named` copies the name into a fresh `Vec<u8>`. The topic layout
@@ -281,6 +350,8 @@ pub struct IggyJournal {
     // only read afterwards.
     header_keys: Box<HeaderKeys>,
     ids: Box<TopicIds>,
+    /// Consume/commit-side consumer identifiers; never used by appends.
+    consumers: Box<ConsumerCache>,
 }
 
 impl IggyJournal {
@@ -310,6 +381,7 @@ impl IggyJournal {
             address: address.to_string(),
             header_keys: Box::new(HeaderKeys::new()?),
             ids: Box::new(TopicIds::new()?),
+            consumers: Box::new(ConsumerCache::new()),
         })
     }
 
@@ -598,6 +670,39 @@ impl IggyJournal {
         count: u32,
         max_wait_ms: u64,
     ) -> Result<Vec<PayloadRecord>> {
+        let mut records = Vec::new();
+        self.read_payloads_into(
+            topic,
+            partition,
+            consumer,
+            offset,
+            count,
+            max_wait_ms,
+            &mut records,
+        )
+        .await?;
+        Ok(records)
+    }
+
+    /// Poll records into a caller-owned buffer.
+    ///
+    /// `out` is cleared and then filled with the polled records; the number
+    /// appended is returned. A caller that keeps its buffer across iterations
+    /// pays no per-poll `Vec` allocation once the buffer has the capacity. The
+    /// consumer identifier comes from the connection's cache, so a repeat poll
+    /// for the same `(topic, partition, consumer)` allocates nothing for it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn read_payloads_into(
+        &self,
+        topic: Topic,
+        partition: u32,
+        consumer: &str,
+        offset: u64,
+        count: u32,
+        max_wait_ms: u64,
+        out: &mut Vec<PayloadRecord>,
+    ) -> Result<usize> {
+        out.clear();
         let first = self
             .poll(topic, partition, consumer, offset, count, max_wait_ms)
             .await;
@@ -606,15 +711,15 @@ impl IggyJournal {
                 self.poll(topic, partition, consumer, offset, count, max_wait_ms)
             })
             .await?;
-        let mut records = Vec::with_capacity(polled.messages.len());
+        out.reserve(polled.messages.len());
         for message in polled.messages {
-            records.push(PayloadRecord {
+            out.push(PayloadRecord {
                 offset: message.header.offset,
                 timestamp_ns: message.header.timestamp,
                 payload: message.payload,
             });
         }
-        Ok(records)
+        Ok(out.len())
     }
 
     async fn poll(
@@ -627,7 +732,7 @@ impl IggyJournal {
         max_wait_ms: u64,
     ) -> Result<PolledMessages> {
         let (stream_id, topic_id) = self.ids.get(topic)?;
-        let consumer = Consumer::new(Identifier::named(consumer)?);
+        let consumer = self.consumers.get(topic, partition, consumer)?;
         let options = PollOptions {
             count,
             max_wait: IggyDuration::from(Duration::from_millis(max_wait_ms)),
@@ -670,7 +775,7 @@ impl IggyJournal {
         offset: u64,
     ) -> Result<()> {
         let (stream_id, topic_id) = self.ids.get(topic)?;
-        let consumer = Consumer::new(Identifier::named(consumer)?);
+        let consumer = self.consumers.get(topic, partition, consumer)?;
         self.client
             .store_consumer_offset(&consumer, stream_id, topic_id, Some(partition), offset)
             .await?;
@@ -695,7 +800,7 @@ impl IggyJournal {
         consumer: &str,
     ) -> Result<Option<u64>> {
         let (stream_id, topic_id) = self.ids.get(topic)?;
-        let consumer = Consumer::new(Identifier::named(consumer)?);
+        let consumer = self.consumers.get(topic, partition, consumer)?;
         let info = self
             .client
             .get_consumer_offset(&consumer, stream_id, topic_id, Some(partition))
@@ -875,22 +980,46 @@ impl MemoryJournal {
         offset: u64,
         count: u32,
     ) -> Vec<PayloadRecord> {
+        let mut records = Vec::new();
+        self.read_payloads_into(topic, partition, offset, count, &mut records);
+        records
+    }
+
+    /// Read payloads into a caller-owned buffer.
+    ///
+    /// `out` is cleared and then filled with the matching records; the number
+    /// appended is returned. A reused buffer pays no per-read allocation.
+    pub fn read_payloads_into(
+        &self,
+        topic: Topic,
+        partition: u32,
+        offset: u64,
+        count: u32,
+        out: &mut Vec<PayloadRecord>,
+    ) -> usize {
+        out.clear();
         let state = self.state.lock().expect("memory journal poisoned");
-        state
-            .logs
-            .get(&(topic, partition))
-            .map(|log| {
-                log.iter()
-                    .filter(|record| record.offset >= offset)
-                    .take(count as usize)
-                    .map(|record| PayloadRecord {
-                        offset: record.offset,
-                        timestamp_ns: record.timestamp_ns,
-                        payload: Bytes::from(record.payload.clone()),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        let Some(log) = state.logs.get(&(topic, partition)) else {
+            return 0;
+        };
+        // Offsets are append-ordered, so the first candidate is a binary
+        // search. The reserve is then exact: an empty poll allocates nothing,
+        // and a full batch allocates once.
+        let start = log.partition_point(|record| record.offset < offset);
+        out.reserve(log.len().saturating_sub(start).min(count as usize));
+        for record in log
+            .iter()
+            .skip(start)
+            .filter(|record| record.offset >= offset)
+            .take(count as usize)
+        {
+            out.push(PayloadRecord {
+                offset: record.offset,
+                timestamp_ns: record.timestamp_ns,
+                payload: Bytes::from(record.payload.clone()),
+            });
+        }
+        out.len()
     }
 
     pub fn commit(&self, topic: Topic, partition: u32, consumer: &str, offset: u64) {
@@ -997,6 +1126,35 @@ impl Journal {
                     .await
             }
             Self::Memory(journal) => Ok(journal.read_payloads(topic, partition, offset, count)),
+        }
+    }
+
+    /// Read payloads into a caller-owned buffer.
+    ///
+    /// `out` is cleared and filled with the polled records; the number appended
+    /// is returned. Keep the buffer across loop iterations to avoid a per-poll
+    /// allocation. On the Iggy backend the consumer identifier also comes from
+    /// the connection's bounded cache.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn read_payloads_into(
+        &self,
+        topic: Topic,
+        partition: u32,
+        consumer: &str,
+        offset: u64,
+        count: u32,
+        max_wait_ms: u64,
+        out: &mut Vec<PayloadRecord>,
+    ) -> Result<usize> {
+        match self {
+            Self::Iggy(journal) => {
+                journal
+                    .read_payloads_into(topic, partition, consumer, offset, count, max_wait_ms, out)
+                    .await
+            }
+            Self::Memory(journal) => {
+                Ok(journal.read_payloads_into(topic, partition, offset, count, out))
+            }
         }
     }
 
@@ -1150,6 +1308,16 @@ mod tests {
         assert_send(journal.append_owned(Topic::Orders, 0, Vec::new()));
         assert_send(journal.read(Topic::Orders, 0, "consumer", 0, 1, 0));
         assert_send(journal.read_payloads(Topic::Orders, 0, "consumer", 0, 1, 0));
+        let mut payloads = Vec::new();
+        assert_send(journal.read_payloads_into(
+            Topic::Orders,
+            0,
+            "consumer",
+            0,
+            1,
+            0,
+            &mut payloads,
+        ));
         assert_send(journal.commit(Topic::Orders, 0, "consumer", 0));
         assert_send(journal.committed(Topic::Orders, 0, "consumer"));
         assert_send(journal.lag(Topic::Orders, 0, 0));
@@ -1328,6 +1496,122 @@ mod tests {
 
         assert!(journal.read_payloads(Topic::Orders, 1, 2, 10).is_empty());
         assert!(journal.read_payloads(Topic::Orders, 9, 0, 10).is_empty());
+    }
+
+    #[test]
+    fn consumer_identifiers_are_cached_per_topic_partition_and_name() {
+        let cache = ConsumerCache::new();
+        let first = cache
+            .get(Topic::Orders, 0, "engine-p0")
+            .expect("consumer identifier");
+        let second = cache
+            .get(Topic::Orders, 0, "engine-p0")
+            .expect("consumer identifier");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a repeat poll for the same consumer reuses the cached identifier"
+        );
+        assert_eq!(*first, *second, "the cached consumer equals a fresh one");
+        assert_eq!(cache.entry_count(), 1);
+
+        // The partition and the topic are part of the key: each is a distinct
+        // entry, even though the name (and therefore the consumer) is equal.
+        let other_partition = cache
+            .get(Topic::Orders, 1, "engine-p0")
+            .expect("consumer identifier");
+        let other_topic = cache
+            .get(Topic::Md, 0, "engine-p0")
+            .expect("consumer identifier");
+        assert!(!Arc::ptr_eq(&first, &other_partition));
+        assert!(!Arc::ptr_eq(&first, &other_topic));
+        assert_eq!(*first, *other_partition);
+        assert_eq!(cache.entry_count(), 3);
+    }
+
+    #[test]
+    fn consumer_cache_is_bounded_and_keeps_serving_misses() {
+        let cache = ConsumerCache::new();
+        let names: Vec<String> = (0..CONSUMER_CACHE_LIMIT * 3)
+            .map(|index| format!("engine-p{index}"))
+            .collect();
+
+        for name in &names {
+            let consumer = cache.get(Topic::Orders, 0, name).expect("consumer");
+            assert_eq!(
+                consumer.id.get_cow_str_value().expect("named id").as_ref(),
+                name.as_str(),
+                "a cache miss still builds the right consumer"
+            );
+        }
+        assert_eq!(
+            cache.entry_count(),
+            CONSUMER_CACHE_LIMIT,
+            "many distinct consumer names must not grow the cache without limit"
+        );
+
+        // The earliest names are the ones kept; they still hit the cache.
+        let cached = cache
+            .get(Topic::Orders, 0, &names[0])
+            .expect("cached consumer");
+        let cached_again = cache
+            .get(Topic::Orders, 0, &names[0])
+            .expect("cached consumer");
+        assert!(Arc::ptr_eq(&cached, &cached_again));
+
+        // Names past the limit are served without being stored.
+        let late = names.last().expect("a name");
+        let miss = cache.get(Topic::Orders, 0, late).expect("consumer");
+        assert_eq!(
+            miss.id.get_cow_str_value().expect("named id").as_ref(),
+            late.as_str()
+        );
+        assert_eq!(
+            cache.entry_count(),
+            CONSUMER_CACHE_LIMIT,
+            "a full cache is not grown by further misses"
+        );
+    }
+
+    #[test]
+    fn memory_read_payloads_into_clears_and_fills_the_buffer() {
+        let journal = MemoryJournal::new();
+        journal.append(
+            Topic::Md,
+            0,
+            &[
+                JournalMessage::new(vec![1], vec![]),
+                JournalMessage::new(vec![2], vec![]),
+            ],
+        );
+
+        // A pre-filled buffer is cleared, not appended to.
+        let mut out = vec![PayloadRecord {
+            offset: 99,
+            timestamp_ns: 99,
+            payload: Bytes::from_static(b"stale"),
+        }];
+        let appended = journal.read_payloads_into(Topic::Md, 0, 0, 10, &mut out);
+        assert_eq!(appended, 2);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].offset, 0, "the stale entry is gone");
+        assert_eq!(out[0].payload.as_ref(), b"\x01");
+        assert_eq!(
+            out,
+            journal.read_payloads(Topic::Md, 0, 0, 10),
+            "the buffered read matches the allocating read"
+        );
+
+        // A reused buffer holds only the newest batch.
+        let appended = journal.read_payloads_into(Topic::Md, 0, 1, 10, &mut out);
+        assert_eq!(appended, 1);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].offset, 1);
+        assert_eq!(out[0].payload.as_ref(), b"\x02");
+
+        // A miss clears the buffer and appends nothing.
+        let appended = journal.read_payloads_into(Topic::Md, 9, 0, 10, &mut out);
+        assert_eq!(appended, 0);
+        assert!(out.is_empty());
     }
 
     #[test]
