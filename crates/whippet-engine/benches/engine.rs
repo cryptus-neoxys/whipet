@@ -220,6 +220,119 @@ fn bench_aggressive_burst(c: &mut Criterion) {
     group.finish();
 }
 
+/// Fill-or-kill orders against a 50k-order ask ladder. Each FOK needs 10% of
+/// the resting quantity, so the liquidity check has to prove fillability
+/// without summing the whole crossing side of the book.
+fn bench_fok_burst(c: &mut Criterion) {
+    /// Resting orders in the ladder: 500 levels of 100 orders.
+    const BOOK_ORDERS: u64 = 50_000;
+    const LEVELS: i64 = 500;
+    const PER_LEVEL: u64 = 100;
+    const ORDER_QTY: u64 = 10;
+    /// FOK orders submitted per measured iteration. Ten of them consume the
+    /// ladder exactly, so every one is fillable.
+    const FOK_OPS: u64 = 10;
+    /// Ten percent of the ladder's total resting quantity.
+    const FOK_QTY: u64 = LEVELS as u64 * PER_LEVEL * ORDER_QTY / 10;
+
+    fn ladder() -> Book {
+        let mut book = Book::new(&book_config(BOOK_ORDERS as usize + 8));
+        let mut id = 0u128;
+        for level in 0..LEVELS {
+            for _ in 0..PER_LEVEL {
+                id += 1;
+                book.insert(
+                    OrderId(id),
+                    ParticipantId(1),
+                    Side::Sell,
+                    Price(200 + level),
+                    Qty(ORDER_QTY),
+                    id as u64,
+                )
+                .expect("resting ask");
+            }
+        }
+        book
+    }
+
+    let book = ladder();
+    assert_eq!(book.order_count(), BOOK_ORDERS as usize);
+
+    let mut group = c.benchmark_group("fok_burst");
+
+    // The check in isolation: same question, old and new form, on the same
+    // immutable book. This is the pair the early exit replaces.
+    group.bench_function("check_only_full_walk", |b| {
+        b.iter(|| {
+            black_box(
+                book.executable_qty_excluding(Side::Sell, Price(600), ParticipantId(2)) >= FOK_QTY,
+            );
+        });
+    });
+    group.bench_function("check_only_early_exit", |b| {
+        b.iter(|| {
+            black_box(book.has_executable_qty_excluding(
+                Side::Sell,
+                Price(600),
+                ParticipantId(2),
+                Qty(FOK_QTY),
+            ));
+        });
+    });
+
+    // End to end through the engine, including matching the 10% it consumes.
+    group.throughput(Throughput::Elements(FOK_OPS));
+    group.sample_size(10);
+    group.bench_function("50k_book_10pct", |b| {
+        b.iter_batched(
+            || {
+                let mut engine = SymbolEngine::new(book_config(BOOK_ORDERS as usize + 8));
+                let symbol = engine.config().symbol;
+                let mut out = EngineOutput::with_capacity(256, 256);
+                let mut id = 0u128;
+                for level in 0..LEVELS {
+                    for _ in 0..PER_LEVEL {
+                        id += 1;
+                        let command = Command::new_order(
+                            symbol,
+                            Side::Sell,
+                            OrderType::Limit,
+                            Price(200 + level),
+                            Qty(ORDER_QTY),
+                            OrderId(id),
+                            ParticipantId(1),
+                            id as u64,
+                        );
+                        engine.process(&command, id as u64, &mut out);
+                        out.clear();
+                    }
+                }
+                (engine, out, symbol, id)
+            },
+            |(mut engine, mut out, symbol, mut id)| {
+                for _ in 0..FOK_OPS {
+                    id += 1;
+                    let command = Command::new_order(
+                        symbol,
+                        Side::Buy,
+                        OrderType::Fok,
+                        Price(5_000),
+                        Qty(FOK_QTY),
+                        OrderId(id),
+                        ParticipantId(2),
+                        id as u64,
+                    );
+                    engine.process(&command, id as u64, &mut out);
+                    out.clear();
+                }
+                black_box(engine.book().best_ask());
+            },
+            BatchSize::PerIteration,
+        );
+    });
+    group.finish();
+}
+
 /// Snapshot construction and the deterministic state hash.
 fn bench_snapshot_hash(c: &mut Criterion) {
     let book = deep_book(1_000, 4);
@@ -279,6 +392,6 @@ criterion_group! {
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(2))
         .measurement_time(Duration::from_secs(5));
-    targets = bench_insert_cancel, bench_best_price, bench_aggressive_burst, bench_snapshot_hash, bench_engine_state_hash
+    targets = bench_insert_cancel, bench_best_price, bench_aggressive_burst, bench_fok_burst, bench_snapshot_hash, bench_engine_state_hash
 }
 criterion_main!(benches);

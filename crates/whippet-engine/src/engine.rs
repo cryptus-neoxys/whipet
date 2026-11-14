@@ -100,13 +100,31 @@ pub struct SymbolEngine {
     snapshot_every: u64,
     /// How often a full market-data snapshot is emitted on `EngineOutput`.
     md_snapshot_every: u64,
+    /// Commands left before the next state persistence, counted down instead
+    /// of dividing `commands` on every command. Re-derived whenever
+    /// `commands` jumps (restore) or an interval changes.
+    until_state_snapshot: u64,
+    /// Commands left before the next market-data snapshot. See
+    /// [`SymbolEngine::until_state_snapshot`].
+    until_md_snapshot: u64,
+}
+
+/// Commands left before `commands` next reaches a multiple of `every`.
+fn commands_until(every: u64, commands: u64) -> u64 {
+    let every = every.max(1);
+    let remainder = commands % every;
+    if remainder == 0 {
+        every
+    } else {
+        every - remainder
+    }
 }
 
 impl SymbolEngine {
     pub fn new(config: InstrumentConfig) -> Self {
         let dedup_capacity = config.max_orders.saturating_mul(2);
         let book = Book::new(&config);
-        Self {
+        let mut engine = Self {
             config,
             book,
             dedup: DedupTable::new(dedup_capacity),
@@ -118,25 +136,39 @@ impl SymbolEngine {
             halted: false,
             snapshot_every: 10_000,
             md_snapshot_every: 100_000,
-        }
+            until_state_snapshot: 0,
+            until_md_snapshot: 0,
+        };
+        engine.rederive_snapshot_countdowns();
+        engine
+    }
+
+    /// Recompute the countdowns from `commands`. The cadence is defined as
+    /// "every command count that is a multiple of the interval", so a restore
+    /// or a mid-stream interval change resumes at exactly the same command.
+    fn rederive_snapshot_countdowns(&mut self) {
+        self.until_state_snapshot = commands_until(self.snapshot_every, self.commands);
+        self.until_md_snapshot = commands_until(self.md_snapshot_every, self.commands);
     }
 
     pub fn with_snapshot_interval(mut self, every: u64) -> Self {
-        self.snapshot_every = every.max(1);
+        self.set_snapshot_interval(every);
         self
     }
 
     pub fn set_snapshot_interval(&mut self, every: u64) {
         self.snapshot_every = every.max(1);
+        self.until_state_snapshot = commands_until(self.snapshot_every, self.commands);
     }
 
     pub fn with_md_snapshot_interval(mut self, every: u64) -> Self {
-        self.md_snapshot_every = every.max(1);
+        self.set_md_snapshot_interval(every);
         self
     }
 
     pub fn set_md_snapshot_interval(&mut self, every: u64) {
         self.md_snapshot_every = every.max(1);
+        self.until_md_snapshot = commands_until(self.md_snapshot_every, self.commands);
     }
 
     pub fn config(&self) -> &InstrumentConfig {
@@ -182,10 +214,20 @@ impl SymbolEngine {
             CommandKind::NewOrder => self.process_new_order(command, out),
         }
 
-        out.state_snapshot_due =
-            self.snapshot_every > 0 && self.commands.is_multiple_of(self.snapshot_every);
-        if self.md_snapshot_every > 0 && self.commands.is_multiple_of(self.md_snapshot_every) {
-            out.snapshots.push(self.snapshot());
+        out.state_snapshot_due = false;
+        if self.until_state_snapshot > 0 {
+            self.until_state_snapshot -= 1;
+            if self.until_state_snapshot == 0 {
+                out.state_snapshot_due = true;
+                self.until_state_snapshot = self.snapshot_every;
+            }
+        }
+        if self.until_md_snapshot > 0 {
+            self.until_md_snapshot -= 1;
+            if self.until_md_snapshot == 0 {
+                out.snapshots.push(self.snapshot());
+                self.until_md_snapshot = self.md_snapshot_every;
+            }
         }
     }
 
@@ -279,10 +321,12 @@ impl SymbolEngine {
         }
 
         if command.order_type == OrderType::Fok
-            && self
-                .book
-                .executable_qty_excluding(opposite, command.price, command.participant)
-                < command.qty.0
+            && !self.book.has_executable_qty_excluding(
+                opposite,
+                command.price,
+                command.participant,
+                command.qty,
+            )
         {
             self.reject(out, command, RejectReason::FokUnfillable);
             return;
@@ -696,7 +740,10 @@ impl SymbolEngine {
             halted: snapshot.halted,
             snapshot_every: 10_000,
             md_snapshot_every: 100_000,
+            until_state_snapshot: 0,
+            until_md_snapshot: 0,
         };
+        engine.rederive_snapshot_countdowns();
         let actual = engine.state_hash();
         if actual != snapshot.state_hash {
             return Err(EngineError::HashMismatch {
@@ -1238,6 +1285,46 @@ mod tests {
             out.clear();
         }
         assert_eq!(eager.state_hash(), lazy.state_hash());
+    }
+
+    #[test]
+    fn snapshot_cadence_resumes_from_the_restored_command_count() {
+        let mut engine = SymbolEngine::new(config())
+            .with_snapshot_interval(10)
+            .with_md_snapshot_interval(10);
+        let mut out = EngineOutput::with_capacity(8, 8);
+        for offset in 0..7u64 {
+            engine.process(
+                &limit(Side::Buy, 100, 1, u128::from(offset) + 1, 1),
+                offset,
+                &mut out,
+            );
+            out.clear();
+        }
+        assert_eq!(engine.commands(), 7);
+
+        let mut restored =
+            SymbolEngine::from_snapshot(config(), engine.snapshot_state()).expect("restore");
+        restored.set_snapshot_interval(10);
+        restored.set_md_snapshot_interval(10);
+
+        // `commands` is 7, so command 10 is the next due one: three commands
+        // away, exactly as `commands % interval` would have said before the
+        // countdown replaced the division.
+        for offset in 7..9u64 {
+            restored.process(
+                &limit(Side::Buy, 100, 1, u128::from(offset) + 100, 1),
+                offset,
+                &mut out,
+            );
+            assert!(!out.state_snapshot_due);
+            assert!(out.snapshots.is_empty());
+            out.clear();
+        }
+        restored.process(&limit(Side::Buy, 100, 1, 200, 1), 9, &mut out);
+        assert!(out.state_snapshot_due);
+        assert_eq!(out.snapshots.len(), 1);
+        assert_eq!(restored.commands(), 10);
     }
 
     #[test]

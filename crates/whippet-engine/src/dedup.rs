@@ -71,17 +71,32 @@ impl DedupTable {
     /// Record a first observation. Returns the previous entry if the id was
     /// already present; callers treat that as a duplicate.
     pub fn insert(&mut self, order_id: OrderId, entry: DedupEntry) -> Option<DedupEntry> {
-        if let Some(previous) = self.map.get(&order_id) {
-            return Some(*previous);
+        // One hash probe: `insert` hands back the displaced entry, which is
+        // exactly the duplicate signal. The old code probed twice (`get` then
+        // `insert`). A duplicate restores the displaced entry, so the second
+        // probe only happens on that cold path.
+        if let Some(previous) = self.map.insert(order_id, entry) {
+            self.map.insert(order_id, previous);
+            return Some(previous);
         }
         // Evict terminal entries only. A resting order must keep its dedup
         // record even if it is older than the window, otherwise a late retry
         // could rest a second copy. If every entry is active, grow beyond the
         // soft capacity rather than break that invariant.
-        while self.map.len() >= self.capacity {
+        //
+        // The new entry is already in the map, so the bound is `> capacity`
+        // rather than the old `>= capacity` before insertion; the resulting
+        // table size and the set of evicted entries are identical.
+        while self.map.len() > self.capacity {
             let Some(candidate) = self.terminal_order.pop_front() else {
                 break;
             };
+            // A stale id can sit in `terminal_order` after being evicted. The
+            // entry now in the map is the one just inserted, which the old
+            // pre-insert loop could not see, so skip it explicitly.
+            if candidate == order_id {
+                continue;
+            }
             let terminal = self.map.get(&candidate).is_some_and(|entry| {
                 matches!(
                     entry.status,
@@ -92,7 +107,6 @@ impl DedupTable {
                 self.map.remove(&candidate);
             }
         }
-        self.map.insert(order_id, entry);
         self.insertion_order.push_back(order_id);
         self.compact_if_needed();
         None
@@ -191,6 +205,26 @@ mod tests {
         assert!(table.insert(OrderId(1), entry(1)).is_none());
         let previous = table.insert(OrderId(1), entry(2)).unwrap();
         assert_eq!(previous.input_offset, 1);
+    }
+
+    #[test]
+    fn duplicate_insert_does_not_evict_at_capacity() {
+        let mut table = DedupTable::new(2);
+        table.insert(OrderId(1), entry(1));
+        table.update(OrderId(1), DedupStatus::Filled);
+        table.insert(OrderId(2), entry(2));
+
+        // At capacity, a brand-new id would evict the terminal entry 1. A
+        // duplicate must instead return the stored entry and leave the table,
+        // including its eviction order, untouched.
+        let previous = table.insert(OrderId(2), entry(9)).expect("duplicate");
+        assert_eq!(previous.input_offset, 2);
+        assert_eq!(table.get(OrderId(2)).unwrap().input_offset, 2);
+        assert!(
+            table.contains(OrderId(1)),
+            "a duplicate insert must not evict a terminal entry"
+        );
+        assert_eq!(table.len(), 2);
     }
 
     #[test]

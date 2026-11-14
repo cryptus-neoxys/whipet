@@ -220,9 +220,6 @@ impl Book {
         qty: Qty,
         seq: u64,
     ) -> Result<u32, BookError> {
-        if self.index.contains_key(&order_id) {
-            return Err(BookError::DuplicateOrderId(order_id));
-        }
         if qty.0 == 0 || qty.0 > crate::MAX_ORDER_QTY {
             return Err(BookError::InvalidQty(qty.0));
         }
@@ -238,6 +235,17 @@ impl Book {
         let Some(slot_index) = self.free.pop() else {
             return Err(BookError::BookFull);
         };
+
+        // One hash probe for the order-id index: `insert` returns the previous
+        // slot when the id is already resting, which is exactly the duplicate
+        // case. The old code probed twice (`contains_key` then `insert`). The
+        // duplicate path restores the displaced mapping and the reserved slot,
+        // so a rejected insert leaves the book untouched.
+        if let Some(previous) = self.index.insert(order_id, slot_index) {
+            self.index.insert(order_id, previous);
+            self.free.push(slot_index);
+            return Err(BookError::DuplicateOrderId(order_id));
+        }
 
         let prev = match side {
             Side::Buy => self.bids[price_idx].tail,
@@ -276,7 +284,6 @@ impl Book {
         if was_empty && self.is_better_best(side, price_idx) {
             self.set_best(side, Some(price_idx));
         }
-        self.index.insert(order_id, slot_index);
         self.order_count += 1;
         debug_assert_eq!(self.best_index(side), self.bitmap_best_index(side));
         Ok(slot_index)
@@ -529,6 +536,52 @@ impl Book {
         total
     }
 
+    /// Early-exit form of [`Book::executable_qty_excluding`]: true when at
+    /// least `needed` crosses `limit` on `side` from participants other than
+    /// `excluded`.
+    ///
+    /// Equivalent to `executable_qty_excluding(side, limit, excluded) >=
+    /// needed.0`, but stops walking as soon as the threshold is met. A fillable
+    /// FOK only has to prove the first `needed` lots exist, not sum the whole
+    /// crossing side of the book.
+    pub fn has_executable_qty_excluding(
+        &self,
+        side: Side,
+        limit: Price,
+        excluded: ParticipantId,
+        needed: Qty,
+    ) -> bool {
+        if needed.is_zero() {
+            return true;
+        }
+        let mut total = 0u64;
+        let mut cursor = self.best_index(side);
+        while let Some(price_idx) = cursor {
+            let price = self.price_at(price_idx);
+            let crosses = match side {
+                Side::Sell => price.0 <= limit.0,
+                Side::Buy => price.0 >= limit.0,
+            };
+            if !crosses {
+                break;
+            }
+            let mut index = self.levels(side)[price_idx].head;
+            while index != NONE {
+                let slot = &self.slots[index as usize];
+                if slot.participant != excluded {
+                    total = total.saturating_add(slot.remaining.0);
+                    if total >= needed.0 {
+                        return true;
+                    }
+                }
+                index = slot.next;
+            }
+            cursor = self.next_index(side, price_idx);
+        }
+        false
+    }
+
+    /// Next occupied level in matching order: asks ascend, bids descend.
     fn next_index(&self, side: Side, from: usize) -> Option<usize> {
         let bitmap = self.bitmap(side);
         match side {
@@ -718,6 +771,7 @@ impl Book {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use whippet_core::config::InstrumentConfig;
 
     fn config() -> InstrumentConfig {
@@ -1137,5 +1191,179 @@ mod tests {
         assert_eq!(asks[0].price, Price(110));
         assert_eq!(book.executable_qty(Side::Sell, Price(108)), 0);
         assert_eq!(book.executable_qty(Side::Buy, Price(100)), 5);
+    }
+
+    #[test]
+    fn duplicate_insert_is_rejected_without_touching_the_book() {
+        let mut book = Book::new(&config());
+        add(&mut book, 1, Side::Buy, 100, 5);
+        add(&mut book, 2, Side::Sell, 110, 5);
+        let before = book.snapshot();
+        let original_slot = book.order_index(OrderId(1)).expect("original slot");
+        let hash_before = {
+            let mut hasher = blake3::Hasher::new();
+            book.hash_into(&mut hasher);
+            *hasher.finalize().as_bytes()
+        };
+
+        let error = book
+            .insert(
+                OrderId(1),
+                ParticipantId(7),
+                Side::Sell,
+                Price(120),
+                Qty(9),
+                99,
+            )
+            .expect_err("duplicate id");
+        assert_eq!(error, BookError::DuplicateOrderId(OrderId(1)));
+
+        // The rejected insert must leave the original order, its level, the
+        // free list, and the state hash exactly as they were.
+        assert_eq!(book.order_index(OrderId(1)), Some(original_slot));
+        assert_eq!(book.slot(original_slot).participant, ParticipantId(1));
+        assert_eq!(book.level_qty(Side::Buy, 0), Qty(5));
+        assert_eq!(book.level_orders(Side::Buy, 0), 1);
+        assert_eq!(book.level_qty(Side::Sell, 10), Qty(5));
+        assert_eq!(book.order_count(), 2);
+        assert_eq!(book.snapshot().orders.len(), before.orders.len());
+        let hash_after = {
+            let mut hasher = blake3::Hasher::new();
+            book.hash_into(&mut hasher);
+            *hasher.finalize().as_bytes()
+        };
+        assert_eq!(hash_before, hash_after);
+
+        // The arena slot reserved by the failed insert is reusable.
+        add(&mut book, 3, Side::Buy, 101, 1);
+        assert_eq!(book.order_count(), 3);
+    }
+
+    #[test]
+    fn early_exit_answers_a_deep_book_from_the_first_levels() {
+        // 50k resting asks across 500 levels, ten lots each. A FOK that the
+        // best few levels can cover must be answered without walking the rest
+        // of the ladder.
+        let mut config = InstrumentConfig::new("BTC-USD", 100, 100, 600).unwrap();
+        config.max_orders = 50_000;
+        let mut book = Book::new(&config);
+        let mut id = 0u128;
+        for level in 0..500i64 {
+            for _ in 0..100 {
+                id += 1;
+                book.insert(
+                    OrderId(id),
+                    ParticipantId(1),
+                    Side::Sell,
+                    Price(100 + level),
+                    Qty(10),
+                    id as u64,
+                )
+                .expect("insert");
+            }
+        }
+        assert_eq!(book.order_count(), 50_000);
+
+        // One lot and ten thousand lots are both covered by the first levels.
+        assert!(book.has_executable_qty_excluding(
+            Side::Sell,
+            Price(600),
+            ParticipantId(2),
+            Qty(1)
+        ));
+        assert!(book.has_executable_qty_excluding(
+            Side::Sell,
+            Price(600),
+            ParticipantId(2),
+            Qty(10_000)
+        ));
+        // Ten thousand lots also sit on the first ten levels, so the early
+        // exit is reached long before the 50k-th order.
+        assert!(book.has_executable_qty_excluding(
+            Side::Sell,
+            Price(109),
+            ParticipantId(2),
+            Qty(10_000)
+        ));
+        // Asking for more than the whole book has to walk it all and fail.
+        assert!(!book.has_executable_qty_excluding(
+            Side::Sell,
+            Price(600),
+            ParticipantId(2),
+            Qty(500_001)
+        ));
+        // A limit below the best ask crosses nothing.
+        assert!(!book.has_executable_qty_excluding(
+            Side::Sell,
+            Price(99),
+            ParticipantId(2),
+            Qty(1)
+        ));
+        // Self-trade liquidity never counts toward the threshold.
+        assert!(!book.has_executable_qty_excluding(
+            Side::Sell,
+            Price(600),
+            ParticipantId(1),
+            Qty(1)
+        ));
+        // The early exit must agree with the full walk on the same book.
+        assert_eq!(
+            book.executable_qty_excluding(Side::Sell, Price(600), ParticipantId(2)),
+            500_000
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// The early-exit threshold and the full walk must agree for every
+        /// query on a randomly shaped book.
+        #[test]
+        fn early_exit_matches_the_full_walk(
+            orders in proptest::collection::vec(
+                (any::<bool>(), 100i64..=140, 1u64..=50, 1u64..=3),
+                0..60,
+            ),
+            probes in proptest::collection::vec((100i64..=140, 0u64..=2_000, 1u64..=3), 1..12),
+        ) {
+            let mut config = InstrumentConfig::new("BTC-USD", 100, 100, 140).unwrap();
+            config.max_orders = 128;
+            let mut book = Book::new(&config);
+            for (index, &(buy, price, qty, participant)) in orders.iter().enumerate() {
+                book.insert(
+                    OrderId(index as u128 + 1),
+                    ParticipantId(participant),
+                    if buy { Side::Buy } else { Side::Sell },
+                    Price(price),
+                    Qty(qty),
+                    index as u64,
+                )
+                .expect("insert");
+            }
+            for &(limit, needed, participant) in &probes {
+                for side in [Side::Buy, Side::Sell] {
+                    let full = book.executable_qty_excluding(
+                        side,
+                        Price(limit),
+                        ParticipantId(participant),
+                    );
+                    prop_assert_eq!(
+                        book.has_executable_qty_excluding(
+                            side,
+                            Price(limit),
+                            ParticipantId(participant),
+                            Qty(needed),
+                        ),
+                        full >= needed,
+                        "side {:?}, limit {}, needed {}, excluded {}, full walk {}",
+                        side,
+                        limit,
+                        needed,
+                        participant,
+                        full
+                    );
+                }
+            }
+        }
     }
 }
