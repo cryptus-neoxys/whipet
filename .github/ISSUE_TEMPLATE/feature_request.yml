@@ -1,0 +1,114 @@
+name: Feature request
+description: Propose a change that fits the current phase or a later roadmap phase.
+title: "[feature]: "
+labels: ["feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Whippet is phase-gated. Check the
+        [roadmap](https://github.com/cryptus-neoxys/whippet/blob/main/docs/ROADMAP.md)
+        and the [ADRs](https://github.com/cryptus-neoxys/whippet/tree/main/docs/adr)
+        first. Turbo, HA/cluster, surveillance, audit, and scoped security are
+        later phases, not Phase 1.
+
+        Do not use this form for security vulnerabilities. Use SECURITY.md.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What should change, and for whom?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      description: Pick the closest component.
+      options:
+        - Gateway / HTTP API / WebSocket
+        - Matching engine / order book
+        - Iggy journal / topics / offsets
+        - Market data / dashboard
+        - Simulator
+        - Benchmark harness / manifest
+        - CLI / snapshots / verify
+        - Security / identity / transport
+        - Build, docs, or deployment
+        - Other / unsure
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or motivation
+      description: What is hard, missing, or misleading today? Include evidence, not just a preference.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: A concrete approach. Note the API, topic, protocol, or UI surface it touches.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What else did you consider, and why is it worse?
+    validations:
+      required: false
+
+  - type: dropdown
+    id: phase
+    attributes:
+      label: Roadmap phase
+      description: Where do you think this belongs? "Not sure" is fine.
+      options:
+        - Phase 1 (current durable slice)
+        - Phase 2 (turbo, fanout, security, audit)
+        - Phase 3 (HA cluster, chaos, polish)
+        - Phase 4 (community / upstream)
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: upstream
+    attributes:
+      label: Does this need an Apache Iggy change?
+      description: Upstream work follows the issue-first rule in docs/UPSTREAM.md.
+      options:
+        - "No"
+        - "Yes, an upstream issue should be filed first"
+        - Not sure
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues, pull requests, and the roadmap.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
+        - label: I have not included credentials, tokens, or private runtime data.
+          required: true
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      description: Optional. Maintainer agreement is still required before a pull request.
+      options:
+        - label: I can implement this after maintainer agreement.
+        - label: I can help test or review this.
+        - label: I can write the documentation or ADR.

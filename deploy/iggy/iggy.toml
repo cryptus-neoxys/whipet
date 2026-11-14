@@ -1,0 +1,62 @@
+# Single-node Apache Iggy 0.10 configuration example.
+#
+# The default Compose stack configures Iggy through the documented IGGY_*
+# environment variables. This file is the equivalent file-based configuration
+# for operators who prefer a checked config:
+#
+#   volumes:
+#     - ./iggy/iggy.toml:/app/iggy.toml:ro
+#   environment:
+#     IGGY_CONFIG_PATH: /app/iggy.toml
+#
+# Data lives in the named volume mounted at /app/local_data. Do not replace
+# this with a macOS bind mount.
+#
+# Tested with apache/iggy:0.10.0. The root username and password are supplied
+# by IGGY_ROOT_USERNAME / IGGY_ROOT_PASSWORD at first boot, not stored here.
+
+path = "local_data"
+
+[node]
+# Clients on the Compose network dial `iggy:8090`. Iggy requires an advertised
+# address when a listener binds a wildcard.
+advertised_address = "iggy"
+
+[http]
+enabled = true
+address = "0.0.0.0:3000"
+
+[http.metrics]
+enabled = true
+endpoint = "/metrics"
+
+[tcp]
+enabled = true
+address = "0.0.0.0:8090"
+
+[quic]
+enabled = true
+address = "0.0.0.0:8080"
+
+[websocket]
+enabled = true
+address = "0.0.0.0:8092"
+
+[cluster]
+enabled = false
+
+[memory_pool]
+# 1 GiB is the documented single-node demo profile. The upstream default is
+# 4 GiB, which is too much for a 3-node laptop Compose file.
+enabled = true
+size = "1 GiB"
+
+[sharding]
+# Four shards is the single-node M4 profile from the research dossier. Docker
+# shares cores, so do not pin.
+cpu_allocation = 4
+pin_cores = false
+
+[logging]
+file_enabled = false
+level = "info"

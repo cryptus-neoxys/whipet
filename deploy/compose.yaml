@@ -1,0 +1,201 @@
+# Whippet default demo stack.
+#
+#   scripts/gen-secrets.sh   # once, or use `make up`
+#   docker compose -f deploy/compose.yaml up --build -d
+#
+# Dashboard: http://localhost:8080
+#
+# Only port 8080 is published. Iggy stays on the internal network. The
+# simulator is part of the default stack; run `iggy` and `node` alone if you
+# want a quiet book:
+#
+#   docker compose -f deploy/compose.yaml up -d iggy node
+#
+# Iggy needs io_uring, so the container runs with seccomp=unconfined. Its data
+# lives in a named volume, never a macOS bind mount.
+#
+# Snapshots are coupled to the engine build. If the node fails to restore a
+# snapshot after switching binaries, run `make reset` to drop the demo volumes
+# and start from a clean log.
+
+name: whippet
+
+x-whippet-build: &whippet-build
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+    args:
+      RUST_VERSION: "1.95"
+      NODE_VERSION: "25"
+      PNPM_VERSION: "10.23.0"
+  image: whippet:0.1.0
+
+x-whippet-env: &whippet-env
+  WHIPPET_JOURNAL: iggy
+  WHIPPET_MODE: durable
+  WHIPPET_SYMBOLS: BTC-USD,ETH-USD,SOL-USD
+  WHIPPET_PARTITIONS: "16"
+  WHIPPET_VENUE: whippet
+  WHIPPET_BUILD: ${WHIPPET_BUILD:-local}
+
+services:
+  iggy:
+    image: apache/iggy:0.10.0
+    restart: unless-stopped
+    security_opt:
+      - seccomp=unconfined
+    ulimits:
+      memlock: -1
+    cap_add:
+      - SYS_NICE
+    environment:
+      IGGY_ROOT_USERNAME: ${IGGY_ROOT_USERNAME:-whippet}
+      IGGY_TCP_ADDRESS: 0.0.0.0:8090
+      # Iggy HTTP stays on the container's loopback. It is not published and is
+      # not scraped by default (0.10 /metrics needs a bearer credential).
+      # IGGY_HTTP_ADDRESS: 0.0.0.0:3000
+      IGGY_QUIC_ADDRESS: 0.0.0.0:8080
+      IGGY_WEBSOCKET_ADDRESS: 0.0.0.0:8092
+      # Required when a listener binds a wildcard. Tested with
+      # apache/iggy:0.10.0 on Docker Desktop 29.9.2 (arm64): `iggy` works and
+      # the node dials `iggy:8090`.
+      IGGY_NODE_ADVERTISED_ADDRESS: iggy
+      IGGY_LOGGING_LEVEL: ${IGGY_LOGGING_LEVEL:-info}
+    # Read the root password from a Compose secret instead of an environment
+    # variable, then exec the stock server binary. The image entrypoint is
+    # `iggy-server`; the wrapper only adds the secret and keeps PID 1 correct.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        if [ -r /run/secrets/iggy_root_password ]; then
+          IGGY_ROOT_PASSWORD="$$(cat /run/secrets/iggy_root_password)"
+          export IGGY_ROOT_PASSWORD
+        fi
+        exec iggy-server
+    secrets:
+      - iggy_root_password
+    volumes:
+      - iggy-data:/app/local_data
+    healthcheck:
+      # The bundled CLI (0.15) can ping a 0.10 server. Ping does not need
+      # credentials, so the healthcheck never reads the secret.
+      test:
+        - CMD
+        - iggy
+        - --transport
+        - tcp
+        - --tcp-server-address
+        - 127.0.0.1:8090
+        - ping
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  node:
+    <<: *whippet-build
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 20s
+    environment:
+      <<: *whippet-env
+      WHIPPET_HTTP_ADDR: 0.0.0.0:8080
+      WHIPPET_IGGY_ADDR: iggy:8090
+      WHIPPET_IGGY_USER: ${IGGY_ROOT_USERNAME:-whippet}
+      WHIPPET_IGGY_PASSWORD_FILE: /run/secrets/iggy_root_password
+      WHIPPET_SNAPSHOT_DIR: /data/snapshots
+      # Snapshot often enough that `make verify` and `make replay` exercise the
+      # snapshot path during a short demo.
+      WHIPPET_SNAPSHOT_EVERY: ${WHIPPET_SNAPSHOT_EVERY:-1000}
+      WHIPPET_DASHBOARD_DIR: /app/dashboard
+    secrets:
+      - iggy_root_password
+    volumes:
+      - whippet-data:/data
+    ports:
+      - "8080:8080"
+    depends_on:
+      iggy:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - whippet
+        - healthcheck
+        - --gateway
+        - http://127.0.0.1:8080
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  sim:
+    <<: *whippet-build
+    restart: unless-stopped
+    init: true
+    # The simulator derives order ids from its seed. A fixed seed replays the
+    # same ids after a node restart, and the engine correctly rejects them as
+    # duplicates. Use a per-start seed for demo traffic; set WHIPPET_SIM_SEED
+    # to reproduce a specific run.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        exec /usr/local/bin/whippet sim \
+          --gateway http://node:8080 \
+          --rate "${WHIPPET_SIM_RATE:-50}" \
+          --scenario "${WHIPPET_SIM_SCENARIO:-calm_open}" \
+          --symbols BTC-USD,ETH-USD,SOL-USD \
+          --seed "$(date +%s%N)"
+    depends_on:
+      node:
+        condition: service_healthy
+    # The image healthcheck targets the node's HTTP port; the simulator does
+    # not serve HTTP. Disable it so `up --wait` does not call the sim unhealthy.
+    healthcheck:
+      disable: true
+
+  bench:
+    <<: *whippet-build
+    profiles: ["bench"]
+    restart: "no"
+    init: true
+    command:
+      - bench
+      - --gateway
+      - http://node:8080
+      - --rate
+      - "${WHIPPET_BENCH_RATE:-1000}"
+      - --duration
+      - "${WHIPPET_BENCH_DURATION:-30}"
+      - --warmup
+      - "${WHIPPET_BENCH_WARMUP:-5}"
+      - --repetitions
+      - "${WHIPPET_BENCH_REPETITIONS:-5}"
+      - --mode
+      - durable
+      - --output-dir
+      - /artifacts/bench
+      - --label
+      - "${WHIPPET_BENCH_LABEL:-L1}"
+    volumes:
+      - ../artifacts:/artifacts
+    depends_on:
+      node:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+
+secrets:
+  iggy_root_password:
+    file: ../secrets/iggy_root_password
+
+volumes:
+  iggy-data:
+  whippet-data:
+
+networks:
+  default:
+    name: whippet

@@ -1,0 +1,14 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security policy
+    url: https://github.com/cryptus-neoxys/whippet/blob/main/SECURITY.md
+    about: Report vulnerabilities privately. Do not open a public issue.
+  - name: Contributing guide
+    url: https://github.com/cryptus-neoxys/whippet/blob/main/CONTRIBUTING.md
+    about: Local setup, checks, commit style, ADR rules, and the upstream issue-first rule.
+  - name: Upstream friction log
+    url: https://github.com/cryptus-neoxys/whippet/blob/main/docs/UPSTREAM.md
+    about: Verified Apache Iggy gaps, workarounds, and filing rules.
+  - name: Architecture and research
+    url: https://github.com/cryptus-neoxys/whippet/blob/main/docs/research/01-research-dossier.md
+    about: The exchange architecture, Iggy playbook, benchmark protocol, and failure matrix.

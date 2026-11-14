@@ -1,0 +1,52 @@
+# Observability profile. Use it as an override on the default stack:
+#
+#   docker compose -f deploy/compose.yaml -f deploy/compose.obs.yaml \
+#     --profile obs up -d
+#
+# Prometheus: http://localhost:9091
+# Grafana:    http://localhost:3001  (demo credentials, change them)
+#
+# Only the Whippet node is scraped by default. Iggy's /metrics route requires a
+# bearer credential (JWT or PAT) in 0.10; see prometheus/prometheus.yml for the
+# commented job to enable once a read-only token exists.
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.7.3
+    profiles: ["obs"]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.listen-address=0.0.0.0:9090
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9091:9090"
+    depends_on:
+      node:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:12.3.1
+    profiles: ["obs"]
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-whippet-demo}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    depends_on:
+      prometheus:
+        condition: service_started
+
+volumes:
+  prometheus-data:
+  grafana-data:

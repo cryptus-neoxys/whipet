@@ -1,0 +1,41 @@
+# EXPERIMENTAL chaos skeleton. Not part of the demo path and not validated.
+#
+# Use it as an override on the default stack:
+#
+#   docker compose -f deploy/compose.yaml -f deploy/compose.chaos.yaml \
+#     --profile chaos up -d toxiproxy
+#
+# Toxiproxy gives you a controllable TCP proxy. It is NOT in the order path
+# until you point the node at it (WHIPPET_IGGY_ADDR=toxiproxy:8666) and restart
+# the node. See scripts/chaos.sh for the warning and the manual steps.
+#
+# Pumba is deliberately commented out. It mounts the Docker socket, which is
+# root-equivalent on the host. Run it only on a disposable machine.
+
+services:
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    profiles: ["chaos"]
+    restart: unless-stopped
+    command: ["-host", "0.0.0.0"]
+    ports:
+      - "8474:8474" # Toxiproxy HTTP API
+      - "8666:8666" # proxy listener for Iggy TCP (opt-in)
+    networks:
+      - default
+
+  # pumba:
+  #   image: gaiaadm/pumba:0.10.0
+  #   profiles: ["chaos"]
+  #   restart: "no"
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock:ro
+  #   command:
+  #     - --interval
+  #     - "30s"
+  #     - netem
+  #     - --duration
+  #     - "10s"
+  #     - --tc-delay
+  #     - "200ms"
+  #     - re2:^whippet-iggy-1$

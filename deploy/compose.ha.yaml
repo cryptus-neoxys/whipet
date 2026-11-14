@@ -1,0 +1,212 @@
+# EXPERIMENTAL, NOT VALIDATED: three-node Iggy (VSR) skeleton.
+#
+# This file is intentionally separate from the default demo stack. It has not
+# been run end-to-end. The Phase 1 claim is the single-node durable slice; do
+# not describe this profile as tested HA.
+#
+# Requirements and caveats:
+# - Assign at least 12 GB to the Docker VM. Three Iggy nodes with 1 GiB memory
+#   pools plus the Whippet node and simulator do not fit comfortably in less.
+# - The Whippet client is not cluster-aware in Phase 1. It connects to iggy-1
+#   and will not follow a primary change.
+# - Iggy requires literal IPs in the cluster roster. The Compose network below
+#   pins 172.28.0.11-13 and the example config uses those addresses.
+# - All three Iggy nodes load deploy/iggy/iggy-ha.toml.example. Replace the
+#   `.example` suffix with a real file only after validating it.
+# - The root password and cluster PSK come from scripts/gen-secrets.sh.
+#
+#   scripts/gen-secrets.sh
+#   docker compose -f deploy/compose.ha.yaml up --build -d
+#
+# Dashboard: http://localhost:8080
+
+name: whippet-ha
+
+x-whippet-build: &whippet-build
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+    args:
+      RUST_VERSION: "1.95"
+      NODE_VERSION: "25"
+      PNPM_VERSION: "10.23.0"
+  image: whippet:0.1.0
+
+x-iggy-common: &iggy-common
+  image: apache/iggy:0.10.0
+  restart: unless-stopped
+  security_opt:
+    - seccomp=unconfined
+  ulimits:
+    memlock: -1
+  cap_add:
+    - SYS_NICE
+  environment:
+    IGGY_ROOT_USERNAME: ${IGGY_ROOT_USERNAME:-whippet}
+    IGGY_CONFIG_PATH: /app/iggy-ha.toml
+    IGGY_LOGGING_LEVEL: ${IGGY_LOGGING_LEVEL:-info}
+  volumes:
+    - ./iggy/iggy-ha.toml.example:/app/iggy-ha.toml:ro
+  secrets:
+    - iggy_root_password
+    - iggy_cluster_psk
+  healthcheck:
+    test:
+      - CMD
+      - iggy
+      - --transport
+      - tcp
+      - --tcp-server-address
+      - 127.0.0.1:8090
+      - ping
+    interval: 5s
+    timeout: 5s
+    retries: 30
+    start_period: 30s
+
+services:
+  iggy-1:
+    <<: *iggy-common
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        IGGY_ROOT_PASSWORD="$$(cat /run/secrets/iggy_root_password)"
+        IGGY_CLUSTER_AUTH_SHARED_SECRET="$$(cat /run/secrets/iggy_cluster_psk)"
+        export IGGY_ROOT_PASSWORD IGGY_CLUSTER_AUTH_SHARED_SECRET
+        exec iggy-server --replica-id 0
+    volumes:
+      - ./iggy/iggy-ha.toml.example:/app/iggy-ha.toml:ro
+      - iggy-1-data:/app/local_data
+    networks:
+      iggy-ha:
+        ipv4_address: 172.28.0.11
+        aliases:
+          - iggy-1
+
+  iggy-2:
+    <<: *iggy-common
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        IGGY_ROOT_PASSWORD="$$(cat /run/secrets/iggy_root_password)"
+        IGGY_CLUSTER_AUTH_SHARED_SECRET="$$(cat /run/secrets/iggy_cluster_psk)"
+        export IGGY_ROOT_PASSWORD IGGY_CLUSTER_AUTH_SHARED_SECRET
+        exec iggy-server --replica-id 1
+    volumes:
+      - ./iggy/iggy-ha.toml.example:/app/iggy-ha.toml:ro
+      - iggy-2-data:/app/local_data
+    networks:
+      iggy-ha:
+        ipv4_address: 172.28.0.12
+        aliases:
+          - iggy-2
+
+  iggy-3:
+    <<: *iggy-common
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        IGGY_ROOT_PASSWORD="$$(cat /run/secrets/iggy_root_password)"
+        IGGY_CLUSTER_AUTH_SHARED_SECRET="$$(cat /run/secrets/iggy_cluster_psk)"
+        export IGGY_ROOT_PASSWORD IGGY_CLUSTER_AUTH_SHARED_SECRET
+        exec iggy-server --replica-id 2
+    volumes:
+      - ./iggy/iggy-ha.toml.example:/app/iggy-ha.toml:ro
+      - iggy-3-data:/app/local_data
+    networks:
+      iggy-ha:
+        ipv4_address: 172.28.0.13
+        aliases:
+          - iggy-3
+
+  node:
+    <<: *whippet-build
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 20s
+    environment:
+      WHIPPET_HTTP_ADDR: 0.0.0.0:8080
+      WHIPPET_IGGY_ADDR: iggy-1:8090
+      WHIPPET_IGGY_USER: ${IGGY_ROOT_USERNAME:-whippet}
+      WHIPPET_IGGY_PASSWORD_FILE: /run/secrets/iggy_root_password
+      WHIPPET_JOURNAL: iggy
+      WHIPPET_MODE: durable
+      WHIPPET_SYMBOLS: BTC-USD,ETH-USD,SOL-USD
+      WHIPPET_PARTITIONS: "16"
+      WHIPPET_SNAPSHOT_DIR: /data/snapshots
+      WHIPPET_SNAPSHOT_EVERY: ${WHIPPET_SNAPSHOT_EVERY:-10000}
+      WHIPPET_DASHBOARD_DIR: /app/dashboard
+      WHIPPET_VENUE: whippet
+      WHIPPET_BUILD: ${WHIPPET_BUILD:-ha-experimental}
+    secrets:
+      - iggy_root_password
+    volumes:
+      - whippet-data:/data
+    ports:
+      - "8080:8080"
+    depends_on:
+      iggy-1:
+        condition: service_healthy
+      iggy-2:
+        condition: service_healthy
+      iggy-3:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - whippet
+        - healthcheck
+        - --gateway
+        - http://127.0.0.1:8080
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - iggy-ha
+
+  sim:
+    <<: *whippet-build
+    restart: unless-stopped
+    init: true
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        exec /usr/local/bin/whippet sim \
+          --gateway http://node:8080 \
+          --rate "${WHIPPET_SIM_RATE:-50}" \
+          --scenario "${WHIPPET_SIM_SCENARIO:-calm_open}" \
+          --seed "$(date +%s%N)"
+    depends_on:
+      node:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+    networks:
+      - iggy-ha
+
+secrets:
+  iggy_root_password:
+    file: ../secrets/iggy_root_password
+  iggy_cluster_psk:
+    file: ../secrets/iggy_cluster_psk
+
+volumes:
+  iggy-1-data:
+  iggy-2-data:
+  iggy-3-data:
+  whippet-data:
+
+networks:
+  iggy-ha:
+    name: whippet-ha-iggy
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

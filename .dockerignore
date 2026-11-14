@@ -1,0 +1,36 @@
+# Build outputs
+/target
+**/target
+/apps/dashboard/dist
+/apps/dashboard/node_modules
+
+# Version control and editor state
+.git
+.gitignore
+**/.DS_Store
+.idea
+.vscode
+
+# Local secrets and environment
+.env
+.env.*
+!/env.example
+/secrets
+**/secrets
+
+# Runtime data and benchmark artifacts
+/data
+/artifacts
+/bench-results
+*.hdr
+
+# Documentation, CI and deployment files are not needed in the image build
+/docs
+/.github
+/deploy
+/scripts
+/justfile
+/Makefile
+/README.md
+/LICENSE
+/NOTICE

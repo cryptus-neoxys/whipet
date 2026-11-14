@@ -1,0 +1,36 @@
+# Prometheus configuration for the `obs` Compose profile.
+#
+# The Whippet node exposes Prometheus text exposition at /metrics with no
+# authentication. Iggy 0.10 also has /metrics, but that route requires a
+# bearer credential (JWT or PAT). It is intentionally not scraped here; add a
+# read-only PAT and an authorization block if you need broker metrics.
+#
+#   docker compose -f deploy/compose.yaml -f deploy/compose.obs.yaml \
+#     --profile obs up -d
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: whippet-node
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["node:8080"]
+        labels:
+          service: whippet-node
+
+  # Iggy 0.10 /metrics requires a bearer credential (JWT or PAT). The default
+  # Compose stack leaves Iggy's HTTP listener on the container loopback, so it
+  # is not reachable from Prometheus. To enable this job:
+  #   1. set IGGY_HTTP_ADDRESS=0.0.0.0:3000 on the iggy service,
+  #   2. provision a read-only PAT,
+  #   3. mount it at /etc/prometheus/iggy_pat and uncomment this job.
+  #
+  # - job_name: iggy
+  #   metrics_path: /metrics
+  #   authorization:
+  #     type: Bearer
+  #     credentials_file: /etc/prometheus/iggy_pat
+  #   static_configs:
+  #     - targets: ["iggy:3000"]

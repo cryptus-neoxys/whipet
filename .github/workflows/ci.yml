@@ -1,0 +1,89 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: rust (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace --all-targets
+
+  dashboard:
+    name: dashboard (typecheck, build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.23.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "25"
+          cache: pnpm
+          cache-dependency-path: apps/dashboard/pnpm-lock.yaml
+      - name: pnpm install
+        working-directory: apps/dashboard
+        run: pnpm install --frozen-lockfile
+      - name: pnpm build
+        working-directory: apps/dashboard
+        run: pnpm build
+
+  compose-config:
+    name: compose config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: generate ephemeral demo secrets
+        run: scripts/gen-secrets.sh
+      - name: validate default stack
+        run: docker compose -f deploy/compose.yaml config -q
+      - name: validate observability override
+        run: docker compose -f deploy/compose.yaml -f deploy/compose.obs.yaml --profile obs config -q
+      - name: validate chaos override
+        run: docker compose -f deploy/compose.yaml -f deploy/compose.chaos.yaml --profile chaos config -q
+      - name: validate HA skeleton
+        run: docker compose -f deploy/compose.ha.yaml config -q
+
+  compose-smoke:
+    name: compose smoke
+    # The smoke job needs Docker and builds the image, so it runs on main and
+    # on manual dispatch, not on every pull request. The Rust job never needs
+    # Docker.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: [compose-config]
+    steps:
+      - uses: actions/checkout@v4
+      - name: bring up the demo
+        run: make up
+      - name: verify health, a crossing trade, and snapshots
+        run: make verify
+      - name: run the demo script
+        run: make demo
+      - name: stop the stack
+        if: always()
+        run: make down || true

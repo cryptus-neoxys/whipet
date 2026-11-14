@@ -1,0 +1,109 @@
+# EXPERIMENTAL, NOT VALIDATED: three-node Apache Iggy 0.10 cluster skeleton.
+#
+# This file is a starting point for `deploy/compose.ha.yaml`. It has not been
+# run as part of the Phase 1 demo. Do not present it as a tested HA deployment.
+#
+# Resource requirement: the three Iggy nodes plus the Whippet node and
+# simulator need at least 12 GB assigned to the Docker VM. On a smaller VM the
+# memory pool allocations and the host will fight.
+#
+# The roster below assumes the Compose network in deploy/compose.ha.yaml:
+#   iggy-1 172.28.0.11
+#   iggy-2 172.28.0.12
+#   iggy-3 172.28.0.13
+#
+# Every node must load the same file. The running node selects its roster entry
+# with `iggy-server --replica-id N`. The cluster PSK is supplied through
+# IGGY_CLUSTER_AUTH_SHARED_SECRET from a Compose secret; do not put it here.
+#
+# Known caveats:
+# - The Whippet client is not cluster-aware in Phase 1. It points at iggy-1 and
+#   does not follow primary changes.
+# - Iggy requires literal IPs in the roster, not Compose service names.
+# - All nodes must run the same Iggy version.
+# - This file has not been validated against apache/iggy:0.10.0.
+
+path = "local_data"
+
+[http]
+enabled = true
+address = "0.0.0.0:3000"
+
+[http.metrics]
+enabled = true
+endpoint = "/metrics"
+
+[tcp]
+enabled = true
+address = "0.0.0.0:8090"
+
+[quic]
+enabled = true
+address = "0.0.0.0:8080"
+
+[websocket]
+enabled = true
+address = "0.0.0.0:8092"
+
+[cluster]
+enabled = true
+name = "whippet-ha"
+heartbeat_timeout = "5s"
+commit_broadcast_interval = "500ms"
+prepare_retransmit_interval = "250ms"
+view_change_retransmit_interval = "500ms"
+view_change_status_timeout = "5s"
+request_start_view_retransmit_interval = "1s"
+view_probe_attempts_max = 5
+repair_retry_interval = "1s"
+repair_gap_debounce_interval = "1s"
+repair_chunk_max = 128
+superblock_wedged_fatal_timeout = "2m"
+default_replication_factor = 3
+
+[cluster.auth]
+# The PSK is at least 32 bytes. Supply it with
+# IGGY_CLUSTER_AUTH_SHARED_SECRET, not in this file.
+enabled = true
+shared_secret = ""
+
+[cluster.tls]
+enabled = false
+
+[cluster.coordinator]
+skip_shard_zero_for_replicas = true
+replica_connections_per_peer = 1
+skip_shard_zero_for_clients = false
+
+[[cluster.nodes]]
+name = "iggy-1"
+ip = "172.28.0.11"
+advertised_address = "iggy-1"
+replica_id = 0
+ports = { tcp = 8090, quic = 8080, http = 3000, websocket = 8092, tcp_replica = 9090 }
+
+[[cluster.nodes]]
+name = "iggy-2"
+ip = "172.28.0.12"
+advertised_address = "iggy-2"
+replica_id = 1
+ports = { tcp = 8090, quic = 8080, http = 3000, websocket = 8092, tcp_replica = 9090 }
+
+[[cluster.nodes]]
+name = "iggy-3"
+ip = "172.28.0.13"
+advertised_address = "iggy-3"
+replica_id = 2
+ports = { tcp = 8090, quic = 8080, http = 3000, websocket = 8092, tcp_replica = 9090 }
+
+[memory_pool]
+enabled = true
+size = "1 GiB"
+
+[sharding]
+cpu_allocation = 2
+pin_cores = false
+
+[logging]
+file_enabled = false
+level = "info"
