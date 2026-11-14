@@ -1,9 +1,11 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE.
 
+#![forbid(unsafe_code)]
+
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(
     name = "whippet",
     version,
@@ -15,7 +17,7 @@ struct Cli {
     command: Commands,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand)]
 enum Commands {
     /// Run the exchange node: gateway, engine shards, journal, and dashboard API.
     Node(whippet::config::NodeArgs),

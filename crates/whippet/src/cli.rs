@@ -203,8 +203,12 @@ pub async fn run_replay(args: ReplayArgs) -> Result<()> {
     };
     let store = SnapshotStore::new(args.snapshot_dir.clone());
     let snapshot = store.load(args.partition)?;
-    let (mut engine, snapshot_offset, seeded) = match &snapshot {
-        Some(snapshot) => {
+    // An explicit --from means a clean replay from that offset. Without it,
+    // seed from the snapshot and replay only the tail. Never do both: that
+    // would apply the tail twice.
+    let use_snapshot = args.from.is_none() && snapshot.is_some();
+    let (mut engine, snapshot_offset, seeded) = match (use_snapshot, &snapshot) {
+        (true, Some(snapshot)) => {
             let mut engine = ShardEngine::from_snapshot(&exchange, snapshot.clone())
                 .with_context(|| format!("restoring shard {}", args.partition))?;
             engine.set_snapshot_interval(u64::MAX);
@@ -216,7 +220,7 @@ pub async fn run_replay(args: ReplayArgs) -> Result<()> {
                 .unwrap_or(0);
             (engine, Some(offset), true)
         }
-        None => (
+        _ => (
             ShardEngine::new_with_snapshot_interval(args.partition, &exchange, u64::MAX),
             None,
             false,
@@ -237,6 +241,7 @@ pub async fn run_replay(args: ReplayArgs) -> Result<()> {
     let mut skipped = 0u64;
     let mut last_offset = start.saturating_sub(1);
     let mut out = whippet_engine::EngineOutput::with_capacity(16, 16);
+    let mut empty_polls = 0u32;
 
     loop {
         if let Some(to) = args.to
@@ -245,11 +250,28 @@ pub async fn run_replay(args: ReplayArgs) -> Result<()> {
             break;
         }
         let records = journal
-            .read(Topic::Orders, args.partition, &consumer, offset, 1_000, 0)
+            .read(Topic::Orders, args.partition, &consumer, offset, 1_000, 100)
             .await
             .with_context(|| format!("reading orders from offset {offset}"))?;
         if records.is_empty() {
-            break;
+            // An empty poll can be transient while the server materialises a
+            // partition or a producer's last write becomes visible. Do not
+            // declare end-of-log on the first empty batch.
+            empty_polls += 1;
+            if empty_polls >= 5 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            continue;
+        }
+        empty_polls = 0;
+        if let Some(first) = records.first()
+            && first.offset > offset
+        {
+            bail!(
+                "order log gap: requested offset {offset}, first available {}; a snapshot or reset is required",
+                first.offset
+            );
         }
         for record in records {
             if let Some(to) = args.to

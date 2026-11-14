@@ -1,6 +1,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -54,6 +55,7 @@ pub async fn run(args: NodeArgs) -> Result<()> {
         snapshots: SnapshotStore::new(config.snapshot_dir.clone()),
         started: Instant::now(),
         shutdown,
+        shards_ok: Arc::new(AtomicBool::new(true)),
     });
 
     hub.spawn_publisher();
@@ -61,8 +63,24 @@ pub async fn run(args: NodeArgs) -> Result<()> {
 
     let mut handles = Vec::new();
     for shard in ctx.active_shards() {
-        handles.push(tokio::spawn(run_engine_shard(Arc::clone(&ctx), shard)));
-        handles.push(tokio::spawn(run_md_shard(Arc::clone(&ctx), shard)));
+        let engine_ctx = Arc::clone(&ctx);
+        handles.push(tokio::spawn(async move {
+            let result = run_engine_shard(Arc::clone(&engine_ctx), shard).await;
+            if let Err(error) = &result {
+                tracing::error!(shard, error = %error, "engine shard stopped unexpectedly");
+                engine_ctx.mark_shard_failed();
+            }
+            result
+        }));
+        let md_ctx = Arc::clone(&ctx);
+        handles.push(tokio::spawn(async move {
+            let result = run_md_shard(Arc::clone(&md_ctx), shard).await;
+            if let Err(error) = &result {
+                tracing::error!(shard, error = %error, "MD shard stopped unexpectedly");
+                md_ctx.mark_shard_failed();
+            }
+            result
+        }));
     }
     info!(
         shards = ?ctx.active_shards(),
@@ -90,11 +108,11 @@ pub async fn run(args: NodeArgs) -> Result<()> {
     info!("shutdown requested; flushing snapshots");
     let _ = ctx.shutdown.send(true);
     for handle in handles {
-        if tokio::time::timeout(Duration::from_secs(5), handle)
-            .await
-            .is_err()
-        {
-            warn!("a shard task did not stop within five seconds");
+        match tokio::time::timeout(Duration::from_secs(5), handle).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => warn!(error = %error, "a shard task exited with an error"),
+            Ok(Err(error)) => warn!(error = %error, "a shard task panicked"),
+            Err(_) => warn!("a shard task did not stop within five seconds"),
         }
     }
     info!("Whippet node stopped");
@@ -132,14 +150,16 @@ async fn connect_iggy(config: &NodeConfig) -> Result<Journal> {
 fn spawn_health_monitor(ctx: Arc<NodeContext>) {
     tokio::spawn(async move {
         let mut shutdown = ctx.shutdown.subscribe();
-        let connected = ctx.journal.ping().await;
+        let connected = ctx.journal.is_iggy() && ctx.journal.ping().await;
         ctx.metrics.set_iggy_connected(connected);
+        refresh_lag(&ctx).await;
         loop {
             tokio::select! {
                 _ = shutdown.changed() => return,
                 _ = sleep(Duration::from_secs(5)) => {
-                    let connected = ctx.journal.ping().await;
+                    let connected = ctx.journal.is_iggy() && ctx.journal.ping().await;
                     ctx.metrics.set_iggy_connected(connected);
+                    refresh_lag(&ctx).await;
                     if !connected {
                         warn!("Iggy health check failed");
                     }
@@ -172,4 +192,23 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
     info!("shutdown signal received");
+}
+
+async fn refresh_lag(ctx: &NodeContext) {
+    let mut total = 0u64;
+    for shard in ctx.active_shards() {
+        let consumer = format!("whippet-engine-p{shard}");
+        if let Ok(Some(committed)) = ctx
+            .journal
+            .committed(whippet_journal::Topic::Orders, shard, &consumer)
+            .await
+            && let Ok(lag) = ctx
+                .journal
+                .lag(whippet_journal::Topic::Orders, shard, committed)
+                .await
+        {
+            total = total.saturating_add(lag);
+        }
+    }
+    ctx.metrics.set_consumer_lag(total);
 }

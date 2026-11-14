@@ -14,7 +14,7 @@ use whippet_core::config::{ExchangeConfig, InstrumentConfig};
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Seq, Symbol};
 use whippet_core::protocol::{
     Command, CommandKind, ExecKind, ExecutionReport, FLAG_MAKER, FLAG_RESTED, FLAG_TAKER, MdEvent,
-    MdKind, MdSnapshot, OrderType, RejectReason, Side,
+    MdKind, MdOrder, MdSnapshot, OrderType, RejectReason, Side,
 };
 
 use crate::book::{Book, BookError, BookSnapshot, RestingOrder};
@@ -31,6 +31,10 @@ pub enum EngineError {
     #[error("state hash mismatch after restore: expected {expected}, got {actual}")]
     HashMismatch { expected: String, actual: String },
 }
+
+/// Hard upper bound for a single order quantity. The gateway enforces the same
+/// bound; the engine also enforces it because the journal is a trust boundary.
+pub const MAX_ORDER_QTY: u64 = 1_000_000_000;
 
 #[derive(Default)]
 pub struct EngineOutput {
@@ -215,7 +219,11 @@ impl SymbolEngine {
             self.reject(out, command, RejectReason::Halted);
             return;
         }
-        if command.qty.is_zero() {
+        if command.qty.is_zero() || command.qty.0 > MAX_ORDER_QTY {
+            self.reject(out, command, RejectReason::InvalidQty);
+            return;
+        }
+        if command.order_id.0 == 0 {
             self.reject(out, command, RejectReason::InvalidQty);
             return;
         }
@@ -249,7 +257,10 @@ impl SymbolEngine {
         }
 
         if command.order_type == OrderType::Fok
-            && self.book.executable_qty(opposite, command.price) < command.qty.0
+            && self
+                .book
+                .executable_qty_excluding(opposite, command.price, command.participant)
+                < command.qty.0
         {
             self.reject(out, command, RejectReason::FokUnfillable);
             return;
@@ -263,7 +274,15 @@ impl SymbolEngine {
         };
         self.dedup.insert(command.order_id, entry);
 
-        let accepted_flags = if crosses { FLAG_TAKER } else { FLAG_RESTED };
+        let accepted_flags = if crosses
+            || matches!(
+                command.order_type,
+                OrderType::Market | OrderType::Ioc | OrderType::Fok
+            ) {
+            FLAG_TAKER
+        } else {
+            FLAG_RESTED
+        };
         self.push_exec(
             out,
             ExecKind::Accepted,
@@ -574,21 +593,44 @@ impl SymbolEngine {
     pub fn snapshot(&self) -> MdSnapshot {
         let (bids, asks) = self.book.snapshot_levels(self.config.snapshot_depth);
         let (last_trade_price, last_trade_qty, _) = self.book.last_trade();
+        let book_snapshot = self.book.snapshot();
+        let orders = book_snapshot
+            .orders
+            .iter()
+            .map(|order| MdOrder {
+                order_id: order.order_id,
+                side: order.side,
+                price: order.price,
+                qty: order.remaining,
+                participant: order.participant,
+            })
+            .collect();
         MdSnapshot {
             symbol: self.config.symbol,
-            seq: self.md_seq,
+            // The snapshot describes the state through the last emitted MD
+            // event, not the next sequence to use. At startup this is 0, so the
+            // first event is 1 and the sequence never repeats.
+            seq: Seq(self.md_seq.0.saturating_sub(1)),
             cause_offset: self.last_offset,
             timestamp_ns: self.last_ts_ns,
             last_trade_price,
             last_trade_qty,
             bids,
             asks,
+            orders,
         }
     }
 
     pub fn state_hash(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"whippet-engine-v1");
+        hasher.update(&self.config.tick_size_cents.to_le_bytes());
+        hasher.update(&self.config.min_price_ticks.to_le_bytes());
+        hasher.update(&self.config.max_price_ticks.to_le_bytes());
+        hasher.update(&(self.config.max_orders as u64).to_le_bytes());
+        hasher.update(&(self.config.snapshot_depth as u64).to_le_bytes());
+        hasher.update(&u64::from(self.config.market_collar_bps).to_le_bytes());
+        hasher.update(&self.commands.to_le_bytes());
         self.book.hash_into(&mut hasher);
         self.dedup.hash_into(&mut hasher);
         hasher.update(&self.exec_seq.0.to_le_bytes());
@@ -603,7 +645,7 @@ impl SymbolEngine {
         SymbolSnapshot {
             symbol: self.config.symbol,
             book: self.book.snapshot(),
-            dedup: self.dedup.entries_sorted(),
+            dedup: self.dedup.entries_in_order(),
             exec_seq: self.exec_seq,
             md_seq: self.md_seq,
             last_offset: self.last_offset,
@@ -735,8 +777,34 @@ impl ShardEngine {
         exchange: &ExchangeConfig,
         snapshot: ShardSnapshot,
     ) -> Result<Self, EngineError> {
+        let expected: Vec<Symbol> = exchange
+            .instruments
+            .iter()
+            .filter(|instrument| {
+                instrument.symbol.partition(exchange.partitions) == snapshot.shard_id
+            })
+            .map(|instrument| instrument.symbol)
+            .collect();
+        let found: Vec<Symbol> = snapshot
+            .symbols
+            .iter()
+            .map(|symbol| symbol.symbol)
+            .collect();
+        if expected != found {
+            return Err(EngineError::Snapshot(format!(
+                "shard {} snapshot symbols {:?} do not match configured symbols {:?}",
+                snapshot.shard_id, found, expected
+            )));
+        }
         let mut engines = HashMap::new();
         for symbol_snapshot in snapshot.symbols {
+            let expected_shard = symbol_snapshot.symbol.partition(exchange.partitions);
+            if expected_shard != snapshot.shard_id {
+                return Err(EngineError::Snapshot(format!(
+                    "symbol {} belongs to shard {} under {} partitions, but the snapshot is for shard {}",
+                    symbol_snapshot.symbol, expected_shard, exchange.partitions, snapshot.shard_id
+                )));
+            }
             let config = exchange
                 .instrument(symbol_snapshot.symbol)
                 .ok_or(EngineError::UnknownSymbol(
@@ -936,6 +1004,88 @@ mod tests {
             exec.kind == ExecKind::Cancelled && exec.reason == RejectReason::SelfTradePrevention
         }));
         assert_eq!(engine.book().best_ask(), None);
+    }
+
+    #[test]
+    fn market_order_fills_and_cancels_remainder() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Sell, 100, 5, 1, 1), 0);
+        let mut market = Command::new_order(
+            symbol(),
+            Side::Buy,
+            OrderType::Market,
+            Price::ZERO,
+            Qty(10),
+            OrderId(2),
+            ParticipantId(2),
+            2,
+        );
+        market.timestamp_ns = 2;
+        let out = process(&mut engine, &market, 1);
+        assert!(
+            out.executions
+                .iter()
+                .any(|exec| exec.kind == ExecKind::PartiallyFilled)
+        );
+        assert!(
+            out.executions
+                .iter()
+                .any(|exec| exec.kind == ExecKind::Cancelled)
+        );
+        assert_eq!(engine.book().best_ask(), None);
+        assert_eq!(engine.book().best_bid(), None);
+    }
+
+    #[test]
+    fn fok_rejects_self_trade_liquidity_without_touching_the_book() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Sell, 100, 10, 1, 1), 0);
+        let mut fok = limit(Side::Buy, 100, 10, 2, 1);
+        fok.order_type = OrderType::Fok;
+        let out = process(&mut engine, &fok, 1);
+        assert_eq!(out.executions.len(), 1);
+        assert_eq!(out.executions[0].kind, ExecKind::Rejected);
+        assert_eq!(out.executions[0].reason, RejectReason::FokUnfillable);
+        assert_eq!(engine.book().best_ask(), Some(Price(100)));
+        assert_eq!(engine.book().level_qty(Side::Sell, 0), Qty(10));
+    }
+
+    #[test]
+    fn oversized_quantity_is_rejected() {
+        let mut engine = SymbolEngine::new(config());
+        let mut command = limit(Side::Buy, 100, 1, 1, 1);
+        command.qty = Qty(MAX_ORDER_QTY + 1);
+        let out = process(&mut engine, &command, 0);
+        assert_eq!(out.executions[0].reason, RejectReason::InvalidQty);
+        assert!(engine.book().is_empty());
+    }
+
+    #[test]
+    fn zero_order_id_is_rejected() {
+        let mut engine = SymbolEngine::new(config());
+        let command = limit(Side::Buy, 100, 1, 0, 1);
+        let out = process(&mut engine, &command, 0);
+        assert_eq!(out.executions[0].reason, RejectReason::InvalidQty);
+    }
+
+    #[test]
+    fn cancel_then_replace_loses_time_priority() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Sell, 100, 5, 1, 1), 0);
+        process(&mut engine, &limit(Side::Sell, 100, 5, 2, 2), 1);
+        process(
+            &mut engine,
+            &Command::cancel(symbol(), OrderId(1), ParticipantId(1), 2),
+            2,
+        );
+        process(&mut engine, &limit(Side::Sell, 100, 5, 3, 1), 3);
+        let out = process(&mut engine, &limit(Side::Buy, 100, 5, 4, 3), 4);
+        let fill = out
+            .executions
+            .iter()
+            .find(|exec| exec.kind == ExecKind::Filled)
+            .expect("fill");
+        assert_eq!(fill.maker_order_id, OrderId(2));
     }
 
     #[test]

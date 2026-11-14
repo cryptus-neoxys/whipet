@@ -6,6 +6,8 @@
 //! integer ticks; quantities are integer units. There are no floats in the
 //! protocol, the engine, or the state hash.
 
+#![forbid(unsafe_code)]
+
 pub mod api;
 pub mod codec;
 pub mod config;

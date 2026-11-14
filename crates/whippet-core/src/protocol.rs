@@ -351,10 +351,9 @@ impl RejectReason {
             9 => Ok(Self::SelfTradePrevention),
             10 => Ok(Self::Halted),
             11 => Ok(Self::Internal),
-            other => Err(CoreError::UnknownDiscriminant {
-                kind: "RejectReason",
-                value: other as u8,
-            }),
+            other => Err(CoreError::InvalidValue(format!(
+                "unknown RejectReason code {other}"
+            ))),
         }
     }
 
@@ -603,10 +602,44 @@ impl MdLevel {
     }
 }
 
-pub const MD_SNAPSHOT_HEADER_LEN: usize = 1 + 1 + 16 + 8 + 8 + 8 + 8 + 8 + 2 + 2;
+pub const MD_SNAPSHOT_HEADER_LEN: usize = 1 + 1 + 16 + 8 + 8 + 8 + 8 + 8 + 2 + 2 + 4;
 
-/// A full top-of-book snapshot, emitted on startup and periodically so a
-/// subscriber can recover without replaying the whole partition.
+/// One resting order in a full snapshot. The MD hub needs this to apply
+/// subsequent reduce/remove deltas after a recovery; the top-N levels alone are
+/// not enough.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MdOrder {
+    pub order_id: OrderId,
+    pub side: Side,
+    pub price: Price,
+    pub qty: Qty,
+    pub participant: ParticipantId,
+}
+
+impl MdOrder {
+    pub fn encode(&self, writer: &mut Writer) {
+        writer
+            .u128(self.order_id.0)
+            .u8(self.side.as_code())
+            .i64(self.price.0)
+            .u64(self.qty.0)
+            .u64(self.participant.0);
+    }
+
+    pub fn decode(reader: &mut Reader<'_>) -> Result<Self> {
+        Ok(Self {
+            order_id: OrderId(reader.u128()?),
+            side: Side::from_code(reader.u8()?)?,
+            price: Price(reader.i64()?),
+            qty: Qty(reader.u64()?),
+            participant: ParticipantId(reader.u64()?),
+        })
+    }
+}
+
+/// A full snapshot, emitted on startup and periodically so a subscriber can
+/// recover without replaying the whole partition. `orders` is the complete
+/// resting book; `bids`/`asks` are the display top-N levels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MdSnapshot {
     pub symbol: Symbol,
@@ -617,12 +650,15 @@ pub struct MdSnapshot {
     pub last_trade_qty: Qty,
     pub bids: Vec<MdLevel>,
     pub asks: Vec<MdLevel>,
+    pub orders: Vec<MdOrder>,
 }
 
 impl MdSnapshot {
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = Writer::with_capacity(
-            MD_SNAPSHOT_HEADER_LEN + (self.bids.len() + self.asks.len()) * 20,
+            MD_SNAPSHOT_HEADER_LEN
+                + (self.bids.len() + self.asks.len()) * 20
+                + self.orders.len() * 37,
         );
         writer
             .u8(WIRE_VERSION)
@@ -634,12 +670,16 @@ impl MdSnapshot {
             .i64(self.last_trade_price.0)
             .u64(self.last_trade_qty.0)
             .u16(self.bids.len() as u16)
-            .u16(self.asks.len() as u16);
+            .u16(self.asks.len() as u16)
+            .u32(self.orders.len() as u32);
         for level in &self.bids {
             level.encode(&mut writer);
         }
         for level in &self.asks {
             level.encode(&mut writer);
+        }
+        for order in &self.orders {
+            order.encode(&mut writer);
         }
         writer.finish()
     }
@@ -667,6 +707,7 @@ impl MdSnapshot {
         let last_trade_qty = Qty(reader.u64()?);
         let bid_count = reader.u16()? as usize;
         let ask_count = reader.u16()? as usize;
+        let order_count = reader.u32()? as usize;
         let mut bids = Vec::with_capacity(bid_count);
         for _ in 0..bid_count {
             bids.push(MdLevel::decode(&mut reader)?);
@@ -674,6 +715,16 @@ impl MdSnapshot {
         let mut asks = Vec::with_capacity(ask_count);
         for _ in 0..ask_count {
             asks.push(MdLevel::decode(&mut reader)?);
+        }
+        if order_count > reader.remaining() / 37 {
+            return Err(CoreError::InvalidValue(format!(
+                "snapshot claims {order_count} orders but only {} bytes remain",
+                reader.remaining()
+            )));
+        }
+        let mut orders = Vec::with_capacity(order_count);
+        for _ in 0..order_count {
+            orders.push(MdOrder::decode(&mut reader)?);
         }
         reader.finish()?;
         Ok(Self {
@@ -685,6 +736,7 @@ impl MdSnapshot {
             last_trade_qty,
             bids,
             asks,
+            orders,
         })
     }
 }
@@ -790,6 +842,13 @@ mod tests {
                     orders: 3,
                 },
             ],
+            orders: vec![MdOrder {
+                order_id: OrderId(1),
+                side: Side::Buy,
+                price: Price(64_999),
+                qty: Qty(10),
+                participant: ParticipantId(2),
+            }],
         };
         let bytes = snapshot.encode();
         assert_eq!(MdSnapshot::decode(&bytes).unwrap(), snapshot);

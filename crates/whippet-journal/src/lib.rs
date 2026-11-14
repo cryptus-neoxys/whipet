@@ -6,6 +6,8 @@
 //! only async Iggy client code in the system: topic bootstrap, appends, polls,
 //! and manual consumer-offset commits. The matcher never sees an `await`.
 
+#![forbid(unsafe_code)]
+
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -129,23 +131,33 @@ impl IggyJournal {
         for topic in Topic::ALL {
             let stream_id = Identifier::named(topic.stream())?;
             let topic_id = Identifier::named(topic.name())?;
-            if self
-                .client
-                .get_topic(&stream_id, &topic_id)
-                .await?
-                .is_none()
-            {
-                let options = topic_create_options(topic, exchange);
-                self.client
-                    .create_topic(&stream_id, topic.name(), &options)
-                    .await?;
-                tracing::info!(
-                    stream = topic.stream(),
-                    topic = topic.name(),
-                    partitions = topic.partition_count(exchange),
-                    durability = ?topic.durability(),
-                    "created Iggy topic"
-                );
+            match self.client.get_topic(&stream_id, &topic_id).await? {
+                Some(existing) => {
+                    let expected = topic.partition_count(exchange);
+                    if existing.partitions_count != expected {
+                        return Err(JournalError::InvalidConfig(format!(
+                            "topic {}/{} has {} partitions but this configuration expects {}; \
+                             reset the Iggy data volume or use the original partition count",
+                            topic.stream(),
+                            topic.name(),
+                            existing.partitions_count,
+                            expected
+                        )));
+                    }
+                }
+                None => {
+                    let options = topic_create_options(topic, exchange);
+                    self.client
+                        .create_topic(&stream_id, topic.name(), &options)
+                        .await?;
+                    tracing::info!(
+                        stream = topic.stream(),
+                        topic = topic.name(),
+                        partitions = topic.partition_count(exchange),
+                        durability = ?topic.durability(),
+                        "created Iggy topic"
+                    );
+                }
             }
         }
         Ok(())
@@ -230,12 +242,21 @@ impl IggyJournal {
             .await?;
         let mut records = Vec::with_capacity(polled.messages.len());
         for message in polled.messages {
-            let headers = message
-                .user_headers_map()?
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(key, value)| (key.to_string_value(), value.to_string_value()))
-                .collect();
+            let headers = match message.user_headers_map() {
+                Ok(Some(map)) => map
+                    .into_iter()
+                    .map(|(key, value)| (key.to_string_value(), value.to_string_value()))
+                    .collect(),
+                Ok(None) => Vec::new(),
+                Err(error) => {
+                    tracing::warn!(
+                        offset = message.header.offset,
+                        error = %error,
+                        "ignoring malformed Iggy user headers; the payload is still decodable"
+                    );
+                    Vec::new()
+                }
+            };
             records.push(JournalRecord {
                 offset: message.header.offset,
                 timestamp_ns: message.header.timestamp,
@@ -276,6 +297,20 @@ impl IggyJournal {
             .get_consumer_offset(&consumer, &stream_id, &topic_id, Some(partition))
             .await?;
         Ok(info.map(|info| info.stored_offset))
+    }
+
+    /// Records between the committed consumer offset and the partition head.
+    /// `committed` is the last processed offset (inclusive).
+    pub async fn lag(&self, topic: Topic, partition: u32, committed: u64) -> Result<u64> {
+        let stream_id = Identifier::named(topic.stream())?;
+        let topic_id = Identifier::named(topic.name())?;
+        let Some(details) = self.client.get_topic(&stream_id, &topic_id).await? else {
+            return Ok(0);
+        };
+        let Some(details) = details.partitions.iter().find(|item| item.id == partition) else {
+            return Ok(0);
+        };
+        Ok(details.current_offset.saturating_sub(committed))
     }
 }
 
@@ -491,6 +526,15 @@ impl Journal {
         match self {
             Self::Iggy(journal) => journal.ping().await,
             Self::Memory(_) => true,
+        }
+    }
+
+    pub async fn lag(&self, topic: Topic, partition: u32, committed: u64) -> Result<u64> {
+        match self {
+            Self::Iggy(journal) => journal.lag(topic, partition, committed).await,
+            Self::Memory(journal) => Ok(journal
+                .high_watermark(topic, partition)
+                .saturating_sub(committed.saturating_add(1))),
         }
     }
 

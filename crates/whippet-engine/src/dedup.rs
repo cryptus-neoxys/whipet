@@ -68,10 +68,27 @@ impl DedupTable {
         if let Some(previous) = self.map.get(&order_id) {
             return Some(*previous);
         }
-        if self.map.len() >= self.capacity
-            && let Some(oldest) = self.insertion_order.pop_front()
-        {
-            self.map.remove(&oldest);
+        // Evict terminal entries only. A resting order must keep its dedup
+        // record even if it is older than the window, otherwise a late retry
+        // could rest a second copy. If every entry is active, grow beyond the
+        // soft capacity rather than break that invariant.
+        let mut attempts = self.insertion_order.len().min(4_096);
+        while self.map.len() >= self.capacity && attempts > 0 {
+            attempts -= 1;
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                break;
+            };
+            let terminal = self.map.get(&oldest).is_none_or(|entry| {
+                matches!(
+                    entry.status,
+                    DedupStatus::Filled | DedupStatus::Cancelled | DedupStatus::Rejected
+                )
+            });
+            if terminal {
+                self.map.remove(&oldest);
+            } else {
+                self.insertion_order.push_back(oldest);
+            }
         }
         self.map.insert(order_id, entry);
         self.insertion_order.push_back(order_id);
@@ -84,10 +101,13 @@ impl DedupTable {
         }
     }
 
-    pub fn entries_sorted(&self) -> Vec<(OrderId, DedupEntry)> {
-        let mut entries: Vec<_> = self.map.iter().map(|(id, entry)| (*id, *entry)).collect();
-        entries.sort_unstable_by_key(|(id, _)| *id);
-        entries
+    /// Entries in insertion order. Eviction depends on this order, so the
+    /// snapshot and the state hash must preserve it, not sort it.
+    pub fn entries_in_order(&self) -> Vec<(OrderId, DedupEntry)> {
+        self.insertion_order
+            .iter()
+            .filter_map(|order_id| self.map.get(order_id).map(|entry| (*order_id, *entry)))
+            .collect()
     }
 
     pub fn from_entries(capacity: usize, entries: Vec<(OrderId, DedupEntry)>) -> Self {
@@ -102,7 +122,7 @@ impl DedupTable {
     pub fn hash_into(&self, hasher: &mut blake3::Hasher) {
         hasher.update(b"dedup");
         hasher.update(&(self.map.len() as u64).to_le_bytes());
-        for (order_id, entry) in self.entries_sorted() {
+        for (order_id, entry) in self.entries_in_order() {
             hasher.update(&order_id.0.to_le_bytes());
             hasher.update(&[entry.status as u8]);
             hasher.update(&entry.input_offset.to_le_bytes());
@@ -134,10 +154,12 @@ mod tests {
     }
 
     #[test]
-    fn capacity_evicts_oldest() {
+    fn capacity_evicts_oldest_terminal_entry() {
         let mut table = DedupTable::new(2);
         table.insert(OrderId(1), entry(1));
+        table.update(OrderId(1), DedupStatus::Filled);
         table.insert(OrderId(2), entry(2));
+        table.update(OrderId(2), DedupStatus::Filled);
         table.insert(OrderId(3), entry(3));
         assert!(!table.contains(OrderId(1)));
         assert!(table.contains(OrderId(2)));
@@ -145,7 +167,23 @@ mod tests {
     }
 
     #[test]
-    fn hash_is_order_independent_of_map_layout() {
+    fn active_entries_survive_eviction() {
+        let mut table = DedupTable::new(2);
+        table.insert(OrderId(1), entry(1));
+        table.update(OrderId(1), DedupStatus::Resting);
+        table.insert(OrderId(2), entry(2));
+        table.update(OrderId(2), DedupStatus::Filled);
+        table.insert(OrderId(3), entry(3));
+        assert!(table.contains(OrderId(1)), "resting order was evicted");
+        assert!(
+            !table.contains(OrderId(2)),
+            "terminal order should be evicted"
+        );
+        assert!(table.contains(OrderId(3)));
+    }
+
+    #[test]
+    fn hash_depends_on_insertion_order() {
         let mut a = DedupTable::new(8);
         let mut b = DedupTable::new(8);
         a.insert(OrderId(1), entry(1));
@@ -156,6 +194,20 @@ mod tests {
         let mut hb = blake3::Hasher::new();
         a.hash_into(&mut ha);
         b.hash_into(&mut hb);
-        assert_eq!(ha.finalize(), hb.finalize());
+        assert_ne!(ha.finalize(), hb.finalize());
+    }
+
+    #[test]
+    fn snapshot_restore_preserves_eviction_order() {
+        let mut table = DedupTable::new(2);
+        table.insert(OrderId(5), entry(5));
+        table.update(OrderId(5), DedupStatus::Filled);
+        table.insert(OrderId(1), entry(1));
+        table.update(OrderId(1), DedupStatus::Filled);
+        let mut restored = DedupTable::from_entries(2, table.entries_in_order());
+        table.insert(OrderId(9), entry(9));
+        restored.insert(OrderId(9), entry(9));
+        assert_eq!(table.contains(OrderId(5)), restored.contains(OrderId(5)));
+        assert_eq!(table.contains(OrderId(1)), restored.contains(OrderId(1)));
     }
 }

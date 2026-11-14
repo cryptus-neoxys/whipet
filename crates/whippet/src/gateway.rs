@@ -14,7 +14,6 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde::Serialize;
 use tower_http::compression::CompressionLayer;
-use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing::warn;
@@ -50,8 +49,7 @@ pub fn router(ctx: Arc<NodeContext>) -> Router {
         api.fallback(missing_dashboard)
     };
 
-    api.layer(CorsLayer::permissive())
-        .layer(CompressionLayer::new())
+    api.layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .with_state(ctx)
 }
@@ -92,11 +90,23 @@ async fn submit_order(
         .client_order_id
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    if client_order_id.len() > 128 {
+        return Err(bad_request(
+            "invalid_client_order_id",
+            "client_order_id must be at most 128 bytes",
+        ));
+    }
     let order_id = OrderId::derive(request.symbol, &client_order_id);
     let participant_name = request
         .participant
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "anonymous".into());
+    if participant_name.len() > 64 {
+        return Err(bad_request(
+            "invalid_participant",
+            "participant must be at most 64 bytes",
+        ));
+    }
     let participant = ParticipantId::derive(&participant_name);
     let timestamp_ns = now_ns();
     let command = Command::new_order(
@@ -148,6 +158,12 @@ async fn cancel_order(
         .participant
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "anonymous".into());
+    if participant_name.len() > 64 {
+        return Err(bad_request(
+            "invalid_participant",
+            "participant must be at most 64 bytes",
+        ));
+    }
     let participant = ParticipantId::derive(&participant_name);
     let timestamp_ns = now_ns();
     let command = Command::cancel(request.symbol, request.order_id, participant, timestamp_ns);
@@ -181,8 +197,11 @@ async fn state(State(ctx): State<Arc<NodeContext>>) -> Json<StateView> {
 
 async fn health(State(ctx): State<Arc<NodeContext>>) -> Json<HealthView> {
     let metrics = ctx.metrics.snapshot();
+    let journal_ready =
+        ctx.config.journal == crate::config::JournalKind::Memory || metrics.iggy_connected;
+    let shards_ok = ctx.shards_ok();
     Json(HealthView {
-        status: if metrics.iggy_connected {
+        status: if journal_ready && shards_ok {
             "ok".into()
         } else {
             "degraded".into()
@@ -191,6 +210,7 @@ async fn health(State(ctx): State<Arc<NodeContext>>) -> Json<HealthView> {
         iggy_connected: metrics.iggy_connected,
         iggy_addr: ctx.config.iggy_addr.clone(),
         journal: ctx.config.journal.as_str().to_string(),
+        shards_ok,
         version: env!("CARGO_PKG_VERSION").into(),
         uptime_s: ctx.started.elapsed().as_secs(),
         partitions: ctx.exchange().partitions,
@@ -293,7 +313,7 @@ pub(crate) fn prometheus_text(
         metrics.throughput_orders_s
     ));
     out.push_str("# HELP whippet_uptime_seconds Node uptime.\n");
-    out.push_str("# TYPE whippet_uptime_seconds counter\n");
+    out.push_str("# TYPE whippet_uptime_seconds gauge\n");
     out.push_str(&format!("whippet_uptime_seconds {}\n", metrics.uptime_s));
     out.push_str("# HELP whippet_iggy_connected Whether the last Iggy health check succeeded.\n");
     out.push_str("# TYPE whippet_iggy_connected gauge\n");
@@ -344,7 +364,9 @@ async fn ws_upgrade(
     ws: WebSocketUpgrade,
     State(ctx): State<Arc<NodeContext>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| ws_loop(socket, ctx))
+    ws.max_message_size(64 * 1024)
+        .max_frame_size(64 * 1024)
+        .on_upgrade(move |socket| ws_loop(socket, ctx))
 }
 
 async fn ws_loop(mut socket: WebSocket, ctx: Arc<NodeContext>) {

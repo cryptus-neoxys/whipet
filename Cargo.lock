@@ -3756,12 +3756,14 @@ dependencies = [
  "chrono",
  "clap",
  "futures-util",
+ "http-body-util",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
@@ -3772,6 +3774,7 @@ dependencies = [
  "whippet-journal",
  "whippet-marketdata",
  "whippet-sim",
+ "whippet-testkit",
 ]
 
 [[package]]
@@ -3813,6 +3816,7 @@ dependencies = [
  "serde",
  "thiserror",
  "whippet-core",
+ "whippet-testkit",
 ]
 
 [[package]]
@@ -3852,6 +3856,11 @@ dependencies = [
 [[package]]
 name = "whippet-testkit"
 version = "0.1.0"
+dependencies = [
+ "proptest",
+ "whippet-core",
+ "whippet-engine",
+]
 
 [[package]]
 name = "winapi-util"

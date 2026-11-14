@@ -281,9 +281,30 @@ mod tests {
     }
 
     #[test]
-    fn partition_is_stable() {
+    fn partition_is_stable_and_pinned() {
+        let btc = Symbol::new("BTC-USD").unwrap();
+        let eth = Symbol::new("ETH-USD").unwrap();
+        let sol = Symbol::new("SOL-USD").unwrap();
+        assert_eq!(btc.partition(16), btc.partition(16));
+        assert_eq!(btc.partition(16), 1);
+        assert_eq!(eth.partition(16), 5);
+        assert_eq!(sol.partition(16), 12);
+    }
+
+    #[test]
+    fn order_and_participant_derivation_is_stable() {
         let symbol = Symbol::new("BTC-USD").unwrap();
-        assert_eq!(symbol.partition(16), symbol.partition(16));
-        assert!(symbol.partition(16) < 16);
+        let id = OrderId::derive(symbol, "client-1");
+        assert_eq!(id, OrderId::derive(symbol, "client-1"));
+        assert_ne!(id, OrderId::derive(symbol, "client-2"));
+        assert_ne!(
+            id,
+            OrderId::derive(Symbol::new("ETH-USD").unwrap(), "client-1")
+        );
+        assert_eq!(
+            ParticipantId::derive("alice"),
+            ParticipantId::derive("alice")
+        );
+        assert_ne!(ParticipantId::derive("alice"), ParticipantId::derive("bob"));
     }
 }

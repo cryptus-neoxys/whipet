@@ -1,6 +1,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use tokio::sync::watch;
@@ -20,9 +21,18 @@ pub struct NodeContext {
     pub snapshots: SnapshotStore,
     pub started: Instant,
     pub shutdown: watch::Sender<bool>,
+    pub shards_ok: Arc<AtomicBool>,
 }
 
 impl NodeContext {
+    pub fn mark_shard_failed(&self) {
+        self.shards_ok.store(false, Ordering::Relaxed);
+    }
+
+    pub fn shards_ok(&self) -> bool {
+        self.shards_ok.load(Ordering::Relaxed)
+    }
+
     pub fn exchange(&self) -> &whippet_core::config::ExchangeConfig {
         &self.config.exchange
     }

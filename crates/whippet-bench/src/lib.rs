@@ -7,6 +7,8 @@
 //! leave, which is the coordinated-omission correction. If the generator
 //! cannot keep up, `scheduler_slip` grows and the run says so.
 
+#![forbid(unsafe_code)]
+
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -137,7 +139,7 @@ pub async fn run(config: BenchConfig) -> Result<BenchManifest> {
         rate_per_sec: config.rate_per_sec,
         duration_secs: config.duration_secs,
         warmup_secs: config.warmup_secs,
-        repetitions: config.repetitions,
+        repetitions: config.repetitions.max(1),
         subscribers: 0,
         seed: config.seed,
         durability: "persisted".into(),
@@ -277,11 +279,10 @@ async fn run_repetition(
     } else {
         config.duration_secs as f64
     };
-    let completed = completed.max(1);
     let throughput = ThroughputSummary {
         target_per_sec: config.rate_per_sec,
-        achieved_per_sec: completed as f64 / measured_secs,
-        goodput_per_sec: (completed.saturating_sub(errors)) as f64 / measured_secs,
+        achieved_per_sec: completed as f64 / measured_secs.max(f64::EPSILON),
+        goodput_per_sec: completed.saturating_sub(errors) as f64 / measured_secs.max(f64::EPSILON),
         error_count: errors + spawn_errors,
         scheduled_samples: scheduled,
         completed_samples: completed,
@@ -377,7 +378,7 @@ fn make_order(
         price_cents: Some(price_ticks * instrument.tick_size_cents),
         qty: rng.gen_range(1..=50),
         client_order_id: Some(format!("bench-{run_id}-{repetition}-{tick}")),
-        participant: Some("bench".into()),
+        participant: Some(format!("bench-{tick}")),
     }
 }
 

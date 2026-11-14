@@ -6,6 +6,8 @@
 //! shard is the single writer; the engine itself is synchronous and has no
 //! dependency on Tokio or Iggy.
 
+#![forbid(unsafe_code)]
+
 pub mod book;
 pub mod dedup;
 pub mod engine;
@@ -13,5 +15,6 @@ pub mod engine;
 pub use book::{Book, BookError, BookSnapshot, RestingOrder};
 pub use dedup::{DedupEntry, DedupStatus, DedupTable};
 pub use engine::{
-    EngineError, EngineOutput, ShardEngine, ShardSnapshot, SymbolEngine, SymbolSnapshot,
+    EngineError, EngineOutput, MAX_ORDER_QTY, ShardEngine, ShardSnapshot, SymbolEngine,
+    SymbolSnapshot,
 };

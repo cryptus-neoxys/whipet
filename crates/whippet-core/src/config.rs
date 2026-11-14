@@ -96,6 +96,15 @@ impl InstrumentConfig {
                 "min_price_ticks must be below max_price_ticks".into(),
             ));
         }
+        let ladder_len = max_price_ticks
+            .checked_sub(min_price_ticks)
+            .and_then(|span| span.checked_add(1))
+            .ok_or_else(|| CoreError::InvalidValue("price ladder length overflow".into()))?;
+        if ladder_len > 5_000_000 {
+            return Err(CoreError::InvalidValue(
+                "price ladder exceeds the 5,000,000-level safety limit".into(),
+            ));
+        }
         Ok(Self {
             symbol: Symbol::new(symbol)?,
             tick_size_cents,
@@ -109,6 +118,40 @@ impl InstrumentConfig {
 
     pub fn ladder_len(&self) -> usize {
         (self.max_price_ticks - self.min_price_ticks + 1) as usize
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.tick_size_cents <= 0 {
+            return Err(CoreError::InvalidValue(
+                "tick_size_cents must be positive".into(),
+            ));
+        }
+        if self.min_price_ticks >= self.max_price_ticks {
+            return Err(CoreError::InvalidValue(
+                "min_price_ticks must be below max_price_ticks".into(),
+            ));
+        }
+        if self.ladder_len() > 5_000_000 {
+            return Err(CoreError::InvalidValue(
+                "price ladder exceeds the 5,000,000-level safety limit".into(),
+            ));
+        }
+        if self.max_orders == 0 || self.max_orders > 5_000_000 {
+            return Err(CoreError::InvalidValue(
+                "max_orders must be between 1 and 5,000,000".into(),
+            ));
+        }
+        if self.snapshot_depth == 0 || self.snapshot_depth > u16::MAX as usize {
+            return Err(CoreError::InvalidValue(
+                "snapshot_depth must be between 1 and 65535".into(),
+            ));
+        }
+        if self.market_collar_bps > 10_000 {
+            return Err(CoreError::InvalidValue(
+                "market_collar_bps must be at most 10000".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn contains_ticks(&self, price: Price) -> bool {

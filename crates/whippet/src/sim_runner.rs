@@ -25,8 +25,12 @@ pub struct SimArgs {
     pub duration: u64,
     #[arg(long, default_value = "calm_open")]
     pub scenario: String,
-    #[arg(long, default_value_t = 0x5eed_1234_abcd_0001)]
-    pub seed: u64,
+    /// Omit for a fresh demo run. Pass a value for a reproducible run.
+    #[arg(long)]
+    pub seed: Option<u64>,
+    /// Extra nonce for a reproducible run; defaults to 0 when --seed is given.
+    #[arg(long)]
+    pub run_nonce: Option<u64>,
     #[arg(
         long,
         default_value = "BTC-USD,ETH-USD,SOL-USD",
@@ -53,8 +57,17 @@ pub async fn run(args: SimArgs) -> Result<()> {
         .collect::<std::result::Result<_, _>>()
         .context("parsing --symbols")?;
     let scenario: Scenario = args.scenario.parse()?;
+    let seed = args.seed.unwrap_or_else(now_ns);
+    let run_nonce = args.run_nonce.unwrap_or_else(|| {
+        if args.seed.is_some() {
+            0
+        } else {
+            now_ns() ^ u64::from(std::process::id())
+        }
+    });
     let config = SimConfig {
-        seed: args.seed,
+        seed,
+        run_nonce,
         rate_per_sec: args.rate,
         duration_secs: args.duration,
         scenario,
@@ -80,7 +93,8 @@ pub async fn run(args: SimArgs) -> Result<()> {
     info!(
         rate = args.rate,
         scenario = scenario.as_str(),
-        seed = args.seed,
+        seed,
+        run_nonce,
         gateway = %base,
         "simulator started"
     );
@@ -177,4 +191,10 @@ pub fn example_order() -> OrderRequest {
         client_order_id: Some("example-1".into()),
         participant: Some("demo".into()),
     }
+}
+
+fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64)
 }

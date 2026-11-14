@@ -8,6 +8,8 @@
 //! discipline for a ladder. Trades are retained losslessly in the visible tape
 //! window; audit consumes the log, not the UI.
 
+#![forbid(unsafe_code)]
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -75,7 +77,12 @@ impl BookState {
         }
     }
 
-    fn apply(&mut self, event: &MdEvent) {
+    fn apply(&mut self, event: &MdEvent) -> bool {
+        // At-least-once delivery: a crash between apply and commit replays the
+        // batch. The per-symbol sequence makes deltas idempotent.
+        if self.seq.0 != 0 && event.seq.0 <= self.seq.0 {
+            return false;
+        }
         self.seq = event.seq;
         match event.kind {
             MdKind::Add => {
@@ -98,6 +105,9 @@ impl BookState {
             MdKind::Reduce => {
                 if let Some(order) = self.orders.get(&event.order_id).copied() {
                     let new_qty = event.qty.0;
+                    if new_qty > order.qty {
+                        return false;
+                    }
                     let delta = order.qty.saturating_sub(new_qty);
                     if delta > 0 {
                         let level = self.side_levels_mut(order.side).get_mut(&order.price_cents);
@@ -134,35 +144,71 @@ impl BookState {
             }
             MdKind::Bbo | MdKind::Status | MdKind::Snapshot => {}
         }
+        true
     }
 
-    fn apply_snapshot(&mut self, snapshot: &MdSnapshot) {
+    fn apply_snapshot(&mut self, snapshot: &MdSnapshot) -> bool {
+        // A retried append can deliver an older snapshot after newer deltas.
+        // Never regress a symbol that already has state.
+        if self.seq.0 != 0 && snapshot.seq.0 <= self.seq.0 {
+            return false;
+        }
         self.seq = snapshot.seq;
         self.bids.clear();
         self.asks.clear();
         self.orders.clear();
-        for level in &snapshot.bids {
-            self.bids.insert(
-                self.price_cents(level.price),
-                LevelState {
-                    qty: level.qty.0,
-                    orders: level.orders,
-                },
-            );
+        if snapshot.orders.is_empty() {
+            // Compatibility with a level-only snapshot: keep the aggregates
+            // but accept that later order-level deltas cannot be applied.
+            for level in &snapshot.bids {
+                self.bids.insert(
+                    self.price_cents(level.price),
+                    LevelState {
+                        qty: level.qty.0,
+                        orders: level.orders,
+                    },
+                );
+            }
+            for level in &snapshot.asks {
+                self.asks.insert(
+                    self.price_cents(level.price),
+                    LevelState {
+                        qty: level.qty.0,
+                        orders: level.orders,
+                    },
+                );
+            }
+        } else {
+            // Rebuild the complete book from the resting-order set. The top-N
+            // levels in the snapshot are for display only; applying deltas to
+            // them would leave stale quantities for orders outside the top N.
+            for order in &snapshot.orders {
+                let price_cents = self.price_cents(order.price);
+                let level = self
+                    .side_levels_mut(order.side)
+                    .entry(price_cents)
+                    .or_default();
+                level.qty = level.qty.saturating_add(order.qty.0);
+                level.orders = level.orders.saturating_add(1);
+                self.orders.insert(
+                    order.order_id,
+                    OrderRef {
+                        side: order.side,
+                        price_cents,
+                        qty: order.qty.0,
+                    },
+                );
+            }
         }
-        for level in &snapshot.asks {
-            self.asks.insert(
-                self.price_cents(level.price),
-                LevelState {
-                    qty: level.qty.0,
-                    orders: level.orders,
-                },
-            );
-        }
+        self.last_trade_side = None;
         if snapshot.last_trade_price.0 > 0 {
             self.last_trade_price_cents = Some(self.price_cents(snapshot.last_trade_price));
             self.last_trade_qty = snapshot.last_trade_qty.0;
+        } else {
+            self.last_trade_price_cents = None;
+            self.last_trade_qty = 0;
         }
+        true
     }
 
     fn view(&self) -> BookView {
@@ -209,8 +255,14 @@ impl BookState {
             last_trade_price_cents: self.last_trade_price_cents,
             last_trade_qty: self.last_trade_qty,
             last_trade_side: self.last_trade_side,
-            depth_bid_qty: self.bids.values().map(|level| level.qty).sum(),
-            depth_ask_qty: self.asks.values().map(|level| level.qty).sum(),
+            depth_bid_qty: self
+                .bids
+                .values()
+                .fold(0u64, |total, level| total.saturating_add(level.qty)),
+            depth_ask_qty: self
+                .asks
+                .values()
+                .fold(0u64, |total, level| total.saturating_add(level.qty)),
         }
     }
 }
@@ -452,14 +504,21 @@ impl MdHub {
             return;
         };
         let mut state = self.state.lock().expect("md state poisoned");
-        let price_cents = {
+        let (applied, price_cents) = {
             let Some(book) = state.books.get_mut(&event.symbol) else {
                 return;
             };
             debug_assert_eq!(book.tick_size_cents, instrument.tick_size_cents);
-            book.apply(event);
-            book.price_cents(event.price)
+            let applied = book.apply(event);
+            (applied, book.price_cents(event.price))
         };
+        if !applied {
+            return;
+        }
+        self.metrics.record_md_event();
+        if event.kind == MdKind::Trade {
+            self.metrics.record_trade();
+        }
         state.last_update_ns = now_ns();
         state.sequence = state.sequence.max(event.seq.0);
         state.md_events = state.md_events.saturating_add(1);
@@ -486,7 +545,10 @@ impl MdHub {
         let Some(book) = state.books.get_mut(&snapshot.symbol) else {
             return;
         };
-        book.apply_snapshot(snapshot);
+        if !book.apply_snapshot(snapshot) {
+            return;
+        }
+        self.metrics.record_md_event();
         state.last_update_ns = now_ns();
         state.sequence = state.sequence.max(snapshot.seq.0);
         state.dirty = true;
@@ -564,10 +626,12 @@ mod tests {
     }
 
     fn event(kind: MdKind, side: Side, price: i64, qty: u64, order_id: u128) -> MdEvent {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(1);
         MdEvent {
             kind,
             symbol: Symbol::new("BTC-USD").unwrap(),
-            seq: Seq(1),
+            seq: Seq(SEQ.fetch_add(1, Ordering::Relaxed)),
             cause_offset: 0,
             timestamp_ns: 1,
             side,
@@ -614,6 +678,22 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_delta_is_ignored() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        let add = event(MdKind::Add, Side::Buy, 65_000, 10, 1);
+        hub.apply(&add);
+        hub.apply(&add);
+        let state = hub.state();
+        let btc = state
+            .symbols
+            .iter()
+            .find(|book| book.symbol.as_str() == "BTC-USD")
+            .unwrap();
+        assert_eq!(btc.bids[0].qty, 10);
+        assert_eq!(btc.bids[0].orders, 1);
+    }
+
+    #[test]
     fn trade_updates_last_trade_and_tape() {
         let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
         hub.apply(&event(MdKind::Add, Side::Sell, 65_100, 10, 1));
@@ -630,12 +710,111 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_orders_support_following_deltas() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        let snapshot = MdSnapshot {
+            symbol: Symbol::new("BTC-USD").unwrap(),
+            seq: Seq(0),
+            cause_offset: 0,
+            timestamp_ns: 0,
+            last_trade_price: Price::ZERO,
+            last_trade_qty: Qty::ZERO,
+            bids: vec![whippet_core::protocol::MdLevel {
+                price: Price(65_001),
+                qty: Qty(7),
+                orders: 1,
+            }],
+            asks: vec![],
+            orders: vec![whippet_core::protocol::MdOrder {
+                order_id: OrderId(77),
+                side: Side::Buy,
+                price: Price(65_001),
+                qty: Qty(7),
+                participant: ParticipantId(1),
+            }],
+        };
+        hub.apply_snapshot(&snapshot);
+        let mut reduce = event(MdKind::Reduce, Side::Buy, 65_001, 3, 77);
+        reduce.seq = Seq(1);
+        hub.apply(&reduce);
+        let btc = hub
+            .state()
+            .symbols
+            .into_iter()
+            .find(|book| book.symbol.as_str() == "BTC-USD")
+            .unwrap();
+        assert_eq!(btc.bids[0].qty, 3);
+        let mut remove = event(MdKind::Remove, Side::Buy, 65_001, 0, 77);
+        remove.seq = Seq(2);
+        hub.apply(&remove);
+        let btc = hub
+            .state()
+            .symbols
+            .into_iter()
+            .find(|book| book.symbol.as_str() == "BTC-USD")
+            .unwrap();
+        assert!(btc.bids.is_empty());
+    }
+
+    #[test]
+    fn duplicate_trade_is_not_added_to_the_tape_or_metrics_twice() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        let mut add = event(MdKind::Add, Side::Sell, 65_100, 10, 1);
+        add.seq = Seq(1);
+        hub.apply(&add);
+        let mut trade = event(MdKind::Trade, Side::Buy, 65_100, 4, 2);
+        trade.seq = Seq(2);
+        hub.apply(&trade);
+        hub.apply(&trade);
+        let state = hub.state();
+        assert_eq!(state.trades.len(), 1);
+        assert_eq!(state.metrics.trades, 1);
+        assert_eq!(state.metrics.md_events, 2);
+    }
+
+    #[test]
+    fn stale_snapshot_does_not_regress_the_book() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        let make = |seq: u64, price: i64| MdSnapshot {
+            symbol: Symbol::new("BTC-USD").unwrap(),
+            seq: Seq(seq),
+            cause_offset: 0,
+            timestamp_ns: 0,
+            last_trade_price: Price::ZERO,
+            last_trade_qty: Qty::ZERO,
+            bids: vec![whippet_core::protocol::MdLevel {
+                price: Price(price),
+                qty: Qty(1),
+                orders: 1,
+            }],
+            asks: vec![],
+            orders: vec![whippet_core::protocol::MdOrder {
+                order_id: OrderId(1),
+                side: Side::Buy,
+                price: Price(price),
+                qty: Qty(1),
+                participant: ParticipantId(1),
+            }],
+        };
+        hub.apply_snapshot(&make(5, 65_005));
+        hub.apply_snapshot(&make(3, 65_003));
+        let state = hub.state();
+        let btc = state
+            .symbols
+            .iter()
+            .find(|book| book.symbol.as_str() == "BTC-USD")
+            .unwrap();
+        assert_eq!(btc.best_bid_cents, Some(6_500_500));
+        assert_eq!(btc.seq, Seq(5));
+    }
+
+    #[test]
     fn snapshot_replaces_levels() {
         let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
         hub.apply(&event(MdKind::Add, Side::Buy, 65_000, 10, 1));
         let snapshot = MdSnapshot {
             symbol: Symbol::new("BTC-USD").unwrap(),
-            seq: Seq(9),
+            seq: Seq(1000),
             cause_offset: 0,
             timestamp_ns: 0,
             last_trade_price: Price(65_050),
@@ -646,6 +825,13 @@ mod tests {
                 orders: 1,
             }],
             asks: vec![],
+            orders: vec![whippet_core::protocol::MdOrder {
+                order_id: OrderId(77),
+                side: Side::Buy,
+                price: Price(65_001),
+                qty: Qty(7),
+                participant: ParticipantId(1),
+            }],
         };
         hub.apply_snapshot(&snapshot);
         let state = hub.state();
@@ -656,6 +842,6 @@ mod tests {
             .unwrap();
         assert_eq!(btc.best_bid_cents, Some(6_500_100));
         assert_eq!(btc.bids[0].qty, 7);
-        assert_eq!(state.sequence, 9);
+        assert_eq!(state.sequence, 1000);
     }
 }

@@ -169,6 +169,7 @@ pub struct HealthView {
     pub iggy_connected: bool,
     pub iggy_addr: String,
     pub journal: String,
+    pub shards_ok: bool,
     pub version: String,
     pub uptime_s: u64,
     pub partitions: u32,

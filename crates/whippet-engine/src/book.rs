@@ -29,6 +29,10 @@ pub enum BookError {
     BookFull,
     #[error("duplicate order id {0}")]
     DuplicateOrderId(OrderId),
+    #[error("order quantity overflow")]
+    Overflow,
+    #[error("order quantity {0} exceeds the engine limit")]
+    InvalidQty(u64),
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -212,7 +216,17 @@ impl Book {
         if self.index.contains_key(&order_id) {
             return Err(BookError::DuplicateOrderId(order_id));
         }
+        if qty.0 == 0 || qty.0 > crate::MAX_ORDER_QTY {
+            return Err(BookError::InvalidQty(qty.0));
+        }
         let price_idx = self.price_index(price)?;
+        if self.levels(side)[price_idx]
+            .qty
+            .checked_add(qty.0)
+            .is_none()
+        {
+            return Err(BookError::Overflow);
+        }
         let Some(slot_index) = self.free.pop() else {
             return Err(BookError::BookFull);
         };
@@ -248,7 +262,7 @@ impl Book {
             level.head = slot_index;
         }
         level.tail = slot_index;
-        level.qty += qty.0;
+        level.qty = level.qty.saturating_add(qty.0);
         level.orders += 1;
         self.set_bit(side, price_idx);
         self.index.insert(order_id, slot_index);
@@ -434,6 +448,39 @@ impl Book {
     }
 
     /// Next occupied level in matching order: asks ascend, bids descend.
+    /// Quantity available on `side` that crosses `limit`, excluding orders
+    /// from `excluded`. FOK uses this so self-trade prevention cannot turn a
+    /// fill-or-kill order into a cancel with side effects.
+    pub fn executable_qty_excluding(
+        &self,
+        side: Side,
+        limit: Price,
+        excluded: ParticipantId,
+    ) -> u64 {
+        let mut total = 0u64;
+        let mut cursor = self.best_index(side);
+        while let Some(price_idx) = cursor {
+            let price = self.price_at(price_idx);
+            let crosses = match side {
+                Side::Sell => price.0 <= limit.0,
+                Side::Buy => price.0 >= limit.0,
+            };
+            if !crosses {
+                break;
+            }
+            let mut index = self.levels(side)[price_idx].head;
+            while index != NONE {
+                let slot = &self.slots[index as usize];
+                if slot.participant != excluded {
+                    total = total.saturating_add(slot.remaining.0);
+                }
+                index = slot.next;
+            }
+            cursor = self.next_index(side, price_idx);
+        }
+        total
+    }
+
     fn next_index(&self, side: Side, from: usize) -> Option<usize> {
         let bitmap = self.bitmap(side);
         match side {
@@ -477,7 +524,9 @@ impl Book {
     }
 
     pub fn depth_qty(&self, side: Side) -> u64 {
-        self.levels(side).iter().map(|level| level.qty).sum()
+        self.levels(side)
+            .iter()
+            .fold(0u64, |total, level| total.saturating_add(level.qty))
     }
 
     /// Top `depth` levels per side, best first.

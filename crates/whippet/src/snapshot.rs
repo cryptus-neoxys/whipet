@@ -8,6 +8,7 @@ use whippet_engine::ShardSnapshot;
 
 const MAGIC: &[u8; 8] = b"WHIPSNP1";
 const VERSION: u32 = 1;
+const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
@@ -23,6 +24,7 @@ pub enum SnapshotError {
     WrongShard { found: u32, expected: u32 },
 }
 
+#[derive(Clone)]
 pub struct SnapshotStore {
     dir: PathBuf,
 }
@@ -54,16 +56,28 @@ impl SnapshotStore {
             file.sync_all()?;
         }
         fs::rename(&temp, &path)?;
+        // Persist the directory entry too. Some filesystems reject fsync on a
+        // directory; the file itself is already synced, so a failure here is
+        // not fatal.
+        if let Some(parent) = path.parent()
+            && let Ok(directory) = fs::File::open(parent)
+        {
+            let _ = directory.sync_all();
+        }
         Ok(path)
     }
 
     pub fn load(&self, shard_id: u32) -> Result<Option<ShardSnapshot>, SnapshotError> {
         let path = self.path(shard_id);
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(SnapshotError::Io(error)),
         };
+        if metadata.len() > MAX_SNAPSHOT_BYTES {
+            return Err(SnapshotError::BadMagic(path));
+        }
+        let bytes = fs::read(&path)?;
         if bytes.len() < MAGIC.len() + 4 {
             return Err(SnapshotError::BadMagic(path));
         }

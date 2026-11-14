@@ -43,7 +43,7 @@ pub enum ConfigError {
 
 /// Node configuration. Every value has a demo-safe default; Compose sets the
 /// container paths explicitly.
-#[derive(Args, Debug, Clone)]
+#[derive(Args, Clone)]
 pub struct NodeArgs {
     /// HTTP/WebSocket listen address.
     #[arg(long, env = "WHIPPET_HTTP_ADDR", default_value = "0.0.0.0:8080")]
@@ -57,6 +57,10 @@ pub struct NodeArgs {
     pub iggy_user: String,
     #[arg(long, env = "WHIPPET_IGGY_PASSWORD", default_value = "iggy")]
     pub iggy_password: String,
+    /// Read the Iggy password from a file instead of the environment. Compose
+    /// mounts the password as a secret and points this at `/run/secrets/...`.
+    #[arg(long, env = "WHIPPET_IGGY_PASSWORD_FILE")]
+    pub iggy_password_file: Option<PathBuf>,
     /// `iggy` for the real demo, `memory` for tests and brokerless development.
     #[arg(long, env = "WHIPPET_JOURNAL", default_value = "iggy")]
     pub journal: String,
@@ -89,7 +93,7 @@ pub struct NodeArgs {
     pub build: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NodeConfig {
     pub http_addr: SocketAddr,
     pub iggy_addr: String,
@@ -110,6 +114,18 @@ impl NodeConfig {
             ConfigError::Invalid(format!("invalid HTTP address: {}", args.http_addr))
         })?;
         let journal = JournalKind::parse(&args.journal)?;
+        let iggy_password = match &args.iggy_password_file {
+            Some(path) => std::fs::read_to_string(path)
+                .map_err(|error| {
+                    ConfigError::Invalid(format!(
+                        "could not read Iggy password file {}: {error}",
+                        path.display()
+                    ))
+                })?
+                .trim_end_matches(['\r', '\n'])
+                .to_string(),
+            None => args.iggy_password,
+        };
         let mode: Mode = args.mode.parse()?;
         if mode == Mode::Turbo {
             return Err(ConfigError::Invalid(
@@ -123,13 +139,15 @@ impl NodeConfig {
             ));
         }
 
-        let requested: Vec<Symbol> = args
+        let mut requested: Vec<Symbol> = args
             .symbols
             .split(',')
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(Symbol::new)
             .collect::<Result<_, _>>()?;
+        requested.sort_unstable();
+        requested.dedup();
         if requested.is_empty() {
             return Err(ConfigError::Invalid(
                 "at least one symbol is required".into(),
@@ -140,6 +158,9 @@ impl NodeConfig {
             if requested.contains(&instrument.symbol) {
                 instruments.push(instrument);
             }
+        }
+        for instrument in &instruments {
+            instrument.validate()?;
         }
         if instruments.len() != requested.len() {
             let known: Vec<_> = default_instruments()
@@ -157,7 +178,7 @@ impl NodeConfig {
             http_addr,
             iggy_addr: args.iggy_addr,
             iggy_user: args.iggy_user,
-            iggy_password: args.iggy_password,
+            iggy_password,
             journal,
             mode,
             exchange: ExchangeConfig {
@@ -197,8 +218,20 @@ mod tests {
     #[test]
     fn turbo_is_rejected_with_a_clear_message() {
         let cli = Cli::parse_from(["test", "--mode", "turbo"]);
-        let error = NodeConfig::from_args(cli.node).unwrap_err();
-        assert!(error.to_string().contains("Phase 2"));
+        match NodeConfig::from_args(cli.node) {
+            Ok(_) => panic!("turbo mode must be rejected"),
+            Err(error) => assert!(error.to_string().contains("Phase 2")),
+        }
+    }
+
+    #[test]
+    fn password_file_overrides_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("password");
+        std::fs::write(&path, "s3cret\n").unwrap();
+        let cli = Cli::parse_from(["test", "--iggy-password-file", path.to_str().unwrap()]);
+        let config = NodeConfig::from_args(cli.node).unwrap();
+        assert_eq!(config.iggy_password, "s3cret");
     }
 
     #[test]

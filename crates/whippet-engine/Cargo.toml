@@ -17,3 +17,4 @@ whippet-core.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+whippet-testkit.workspace = true

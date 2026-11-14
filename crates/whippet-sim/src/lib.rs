@@ -8,6 +8,8 @@
 //! scenario produce the same action sequence, which is what the demo and the
 //! regression tests rely on.
 
+#![forbid(unsafe_code)]
+
 use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
 
@@ -60,6 +62,11 @@ impl FromStr for Scenario {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimConfig {
     pub seed: u64,
+    /// Distinguishes two runs that use the same deterministic seed. The
+    /// default demo uses a fresh nonce so a simulator restart does not replay
+    /// client order ids that the durable dedup table has already seen.
+    #[serde(default)]
+    pub run_nonce: u64,
     pub rate_per_sec: u64,
     pub duration_secs: u64,
     pub scenario: Scenario,
@@ -71,6 +78,7 @@ impl Default for SimConfig {
     fn default() -> Self {
         Self {
             seed: 0x5eed_1234_abcd_0001,
+            run_nonce: 0,
             rate_per_sec: 400,
             duration_secs: 0,
             scenario: Scenario::CalmOpen,

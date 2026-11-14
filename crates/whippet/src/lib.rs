@@ -1,5 +1,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE.
 
+#![forbid(unsafe_code)]
+
 pub mod cli;
 pub mod config;
 pub mod context;

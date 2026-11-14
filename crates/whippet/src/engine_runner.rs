@@ -56,17 +56,20 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
             Ok(Some(offset)) => offset.saturating_add(1),
             Ok(None) => 0,
             Err(error) => {
-                warn!(shard = shard_id, error = %error, "could not read committed offset; starting at zero");
-                0
+                anyhow::bail!(
+                    "could not read committed offset for shard {shard_id}: {error}; refusing to replay from zero"
+                );
             }
         },
     };
 
     // Publish a snapshot immediately so a fresh dashboard has a state even
     // before the first order arrives.
-    let initial: Vec<MdSnapshot> = engine
-        .symbols()
-        .filter_map(|symbol| engine.engine(symbol).map(|book| book.snapshot()))
+    let mut initial_symbols: Vec<_> = engine.symbols().collect();
+    initial_symbols.sort_unstable();
+    let initial: Vec<MdSnapshot> = initial_symbols
+        .iter()
+        .filter_map(|symbol| engine.engine(*symbol).map(|book| book.snapshot()))
         .collect();
     if !initial.is_empty() {
         let messages: Vec<JournalMessage> = initial.iter().map(snapshot_message).collect();
@@ -88,10 +91,11 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
         let records = tokio::select! {
             _ = shutdown.changed() => {
                 let snapshot = engine.snapshot_state();
-                if let Err(error) = ctx.snapshots.save(&snapshot) {
-                    warn!(shard = shard_id, error = %error, "final snapshot write failed");
-                } else {
-                    info!(shard = shard_id, hash = %hex(&engine.state_hash()), "engine shard stopped");
+                let store = ctx.snapshots.clone();
+                match tokio::task::spawn_blocking(move || store.save(&snapshot)).await {
+                    Ok(Ok(_)) => info!(shard = shard_id, hash = %hex(&engine.state_hash()), "engine shard stopped"),
+                    Ok(Err(error)) => warn!(shard = shard_id, error = %error, "final snapshot write failed"),
+                    Err(error) => warn!(shard = shard_id, error = %error, "final snapshot task failed"),
                 }
                 return Ok(());
             }
@@ -106,7 +110,18 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
             }
         };
         if records.is_empty() {
+            if !ctx.journal.is_iggy() {
+                sleep(Duration::from_millis(1)).await;
+            }
             continue;
+        }
+        if let Some(first) = records.first()
+            && first.offset > next_offset
+        {
+            anyhow::bail!(
+                "order log gap on shard {shard_id}: requested offset {next_offset}, first available {}; a snapshot or reset is required",
+                first.offset
+            );
         }
 
         let mut executions = Vec::new();
@@ -169,27 +184,31 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
             sleep(Duration::from_millis(250)).await;
             continue;
         }
-        if let Err(error) = ctx
-            .journal
-            .commit(Topic::Orders, shard_id, &consumer, batch_last_offset)
-            .await
-        {
-            warn!(shard = shard_id, error = %error, "offset commit failed; batch will replay");
-            sleep(Duration::from_millis(250)).await;
-            continue;
-        }
+        // The outputs are already appended. Retry only the offset commit; do
+        // not re-read and re-apply the batch, which would duplicate outputs and
+        // diverge the execution sequence from a clean replay.
+        commit_with_retry(&ctx, Topic::Orders, shard_id, &consumer, batch_last_offset).await?;
         next_offset = batch_last_offset.saturating_add(1);
 
         if snapshot_due {
             let snapshot = engine.snapshot_state();
-            match ctx.snapshots.save(&snapshot) {
-                Ok(path) => info!(
+            let store = ctx.snapshots.clone();
+            let hash = hex(&engine.state_hash());
+            match tokio::task::spawn_blocking(move || store.save(&snapshot)).await {
+                Ok(Ok(path)) => info!(
                     shard = shard_id,
                     path = %path.display(),
-                    hash = %hex(&engine.state_hash()),
+                    hash,
                     "snapshot written"
                 ),
-                Err(error) => warn!(shard = shard_id, error = %error, "snapshot write failed"),
+                Ok(Err(error)) => {
+                    warn!(shard = shard_id, error = %error, "snapshot write failed");
+                    ctx.mark_shard_failed();
+                }
+                Err(error) => {
+                    warn!(shard = shard_id, error = %error, "snapshot task failed");
+                    ctx.mark_shard_failed();
+                }
             }
         }
     }
@@ -202,8 +221,9 @@ pub async fn run_md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
         Ok(Some(offset)) => offset.saturating_add(1),
         Ok(None) => 0,
         Err(error) => {
-            warn!(shard = shard_id, error = %error, "could not read MD offset; starting at zero");
-            0
+            anyhow::bail!(
+                "could not read MD committed offset for shard {shard_id}: {error}; refusing to replay from zero"
+            );
         }
     };
     info!(
@@ -227,7 +247,18 @@ pub async fn run_md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
             }
         };
         if records.is_empty() {
+            if !ctx.journal.is_iggy() {
+                sleep(Duration::from_millis(1)).await;
+            }
             continue;
+        }
+        if let Some(first) = records.first()
+            && first.offset > next_offset
+        {
+            anyhow::bail!(
+                "MD log gap on shard {shard_id}: requested offset {next_offset}, first available {}; reset or resnapshot is required",
+                first.offset
+            );
         }
         let mut last_offset = next_offset.saturating_sub(1);
         for record in records {
@@ -246,9 +277,6 @@ pub async fn run_md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
                 }
                 _ => match MdEvent::decode(&record.payload) {
                     Ok(event) => {
-                        if event.kind == MdKind::Trade {
-                            ctx.metrics.record_trade();
-                        }
                         ctx.hub.apply(&event);
                     }
                     Err(error) => warn!(
@@ -259,20 +287,30 @@ pub async fn run_md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
                     ),
                 },
             }
-            ctx.metrics.record_md_event();
             last_offset = record.offset;
         }
-        if let Err(error) = ctx
-            .journal
-            .commit(Topic::Md, shard_id, &consumer, last_offset)
-            .await
-        {
-            warn!(shard = shard_id, error = %error, "MD offset commit failed");
-            sleep(Duration::from_millis(250)).await;
-            continue;
-        }
+        commit_with_retry(&ctx, Topic::Md, shard_id, &consumer, last_offset).await?;
         next_offset = last_offset.saturating_add(1);
-        ctx.metrics.set_consumer_lag(0);
+    }
+}
+
+async fn commit_with_retry(
+    ctx: &NodeContext,
+    topic: Topic,
+    partition: u32,
+    consumer: &str,
+    offset: u64,
+) -> Result<()> {
+    let mut delay = Duration::from_millis(100);
+    loop {
+        match ctx.journal.commit(topic, partition, consumer, offset).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                warn!(topic = %topic, partition, offset, error = %error, "offset commit failed; retrying the commit only");
+                sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(2));
+            }
+        }
     }
 }
 
