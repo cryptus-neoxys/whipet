@@ -296,8 +296,11 @@ impl Metrics {
         record(&self.match_latency, micros);
     }
 
-    pub fn record_execution(&self, rejected: bool) {
+    pub fn record_execution(&self) {
         self.executions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_order_outcome(&self, rejected: bool) {
         if rejected {
             self.orders_rejected.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -384,6 +387,7 @@ pub struct MdHub {
     watch: watch::Sender<Arc<StateView>>,
     metrics: Arc<Metrics>,
     iggy_addr: String,
+    journal: String,
     dashboard_build: Option<String>,
 }
 
@@ -391,6 +395,7 @@ impl MdHub {
     pub fn new(
         config: ExchangeConfig,
         iggy_addr: String,
+        journal: String,
         dashboard_build: Option<String>,
     ) -> Arc<Self> {
         let mut books = BTreeMap::new();
@@ -410,6 +415,7 @@ impl MdHub {
             freshness_ms: 0,
             sequence: 0,
             iggy_addr: iggy_addr.clone(),
+            journal: journal.clone(),
             guarantee: config.mode.guarantee().to_string(),
             dashboard_build: dashboard_build.clone(),
         });
@@ -428,6 +434,7 @@ impl MdHub {
             watch,
             metrics,
             iggy_addr,
+            journal,
             dashboard_build,
         })
     }
@@ -520,6 +527,7 @@ impl MdHub {
             freshness_ms,
             sequence: state.sequence,
             iggy_addr: self.iggy_addr.clone(),
+            journal: self.journal.clone(),
             guarantee: self.config.mode.guarantee().to_string(),
             dashboard_build: self.dashboard_build.clone(),
         }
@@ -573,7 +581,7 @@ mod tests {
 
     #[test]
     fn add_reduce_remove_updates_levels() {
-        let hub = MdHub::new(config(), "test".into(), None);
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
         hub.apply(&event(MdKind::Add, Side::Buy, 65_000, 10, 1));
         hub.apply(&event(MdKind::Add, Side::Buy, 65_000, 5, 2));
         let state = hub.state();
@@ -607,7 +615,7 @@ mod tests {
 
     #[test]
     fn trade_updates_last_trade_and_tape() {
-        let hub = MdHub::new(config(), "test".into(), None);
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
         hub.apply(&event(MdKind::Add, Side::Sell, 65_100, 10, 1));
         hub.apply(&event(MdKind::Trade, Side::Buy, 65_100, 4, 2));
         let state = hub.state();
@@ -623,7 +631,7 @@ mod tests {
 
     #[test]
     fn snapshot_replaces_levels() {
-        let hub = MdHub::new(config(), "test".into(), None);
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
         hub.apply(&event(MdKind::Add, Side::Buy, 65_000, 10, 1));
         let snapshot = MdSnapshot {
             symbol: Symbol::new("BTC-USD").unwrap(),

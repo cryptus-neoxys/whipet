@@ -157,6 +157,7 @@ pub struct StateView {
     /// Newest per-symbol sequence observed by the MD hub.
     pub sequence: u64,
     pub iggy_addr: String,
+    pub journal: String,
     pub guarantee: String,
     pub dashboard_build: Option<String>,
 }
@@ -167,6 +168,7 @@ pub struct HealthView {
     pub mode: Mode,
     pub iggy_connected: bool,
     pub iggy_addr: String,
+    pub journal: String,
     pub version: String,
     pub uptime_s: u64,
     pub partitions: u32,

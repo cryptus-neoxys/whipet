@@ -111,6 +111,10 @@ impl SymbolEngine {
         self
     }
 
+    pub fn set_snapshot_interval(&mut self, every: u64) {
+        self.snapshot_every = every.max(1);
+    }
+
     pub fn config(&self) -> &InstrumentConfig {
         &self.config
     }
@@ -663,6 +667,24 @@ impl ShardEngine {
             }
         }
         Self { shard_id, engines }
+    }
+
+    pub fn new_with_snapshot_interval(
+        shard_id: u32,
+        exchange: &ExchangeConfig,
+        every: u64,
+    ) -> Self {
+        let mut shard = Self::new(shard_id, exchange);
+        for engine in shard.engines.values_mut() {
+            engine.set_snapshot_interval(every);
+        }
+        shard
+    }
+
+    pub fn set_snapshot_interval(&mut self, every: u64) {
+        for engine in self.engines.values_mut() {
+            engine.set_snapshot_interval(every);
+        }
     }
 
     pub fn shard_id(&self) -> u32 {

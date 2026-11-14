@@ -165,6 +165,21 @@ impl<'de> Deserialize<'de> for OrderId {
 )]
 pub struct ParticipantId(pub u64);
 
+impl ParticipantId {
+    /// Stable mapping from an authenticated participant name to the engine's
+    /// integer identity. The gateway performs this at the edge; the matcher
+    /// only ever compares integers.
+    pub fn derive(name: &str) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"whippet-participant-v1");
+        hasher.update(name.as_bytes());
+        let digest = hasher.finalize();
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&digest.as_bytes()[..8]);
+        Self(u64::from_le_bytes(bytes))
+    }
+}
+
 /// A price expressed in integer ticks. The instrument maps ticks to quote
 /// currency; the engine never performs floating-point arithmetic.
 #[derive(

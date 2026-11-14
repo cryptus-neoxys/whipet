@@ -36,6 +36,7 @@ whippet-testkit = { path = "crates/whippet-testkit" }
 iggy = "=0.12.0"
 
 # Runtime
+anyhow = "1"
 axum = { version = "0.8", features = ["ws", "macros"] }
 blake3 = "1"
 bincode = "1.3"
