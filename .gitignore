@@ -19,6 +19,9 @@
 /bench-results
 *.hdr
 
+# Local issue drafts (kept on disk, not published)
+/docs/issues/
+
 # OS / editor
 .DS_Store
 .idea
