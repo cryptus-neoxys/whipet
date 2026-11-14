@@ -27,15 +27,17 @@ use iggy::prelude::{
 use serde::{Deserialize, Serialize};
 use whippet_core::config::ExchangeConfig;
 
+pub mod group;
 pub mod topic;
 
+pub use group::{GroupCommit, GroupCommitConfig, GroupCommitStats};
 pub use topic::Topic;
 
 pub const STREAM_TRADING: &str = "whippet-trading";
 pub const STREAM_MD: &str = "whippet-md";
 pub const STREAM_OPS: &str = "whippet-ops";
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum JournalError {
     #[error("iggy error: {0}")]
     Iggy(#[from] IggyError),
@@ -45,6 +47,9 @@ pub enum JournalError {
     NoConfirmation,
     #[error("invalid journal configuration: {0}")]
     InvalidConfig(String),
+    /// A group-commit writer task is gone; the submission was never appended.
+    #[error("journal group-commit writer stopped")]
+    WriterStopped,
 }
 
 impl JournalError {

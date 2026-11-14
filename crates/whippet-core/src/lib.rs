@@ -16,6 +16,7 @@ pub mod headers;
 pub mod ids;
 pub mod manifest;
 pub mod protocol;
+pub mod tcp;
 
 pub use error::{CoreError, Result};
 pub use ids::{OrderId, ParticipantId, Price, Qty, Seq, Symbol};
