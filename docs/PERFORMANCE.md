@@ -467,9 +467,10 @@ the first suspect because it is the only place with awaited I/O per batch.
 arena. Before the cache, `best_index` scanned bitmap words from the best end on
 every call. The BTC-USD ladder is 50,001 levels (782 `u64` words); ETH-USD and
 SOL-USD are 30,001 levels (469 words). `process` calls `best_index` for the
-cross check and again for each fill. FOK's `executable_qty_excluding` walks
-every resting order at every crossing level. Before the change, the order index
-and dedup table used the default SipHash hasher.
+cross check and again for each fill. FOK's old `executable_qty_excluding` walked
+every resting order at every crossing level; the engine now uses an early-exit
+check. Before the change, the order index and dedup table used the default
+SipHash hasher.
 
 The working tree now has a cached best bid/ask index with a bitmap fallback,
 `FxHashMap` in the book and dedup table, and a criterion bench at
@@ -482,6 +483,8 @@ The working tree now has a cached best bid/ask index with a bitmap fallback,
 | `best_price_lookup/deep_book_bid_ask` | 37.3 ns | 0.312 ns | −99% |
 | `aggressive_burst/10k_ioc` | 1.344 ms | 515 µs | −62% |
 | `engine_state_hash/20k_orders_20k_dedup` | 2.833 ms | 2.560 ms | −10.5% |
+| `fok_burst/check_only` (50k-order book) | 74.4 µs | 6.81 µs | −91% |
+| `fok_burst/50k_book_10pct` (end to end) | 1.974 ms | 1.060 ms | −46% |
 
 The host was running other builds (load average 4–9), so these are directionally
 strong but not headline numbers. The best-price win is algorithmic and

@@ -241,6 +241,12 @@ impl Book {
         // case. The old code probed twice (`contains_key` then `insert`). The
         // duplicate path restores the displaced mapping and the reserved slot,
         // so a rejected insert leaves the book untouched.
+        //
+        // The cheap quantity/price/overflow checks now run first, so an order
+        // that is both a duplicate and invalid reports the validation error
+        // instead of `DuplicateOrderId`. Matching is unaffected: the engine
+        // rejects duplicate ids from its dedup table before an order reaches
+        // the book, and the duplicate error is still produced here.
         if let Some(previous) = self.index.insert(order_id, slot_index) {
             self.index.insert(order_id, previous);
             self.free.push(slot_index);
