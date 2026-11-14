@@ -4,6 +4,34 @@ import type { FeedSample, StateView, WsServerMessage } from '../lib/types';
 
 export type ConnectionState = 'connecting' | 'live' | 'reconnecting' | 'offline';
 
+const SAMPLE_INTERVAL_MS = 500;
+const MAX_SAMPLES = 240;
+
+/**
+ * Append a chart sample at most once per `SAMPLE_INTERVAL_MS`. Returns the new
+ * array only when a sample was added: frames that arrive faster than the sample
+ * interval must not re-publish `history`, or every chart re-renders at frame rate.
+ */
+function sampleHistory(
+  samples: FeedSample[],
+  now: number,
+  state: StateView,
+): FeedSample[] | null {
+  const last = samples[samples.length - 1];
+  if (last && now - last.t < SAMPLE_INTERVAL_MS) return null;
+
+  samples.push({
+    t: now,
+    p50: state.metrics.ingress_p50_us,
+    p99: state.metrics.ingress_p99_us,
+    matchP99: state.metrics.match_p99_us,
+    throughput: state.metrics.throughput_orders_s,
+    trades: state.metrics.trades,
+  });
+  if (samples.length > MAX_SAMPLES) samples.shift();
+  return samples.slice();
+}
+
 export interface ExchangeFeed {
   state: StateView | null;
   connection: ConnectionState;
@@ -28,25 +56,13 @@ export function useExchangeFeed(): ExchangeFeed {
     let timer: ReturnType<typeof setTimeout> | undefined;
 
     const record = (next: StateView) => {
+      const now = Date.now();
       setState(next);
       setConnection('live');
       setError(null);
-      setLastMessageAt(Date.now());
-      const now = Date.now();
-      const samples = historyRef.current;
-      const last = samples[samples.length - 1];
-      if (!last || now - last.t >= 500) {
-        samples.push({
-          t: now,
-          p50: next.metrics.ingress_p50_us,
-          p99: next.metrics.ingress_p99_us,
-          matchP99: next.metrics.match_p99_us,
-          throughput: next.metrics.throughput_orders_s,
-          trades: next.metrics.trades,
-        });
-        if (samples.length > 240) samples.shift();
-        setHistory([...samples]);
-      }
+      setLastMessageAt(now);
+      const samples = sampleHistory(historyRef.current, now, next);
+      if (samples) setHistory(samples);
     };
 
     const connect = () => {

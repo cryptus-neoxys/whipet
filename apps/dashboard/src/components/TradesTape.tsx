@@ -1,6 +1,9 @@
 import { memo } from 'react';
+import type { ReactElement } from 'react';
 import { formatPrice, formatQty, formatTimeNs } from '../lib/format';
 import type { TradeView } from '../lib/types';
+
+const VISIBLE_TRADES = 60;
 
 const TapeRow = memo(
   function TapeRow({ trade, selected }: { trade: TradeView; selected: boolean }) {
@@ -25,13 +28,20 @@ const TapeRow = memo(
 );
 
 export function TradesTape({ trades, selected }: { trades: TradeView[]; selected: string }) {
-  const visible = trades.slice(0, 60);
+  // Read the first 60 by index instead of allocating a slice every frame.
+  const visibleCount = Math.min(trades.length, VISIBLE_TRADES);
+  const rows: ReactElement[] = new Array(visibleCount);
+  for (let index = 0; index < visibleCount; index += 1) {
+    const trade = trades[index];
+    rows[index] = <TapeRow key={trade.seq} trade={trade} selected={trade.symbol === selected} />;
+  }
+
   return (
     <section
       className="panel tape-panel"
       id="trade-tape"
       tabIndex={-1}
-      aria-label="Trade tape, newest 60 trades across all instruments"
+      aria-label={`Trade tape, newest ${VISIBLE_TRADES} trades across all instruments`}
     >
       <div className="panel-head">
         <span>Trades</span>
@@ -45,16 +55,10 @@ export function TradesTape({ trades, selected }: { trades: TradeView[]; selected
         <span>side</span>
       </div>
       <div className="tape">
-        {visible.length === 0 ? (
+        {visibleCount === 0 ? (
           <div className="empty-state">No trades yet. Submit a crossing order.</div>
         ) : null}
-        {visible.map((trade) => (
-          <TapeRow
-            key={`${trade.order_id}-${trade.seq}`}
-            trade={trade}
-            selected={trade.symbol === selected}
-          />
-        ))}
+        {rows}
       </div>
     </section>
   );

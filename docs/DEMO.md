@@ -52,16 +52,25 @@ docker compose -f deploy/compose.yaml exec node whippet healthcheck
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/api/orders` | Submit a new order. |
+| `POST` | `/api/orders/batch` | Up to 256 same-symbol orders in one Iggy append; `?acks=none` omits the per-order array. |
 | `POST` | `/api/cancel` | Cancel a resting order by id. |
+| `GET` | `/readyz` | 200 only when the journal is reachable and every shard is alive. |
 | `GET` | `/api/state` | Full market-data and metrics state. |
 | `GET` | `/api/health` | Liveness plus Iggy connectivity. |
 | `GET` | `/api/instruments` | Configured symbols, tick sizes, ladders, collars. |
 | `GET` | `/api/trades?limit=N` | Newest-first trade tape, default 100. |
 | `GET` | `/metrics` | Prometheus text exposition. |
-| `GET` | `/ws` | WebSocket; full state frames at 20 Hz. |
+| `GET` | `/ws?trades=N` | WebSocket; state frames at 20 Hz, optional trade-tape cap and `Subscribe` filtering. |
 
 Errors use `{"code": "...", "error": "..."}`. Validation errors are HTTP 400;
 an Iggy append failure is HTTP 503 with code `journal_unavailable`.
+
+The same orders can be sent over the binary TCP listener on `8081`
+(`WHIPPET_TCP_ADDR`): a length-prefixed frame carries up to 256 fixed-layout
+78-byte commands of one symbol, and one ack returns the partition, base offset,
+and count. When `WHIPPET_API_TOKEN` is set, the client must send a `Hello` frame
+with the token before `Submit`. The benchmark drives this path with
+`--transport tcp`; see [BENCHMARKS.md](BENCHMARKS.md#tcp-ingress-sweep-dev-loop-measured-headline-pending).
 
 ## Beat 1: place an order
 

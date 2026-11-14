@@ -2,21 +2,29 @@ import { memo } from 'react';
 import { formatPrice, formatQty } from '../lib/format';
 import type { BookView, LevelView } from '../lib/types';
 
+/**
+ * Depth bars only need whole-percent resolution. Quantizing here means a level
+ * whose share of the book did not visibly change keeps an identical `width`
+ * prop, so the row memo can skip it even though a sibling level moved.
+ */
+function depthWidthPct(qty: number, maxQty: number): number {
+  return Math.max(2, Math.round((qty / maxQty) * 100));
+}
+
 const LadderRow = memo(
   function LadderRow({
     level,
     symbol,
     side,
-    maxQty,
+    width,
     best,
   }: {
     level: LevelView;
     symbol: string;
     side: 'buy' | 'sell';
-    maxQty: number;
+    width: number;
     best: boolean;
   }) {
-    const width = Math.max(2, (level.qty / maxQty) * 100);
     return (
       <div className={`ladder-row ladder-${side} ${best ? 'best' : ''}`}>
         <span className="ladder-depth" style={{ width: `${width}%` }} />
@@ -32,7 +40,7 @@ const LadderRow = memo(
     prev.level.orders === next.level.orders &&
     prev.symbol === next.symbol &&
     prev.side === next.side &&
-    prev.maxQty === next.maxQty &&
+    prev.width === next.width &&
     prev.best === next.best,
 );
 
@@ -46,12 +54,11 @@ export function OrderBook({ book }: { book: BookView | null }) {
     );
   }
 
-  const maxQty = Math.max(
-    1,
-    ...book.bids.map((level) => level.qty),
-    ...book.asks.map((level) => level.qty),
-  );
-  const asks = [...book.asks].reverse();
+  let maxQty = 1;
+  for (const level of book.bids) if (level.qty > maxQty) maxQty = level.qty;
+  for (const level of book.asks) if (level.qty > maxQty) maxQty = level.qty;
+
+  const askCount = book.asks.length;
 
   return (
     <section className="panel book-panel" aria-label={`Order book for ${book.symbol}`}>
@@ -60,7 +67,7 @@ export function OrderBook({ book }: { book: BookView | null }) {
           {book.symbol} <span className="panel-sub">book</span>
         </span>
         <span className="panel-meta">
-          seq {book.seq} · {book.bids.length + book.asks.length} levels
+          seq {book.seq} · {book.bids.length + askCount} levels
         </span>
       </div>
       <div className="book-columns">
@@ -70,17 +77,23 @@ export function OrderBook({ book }: { book: BookView | null }) {
       </div>
       <div className="ladder ladder-asks">
         <div className="ladder-side-label">asks</div>
-        {asks.length === 0 ? <div className="ladder-empty">no asks</div> : null}
-        {asks.map((level, index) => (
-          <LadderRow
-            key={level.price_cents}
-            level={level}
-            symbol={book.symbol}
-            side="sell"
-            maxQty={maxQty}
-            best={index === asks.length - 1}
-          />
-        ))}
+        {askCount === 0 ? <div className="ladder-empty">no asks</div> : null}
+        {book.asks.map((_level, index) => {
+          // Walk the ascending asks backwards so the best ask sits next to the
+          // spread, without allocating a reversed copy every frame.
+          const sourceIndex = askCount - 1 - index;
+          const level = book.asks[sourceIndex];
+          return (
+            <LadderRow
+              key={level.price_cents}
+              level={level}
+              symbol={book.symbol}
+              side="sell"
+              width={depthWidthPct(level.qty, maxQty)}
+              best={sourceIndex === 0}
+            />
+          );
+        })}
       </div>
       <div className="spread-row">
         <span className="spread-label">spread</span>
@@ -100,7 +113,7 @@ export function OrderBook({ book }: { book: BookView | null }) {
             level={level}
             symbol={book.symbol}
             side="buy"
-            maxQty={maxQty}
+            width={depthWidthPct(level.qty, maxQty)}
             best={index === 0}
           />
         ))}
