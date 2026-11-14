@@ -297,11 +297,11 @@ replays the tail after the snapshot's maximum `last_offset`. `--to` is
 inclusive. `--expect-hash` turns a hash mismatch into a non-zero exit.
 
 On a local single-node run (M4, Docker Desktop, dev-loop), partition 1 had a
-snapshot at offset 116999. Full replay from offset 0 and snapshot-seeded replay
-from offset 117000 both produced:
+snapshot at offset 124503. Full replay from offset 0 and snapshot-seeded replay
+from offset 124504 both produced:
 
 ```text
-state_hash = 162f4b6f8aa35eaf152b08f7d8c7f7b0dc78fd6c956f41038b67b74d0f15f6aa
+state_hash = db9b78ae6ca70d6cd84131f9568f8b60d2b5b92760eefed21bba41a4926a3cc3
 ```
 
 Equal hashes mean the snapshot state plus the replayed tail matches a replay
