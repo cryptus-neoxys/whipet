@@ -288,7 +288,7 @@ are in [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Durable order ingress | Implemented on one node. The gateway returns after the Iggy append confirmation. `persisted` protects against a process restart, not disk or host loss. |
 | Executions and market data through Iggy | Implemented. Both are published to the log; the MD hub consumes the MD topic. Executions have no Phase 1 consumer. |
 | Snapshot restore with a state hash | Implemented. `whippet verify` recomputes each snapshot hash. |
-| Replay reproduces the state hash | Implemented. `whippet replay` rebuilds an engine from the order log. One local dev-loop check: full replay from offset 0 and snapshot-seeded replay from a snapshot at offset 124503 both ended at `db9b78ae...3cc3`. One run, not a benchmark. |
+| Replay reproduces the state hash | Implemented. `whippet replay` rebuilds an engine from the order log. One local dev-loop check: full replay from offset 0 and snapshot-seeded replay from a snapshot at offset 67038 both ended at `4690bb5d...8182`. One run, not a benchmark. |
 | Sub-millisecond matching | Not published. It is a design target and a live in-process metric only. No benchmark result exists. |
 | Low-single-digit-millisecond durable path on Linux | Not measured. No headline numbers yet. |
 | No acknowledged loss across one node failure | Not implemented. Single node, no failover. |
@@ -313,15 +313,15 @@ whippet replay --iggy-addr 127.0.0.1:8090 --partition 1 --snapshot-dir data/snap
 ```
 
 On a local single-node run (M4, Docker Desktop, dev-loop), the snapshot was
-written at offset 124503 and both replays ended with:
+written at offset 67038 and both replays ended with:
 
 ```text
-state_hash = db9b78ae6ca70d6cd84131f9568f8b60d2b5b92760eefed21bba41a4926a3cc3
+state_hash = 4690bb5d6a7a759dd03163613a834c78b68dd7d3639235e919ae56f5c2ea8182
 ```
 
 The first replay reports `"seeded_from_snapshot": false` and `"from": 0`. The
-second reports `"seeded_from_snapshot": true`, `"snapshot_offset": 124503`, and
-`"from": 124504`. Equal hashes mean the snapshot state plus the replayed tail is
+second reports `"seeded_from_snapshot": true`, `"snapshot_offset": 67038`, and
+`"from": 67039`. Equal hashes mean the snapshot state plus the replayed tail is
 the same state as replaying the whole log. That is a determinism check for
 this log and this build. It is not a crash test, not an audit proof, and not a
 benchmark.
@@ -343,11 +343,11 @@ Fresh stack, simulator stopped, mixed limit/IOC/cancel L1 flow, 8 s measured,
 | Path | p50 | p99 | Errors |
 |---|---:|---:|---:|
 | HTTP single order, 1,000 orders/s | 538 µs | 9,567 µs | 0 |
-| HTTP single order, 5,000 orders/s (group commit) | 2,030 µs | 28,159 µs | 0 |
-| HTTP batch 10, 5,000 orders/s | 1,054 µs | 9,799 µs | 0 |
+| HTTP single order, 5,000 orders/s (group commit) | 1,772 µs | 4,299 µs | 0 |
+| HTTP batch 10, 5,000 orders/s | 1,127 µs | 3,657 µs | 0 |
 | HTTP batch 256, 5,000 orders/s | 7,779 µs | 14,671 µs | 0 |
 | TCP batch 1, 5,000 orders/s, 32 connections | 1,722 µs | 49,311 µs | 0 |
-| TCP batch 10, 10,000 orders/s | 598 µs | 10,647 µs | 0 |
+| TCP batch 10, 10,000 orders/s | 527 µs | 3,921 µs | 0 |
 
 The 5,000 orders/s single-order row used to queue at p50 838 ms with tens of
 thousands of errors; per-partition group commit coalesced up to 78 messages per

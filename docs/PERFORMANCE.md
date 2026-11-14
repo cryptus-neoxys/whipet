@@ -203,8 +203,53 @@ single-order path was p50 838 ms with 40k errors before the tranche.
 
 The 5,000/s single-order path was p50 838 ms with 40k errors before group
 commit. The replay proof was rerun after the tranche: full and snapshot-seeded
-replay both end at `db9b78ae6ca70d6cd84131f9568f8b60d2b5b92760eefed21bba41a4926a3cc3`
-from snapshot offset 124503 (tail 161).
+replay both end at `4690bb5d6a7a759dd03163613a834c78b68dd7d3639235e919ae56f5c2ea8182`
+from snapshot offset 67038 (tail 358).
+
+### Phase 1.5c (implemented; dev-loop measured)
+
+Phase 1.5c continues the order fixed by
+[ADR 0009](adr/0009-performance-budget-and-optimization-order.md) and is
+specified — and now implemented — in
+[ADR 0010](adr/0010-shard-thread-and-journal-pipeline.md). It has four
+workstreams. The microbenchmarks measured with this tranche are listed below;
+the dev-loop rows below are a first before/after, one repetition each, and the
+p50 is within host noise while the tail moved.
+
+| Workstream | Change | Expected effect | Status |
+|---|---|---|---|
+| Shard thread and rings | One dedicated OS thread (`whippet-shard-<id>`) per active shard; bounded input ring (reader → matcher) and output ring (matcher → writer), capacity 2, plus a recycle channel that returns the polled buffer to the reader; the matcher does no I/O and no await; the reader/writer tasks own the journal edge | Removes the runtime migration and interleaving jitter from the match path; bounds in-flight memory per shard; backpressure when a ring fills instead of unbounded queueing | Implemented ([ADR 0010](adr/0010-shard-thread-and-journal-pipeline.md)); end-to-end sweep pending |
+| Snapshot hash off-loop | The matcher calls `snapshot_state_without_hash`; the blocking snapshot writer calls `whippet_engine::fill_symbol_hashes` before saving; snapshots are gated by `appended_offset` | Removes the state-hash cost from the match path; the snapshot can no longer claim a resume offset whose outputs were lost | Implemented; hash cost measured below |
+| Per-shard metrics | Each matcher records into its own lock-free `ShardMetrics` (counters + local histogram), merged into the global `Metrics` once per second and on exit | Removes one `Mutex<Histogram>` lock per command from every shard's serial path | Implemented; merge cost measured below |
+| Gateway/journal allocation pass | Per-event allocations on the edges: `execution_message`/`md_message` payload `Vec` + header `String`s remain the target; the reader's per-batch read `Vec` is now recycled | Lower CPU and allocation per event; fewer transient allocations per output | Partially implemented (recycle channel); message-construction pass pending |
+
+Measured with this tranche (criterion, loaded host — directionally useful, not
+headline numbers):
+
+- **Off-loop hash cost.** `hash_symbol_snapshot` measures ~2.51 ms on a book
+  of 20,000 orders plus a 20,000-entry dedup table. That is the work the match
+  path used to pay on the snapshot interval and now pays on the blocking
+  snapshot writer instead.
+- **Per-shard metrics merge.** Merging a shard's histogram into the global
+  `Metrics` costs ~7.4 µs per 256-sample merge, paid once per second per
+  matcher instead of one lock acquisition per command.
+
+Dev-loop after the shard thread (Docker Desktop, simulator stopped, 8 s
+measured, 2 s warmup, one repetition). Before is the final Sprint A sweep on
+the same host:
+
+| Path | Before p50 / p99 | After p50 / p99 |
+|---|---:|---:|
+| HTTP single order, 5,000/s | 2,030 / 28,159 µs | 1,772 / 4,299 µs |
+| HTTP batch 10, 5,000/s | 1,054 / 9,799 µs | 1,127 / 3,657 µs |
+| TCP batch 10, 10,000/s | 598 / 10,647 µs | 527 / 3,921 µs |
+
+The p50 differences are inside one-repetition host noise; the p99 collapse is
+the shard thread plus the off-loop snapshot hash and per-shard metrics. These
+are not headline numbers and the Linux matrix is still the publishable
+artifact. Per [ADR 0009](adr/0009-performance-budget-and-optimization-order.md),
+a change without a manifest is not a performance result; the manifests are in
+`artifacts/bench` and are local.
 
 ## Stage budget
 
@@ -222,13 +267,13 @@ Status legend:
 | 2 | Order-id / participant hash | `OrderId::derive`, `ParticipantId::derive` in `crates/whippet-core/src/ids.rs` | Two BLAKE3 hashes over short inputs; 16-byte and 8-byte truncation | estimated (two short hashes); no isolated timing |
 | 3 | Header / command encode | `Command::encode` (78 B); `MessageMeta::pairs` (7 string pairs); `JournalMessage` | One 78-byte payload `Vec`; seven header values plus a `Vec`; keys are cached in the journal, values are still strings; 32-hex `trace_id` formatting | estimated; 78 B and 7 headers are documented in [ARCHITECTURE.md](ARCHITECTURE.md#protocol) |
 | 4 | Iggy append ack | `IggyJournal::append_owned` → `send_messages` → await the first confirmation | One TCP round trip for a batch; cached header keys and topic identifiers; owned payload (no copy); 256-message chunks; broker persistence and flush policy | measured only as part of the whole request; not isolated. This is the only awaited I/O before the ack. |
-| 5 | Engine poll/decode | `run_engine_shard` → `journal.read_payloads(Topic::Orders, 1024, 50 ms)` → `Command::decode` | Long poll with `min_count = 1`; up to 1024 records; payload-only read skips header TLV parse; one fixed-layout decode per record | unknown |
+| 5 | Engine poll/decode | `read_orders` → `journal.read_payloads_into(Topic::Orders, 1024, 50 ms)` → `Command::decode` (in `run_matcher`) | Long poll with `min_count = 1`; up to 1024 records; payload-only read skips header TLV parse; one fixed-layout decode per record; the polled buffer is recycled via the recycle channel; the whole batch is offset-validated | unknown |
 | 6 | Match | `ShardEngine::process` → `SymbolEngine::process` | Best-price lookup; order-index and dedup hash lookups; FIFO walk per fill; FOK walks every resting order at crossing levels; output `Vec` pushes | unknown; the live `whippet_match_latency_microseconds` gauge exists, but no published value |
 | 7 | Execution / MD encode | `execution_message`, `md_message`, `snapshot_message` in `engine_runner.rs` | 104-byte or 84-byte payload `Vec` plus seven header `String`s per event; a sweep can emit several events per order | estimated; 104 B and 84 B are documented in [ARCHITECTURE.md](ARCHITECTURE.md#protocol) |
-| 8 | Iggy append (engine output) | `append_with_retry` for `executions` and `md` in parallel, then `commit_with_retry` | Two appends in parallel plus one offset commit per non-empty poll batch; cached header keys; 256-message chunks | unknown; structurally two parallel round trips plus one commit per batch |
+| 8 | Iggy append (engine output) | `run_writer` → `append_with_retry` for `executions` and `md` in parallel (bounded, 30 attempts), then the watermark commit | Two joined appends per batch plus one coalesced offset commit; cached header keys; 256-message chunks; on retry exhaustion the shard stops and its offset does not advance | unknown; structurally two parallel round trips plus one commit per batch |
 | 9 | MD consume | `run_md_shard` → `journal.read_payloads(Topic::Md, 1024, 100 ms)` → `MdHub::apply` | Payload-only read; one global hub `Mutex` acquisition and one clock read per event; `BTreeMap`/`HashMap` updates; one commit per batch | unknown |
 | 10 | 20 Hz state build | `MdHub::spawn_publisher` → `publish` → `build_publish_state` | Full `BookView` build for each symbol (20 levels per side plus depth folds), 250-trade tape clone, metrics snapshot (three locks), `watch` replace; `/api/state` and `/metrics` now read the published `Arc` instead of rebuilding | ~0.73 µs build; ~6.9 ns `latest()` read; 20 Hz documented in [ARCHITECTURE.md](ARCHITECTURE.md#market-data) |
-| 11 | WS / JSON delivery | `ws_loop` → deep clone of `StateView` → `serde_json::to_string` → text frame | One deep clone and one serialization per subscriber per tick; uncompressed text; 64 KiB frame cap | unknown; structurally O(subscribers) serialization and O(subscribers) egress |
+| 11 | WS / JSON delivery | `ws_loop` → `FrameCache` entry for `(symbols, trade-limit)` → refcounted buffer send → text frame | One serialization per distinct `(filter, tick)` per tick, shared to subscribers as a refcounted buffer; the cache holds at most 16 distinct frames per tick; uncompressed text; 64 KiB frame cap | unknown; structurally one serialization per distinct filter per tick plus O(subscribers) egress |
 
 The first four rows are the durable-ack path. Rows 5–8 are the engine path.
 Rows 9–11 are the market-data path. They are three different latency paths; a
@@ -335,15 +380,16 @@ current records do not link them with a single clock.
 ```text
 1 hub frame per 50 ms
   → watch::Sender<Arc<StateView>>
+  → FrameCache: one serde_json::to_string per distinct (filter, tick), capped at 16 entries
   → N WebSocket tasks
-  → N × (deep clone + serde_json::to_string + text frame send)
+  → N × (refcounted buffer send + text frame write)
 ```
 
 The `watch` channel is the isolation mechanism: a slow browser misses
 intermediate frames, and the engine never waits for it. The cost model is:
 
 ```text
-serializations per second = 20 × N
+serializations per second = 20 × distinct (filter, tick) pairs  (≤ 16 per tick)
 egress bytes per second    ≈ 20 × N × frame_bytes
 ```
 
@@ -361,12 +407,12 @@ does not, and the edge is where the baseline knee lives.
 
 | Rule | Where it must hold | Current status | Gap or evidence |
 |---|---|---|---|
-| No allocation in the match loop | `SymbolEngine::process`, `Book` operations | Holds in steady state. Output vectors are caller-owned and reused; the arena, free list, and index are preallocated. | `Book::snapshot` and `state_hash` allocate, but only on the snapshot interval and shutdown. Journal-edge message construction allocates per event: `MessageMeta::pairs` (7 `String`s), `execution_message`/`md_message` (payload `Vec` + 7 `String`s), `build_order`. |
-| No syscall in the match loop | `SymbolEngine::process` | Holds. The matcher performs no I/O. | The shard loop around it reads the clock once per record (`Instant::now()` in `engine_runner.rs`) and the hub reads it once per MD event (`now_ns()` in `MdHub::apply`). On Linux these are vDSO clock reads, not syscalls, but they are still work on the serial path. |
-| No lock in the match loop | `SymbolEngine::process` | Holds. One task owns each partition's books; the engine crate has no lock. | `Metrics::record_match_latency_us` locks a `Mutex<Histogram>` per command in the shard loop. `MdHub::apply_batch` takes the hub mutex once per poll batch, not per event. Both are outside the pure matcher. |
-| No async in the engine | `whippet-engine` | Holds. The crate has no Tokio dependency. The shard task awaits only at the journal edge: poll, append, commit. | None in the engine. The async boundary is the journal edge by design. |
+| No allocation in the match loop | `SymbolEngine::process`, `Book` operations | Holds in steady state. Output vectors are caller-owned and reused; the arena, free list, and index are preallocated. | The snapshot-interval state clone (`snapshot_state_without_hash`) still allocates, but between batches on the matcher thread, not per command; the hash itself is computed on the blocking snapshot writer. Journal-edge message construction allocates per event: `MessageMeta::pairs` (7 `String`s), `execution_message`/`md_message` (payload `Vec` + 7 `String`s), `build_order`. The reader's polled buffer is recycled, not reallocated per batch. |
+| No syscall in the match loop | `SymbolEngine::process` | Holds. The matcher performs no I/O. | The matcher thread reads the clock once per record for the latency sample (`Instant::now()` in `run_matcher`) and the hub reads it once per MD event (`now_ns()` in `MdHub::apply`). On Linux these are vDSO clock reads, not syscalls, but they are still work on the serial path. |
+| No lock in the match loop | `SymbolEngine::process` | Holds. The matcher thread owns each partition's books; the engine crate has no lock. | Match latency and counters go into the per-shard lock-free `ShardMetrics`, merged into the global `Metrics` once per second. `MdHub::apply_batch` takes the hub mutex once per poll batch, not per event. Both are outside the pure matcher. |
+| No async in the engine | `whippet-engine` | Holds. The crate has no Tokio dependency, and the matcher thread has no async context at all. | The async boundary lives in the `read_orders` and `run_writer` tasks around the matcher; the matcher never awaits. |
 | Fixed headers and payload layout | Protocol and journal edge | Holds. Payloads are fixed-width little-endian with no varints, floats, or padding: 78 B command, 104 B execution, 84 B MD event. Orders and MD snapshots carry the full seven headers; executions and MD events carry four routing headers. The engine never parses headers. | The engine and MD runners use the payload-only `read_payloads` path, so no header TLV parse or `String` materialisation happens on the consume path. Header keys are cached; header values are still `String`s on the produce path. |
-| Per-partition single writer | Engine task per active partition | Holds logically. One task per active partition, no concurrent writer, no lock on the book. | The task is a Tokio task on a multi-thread runtime, not a pinned OS thread. It can migrate cores between awaits. Pinning, busy-poll, and SPSC rings are later Linux work. |
+| Per-partition single writer | Matcher thread per active partition | Holds. One dedicated OS thread (`whippet-shard-<id>`) per active partition, no concurrent writer, no lock on the book. | The thread is not pinned to a core; the OS can still migrate it. Core pinning, busy-poll, and NUMA work remain later Linux work, but the rings (bounded channels, capacity 2) are in place. |
 
 ### Periodic costs that are not in the per-order budget
 
@@ -374,11 +420,14 @@ These do not show up in a steady-state per-order measurement, but they can own a
 tail sample:
 
 - **Snapshot build.** Every `WHIPPET_SNAPSHOT_EVERY` commands (default 10,000),
-  `engine.snapshot_state()` clones the book and the dedup table on the shard
-  task, then `spawn_blocking` writes the file. `state_hash()` iterates the book
-  and the dedup table. At the default dedup capacity (500,000 entries per
-  symbol), this is a large clone. It is a periodic tail-latency source, not a
-  per-order cost.
+  the matcher calls `snapshot_state_without_hash()`, which clones the book and
+  the dedup table between batches; the blocking snapshot writer then computes
+  the state hash (`fill_symbol_hashes`) and writes the file. The snapshot is
+  gated by `appended_offset`, so it is only taken once every output up to the
+  matcher's offset is in the journal. At the default dedup capacity (500,000
+  entries per symbol), the clone is large; the hash that used to accompany it
+  on the match path is ~2.51 ms on a 20k/20k book (measured above). It is a
+  periodic tail-latency source, not a per-order cost.
 - **Initial MD snapshot.** At startup, each shard publishes a full MD snapshot
   before it begins consuming. This is a startup cost, not a steady-state cost.
 - **Health monitor.** Every five seconds the node pings Iggy and refreshes
@@ -421,10 +470,14 @@ edge between the matcher and the journal:
   contiguous offsets.
 - Harness: `--batch-size N` drives the batch body, `workload.batch_size` is
   recorded, and orders/s is reported separately from requests/s.
-- Journal: the shard runners use `read_payloads`, the owned append path, and
-  cached header keys; executions/MD carry routing headers.
-- Engine loop: the executions and MD appends and the next orders poll are
-  joined, so the shard overlaps matching with the broker round trip.
+- Journal: the shard runners use `read_payloads`/`read_payloads_into`, the
+  owned append path, and cached header keys; executions/MD carry routing
+  headers.
+- Engine loop: the shard is now the [ADR 0010](adr/0010-shard-thread-and-journal-pipeline.md)
+  pipeline. The reader task polls into the input ring while the matcher works
+  on the previous batch, and the writer's joined Executions/MD appends
+  overlap the matcher's next batch, so matching and the broker round trips
+  overlap without awaits on the match path.
 
 **Expected effect.** One broker round trip per N orders instead of one per
 order. Throughput rises until the broker or disk saturates. The first order's
@@ -450,12 +503,17 @@ engine's output path still has these per-event costs.
 **Addressed.** The runners use `read_payloads`; gateway and TCP use
 `append_owned` (via group commit); executions/MD carry routing headers; the
 commit is coalesced to 256 records or 100 ms with a documented replay window;
-and the shard loop joins the output appends with the next poll.
+the output appends are joined in `run_writer` while the matcher proceeds on
+the input ring.
 
-**Next optimization.** Move the match-latency histogram off a global mutex: a
-per-shard histogram merged on scrape removes one lock per command. Then move
-the state-hash computation into the snapshot writer so the shard does not pay
-it on the loop.
+**Done since.** The match-latency histogram is now per-shard (`ShardMetrics`,
+lock-free, merged once per second), and the state-hash computation moved into
+the snapshot writer (`fill_symbol_hashes`), both measured in
+[Phase 1.5c](#phase-15c-implemented-end-to-end-sweep-pending) above.
+
+**Next optimization.** The remaining per-event costs are message construction:
+`execution_message`/`md_message` still allocate a payload `Vec` and header
+`String`s per event. A profile should decide whether that pass is next.
 
 **Expected effect.** Lower CPU and allocation per event; fewer broker round
 trips per batch. Commit coalescing trades a wider at-least-once replay window

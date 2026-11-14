@@ -19,9 +19,9 @@ static bundle served by the same process.
                      whippet-trading/orders (16 partitions)
                                        │
               ┌────────────────────────┴────────────────────────┐
-              │ engine task for partition 1                      │
-              │ engine task for partition 5                      │
-              │ engine task for partition 12                     │
+              │ engine shard for partition 1                     │
+              │ engine shard for partition 5                      │
+              │ engine shard for partition 12                     │
               │ (one logical writer per partition)               │
               └───────┬──────────────────────────────┬──────────┘
                       │                              │
@@ -157,8 +157,9 @@ With 16 partitions:
 | ETH-USD | 5 |
 | SOL-USD | 12 |
 
-Only partitions that own a configured symbol get an engine task. The node
-starts three engine tasks and three MD consumer tasks, not sixteen. The other
+Only partitions that own a configured symbol get an engine shard: one matcher
+thread plus its reader and writer tasks. The node starts three engine shards
+and three MD consumer tasks, not sixteen. The other
 partitions exist for future scale-out. If two configured symbols hash to the
 same partition, one engine owns both books; that is supported, but the current
 three-symbol set does not collide.
@@ -198,16 +199,82 @@ command sets it in Phase 1.
 
 ## Single writer, not a pinned thread
 
-Each active partition has exactly one engine task. That task is the only code
-that touches the partition's books, so there is no lock and no concurrent
-writer. The task is a Tokio task on the multi-thread runtime, not a pinned OS
-thread, and it awaits between batches. Phase 1 does not use core pinning, a
-busy-poll loop, or an SPSC ring. The single-writer property is logical; it does
-not come from thread affinity.
+Each active partition has exactly one matcher thread, and that thread is the
+only code that touches the partition's books, so there is no lock and no
+concurrent writer. The matcher runs on a dedicated OS thread
+(`whippet-shard-<id>`), not a Tokio task. It is still **not pinned to a core**,
+and the node still does not busy-poll; core pinning, `SYS_NICE`, and NUMA work
+remain Phase-2/Linux work. The single-writer property now comes from thread
+ownership plus bounded channels, not from core affinity.
 
-The async boundary is the journal edge: poll a batch, run the synchronous
-engine over it, append executions, append MD, commit the offset. The match loop
-itself never yields.
+The async boundary has moved out of the match path entirely: an async reader
+task polls the orders log and feeds the matcher through a bounded input ring,
+and an async writer task drains the matcher's bounded output ring, appends
+executions and MD, and commits the offset. The matcher never awaits and never
+calls the journal. Details in [ADR 0010](adr/0010-shard-thread-and-journal-pipeline.md).
+
+### Shard thread and rings
+
+[ADR 0010](adr/0010-shard-thread-and-journal-pipeline.md) is implemented: each
+active shard is a three-stage pipeline on a dedicated OS thread.
+
+```text
+read_orders (async task, orders client)
+        │  bounded input ring (reader → matcher, capacity 2)
+        ▼
+whippet-shard-<id> (dedicated OS thread; owns ShardEngine; no I/O, no await)
+        │  bounded output ring (matcher → writer, capacity 2)
+        ▼
+run_writer (async task; appends executions/MD, commits, forwards snapshots)
+```
+
+The design rules:
+
+- **One dedicated OS thread per active shard.** Three active partitions mean
+  three matcher threads. The thread owns the engine; it never awaits and never
+  calls the journal. Timestamps come from the command, as before.
+- **Recycle channel.** The matcher hands each polled buffer back to the
+  reader, which refills it with `read_payloads_into` instead of allocating a
+  `Vec` per batch.
+- **The reader validates the whole batch.** The first offset must equal the
+  requested offset and the offset span must equal the record count; a gap or
+  an overlap marks the shard failed instead of silently skipping an order.
+- **The writer owns the async journal edge.** It joins the Executions and MD
+  appends, commits the consumer offset, and forwards MD snapshots. An output
+  append is retried up to 30 times with backoff; on exhaustion the shard is
+  marked failed and the applied offset and commit are not advanced, so a
+  restart replays the tail instead of skipping orders whose outputs were
+  never published.
+- **Snapshot gate.** An `appended_offset` atomic records the highest offset
+  whose outputs are in the journal. A periodic snapshot is taken only once
+  the gate is open for the matcher's current offset; a due snapshot that
+  would run ahead of the writer is deferred to the next batch boundary where
+  the gate is open. The snapshot never claims a resume offset whose outputs
+  were lost.
+- **Off-loop hash.** The matcher calls `snapshot_state_without_hash`; the
+  blocking snapshot writer computes the hashes (`fill_symbol_hashes`) before
+  saving. The snapshot file format is version 2 (`SymbolSnapshot` carries the
+  per-symbol config, `BookSnapshot` carries `min_price_ticks`); version 1
+  files are rejected.
+- **Per-shard metrics.** Each matcher records into its own lock-free
+  `ShardMetrics`, merged into the global `Metrics` once per second and once
+  on exit, instead of taking a global histogram lock per command.
+
+Backpressure, failure, and shutdown:
+
+- **Input ring full:** the reader's `send` awaits until the matcher drains.
+  Nothing is dropped; log order is preserved.
+- **Output ring full:** the matcher blocks in `blocking_send` until the writer
+  drains space. Outputs are never dropped — a dropped execution or MD event
+  would break the at-least-once contract and `md_seq` continuity.
+- **Matcher panic:** the thread join detects the dead thread, the shard is
+  marked failed, and the shard errors out. A panicked matcher never leaves the
+  node hanging on a ring that will not drain.
+- **Graceful shutdown:** the reader exits on the shutdown watch and drops its
+  sender, closing the matcher input; the matcher sends its final batch with
+  the final snapshot; the writer appends and commits the remaining outputs and
+  persists the final snapshot inside the shutdown budget. The bounded rings
+  make the drain finite.
 
 ## Market data
 
@@ -258,12 +325,19 @@ BLAKE3 state hash.
 A shard snapshot contains all symbol states for one partition and is written
 to `data/snapshots/partition-<N>.snapshot`:
 
-- Magic `WHIPSNP1`, format version `1`, then a bincode payload.
+- Magic `WHIPSNP1`, format version `2`, then a bincode payload. Version 1
+  files are rejected: `SymbolSnapshot` now carries the per-symbol config and
+  `BookSnapshot` carries `min_price_ticks`, so the state hash can be
+  reproduced from the snapshot alone. An existing deployment must rebuild
+  snapshots (replay, or a graceful-shutdown final snapshot) before upgrading.
 - Written to a temporary file, `fsync`ed, then renamed over the previous
   snapshot. A reader never sees a partial file.
 - Triggered when a symbol reaches `WHIPPET_SNAPSHOT_EVERY` commands (default
-  10,000) and after the batch that crossed the interval commits. A graceful
-  shutdown also writes a final snapshot.
+  10,000) and after the batch that crossed the interval commits — and only
+  once every output up to that offset is in the journal
+  (`appended_offset` gate); a snapshot that comes due while the writer is
+  behind is deferred to the next safe batch boundary. A graceful shutdown
+  also writes a final snapshot.
 
 On startup, for each active shard:
 
@@ -297,11 +371,11 @@ replays the tail after the snapshot's maximum `last_offset`. `--to` is
 inclusive. `--expect-hash` turns a hash mismatch into a non-zero exit.
 
 On a local single-node run (M4, Docker Desktop, dev-loop), partition 1 had a
-snapshot at offset 124503. Full replay from offset 0 and snapshot-seeded replay
-from offset 124504 both produced:
+snapshot at offset 67038. Full replay from offset 0 and snapshot-seeded replay
+from offset 67039 both produced:
 
 ```text
-state_hash = db9b78ae6ca70d6cd84131f9568f8b60d2b5b92760eefed21bba41a4926a3cc3
+state_hash = 4690bb5d6a7a759dd03163613a834c78b68dd7d3639235e919ae56f5c2ea8182
 ```
 
 Equal hashes mean the snapshot state plus the replayed tail matches a replay
@@ -324,8 +398,8 @@ duplicate. See [FAILURE-MODES.md](FAILURE-MODES.md).
   process. Process isolation is logical, not a network boundary.
 - **HTTP JSON ingress.** No binary TCP, QUIC, or FIX session layer. JSON is a
   convenience path for the demo and the bench harness.
-- **Tokio tasks, not pinned cores.** No `SYS_NICE`, no busy-poll, no
-  hugepages, no NUMA work.
+- **No pinned cores.** The matcher has a dedicated OS thread, but no core
+  pinning, no `SYS_NICE`, no busy-poll, no hugepages, no NUMA work.
 - **`BTreeMap` in the MD cache.** The price ladder lives only in the engine.
 - **bincode snapshots.** Simple and versioned, not zero-copy or
   platform-stable across schema changes.
