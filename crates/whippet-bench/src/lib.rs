@@ -30,6 +30,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod fanout;
+
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -114,6 +116,8 @@ pub enum BenchError {
     Histogram(String),
     #[error("protocol error: {0}")]
     Protocol(String),
+    #[error("websocket error: {0}")]
+    WebSocket(String),
     #[error("invalid config: {0}")]
     Config(String),
 }
@@ -1721,7 +1725,7 @@ async fn collect(mut rx: mpsc::Receiver<Sample>, window_count: usize) -> Collect
     }
 }
 
-fn new_histogram() -> Histogram<u64> {
+pub(crate) fn new_histogram() -> Histogram<u64> {
     Histogram::<u64>::new_with_max(HISTOGRAM_MAX_US, HISTOGRAM_SIG_DIGITS)
         .expect("valid histogram bounds")
 }
@@ -1881,7 +1885,7 @@ fn empty_latency() -> LatencySummary {
     }
 }
 
-fn summarize(histogram: &Histogram<u64>) -> LatencySummary {
+pub(crate) fn summarize(histogram: &Histogram<u64>) -> LatencySummary {
     if histogram.is_empty() {
         return empty_latency();
     }
@@ -1982,7 +1986,7 @@ fn generate_order(
     }
 }
 
-fn scope_label(host: &HostInfo) -> String {
+pub fn scope_label(host: &HostInfo) -> String {
     if host.virtualization == "native" && host.os.eq_ignore_ascii_case("linux") {
         "headline".into()
     } else {
@@ -2017,7 +2021,7 @@ fn virtualization() -> String {
     })
 }
 
-fn host_info() -> HostInfo {
+pub fn host_info() -> HostInfo {
     let os = command("uname", &["-s"]).unwrap_or_else(|| std::env::consts::OS.into());
     let kernel = command("uname", &["-r"]).unwrap_or_default();
     let (cpu_model, logical_cores, memory_bytes) = platform_cpu();
@@ -2095,7 +2099,7 @@ fn command(program: &str, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn git_sha() -> String {
+pub fn git_sha() -> String {
     std::env::var("WHIPPET_GIT_SHA")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -2104,11 +2108,17 @@ fn git_sha() -> String {
         })
 }
 
-fn git_dirty() -> bool {
+pub fn git_dirty() -> bool {
     if let Ok(value) = std::env::var("WHIPPET_GIT_DIRTY") {
         return matches!(value.as_str(), "1" | "true" | "TRUE" | "yes");
     }
     command("git", &["status", "--porcelain"]).is_some_and(|value| !value.is_empty())
+}
+
+pub fn image_digest() -> Option<String> {
+    std::env::var("WHIPPET_IMAGE_DIGEST")
+        .ok()
+        .filter(|value| !value.is_empty() && value != "unknown")
 }
 
 #[cfg(test)]

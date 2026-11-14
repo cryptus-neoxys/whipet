@@ -29,9 +29,11 @@ and Iggy 0.10's default `message_bus.max_batch` is 256.
 HTTP JSON is still the default transport. `--transport tcp` drives the binary
 length-prefixed ingress instead, with per-frame stage timestamps. A final
 dev-loop batch-size sweep, a group-commit measurement, and a TCP measurement
-are recorded below; there are still no headline numbers. Fanout, replay,
-failover, and soak workloads are in the matrix but not implemented. The
-run-matrix table says which rows the harness can execute today.
+are recorded below; there are still no headline numbers. A 20 Hz WebSocket
+fanout harness (`examples/fanout.rs`, `scripts/bench-fanout.sh`) measures `/ws`
+egress across `N` concurrent subscribers (results pending); replay, failover,
+and soak workloads are in the matrix but not implemented. The run-matrix table
+says which rows the harness can execute today.
 
 ## Dev-loop result: final batch-size sweep (after)
 
@@ -78,6 +80,19 @@ resolve a p99 difference; the native Linux L1 run is the publishable artifact.
 
 These are one-repetition dev-loop numbers on a shared laptop. They are not
 headline results.
+
+### After the dedicated shard thread (dev-loop)
+
+Same host, simulator stopped, 8 s measured, 2 s warmup, one repetition. The
+shard thread, off-loop snapshot hash, and per-shard metrics mainly moved the
+tail; p50 is within host noise:
+
+| Path | Before p50 / p99 | After p50 / p99 |
+|---|---:|---:|
+| HTTP single order, 5,000/s | 2,030 / 28,159 µs | 1,772 / 4,299 µs |
+| HTTP batch 10, 5,000/s | 1,054 / 9,799 µs | 1,127 / 3,657 µs |
+| TCP batch 10, 10,000/s | 598 / 10,647 µs | 527 / 3,921 µs |
+
 
 ## Method
 
@@ -268,6 +283,10 @@ cgroup), whatever `WHIPPET_VIRTUALIZATION` says.
 - Compares the first and last ten one-second windows for steady state.
 - Writes one JSON manifest with the achieved mix, overload count, and the
   steady-state result.
+- Measures the 20 Hz conflated WebSocket fanout path (`examples/fanout.rs`)
+  across `N` concurrent `/ws` subscribers, recording frames/s, bytes/s,
+  inter-frame gap percentiles, stalled subscribers (>1 s gap), and `/metrics`
+  deltas in a fanout manifest.
 
 What it does not do:
 
@@ -281,7 +300,8 @@ What it does not do:
 - No raw `.hdr` files. The manifest's summaries are the raw artifact.
 - No fill notifications. A cancel can race a fill and be rejected; those
   rejections appear in `error_count`.
-- No fanout, replay, failover, or soak workloads.
+- No replay, failover, or soak workloads; the fanout runner measures the 20 Hz
+  `/ws` feed rather than the dossier's 100k/s raw-tick F2 workload.
 - No CPU pinning or isolation inside the harness. The Linux runner applies
   `taskset` when asked and records governor and SMT state.
 - No server-side metrics correlation; the gateway's own histograms are
@@ -296,7 +316,7 @@ is the honest status of this harness.
 |---|---|---|---|---|
 | L1 | 64 B orders, 1 symbol | 1k / 5k / 10k / 25k / 50k / 100k orders/s | 5 min x 5 | Partial. HTTP JSON by default, binary TCP with `--transport tcp`, mixed limit/IOC/cancel flow, optional batching, TCP stage timestamps. Payload size is not 64 B on the wire. |
 | L2 | 256 B, 10 symbols | 10k / 50k orders/s | 5 min x 5 | Partial. Only three instruments exist; the runner labels the row `L2-3sym`. |
-| F1 | 10k orders/s | 1 / 10 / 100 / 1000 subscribers | 5 min x 5 | No. `subscribers` is always 0; there is no fanout workload. |
+| F1 | 10k orders/s | 1 / 10 / 100 / 1000 subscribers | 5 min x 5 | Partial. `examples/fanout.rs` (`scripts/bench-fanout.sh`) measures `/ws` fanout across `N` subscribers (20 Hz conflated state frames); not yet coupled with a 10k/s ingress driver in one run. |
 | F2 | Fixed 100k egress/s | 10 / 100 subscribers | 5 min x 5 | No. |
 | R1 | 10M replay | 0 / mid / tail; 1 / 10 / 100 consumers | drain x 5 | No. `whippet replay` exists for correctness, not replay throughput. |
 | R2 | Replay + live 10k/s | 1 config | 5 min x 5 | No. |
@@ -483,8 +503,8 @@ mode, not a latency result.
 
 The replay proof was rerun after the change. Full replay and snapshot-seeded
 replay both end at
-`db9b78ae6ca70d6cd84131f9568f8b60d2b5b92760eefed21bba41a4926a3cc3` from
-snapshot offset 124503 (tail 161). This is a correctness check, not a latency
+`4690bb5d6a7a759dd03163613a834c78b68dd7d3639235e919ae56f5c2ea8182` from
+snapshot offset 67038 (tail 358). This is a correctness check, not a latency
 measurement.
 
 ## TCP-ingress sweep (dev-loop measured, headline pending)
@@ -585,6 +605,169 @@ Do not compare a TCP dev-loop run with an HTTP dev-loop run and call the delta a
 transport win. Different hosts, connection pools, and server builds change the
 result; the comparison is only meaningful on the same native host, commit, and
 snapshot setting.
+
+## WebSocket fanout (20 Hz conflated feed — results pending)
+
+The gateway publishes conflated market-data state frames over `/ws` at 20 Hz
+(50 ms nominal period) using a shared `FrameCache` keyed by
+`(symbols, trade_limit, sequence, freshness_ms)`. The fanout harness
+(`crates/whippet-bench/examples/fanout.rs`) measures subscriber frame delivery,
+byte throughput, and inter-frame gap percentiles as the subscriber count scales.
+
+### Method
+
+- **Connection and subscription.** The harness opens `--subscribers N`
+  concurrent WebSocket connections (`tokio-tungstenite`, `TCP_NODELAY`) to
+  `/ws?trades=T` before starting the measurement clock. When `--symbols` is
+  supplied, each subscriber immediately sends
+  `{"type":"subscribe","symbols":[...]}` (`WsClientMessage::Subscribe`).
+- **Warmup and measured window.** Every subscriber drains frames for
+  `--warmup S` seconds and then records measurements for `--duration S`
+  seconds. Each incoming text or binary frame is parsed as `WsServerMessage`
+  (`state`, `notice`, `trade`, `metrics`) to verify wire validity and then
+  dropped immediately; frames are never stored in memory.
+- **Inter-frame gap and stall detection.** Each subscriber records the
+  microsecond gap between consecutive frames in an HDR histogram (3 significant
+  digits, 60 s ceiling). If any inter-frame gap or trailing silence inside the
+  measured window exceeds **1 second (1,000,000 µs)**, that subscriber is
+  flagged as `stalled = true`, `stalled_clients` is incremented, and the
+  manifest adds the `stalled-subscriber` label.
+- **Server `/metrics` scrape.** Immediately before warmup and after the
+  measured window, the harness scrapes `GET /metrics` on the gateway and
+  records `whippet_orders_ingressed_total`, `whippet_md_sequence`, and
+  `process_cpu_seconds_total` (if the endpoint exposes it; skipped cleanly when
+  absent or unreachable), along with their deltas across the run.
+
+### Flags and commands
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--gateway` | `http://127.0.0.1:8080` | Gateway HTTP or WebSocket base URL |
+| `--subscribers` | `10` | Concurrent WebSocket subscribers (`N >= 1`) |
+| `--duration` | `30` | Measured window in seconds |
+| `--warmup` | `5` | Warmup window in seconds (excluded from counts/histograms) |
+| `--trades` | `0` | Trade tape limit passed as `/ws?trades=N` (`0` = full tape) |
+| `--symbols` | *(all)* | Optional comma-separated symbol filter sent as `Subscribe` |
+| `--output-dir` | `artifacts/bench` | Directory for `<run-id>.json` |
+| `--label` | `fanout` | Workload label recorded in the manifest |
+
+Sweep 1 / 10 / 100 subscribers for 30 s each (simulator stopped, label
+`dev-loop-fanout`):
+
+```sh
+scripts/bench-fanout.sh
+```
+
+Manual single runs:
+
+```sh
+cargo run --release -p whippet-bench --example fanout -- \
+  --gateway http://127.0.0.1:8080 \
+  --subscribers 10 \
+  --duration 30 \
+  --warmup 5 \
+  --trades 0 \
+  --label dev-loop-fanout \
+  --output-dir artifacts/bench
+
+# Filtered to a single symbol and 25 trades:
+cargo run --release -p whippet-bench --example fanout -- \
+  --gateway http://127.0.0.1:8080 \
+  --subscribers 100 \
+  --duration 30 \
+  --warmup 5 \
+  --trades 25 \
+  --symbols BTC-USD \
+  --label dev-loop-fanout \
+  --output-dir artifacts/bench
+```
+
+### Fanout manifest shape
+
+Because fanout measures continuous server-push frames rather than open-loop
+request/ack slots, `examples/fanout.rs` writes `FanoutManifest`
+(`kind = "fanout"`) to `<output-dir>/<run-id>.json` without altering the core
+ingress `BenchManifest` schema:
+
+```json
+{
+  "schema_version": 1,
+  "kind": "fanout",
+  "run_id": "<uuid>",
+  "created_at": "2026-11-15T00:00:00Z",
+  "git_sha": "<commit>",
+  "git_dirty": false,
+  "image_digest": null,
+  "scope": "dev-loop",
+  "label": "dev-loop-fanout",
+  "host": { "...": "same HostInfo as BenchManifest" },
+  "gateway": "http://127.0.0.1:8080",
+  "subscribers": 10,
+  "trades": 0,
+  "symbols": ["BTC-USD"],
+  "warmup_secs": 5,
+  "duration_secs": 30,
+  "measured_secs": 30.0,
+  "frames_per_sec": 0.0,
+  "frames_per_sec_per_client": 0.0,
+  "bytes_per_sec_per_client": 0.0,
+  "aggregate_bytes_per_sec": 0.0,
+  "total_frames": 0,
+  "total_bytes": 0,
+  "stalled_clients": 0,
+  "gap_us": {
+    "count": 0,
+    "min": 0.0,
+    "mean": 0.0,
+    "p50": 0.0,
+    "p90": 0.0,
+    "p99": 0.0,
+    "p999": 0.0,
+    "p9999": 0.0,
+    "max": 0.0,
+    "p50_ci95": null,
+    "p99_ci95": null
+  },
+  "clients": [
+    {
+      "client_id": 0,
+      "frames": 0,
+      "bytes": 0,
+      "frames_per_sec": 0.0,
+      "bytes_per_sec": 0.0,
+      "gap_p50_us": 0.0,
+      "gap_p99_us": 0.0,
+      "gap_max_us": 0.0,
+      "stalled": false,
+      "parse_errors": 0
+    }
+  ],
+  "metrics": {
+    "before": {
+      "orders_ingressed_total": 0,
+      "md_sequence": 0,
+      "process_cpu_seconds_total": null
+    },
+    "after": {
+      "orders_ingressed_total": 0,
+      "md_sequence": 0,
+      "process_cpu_seconds_total": null
+    },
+    "orders_ingressed_delta": 0,
+    "md_sequence_delta": 0,
+    "process_cpu_seconds_delta": null
+  },
+  "notes": [],
+  "labels": ["dev-loop", "fanout"]
+}
+```
+
+### Results
+
+**Status: pending.** Neither the `dev-loop-fanout` sweep (1 / 10 / 100
+subscribers) nor a native Linux fanout run has been recorded yet. Run
+`scripts/bench-fanout.sh` and link the resulting manifests from
+`artifacts/bench/` before quoting any fanout numbers.
 
 ## Running a benchmark
 
@@ -696,7 +879,8 @@ Never hand-edit a manifest. If a field is wrong, fix the harness and rerun.
 - Run the TCP sweep on native Linux and publish it. The TCP path and its stage
   timestamps exist, and there is a dev-loop measurement above, but no headline
   TCP row yet.
-- Add fanout, replay, failover, and soak workloads.
+- Run `scripts/bench-fanout.sh` (and the native Linux fanout sweep) and record
+  the manifests; add replay, failover, and soak workloads.
 - Export raw histogram data alongside the manifest if a consumer needs it.
 - The open-order working set bounds the harness's tracked ids; aggressive
   limit remainders are not tracked and can still rest. The steady-state check
