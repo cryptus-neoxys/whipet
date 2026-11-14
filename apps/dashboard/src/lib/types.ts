@@ -75,6 +75,7 @@ export interface HealthView {
   iggy_addr: string;
   journal: string;
   shards_ok: boolean;
+  auth_required: boolean;
   version: string;
   uptime_s: number;
   partitions: number;
@@ -88,6 +89,19 @@ export interface OrderRequest {
   qty: number;
   client_order_id?: string;
   participant?: string;
+}
+
+export interface BatchOrderRequest {
+  orders: OrderRequest[];
+}
+
+export interface BatchOrderAck {
+  partition: number;
+  base_offset: number;
+  count: number;
+  mode: Mode;
+  durable_ack_ms: number;
+  orders: OrderAck[];
 }
 
 export interface OrderAck {

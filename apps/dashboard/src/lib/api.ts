@@ -1,4 +1,4 @@
-import type { ApiError, HealthView, OrderAck, OrderRequest, StateView } from './types';
+import type { ApiError, BatchOrderAck, HealthView, OrderAck, OrderRequest, StateView } from './types';
 
 async function json<T>(response: Response): Promise<T> {
   if (!response.ok) {
@@ -28,6 +28,16 @@ export async function submitOrder(order: OrderRequest): Promise<OrderAck> {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(order),
+    }),
+  );
+}
+
+export async function submitOrderBatch(orders: OrderRequest[]): Promise<BatchOrderAck> {
+  return json<BatchOrderAck>(
+    await fetch('/api/orders/batch?acks=full', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ orders }),
     }),
   );
 }

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { submitOrder } from '../lib/api';
+import { submitOrder, submitOrderBatch } from '../lib/api';
 import { formatPrice } from '../lib/format';
 import type { BookView, OrderType, Side } from '../lib/types';
 
@@ -88,26 +88,35 @@ export function OrderTicket({
     const cents = book.mid_cents ?? book.best_ask_cents ?? 6_500_000;
     setPending(true);
     setMessage(null);
-    const requests = Array.from({ length: 12 }, (_, index) => {
+    const burst = Array.from({ length: 12 }, (_, index) => {
       const buy = index % 2 === 0;
       const offset = Math.floor(index / 2) + 1;
-      return submitOrder({
+      return {
         symbol: book.symbol,
-        side: buy ? 'buy' : 'sell',
-        order_type: 'limit',
-        price_cents: Math.round(cents) + (buy ? -offset : offset) * (book.symbol === 'BTC-USD' ? 100 : 10),
+        side: buy ? ('buy' as const) : ('sell' as const),
+        order_type: 'limit' as const,
+        price_cents:
+          Math.round(cents) +
+          (buy ? -offset : offset) * (book.symbol === 'BTC-USD' ? 100 : 10),
         qty: 1 + (index % 7),
         client_order_id: `web-burst-${crypto.randomUUID()}`,
         participant: 'dashboard-burst',
+      };
+    });
+    try {
+      const ack = await submitOrderBatch(burst);
+      setMessage({
+        tone: 'ok',
+        text: `${ack.count} burst orders accepted in one Iggy append (partition ${ack.partition}, base offset ${ack.base_offset}).`,
       });
-    });
-    const results = await Promise.allSettled(requests);
-    const accepted = results.filter((result) => result.status === 'fulfilled').length;
-    setPending(false);
-    setMessage({
-      tone: accepted === requests.length ? 'ok' : 'error',
-      text: `${accepted}/${requests.length} burst orders accepted by the log.`,
-    });
+    } catch (cause) {
+      setMessage({
+        tone: 'error',
+        text: cause instanceof Error ? cause.message : 'Burst was not accepted.',
+      });
+    } finally {
+      setPending(false);
+    }
   };
 
   // Demo beats drive the ticket through these counters; the component keeps
