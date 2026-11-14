@@ -162,6 +162,11 @@ services:
     profiles: ["bench"]
     restart: "no"
     init: true
+    environment:
+      WHIPPET_VIRTUALIZATION: docker-desktop
+      WHIPPET_GIT_SHA: ${GIT_SHA:-unknown}
+      WHIPPET_GIT_DIRTY: ${GIT_DIRTY:-false}
+      WHIPPET_IMAGE_DIGEST: ${IMAGE_DIGEST:-unknown}
     command:
       - bench
       - --gateway

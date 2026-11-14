@@ -16,6 +16,7 @@ credentials explicitly.
 | `WHIPPET_IGGY_ADDR` | `127.0.0.1:8090` | Iggy TCP address. |
 | `WHIPPET_IGGY_USER` | `iggy` | Iggy username. Compose must pass a non-default account. |
 | `WHIPPET_IGGY_PASSWORD` | `iggy` | Iggy password. Compose must pass a non-default secret. |
+| `WHIPPET_IGGY_PASSWORD_FILE` | unset | Read the Iggy password from a file instead of the environment. Compose points this at `/run/secrets/iggy_root_password`; the container entrypoint also exports the value. |
 | `WHIPPET_JOURNAL` | `iggy` | `iggy` for the demo, `memory` for tests and brokerless development. |
 | `WHIPPET_MODE` | `durable` | Only `durable` is enabled. `turbo` is rejected at startup with a Phase 2 message. |
 | `WHIPPET_SYMBOLS` | `BTC-USD,ETH-USD,SOL-USD` | Comma-separated subset of the built-in instruments. Unknown symbols are rejected. |

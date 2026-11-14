@@ -355,7 +355,7 @@ Expected shape (the counts depend on the log; the hash is the checked value):
   "last_offset": <head offset>,
   "decoded": <number of decoded records>,
   "skipped": 0,
-  "state_hash": "678748d97b713dbd83dfb2a7bebb17a6f9b5b241576c9e9f4ca2410be0a2655f"
+  "state_hash": "45e81a0d2dcaa8716aaa0da386563f02ed269491f972e44a7887d8e2827db73b"
 }
 ```
 
@@ -366,26 +366,26 @@ whippet replay --iggy-addr 127.0.0.1:8090 --partition 1 \
   --snapshot-dir data/snapshots
 ```
 
-Expected shape (snapshot offset 54999 is from the local check; the head offset and count depend on the log):
+Expected shape (snapshot offset 55999 is from the local check; the head offset and count depend on the log):
 
 ```text
 {
   "partition": 1,
   "seeded_from_snapshot": true,
-  "snapshot_offset": 54999,
-  "from": 55000,
+  "snapshot_offset": 55999,
+  "from": 56000,
   "to": null,
   "last_offset": <head offset>,
   "decoded": <number of decoded tail records>,
   "skipped": 0,
-  "state_hash": "678748d97b713dbd83dfb2a7bebb17a6f9b5b241576c9e9f4ca2410be0a2655f"
+  "state_hash": "45e81a0d2dcaa8716aaa0da386563f02ed269491f972e44a7887d8e2827db73b"
 }
 ```
 
 The exact offsets and decoded counts depend on the log. The equality is the
 point: replaying the whole log and replaying the snapshot plus its tail end at
 the same state hash. On a local single-node run (M4, Docker Desktop,
-dev-loop), the snapshot was at offset 54999 and both runs ended at the hash
+dev-loop), the snapshot was at offset 55999 and both runs ended at the hash
 above. This is one determinism check, not a crash test, not an audit proof,
 and not a benchmark.
 

@@ -113,8 +113,8 @@ not the binary-ingress L1 in the dossier. Label it accordingly.
 
 ## Smoke run: smoke, not a benchmark
 
-This is the one recorded run. It is a smoke test: one repetition, three
-seconds of measured traffic, one second of warmup, on a laptop with Docker
+This is the one recorded run. It is a smoke test: one repetition, ten
+seconds of measured traffic, two seconds of warmup, on a laptop with Docker
 Desktop. It exists to show that the harness and manifest work end to end.
 
 | Field | Value |
@@ -123,24 +123,24 @@ Desktop. It exists to show that the harness and manifest work end to end.
 | Scope | `dev-loop` |
 | Host | Apple M4, 10 cores, 16 GB, macOS kernel 27.2.0 |
 | Container runtime | Docker 29.9.2 |
-| Commit | `8eca5ff` (dirty tree) |
+| Commit | `4a75ad1` (dirty tree) |
 | Workload | HTTP JSON limit orders, three symbols, 16 partitions |
 | Rate | 200 orders/s |
-| Duration | 3 s measured, 1 s warmup |
+| Duration | 10 s measured, 2 s warmup |
 | Repetitions | 1 |
-| Samples | 600 |
+| Samples | 2,000 |
 | Errors | 0 |
-| p50 | 3,257 µs |
-| p90 | 6,143 µs |
-| p99 | 54,495 µs |
-| p99.9 | 64,159 µs |
-| Max | 64,159 µs |
-| Scheduler slip p50 | 1,333 µs |
-| Scheduler slip p99 | 6,227 µs |
+| p50 | 1,948 µs |
+| p90 | 2,567 µs |
+| p99 | 3,445 µs |
+| p99.9 | 27,423 µs |
+| Max | 34,495 µs |
+| Scheduler slip p50 | 1,095 µs |
+| Scheduler slip p99 | 1,996 µs |
 
 Why this is not a result:
 
-- One repetition, three seconds, no steady-state check.
+- One repetition, ten seconds, no steady-state check.
 - Generator slip is a large fraction of the latency. The p99 is partly the
   pacer, not the exchange.
 - Docker Desktop on macOS adds VM and filesystem noise.

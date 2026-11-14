@@ -9,7 +9,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -156,7 +156,9 @@ pub async fn run(config: BenchConfig) -> Result<BenchManifest> {
         created_at: Utc::now().to_rfc3339(),
         git_sha: git_sha(),
         git_dirty: git_dirty(),
-        image_digest: std::env::var("WHIPPET_IMAGE_DIGEST").ok(),
+        image_digest: std::env::var("WHIPPET_IMAGE_DIGEST")
+            .ok()
+            .filter(|value| !value.is_empty() && value != "unknown"),
         host,
         workload,
         throughput: median.throughput.clone(),
@@ -395,7 +397,15 @@ fn host_info() -> HostInfo {
     let kernel = command("uname", &["-r"]).unwrap_or_default();
     let (cpu_model, logical_cores, memory_bytes) = platform_cpu();
     let virtualization = std::env::var("WHIPPET_VIRTUALIZATION").unwrap_or_else(|_| {
-        if cfg!(target_os = "linux") {
+        if Path::new("/.dockerenv").exists()
+            || std::fs::read_to_string("/proc/1/cgroup")
+                .map(|contents| contents.contains("docker") || contents.contains("containerd"))
+                .unwrap_or(false)
+        {
+            // A container on a Linux host still reports Linux. Never let that
+            // become a headline number.
+            "docker-desktop".into()
+        } else if cfg!(target_os = "linux") {
             "native".into()
         } else {
             "dev-loop".into()
@@ -473,10 +483,18 @@ fn command(program: &str, args: &[&str]) -> Option<String> {
 }
 
 fn git_sha() -> String {
-    command("git", &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into())
+    std::env::var("WHIPPET_GIT_SHA")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            command("git", &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into())
+        })
 }
 
 fn git_dirty() -> bool {
+    if let Ok(value) = std::env::var("WHIPPET_GIT_DIRTY") {
+        return matches!(value.as_str(), "1" | "true" | "TRUE" | "yes");
+    }
     command("git", &["status", "--porcelain"]).is_some_and(|value| !value.is_empty())
 }
 

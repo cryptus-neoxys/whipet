@@ -39,6 +39,15 @@ command -v docker >/dev/null 2>&1 || {
 
 mkdir -p "${ROOT}/artifacts/bench"
 
+GIT_SHA="$(git -C "${ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
+if [ -n "$(git -C "${ROOT}" status --porcelain 2>/dev/null || true)" ]; then
+    GIT_DIRTY=true
+else
+    GIT_DIRTY=false
+fi
+IMAGE_DIGEST="$(docker image inspect whippet:0.1.0 --format '{{.Id}}' 2>/dev/null || echo unknown)"
+export GIT_SHA GIT_DIRTY IMAGE_DIGEST
+
 cleanup() {
     if [ "${RESTART_SIM}" -eq 1 ]; then
         "${COMPOSE[@]}" start sim >/dev/null 2>&1 || true
@@ -71,7 +80,12 @@ run_bench() {
     echo "bench: ${label} rate=${rate}/s duration=${duration}s warmup=${warmup}s reps=${repetitions} seed=${seed}"
     # Run as the invoking user so the bind-mounted ./artifacts directory is
     # writable on Linux CI as well as Docker Desktop.
-    "${COMPOSE[@]}" --profile bench run --rm --user "$(id -u):$(id -g)" bench \
+    "${COMPOSE[@]}" --profile bench run --rm --user "$(id -u):$(id -g)" \
+        -e WHIPPET_GIT_SHA="${GIT_SHA}" \
+        -e WHIPPET_GIT_DIRTY="${GIT_DIRTY}" \
+        -e WHIPPET_IMAGE_DIGEST="${IMAGE_DIGEST}" \
+        -e WHIPPET_VIRTUALIZATION=docker-desktop \
+        bench \
         bench \
         --gateway http://node:8080 \
         --rate "${rate}" \

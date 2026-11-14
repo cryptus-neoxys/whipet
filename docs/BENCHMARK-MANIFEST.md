@@ -165,7 +165,7 @@ run described in [BENCHMARKS.md](BENCHMARKS.md), not a benchmark result.
   "schema_version": 1,
   "run_id": "e27889ad-fd31-421c-806a-b2e38699b27f",
   "created_at": "2026-11-14T13:32:16.682695+00:00",
-  "git_sha": "8eca5ff3283688a2f2e8a8a9d076e023f7e57715",
+  "git_sha": "4a75ad1c0178434706fa0d83bd8ce7ff4ff47638",
   "git_dirty": true,
   "image_digest": null,
   "host": {
