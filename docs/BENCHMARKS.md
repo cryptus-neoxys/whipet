@@ -483,8 +483,8 @@ mode, not a latency result.
 
 The replay proof was rerun after the change. Full replay and snapshot-seeded
 replay both end at
-`3a3228b97499304802aac091e369dc363f9546c2e2684488040b39e6fbf87f27` from
-snapshot offset 109005 (tail 7547). This is a correctness check, not a latency
+`162f4b6f8aa35eaf152b08f7d8c7f7b0dc78fd6c956f41038b67b74d0f15f6aa` from
+snapshot offset 116999 (tail 85). This is a correctness check, not a latency
 measurement.
 
 ## TCP-ingress sweep (dev-loop measured, headline pending)

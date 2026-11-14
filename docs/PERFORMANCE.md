@@ -169,8 +169,23 @@ repetition, 8 s measured, 2 s warmup). Every row has 0 errors.
 | 5,000/s | 100 | 4,363 µs | 246,399 µs | 325,375 µs | 8,231 µs |
 | 5,000/s | 256 | 7,779 µs | 14,671 µs | 19,519 µs | 19,407 µs |
 
-The `5,000/s batch 100` p99 is a one-repetition outlier, not a trend. TCP
-(same host, `--transport tcp`):
+The `5,000/s batch 100` p99 is a one-repetition outlier, not a trend. The
+harness now also records scheduler slip, so `service = latency - slip` is
+available per sample. On the final sweep:
+
+| Rate | Batch | service p50 | service p99 | slip p50 |
+|---:|---:|---:|---:|---:|
+| 1,000/s | 1 | 444 µs | 9,416 µs | 94 µs |
+| 5,000/s | 1 | 1,969 µs | 22,760 µs | 61 µs |
+| 5,000/s | 10 | 985 µs | 9,177 µs | 69 µs |
+| 5,000/s | 256 | 6,989 µs | 10,540 µs | 790 µs |
+
+At 5,000/s batch 1 the pacer contributes ~5.4 ms of the 28 ms p99; the rest is
+the server, dominated by the Iggy append latency distribution on Docker
+Desktop. The 1,000/s run is labeled `generator-bound`; treat its p50 as an
+upper bound on the server.
+
+TCP (same host, `--transport tcp`):
 
 | Path | p50 | p99 | Errors |
 |---|---:|---:|---:|
@@ -184,8 +199,8 @@ single-order path was p50 838 ms with 40k errors before the tranche.
 
 The 5,000/s single-order path was p50 838 ms with 40k errors before group
 commit. The replay proof was rerun after the tranche: full and snapshot-seeded
-replay both end at `3a3228b97499304802aac091e369dc363f9546c2e2684488040b39e6fbf87f27`
-from snapshot offset 109005 (tail 7547).
+replay both end at `162f4b6f8aa35eaf152b08f7d8c7f7b0dc78fd6c956f41038b67b74d0f15f6aa`
+from snapshot offset 116999 (tail 85).
 
 ## Stage budget
 

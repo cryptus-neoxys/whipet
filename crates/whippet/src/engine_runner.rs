@@ -145,69 +145,80 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
     let mut last_snapshot_at = Instant::now();
     let mut watermark = CommitWatermark::new(committed_offset);
     let mut commit_retry = CommitRetry::new();
+    // The next poll is issued alongside the output appends. Matching and the
+    // broker round trip then overlap instead of running one after the other.
+    let mut prefetched: Option<Vec<whippet_journal::PayloadRecord>> = None;
 
     loop {
+        // `biased` checks shutdown before the prefetched batch, so a steady
+        // stream of prefetched batches cannot starve graceful shutdown.
+        let prefetched_now = prefetched.take();
         let records = tokio::select! {
+            biased;
             _ = shutdown.changed() => {
-                // Persist progress before the final snapshot. The snapshot is the
-                // authoritative resume point, but the committed offset is what the
-                // lag metric and any other reader sees.
-                if let Some(offset) = watermark.pending() {
-                    match commit_once(&ctx, Topic::Orders, shard_id, &consumer, offset).await {
-                        Ok(()) => {
-                            watermark.mark_committed(offset, Instant::now());
-                            info!(shard = shard_id, offset, "committed final applied offset");
+                    // Persist progress before the final snapshot. The snapshot is the
+                    // authoritative resume point, but the committed offset is what the
+                    // lag metric and any other reader sees.
+                    if let Some(offset) = watermark.pending() {
+                        match commit_once(&ctx, Topic::Orders, shard_id, &consumer, offset).await {
+                            Ok(()) => {
+                                watermark.mark_committed(offset, Instant::now());
+                                info!(shard = shard_id, offset, "committed final applied offset");
+                            }
+                            Err(error) => warn!(
+                                shard = shard_id,
+                                offset,
+                                error = %error,
+                                "final offset commit failed; the snapshot still records the applied state"
+                            ),
                         }
-                        Err(error) => warn!(
+                    }
+                    snapshot_sequence += 1;
+                    let final_snapshot = SequencedSnapshot {
+                        sequence: snapshot_sequence,
+                        snapshot: engine.snapshot_state(),
+                    };
+                    match tokio::time::timeout(
+                        FINAL_SNAPSHOT_SEND_TIMEOUT,
+                        snapshot_tx.send(final_snapshot),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => warn!(
                             shard = shard_id,
-                            offset,
-                            error = %error,
-                            "final offset commit failed; the snapshot still records the applied state"
+                            "snapshot writer stopped before the final snapshot was queued"
+                        ),
+                        Err(_) => warn!(shard = shard_id, "timed out queueing the final snapshot"),
+                    }
+                    // Close the queue so the writer drains and exits.
+                    drop(snapshot_tx);
+                    match tokio::time::timeout(FINAL_SNAPSHOT_JOIN_TIMEOUT, snapshot_writer).await {
+                        Ok(Ok(())) => info!(
+                            shard = shard_id,
+                            sequence = snapshot_sequence,
+                            "engine shard stopped"
+                        ),
+                        Ok(Err(error)) => warn!(shard = shard_id, error = %error, "final snapshot writer failed"),
+                        Err(_) => warn!(
+                            shard = shard_id,
+                            "final snapshot did not finish within the shutdown budget"
                         ),
                     }
-                }
-                snapshot_sequence += 1;
-                let final_snapshot = SequencedSnapshot {
-                    sequence: snapshot_sequence,
-                    snapshot: engine.snapshot_state(),
-                };
-                match tokio::time::timeout(
-                    FINAL_SNAPSHOT_SEND_TIMEOUT,
-                    snapshot_tx.send(final_snapshot),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(_)) => warn!(
-                        shard = shard_id,
-                        "snapshot writer stopped before the final snapshot was queued"
-                    ),
-                    Err(_) => warn!(shard = shard_id, "timed out queueing the final snapshot"),
-                }
-                // Close the queue so the writer drains and exits.
-                drop(snapshot_tx);
-                match tokio::time::timeout(FINAL_SNAPSHOT_JOIN_TIMEOUT, snapshot_writer).await {
-                    Ok(Ok(())) => info!(
-                        shard = shard_id,
-                        sequence = snapshot_sequence,
-                        "engine shard stopped"
-                    ),
-                    Ok(Err(error)) => warn!(shard = shard_id, error = %error, "final snapshot writer failed"),
-                    Err(_) => warn!(
-                        shard = shard_id,
-                        "final snapshot did not finish within the shutdown budget"
-                    ),
-                }
-                return Ok(());
+                    return Ok(());
             }
-            result = ctx.journal.read_payloads(Topic::Orders, shard_id, &consumer, next_offset, BATCH_CAPACITY as u32, 50) => result,
-        };
-        let records = match records {
-            Ok(records) => records,
-            Err(error) => {
-                warn!(shard = shard_id, error = %error, "order poll failed; retrying");
-                sleep(Duration::from_millis(250)).await;
-                continue;
+            result = ctx.journal.read_payloads(Topic::Orders, shard_id, &consumer, next_offset, BATCH_CAPACITY as u32, 50), if prefetched_now.is_none() => {
+                match result {
+                    Ok(records) => records,
+                    Err(error) => {
+                        warn!(shard = shard_id, error = %error, "order poll failed; retrying");
+                        sleep(Duration::from_millis(250)).await;
+                        continue;
+                    }
+                }
+            }
+            _ = std::future::ready(()), if prefetched_now.is_some() => {
+                prefetched_now.expect("prefetched batch")
             }
         };
         if records.is_empty() {
@@ -285,13 +296,22 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
             batch_last_offset = record.offset;
         }
 
-        // Executions and MD are independent topics. Awaiting them in sequence
-        // added a full broker round trip to every batch; join them so the shard
-        // pays one RTT instead of two. Both must succeed before the applied
-        // offset advances.
-        let (execution_result, md_result) = tokio::join!(
+        let next_offset_after = batch_last_offset.saturating_add(1);
+        // Executions and MD are independent topics, and the next orders poll is
+        // independent of both. Join all three: the shard pays one overlapped
+        // round trip per batch instead of three sequential ones. Both appends
+        // must succeed before the applied offset advances.
+        let (execution_result, md_result, poll_result) = tokio::join!(
             append_with_retry(&ctx, Topic::Executions, shard_id, &executions),
             append_with_retry(&ctx, Topic::Md, shard_id, &md_messages),
+            ctx.journal.read_payloads(
+                Topic::Orders,
+                shard_id,
+                &consumer,
+                next_offset_after,
+                BATCH_CAPACITY as u32,
+                50,
+            ),
         );
         if let Err(error) = execution_result {
             error!(shard = shard_id, error = %error, "execution publish failed");
@@ -303,11 +323,19 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
             sleep(Duration::from_millis(250)).await;
             continue;
         }
+        // A failed prefetch is not a batch failure: the offset is still applied,
+        // and the next iteration polls again from the same offset.
+        match poll_result {
+            Ok(records) => prefetched = Some(records),
+            Err(error) => {
+                warn!(shard = shard_id, error = %error, "prefetch poll failed; polling next iteration")
+            }
+        }
         // The outputs are already appended, so this offset is fully applied.
         // The commit itself is decoupled: it is retried with backoff on later
         // iterations and never blocks the loop or re-reads the batch.
         watermark.note_applied(batch_last_offset);
-        next_offset = batch_last_offset.saturating_add(1);
+        next_offset = next_offset_after;
         maybe_commit(
             &ctx,
             Topic::Orders,
