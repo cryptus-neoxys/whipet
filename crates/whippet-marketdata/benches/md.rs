@@ -22,7 +22,7 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use whippet_core::config::ExchangeConfig;
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Seq, Symbol};
 use whippet_core::protocol::{MdEvent, MdKind, Side};
-use whippet_marketdata::MdHub;
+use whippet_marketdata::{MdHub, Metrics, ShardMetrics};
 
 fn hub() -> Arc<MdHub> {
     MdHub::new(
@@ -334,11 +334,51 @@ fn contended_apply(c: &mut Criterion) {
     group.finish();
 }
 
+/// Shard metrics: the per-merge cost of draining one shard recorder into the
+/// global metrics. Each merge carries 256 samples, matching a full engine
+/// command batch; `record_shard_batch` is the same recording work without the
+/// merge, so the merge cost is the difference.
+fn merge_shard(c: &mut Criterion) {
+    const SAMPLES_PER_MERGE: u64 = 256;
+
+    let config = ExchangeConfig::default();
+    let metrics = Metrics::new(config.mode, config.partitions);
+    let shard = ShardMetrics::new();
+
+    let mut group = c.benchmark_group("metrics");
+    group.sample_size(100);
+    group.throughput(Throughput::Elements(SAMPLES_PER_MERGE));
+
+    group.bench_function("record_shard_batch", |b| {
+        b.iter(|| {
+            for sample in 0..SAMPLES_PER_MERGE {
+                shard.record_match_latency_us(50 + sample * 7);
+                shard.record_engine_command();
+                shard.record_execution();
+                shard.record_order_outcome(sample % 16 == 0);
+            }
+            black_box(&shard);
+        });
+    });
+    group.bench_function("merge_shard", |b| {
+        b.iter(|| {
+            for sample in 0..SAMPLES_PER_MERGE {
+                shard.record_match_latency_us(50 + sample * 7);
+                shard.record_engine_command();
+                shard.record_execution();
+                shard.record_order_outcome(sample % 16 == 0);
+            }
+            shard.merge_into(&metrics);
+        });
+    });
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default()
         .sample_size(10)
         .measurement_time(Duration::from_secs(8));
-    targets = apply_1m, apply_batch_1m, state_view, latest_for, duplicate_stale, read_path, contended_apply
+    targets = apply_1m, apply_batch_1m, state_view, latest_for, duplicate_stale, read_path, contended_apply, merge_shard
 }
 criterion_main!(benches);

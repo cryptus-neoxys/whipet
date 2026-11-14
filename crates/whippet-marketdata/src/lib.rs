@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -457,6 +458,62 @@ impl Metrics {
         self.engine_commands.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Add one shard's counters to the global atomics. Called by
+    /// [`ShardMetrics::merge_into`], which swaps its own counters to zero
+    /// first, so each recorded event reaches the globals exactly once.
+    pub(crate) fn add_match_counters(
+        &self,
+        commands: u64,
+        executions: u64,
+        matched: u64,
+        rejected: u64,
+    ) {
+        if commands != 0 {
+            self.engine_commands.fetch_add(commands, Ordering::Relaxed);
+        }
+        if executions != 0 {
+            self.executions.fetch_add(executions, Ordering::Relaxed);
+        }
+        if matched != 0 {
+            self.orders_matched.fetch_add(matched, Ordering::Relaxed);
+        }
+        if rejected != 0 {
+            self.orders_rejected.fetch_add(rejected, Ordering::Relaxed);
+        }
+    }
+
+    /// Drain a shard's match-latency histogram into the global one and clear
+    /// the source. Both histograms are built by [`new_histogram`], so
+    /// [`Histogram::add`] cannot fail; the value-by-value replay is a
+    /// lossless fallback for a config mismatch that cannot happen today.
+    pub(crate) fn merge_match_latency(&self, source: &mut Histogram<u64>) {
+        if source.is_empty() {
+            return;
+        }
+        // A poisoned lock leaves `source` unmerged and uncleaned, so the next
+        // merge retries instead of dropping the samples.
+        let Ok(mut histogram) = self.match_latency.lock() else {
+            return;
+        };
+        if histogram.add(&*source).is_err() {
+            for sample in source.iter_recorded() {
+                let value = sample.value_iterated_to();
+                for _ in 0..sample.count_at_value() {
+                    let _ = histogram.record(value);
+                }
+            }
+        }
+        source.clear();
+    }
+
+    #[cfg(test)]
+    fn match_latency_sample_count(&self) -> u64 {
+        self.match_latency
+            .lock()
+            .map(|histogram| histogram.len())
+            .unwrap_or(0)
+    }
+
     pub fn snapshot(&self) -> MetricsView {
         let uptime = self.started.elapsed().as_secs().max(1);
         let orders = self.orders_ingressed.load(Ordering::Relaxed);
@@ -514,6 +571,88 @@ fn percentile(histogram: &Mutex<Histogram<u64>>, quantile: f64) -> f64 {
             }
         })
         .unwrap_or(0.0)
+}
+
+/// Per-shard metrics recorder, owned by one match-loop task.
+///
+/// The shard thread owns this value, so recording never takes a lock: the
+/// counters are plain [`Cell`]s and latency samples go into a shard-local HDR
+/// histogram behind a [`RefCell`], both uncontended single-thread writes on
+/// the same stack the engine already touches.
+///
+/// `merge_into` is the only cross-thread step, and the shard loop calls it
+/// periodically (e.g. once per batch or on the 20 Hz cadence): counters are
+/// swapped to zero and fetched onto the global atomics, and the local
+/// histogram is drained into the global one under the existing histogram
+/// mutex. Because counters swap to zero and the histogram clears on drain, a
+/// second merge without new records adds nothing, and no recorded sample is
+/// ever added twice or lost.
+///
+/// `ShardMetrics` is `Send` but deliberately not `Sync`: it must move to, and
+/// stay on, its shard thread.
+pub struct ShardMetrics {
+    engine_commands: Cell<u64>,
+    executions: Cell<u64>,
+    orders_matched: Cell<u64>,
+    orders_rejected: Cell<u64>,
+    match_latency: RefCell<Histogram<u64>>,
+}
+
+impl Default for ShardMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ShardMetrics {
+    pub fn new() -> Self {
+        Self {
+            engine_commands: Cell::new(0),
+            executions: Cell::new(0),
+            orders_matched: Cell::new(0),
+            orders_rejected: Cell::new(0),
+            match_latency: RefCell::new(new_histogram()),
+        }
+    }
+
+    /// Same clamping as [`Metrics::record_match_latency_us`] so a merged
+    /// sample and a directly recorded sample land in identical buckets.
+    pub fn record_match_latency_us(&self, micros: u64) {
+        let mut histogram = self.match_latency.borrow_mut();
+        let _ = histogram.record(micros.min(59_999_999));
+    }
+
+    pub fn record_engine_command(&self) {
+        self.engine_commands.set(self.engine_commands.get() + 1);
+    }
+
+    pub fn record_execution(&self) {
+        self.executions.set(self.executions.get() + 1);
+    }
+
+    pub fn record_order_outcome(&self, rejected: bool) {
+        if rejected {
+            self.orders_rejected.set(self.orders_rejected.get() + 1);
+        } else {
+            self.orders_matched.set(self.orders_matched.get() + 1);
+        }
+    }
+
+    /// Hand this shard's records to the global [`Metrics`].
+    ///
+    /// Counters are read with a swap-to-zero, so they are added exactly once;
+    /// the latency histogram is drained and cleared, so a merge without new
+    /// records is a no-op. Call this only from the thread that records: the
+    /// counters are not atomic.
+    pub fn merge_into(&self, global: &Metrics) {
+        global.add_match_counters(
+            self.engine_commands.replace(0),
+            self.executions.replace(0),
+            self.orders_matched.replace(0),
+            self.orders_rejected.replace(0),
+        );
+        global.merge_match_latency(&mut self.match_latency.borrow_mut());
+    }
 }
 
 /// Market-data hub. Cloneable handle shared by the consumer, HTTP API, and
@@ -1526,5 +1665,156 @@ mod tests {
         let latest = hub.latest();
         assert_eq!(latest.symbols.len(), 3);
         assert_eq!(latest.trades.len(), 70);
+    }
+}
+
+#[cfg(test)]
+mod shard_metrics_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+
+    fn global() -> Metrics {
+        Metrics::new(
+            ExchangeConfig::default().mode,
+            ExchangeConfig::default().partitions,
+        )
+    }
+
+    fn record_batch(shard: &ShardMetrics, count: u64) {
+        for sample in 0..count {
+            shard.record_match_latency_us(50 + sample * 7);
+            shard.record_engine_command();
+            shard.record_execution();
+            shard.record_order_outcome(sample % 4 == 0);
+        }
+    }
+
+    #[test]
+    fn merge_adds_counters_exactly_once() {
+        let global = global();
+        let shard = ShardMetrics::new();
+        record_batch(&shard, 100);
+
+        shard.merge_into(&global);
+        shard.merge_into(&global);
+
+        let view = global.snapshot();
+        assert_eq!(view.engine_commands, 100);
+        assert_eq!(view.executions, 100);
+        assert_eq!(view.orders_matched, 75);
+        assert_eq!(view.orders_rejected, 25);
+        // The second merge was empty: the shard was drained by the first.
+        assert_eq!(global.match_latency_sample_count(), 100);
+    }
+
+    #[test]
+    fn merged_percentiles_match_direct_recording() {
+        // A spread wide enough to cross several HDR buckets at 3 significant
+        // digits, plus heavy tail weight so p99 is not the max.
+        let samples: Vec<u64> = (0..2_000)
+            .map(|index| match index % 10 {
+                0..=4 => 100 + index as u64,
+                5..=8 => 1_000 + index as u64,
+                _ => 25_000 + index as u64,
+            })
+            .collect();
+
+        let direct = global();
+        for sample in &samples {
+            direct.record_match_latency_us(*sample);
+        }
+
+        let merged = global();
+        let shard = ShardMetrics::new();
+        for sample in &samples {
+            shard.record_match_latency_us(*sample);
+        }
+        shard.merge_into(&merged);
+
+        let direct_view = direct.snapshot();
+        let merged_view = merged.snapshot();
+        assert_eq!(merged_view.match_p50_us, direct_view.match_p50_us);
+        assert_eq!(merged_view.match_p99_us, direct_view.match_p99_us);
+        assert!(merged_view.match_p50_us > 0.0);
+        assert!(merged_view.match_p99_us >= merged_view.match_p50_us);
+        // p99 sits in the heavy tail of the sample set (HDR may report the
+        // bucket value, not the exact sample, so only bound it).
+        assert!(merged_view.match_p99_us >= 25_000.0);
+        assert!(merged_view.match_p99_us <= 27_000.0);
+    }
+
+    #[test]
+    fn concurrent_merges_do_not_lose_counts() {
+        const SHARDS: u64 = 4;
+        const RECORDS_PER_SHARD: u64 = 5_000;
+        const MERGE_EVERY: u64 = 10;
+
+        let global = Arc::new(global());
+        thread::scope(|scope| {
+            for _ in 0..SHARDS {
+                let global = Arc::clone(&global);
+                scope.spawn(move || {
+                    let shard = ShardMetrics::new();
+                    for sample in 0..RECORDS_PER_SHARD {
+                        shard.record_match_latency_us(20 + sample * 3);
+                        shard.record_engine_command();
+                        shard.record_execution();
+                        shard.record_order_outcome(sample % 3 == 0);
+                        if sample % MERGE_EVERY == MERGE_EVERY - 1 {
+                            shard.merge_into(&global);
+                        }
+                    }
+                    shard.merge_into(&global);
+                });
+            }
+        });
+
+        let view = global.snapshot();
+        assert_eq!(view.engine_commands, SHARDS * RECORDS_PER_SHARD);
+        assert_eq!(view.executions, SHARDS * RECORDS_PER_SHARD);
+        // samples 0, 3, ..., 4998 are rejected per shard: ceil(count / 3).
+        let rejected = SHARDS * RECORDS_PER_SHARD.div_ceil(3);
+        assert_eq!(view.orders_rejected, rejected);
+        assert_eq!(view.orders_matched, SHARDS * RECORDS_PER_SHARD - rejected);
+        // Every latency sample survived its shard's merge loop.
+        assert_eq!(
+            global.match_latency_sample_count(),
+            SHARDS * RECORDS_PER_SHARD
+        );
+    }
+
+    #[test]
+    fn empty_merge_is_a_no_op() {
+        let global = global();
+        let before = global.snapshot();
+
+        let shard = ShardMetrics::new();
+        shard.merge_into(&global);
+        shard.merge_into(&global);
+
+        let after = global.snapshot();
+        assert_eq!(after.engine_commands, before.engine_commands);
+        assert_eq!(after.executions, before.executions);
+        assert_eq!(after.orders_matched, before.orders_matched);
+        assert_eq!(after.orders_rejected, before.orders_rejected);
+        assert_eq!(after.match_p50_us, 0.0);
+        assert_eq!(after.match_p99_us, 0.0);
+    }
+
+    #[test]
+    fn records_between_merges_are_not_lost() {
+        let global = global();
+        let shard = ShardMetrics::new();
+
+        record_batch(&shard, 10);
+        shard.merge_into(&global);
+        // Records that land after one merge and before the next.
+        record_batch(&shard, 5);
+        shard.merge_into(&global);
+
+        let view = global.snapshot();
+        assert_eq!(view.engine_commands, 15);
+        assert_eq!(global.match_latency_sample_count(), 15);
     }
 }
