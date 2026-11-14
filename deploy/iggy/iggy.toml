@@ -46,8 +46,9 @@ address = "0.0.0.0:8092"
 enabled = false
 
 [memory_pool]
-# 1 GiB is the documented single-node demo profile. The upstream default is
-# 4 GiB, which is too much for a 3-node laptop Compose file.
+# 1 GiB is an option for a memory-constrained 3-node laptop Compose file. The
+# single-node default stack keeps the upstream 4 GiB pool because it measured
+# better on a 16 GB Docker Desktop VM.
 enabled = true
 size = "1 GiB"
 
@@ -56,6 +57,12 @@ size = "1 GiB"
 # shares cores, so do not pin.
 cpu_allocation = 4
 pin_cores = false
+partition_io_capacity = 32
+
+[partition]
+# Smaller WAL than the 256 MiB default; use this only after measuring it on the
+# target host. The single-node default stack keeps 256 MiB.
+wal_bytes_max = "136 MiB"
 
 [logging]
 file_enabled = false

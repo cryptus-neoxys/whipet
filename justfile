@@ -16,11 +16,17 @@ demo:
 bench:
     make bench
 
+bench-sweep:
+    make bench-sweep
+
 verify:
     make verify
 
 replay:
     make replay
+
+doctor:
+    make doctor
 
 reset:
     make reset

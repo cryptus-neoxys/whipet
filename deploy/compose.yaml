@@ -110,6 +110,10 @@ services:
       # snapshot path during a short demo.
       WHIPPET_SNAPSHOT_EVERY: ${WHIPPET_SNAPSHOT_EVERY:-1000}
       WHIPPET_DASHBOARD_DIR: /app/dashboard
+      WHIPPET_API_TOKEN: ${WHIPPET_API_TOKEN:-}
+      WHIPPET_API_PARTICIPANT: ${WHIPPET_API_PARTICIPANT:-api}
+      WHIPPET_RATE_LIMIT_PER_SEC: ${WHIPPET_RATE_LIMIT_PER_SEC:-0}
+      WHIPPET_HTTP_TRACE: ${WHIPPET_HTTP_TRACE:-}
     secrets:
       - iggy_root_password
     volumes:

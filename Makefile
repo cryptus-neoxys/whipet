@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 COMPOSE := docker compose -f deploy/compose.yaml
 
-.PHONY: help secrets up down demo bench bench-smoke verify replay reset logs build dashboard ci obs chaos ha ps
+.PHONY: help secrets up down demo bench bench-smoke bench-sweep verify replay doctor reset logs build dashboard ci obs chaos ha ps
 
 help:
 	@printf '%s\n' \
@@ -10,8 +10,10 @@ help:
 		'make demo        submit a crossing sell/buy pair and print the trade' \
 		'make bench       full L1 benchmark (profile bench)' \
 		'make bench-smoke short benchmark sanity run' \
+		'make bench-sweep batch-size sweep (1/10/100/256)' \
 		'make verify      healthcheck, crossing pair, snapshot hash check' \
 		'make replay      full vs snapshot-seeded replay; hashes must match' \
+		'make doctor      read-only preflight: Iggy topics, snapshots, health' \
 		'make reset       down -v (keeps local files and secrets)' \
 		'make logs        follow default stack logs' \
 		'make build       build the whippet image' \
@@ -45,6 +47,9 @@ bench:
 bench-smoke:
 	@scripts/bench.sh smoke
 
+bench-sweep:
+	@scripts/bench-sweep.sh
+
 verify:
 	@$(COMPOSE) exec -T node /usr/local/bin/whippet healthcheck --gateway http://127.0.0.1:8080
 	@scripts/verify-demo.sh
@@ -52,6 +57,9 @@ verify:
 
 replay:
 	@scripts/replay.sh
+
+doctor:
+	@$(COMPOSE) exec -T node /usr/local/bin/whippet doctor
 
 reset:
 	@scripts/reset.sh
