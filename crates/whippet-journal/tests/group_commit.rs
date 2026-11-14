@@ -328,3 +328,67 @@ async fn separate_partitions_linger_in_parallel() {
 
     group.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_large_submissions_never_cross_offsets() {
+    // 200 + 200 messages exceeds the 256-message cap, so the writer must split
+    // them into two appends. Each submission's ack must still address its own
+    // payloads: this is the silent-mis-ack case a job-count cap would miss.
+    let journal = Arc::new(Journal::memory());
+    let group = GroupCommit::new(
+        Arc::clone(&journal),
+        GroupCommitConfig {
+            max_batch: 256,
+            linger: Duration::from_millis(5),
+        },
+    );
+
+    let first = tokio::spawn({
+        let group = group.clone();
+        async move {
+            group
+                .append(
+                    Topic::Orders,
+                    0,
+                    (0..200u64).map(message).collect::<Vec<_>>(),
+                )
+                .await
+                .expect("first append")
+        }
+    });
+    let second = tokio::spawn({
+        let group = group.clone();
+        async move {
+            group
+                .append(
+                    Topic::Orders,
+                    0,
+                    (200..400u64).map(message).collect::<Vec<_>>(),
+                )
+                .await
+                .expect("second append")
+        }
+    });
+
+    let first = first.await.expect("first task");
+    let second = second.await.expect("second task");
+    let stored = records(&journal, Topic::Orders, 0, 400).await;
+    assert_eq!(stored.len(), 400);
+
+    for index in 0..200u64 {
+        assert_eq!(
+            stored[first.base_offset as usize + index as usize].payload,
+            payload(index),
+            "first submission payload at its own offset"
+        );
+        assert_eq!(
+            stored[second.base_offset as usize + index as usize].payload,
+            payload(200 + index),
+            "second submission payload at its own offset"
+        );
+    }
+
+    let mut starts = [first.base_offset, second.base_offset];
+    starts.sort_unstable();
+    assert_eq!(starts, [0, 200], "the two submissions cover 0..400");
+}

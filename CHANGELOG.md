@@ -30,8 +30,8 @@ Whippet is pre-1.0; minor releases may change internal APIs.
 
 ### Changed
 
-- The shard loop joins the executions and MD appends instead of awaiting them
-  in sequence.
+- The shard loop joins the executions and MD appends with the next orders poll,
+  so matching and the broker round trip overlap instead of running in series.
 - Hot path: cached best bid/ask indices, `FxHashMap` order/dedup maps,
   payload-only journal reads, cached header keys and topic identifiers, owned
   append, 256-message append chunking, parallel executions/MD appends, and
