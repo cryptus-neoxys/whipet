@@ -606,13 +606,31 @@ transport win. Different hosts, connection pools, and server builds change the
 result; the comparison is only meaningful on the same native host, commit, and
 snapshot setting.
 
-## WebSocket fanout (20 Hz conflated feed — results pending)
+## WebSocket fanout (20 Hz conflated feed — dev-loop measured)
 
 The gateway publishes conflated market-data state frames over `/ws` at 20 Hz
 (50 ms nominal period) using a shared `FrameCache` keyed by
 `(symbols, trade_limit, sequence, freshness_ms)`. The fanout harness
 (`crates/whippet-bench/examples/fanout.rs`) measures subscriber frame delivery,
 byte throughput, and inter-frame gap percentiles as the subscriber count scales.
+
+### Dev-loop result
+
+Docker Desktop on M4, node and simulator running, `?trades=60`, 8 s measured,
+2 s warmup, one run per subscriber count. The frame cache means the server
+serializes once per `(filter, tick)`; egress is per subscriber.
+
+| Subscribers | Frames/s | Aggregate MB/s | Gap p50 | Gap p99 | Stalled |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 20.0 | 0.29 | 50.0 ms | 52.4 ms | 0 |
+| 10 | 198.8 | 2.88 | 50.1 ms | 74.8 ms | 0 |
+| 100 | 2,000.0 | 29.42 | 50.3 ms | 59.6 ms | 0 |
+
+At 100 subscribers the node was at ~5.6% CPU while also serving the simulator,
+and no subscriber stalled. The 10-subscriber gap p99 (74.8 ms) is worse than
+the 100-subscriber one (59.6 ms); this is scheduler noise on a shared laptop,
+not a scaling trend. These are `dev-loop`, one-run numbers, not headline
+results.
 
 ### Method
 

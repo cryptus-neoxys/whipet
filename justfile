@@ -22,6 +22,9 @@ bench-sweep:
 bench-tcp:
     make bench-tcp
 
+bench-fanout:
+    make bench-fanout
+
 verify:
     make verify
 

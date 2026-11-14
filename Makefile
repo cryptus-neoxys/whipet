@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 COMPOSE := docker compose -f deploy/compose.yaml
 
-.PHONY: help secrets up down demo bench bench-smoke bench-sweep bench-tcp verify replay doctor reset logs build dashboard ci obs chaos ha ps
+.PHONY: help secrets up down demo bench bench-smoke bench-sweep bench-tcp bench-fanout verify replay doctor reset logs build dashboard ci obs chaos ha ps
 
 help:
 	@printf '%s\n' \
@@ -12,6 +12,7 @@ help:
 		'make bench-smoke short benchmark sanity run' \
 		'make bench-sweep batch-size sweep (1/10/100/256)' \
 		'make bench-tcp   binary TCP sweep (1k/5k/10k)' \
+		'make bench-fanout WebSocket fanout (1/10/100 subscribers)' \
 		'make verify      healthcheck, crossing pair, snapshot hash check' \
 		'make replay      full vs snapshot-seeded replay; hashes must match' \
 		'make doctor      read-only preflight: Iggy topics, snapshots, health' \
@@ -53,6 +54,9 @@ bench-sweep:
 
 bench-tcp:
 	@scripts/bench-tcp.sh
+
+bench-fanout:
+	@scripts/bench-fanout.sh
 
 verify:
 	@$(COMPOSE) exec -T node /usr/local/bin/whippet healthcheck --gateway http://127.0.0.1:8080
