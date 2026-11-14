@@ -118,5 +118,12 @@ export function DepthChart({ book }: { book: BookView | null }) {
     return () => observer.disconnect();
   }, [book]);
 
-  return <canvas ref={canvasRef} className="depth-chart" aria-label="Cumulative market depth" />;
+  const label = book
+    ? `Cumulative market depth for ${book.symbol}. Best bid ${formatPrice(
+        book.best_bid_cents,
+        book.symbol,
+      )}, best ask ${formatPrice(book.best_ask_cents, book.symbol)}.`
+    : 'Cumulative market depth. No book snapshot yet.';
+
+  return <canvas ref={canvasRef} className="depth-chart" role="img" aria-label={label} />;
 }

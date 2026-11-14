@@ -25,6 +25,7 @@ export function SymbolList({
               key={book.symbol}
               type="button"
               className={`symbol-row ${active ? 'active' : ''}`}
+              aria-pressed={active}
               onClick={() => onSelect(book.symbol)}
             >
               <span className="symbol-name">{book.symbol}</span>

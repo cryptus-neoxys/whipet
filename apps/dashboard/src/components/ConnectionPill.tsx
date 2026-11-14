@@ -17,10 +17,17 @@ export function ConnectionPill({
   ageMs: number;
 }) {
   const state = stale && connection === 'live' ? 'reconnecting' : connection;
+  const visible = stale && connection === 'live' ? 'STALE' : labels[connection];
   return (
-    <span className={`connection connection-${state}`} title={`Last state frame ${Math.max(0, Math.round(ageMs))} ms ago`}>
-      <span className="connection-dot" />
-      {stale && connection === 'live' ? 'STALE' : labels[connection]}
+    <span
+      className={`connection connection-${state}`}
+      role="status"
+      aria-live="polite"
+      aria-label={`Connection ${visible.toLowerCase()}`}
+      title={`Last state frame ${Math.max(0, Math.round(ageMs))} ms ago`}
+    >
+      <span className="connection-dot" aria-hidden="true" />
+      {visible}
     </span>
   );
 }

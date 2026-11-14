@@ -74,6 +74,7 @@ export interface HealthView {
   iggy_connected: boolean;
   iggy_addr: string;
   journal: string;
+  shards_ok: boolean;
   version: string;
   uptime_s: number;
   partitions: number;

@@ -24,10 +24,13 @@ export function useExchangeFeed(): ExchangeFeed {
     let closed = false;
     let socket: WebSocket | null = null;
     let retry = 0;
+    let opened = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
 
     const record = (next: StateView) => {
       setState(next);
+      setConnection('live');
+      setError(null);
       setLastMessageAt(Date.now());
       const now = Date.now();
       const samples = historyRef.current;
@@ -48,10 +51,11 @@ export function useExchangeFeed(): ExchangeFeed {
 
     const connect = () => {
       if (closed) return;
-      setConnection(retry === 0 ? 'connecting' : 'reconnecting');
+      setConnection(retry === 0 ? 'connecting' : opened ? 'reconnecting' : 'offline');
       const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
       socket = new WebSocket(`${protocol}://${window.location.host}/ws`);
       socket.onopen = () => {
+        opened = true;
         retry = 0;
         setConnection('live');
         setError(null);
@@ -71,7 +75,9 @@ export function useExchangeFeed(): ExchangeFeed {
       };
       socket.onclose = () => {
         if (closed) return;
-        setConnection('reconnecting');
+        // Before the first successful open, report offline rather than a
+        // reconnecting state that suggests a working feed.
+        setConnection(opened ? 'reconnecting' : 'offline');
         const delay = Math.min(10_000, 1_000 * 2 ** retry);
         retry += 1;
         timer = setTimeout(connect, delay);

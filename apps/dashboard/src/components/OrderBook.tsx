@@ -1,34 +1,45 @@
+import { memo } from 'react';
 import { formatPrice, formatQty } from '../lib/format';
 import type { BookView, LevelView } from '../lib/types';
 
-function LadderRow({
-  level,
-  symbol,
-  side,
-  maxQty,
-  best,
-}: {
-  level: LevelView;
-  symbol: string;
-  side: 'buy' | 'sell';
-  maxQty: number;
-  best: boolean;
-}) {
-  const width = Math.max(2, (level.qty / maxQty) * 100);
-  return (
-    <div className={`ladder-row ladder-${side} ${best ? 'best' : ''}`}>
-      <span className="ladder-depth" style={{ width: `${width}%` }} />
-      <span className="ladder-price">{formatPrice(level.price_cents, symbol)}</span>
-      <span className="ladder-qty">{formatQty(level.qty)}</span>
-      <span className="ladder-orders">{level.orders}</span>
-    </div>
-  );
-}
+const LadderRow = memo(
+  function LadderRow({
+    level,
+    symbol,
+    side,
+    maxQty,
+    best,
+  }: {
+    level: LevelView;
+    symbol: string;
+    side: 'buy' | 'sell';
+    maxQty: number;
+    best: boolean;
+  }) {
+    const width = Math.max(2, (level.qty / maxQty) * 100);
+    return (
+      <div className={`ladder-row ladder-${side} ${best ? 'best' : ''}`}>
+        <span className="ladder-depth" style={{ width: `${width}%` }} />
+        <span className="ladder-price">{formatPrice(level.price_cents, symbol)}</span>
+        <span className="ladder-qty">{formatQty(level.qty)}</span>
+        <span className="ladder-orders">{level.orders}</span>
+      </div>
+    );
+  },
+  (prev, next) =>
+    prev.level.price_cents === next.level.price_cents &&
+    prev.level.qty === next.level.qty &&
+    prev.level.orders === next.level.orders &&
+    prev.symbol === next.symbol &&
+    prev.side === next.side &&
+    prev.maxQty === next.maxQty &&
+    prev.best === next.best,
+);
 
 export function OrderBook({ book }: { book: BookView | null }) {
   if (!book) {
     return (
-      <section className="panel book-panel">
+      <section className="panel book-panel" aria-label="Order book">
         <div className="panel-head">Order book</div>
         <div className="empty-state">Waiting for the first market-data snapshot…</div>
       </section>
@@ -43,7 +54,7 @@ export function OrderBook({ book }: { book: BookView | null }) {
   const asks = [...book.asks].reverse();
 
   return (
-    <section className="panel book-panel">
+    <section className="panel book-panel" aria-label={`Order book for ${book.symbol}`}>
       <div className="panel-head">
         <span>
           {book.symbol} <span className="panel-sub">book</span>
@@ -58,6 +69,7 @@ export function OrderBook({ book }: { book: BookView | null }) {
         <span>orders</span>
       </div>
       <div className="ladder ladder-asks">
+        <div className="ladder-side-label">asks</div>
         {asks.length === 0 ? <div className="ladder-empty">no asks</div> : null}
         {asks.map((level, index) => (
           <LadderRow
@@ -80,6 +92,7 @@ export function OrderBook({ book }: { book: BookView | null }) {
         </span>
       </div>
       <div className="ladder ladder-bids">
+        <div className="ladder-side-label">bids</div>
         {book.bids.length === 0 ? <div className="ladder-empty">no bids</div> : null}
         {book.bids.map((level, index) => (
           <LadderRow

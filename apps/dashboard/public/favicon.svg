@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Whippet">
+  <rect width="32" height="32" rx="7" fill="#070a0f"/>
+  <path
+    d="M4 23 L10 9 L16 20 L21 7 L28 23"
+    fill="none"
+    stroke="#5eead4"
+    stroke-width="2.6"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <path
+    d="M4 27 H19"
+    fill="none"
+    stroke="#5eead4"
+    stroke-opacity="0.45"
+    stroke-width="1.6"
+    stroke-linecap="round"
+  />
+</svg>

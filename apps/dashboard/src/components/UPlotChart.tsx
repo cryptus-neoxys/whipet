@@ -15,11 +15,13 @@ export function UPlotChart({
   series,
   height = 200,
   yFormat,
+  ariaLabel,
 }: {
   data: uPlot.AlignedData;
   series: ChartSeries[];
   height?: number;
   yFormat?: (value: number) => string;
+  ariaLabel?: string;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<uPlot | null>(null);
@@ -32,10 +34,19 @@ export function UPlotChart({
 
   const hasData = (data[0]?.length ?? 0) > 1;
 
+  const measure = () => {
+    const container = containerRef.current;
+    if (!container) return 220;
+    const styles = window.getComputedStyle(container);
+    const horizontal =
+      (Number.parseFloat(styles.paddingLeft) || 0) + (Number.parseFloat(styles.paddingRight) || 0);
+    return Math.max(220, Math.floor(container.clientWidth - horizontal));
+  };
+
   useEffect(() => {
     const container = containerRef.current;
     if (!container || !hasData) return;
-    const width = Math.max(320, container.clientWidth || 600);
+    const width = measure();
     const options: uPlot.Options = {
       width,
       height,
@@ -75,7 +86,7 @@ export function UPlotChart({
     const chart = new uPlot(options, dataRef.current, container);
     chartRef.current = chart;
     const observer = new ResizeObserver(() => {
-      const nextWidth = container.clientWidth;
+      const nextWidth = measure();
       if (nextWidth > 0) chart.setSize({ width: nextWidth, height });
     });
     observer.observe(container);
@@ -91,7 +102,12 @@ export function UPlotChart({
   }, [data]);
 
   return (
-    <div className="chart-wrap" ref={containerRef}>
+    <div
+      className="chart-wrap"
+      ref={containerRef}
+      role={ariaLabel ? 'img' : undefined}
+      aria-label={ariaLabel}
+    >
       {!hasData ? <div className="chart-empty">collecting samples…</div> : null}
     </div>
   );

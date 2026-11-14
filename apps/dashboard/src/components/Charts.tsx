@@ -1,4 +1,5 @@
 import { useMemo } from 'react';
+import { Link } from '@tanstack/react-router';
 import type uPlot from 'uplot';
 import { formatLatency, formatRate } from '../lib/format';
 import type { FeedSample } from '../lib/types';
@@ -30,12 +31,27 @@ export function LatencyChart({ history }: { history: FeedSample[] }) {
     <section className="panel chart-panel">
       <div className="panel-head">
         <span>Latency over time</span>
-        <span className="panel-meta">µs · gateway append and engine</span>
+        <span className="panel-meta">
+          <span className="dev-loop">dev-loop</span> · µs ·{' '}
+          <Link to="/bench" className="inline-link">
+            bench method
+          </Link>
+        </span>
       </div>
-      <UPlotChart data={data} series={latencySeries} height={210} yFormat={formatLatency} />
+      <UPlotChart
+        data={data}
+        series={latencySeries}
+        height={210}
+        yFormat={formatLatency}
+        ariaLabel="Ingress and matcher latency over time, in microseconds"
+      />
       <p className="chart-note">
         Ingress is measured around the durable Iggy append. Match is engine dequeue → execution events.
-        This is the dev-loop path; Linux headline numbers are published separately.
+        This is the dev-loop path; the five-repetition protocol and manifests are on the{' '}
+        <Link to="/bench" className="inline-link">
+          Bench page
+        </Link>
+        .
       </p>
     </section>
   );
@@ -54,9 +70,17 @@ export function ThroughputChart({ history }: { history: FeedSample[] }) {
     <section className="panel chart-panel">
       <div className="panel-head">
         <span>Order throughput</span>
-        <span className="panel-meta">accepted orders per second</span>
+        <span className="panel-meta">
+          <span className="dev-loop">dev-loop</span> · accepted orders/s
+        </span>
       </div>
-      <UPlotChart data={data} series={throughputSeries} height={210} yFormat={(value) => `${formatRate(value)}/s`} />
+      <UPlotChart
+        data={data}
+        series={throughputSeries}
+        height={210}
+        yFormat={(value) => `${formatRate(value)}/s`}
+        ariaLabel="Accepted order throughput over time, in orders per second"
+      />
       <p className="chart-note">
         Open-loop load from the simulator or bench harness. If the generator falls behind, the benchmark
         manifest records scheduler slip instead of hiding it.

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { submitOrder } from '../lib/api';
 import { formatPrice } from '../lib/format';
 import type { BookView, OrderType, Side } from '../lib/types';
@@ -11,13 +11,25 @@ const orderTypes: { value: OrderType; label: string }[] = [
   { value: 'post_only', label: 'Post-only' },
 ];
 
-export function OrderTicket({ book }: { book: BookView | null }) {
+export function OrderTicket({
+  book,
+  focusSignal = 0,
+  burstSignal = 0,
+}: {
+  book: BookView | null;
+  focusSignal?: number;
+  burstSignal?: number;
+}) {
   const [side, setSide] = useState<Side>('buy');
   const [orderType, setOrderType] = useState<OrderType>('limit');
   const [price, setPrice] = useState('');
   const [qty, setQty] = useState('10');
   const [pending, setPending] = useState(false);
   const [message, setMessage] = useState<{ tone: 'ok' | 'error'; text: string } | null>(null);
+  const priceRef = useRef<HTMLInputElement>(null);
+  const qtyRef = useRef<HTMLInputElement>(null);
+  const lastFocusSignal = useRef(0);
+  const lastBurstSignal = useRef(0);
 
   useEffect(() => {
     if (!book) return;
@@ -98,16 +110,33 @@ export function OrderTicket({ book }: { book: BookView | null }) {
     });
   };
 
+  // Demo beats drive the ticket through these counters; the component keeps
+  // its own state and stays usable without them.
+  useEffect(() => {
+    if (focusSignal === lastFocusSignal.current) return;
+    lastFocusSignal.current = focusSignal;
+    const target = orderType === 'market' ? qtyRef.current : priceRef.current;
+    target?.focus();
+    target?.select();
+  }, [focusSignal, orderType]);
+
+  useEffect(() => {
+    if (burstSignal === lastBurstSignal.current) return;
+    lastBurstSignal.current = burstSignal;
+    if (!pending) void burst();
+  }, [burstSignal]); // eslint-disable-line react-hooks/exhaustive-deps
+
   return (
     <section className="panel ticket-panel">
       <div className="panel-head">
         <span>Order ticket</span>
         <span className="panel-meta">{book?.symbol ?? '—'}</span>
       </div>
-      <div className="ticket-side">
+      <div className="ticket-side" role="group" aria-label="Order side">
         <button
           type="button"
           className={side === 'buy' ? 'active buy' : ''}
+          aria-pressed={side === 'buy'}
           onClick={() => setSide('buy')}
         >
           Buy
@@ -115,6 +144,7 @@ export function OrderTicket({ book }: { book: BookView | null }) {
         <button
           type="button"
           className={side === 'sell' ? 'active sell' : ''}
+          aria-pressed={side === 'sell'}
           onClick={() => setSide('sell')}
         >
           Sell
@@ -133,6 +163,8 @@ export function OrderTicket({ book }: { book: BookView | null }) {
       <label className="field">
         <span>Price (USD)</span>
         <input
+          ref={priceRef}
+          id="ticket-price"
           value={price}
           onChange={(event) => setPrice(event.target.value)}
           disabled={!requiresPrice}
@@ -142,20 +174,36 @@ export function OrderTicket({ book }: { book: BookView | null }) {
       </label>
       <label className="field">
         <span>Quantity</span>
-        <input value={qty} onChange={(event) => setQty(event.target.value)} inputMode="numeric" />
+        <input
+          ref={qtyRef}
+          id="ticket-qty"
+          value={qty}
+          onChange={(event) => setQty(event.target.value)}
+          inputMode="numeric"
+        />
       </label>
       <div className="ticket-reference">
         {book?.best_bid_cents ? `bid ${formatPrice(book.best_bid_cents, book.symbol)}` : 'no bid'}
         {' · '}
         {book?.best_ask_cents ? `ask ${formatPrice(book.best_ask_cents, book.symbol)}` : 'no ask'}
       </div>
-      <button type="button" className={`submit ${side}`} onClick={submit} disabled={pending || !book}>
+      <button
+        type="button"
+        className={`submit ${side}`}
+        onClick={submit}
+        disabled={pending || !book}
+        aria-busy={pending}
+      >
         {pending ? 'Submitting…' : `${side === 'buy' ? 'Buy' : 'Sell'} ${book?.symbol ?? ''}`}
       </button>
       <button type="button" className="burst" onClick={burst} disabled={pending || !book}>
         Send 12-order burst
       </button>
-      {message ? <div className={`ticket-message ${message.tone}`}>{message.text}</div> : null}
+      {message ? (
+        <div className={`ticket-message ${message.tone}`} role="status" aria-live="polite">
+          {message.text}
+        </div>
+      ) : null}
       <p className="ticket-note">
         The gateway acknowledges after the Iggy append. Matching and MD fanout follow through the log.
       </p>
