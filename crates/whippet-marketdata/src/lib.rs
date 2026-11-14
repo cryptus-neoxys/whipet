@@ -58,6 +58,11 @@ struct BookState {
     last_trade_qty: u64,
     last_trade_side: Option<Side>,
     seq: Seq,
+    /// Running sum of every bid level, including levels below the visible
+    /// depth. Kept in step with the level maps so `view()` never folds them.
+    depth_bid_qty: u64,
+    /// Running sum of every ask level. See `depth_bid_qty`.
+    depth_ask_qty: u64,
 }
 
 impl BookState {
@@ -72,6 +77,8 @@ impl BookState {
             last_trade_qty: 0,
             last_trade_side: None,
             seq: Seq(0),
+            depth_bid_qty: 0,
+            depth_ask_qty: 0,
         }
     }
 
@@ -86,6 +93,20 @@ impl BookState {
         }
     }
 
+    fn depth_mut(&mut self, side: Side) -> &mut u64 {
+        match side {
+            Side::Buy => &mut self.depth_bid_qty,
+            Side::Sell => &mut self.depth_ask_qty,
+        }
+    }
+
+    /// Recompute the cached totals from the level maps. Only snapshots need
+    /// this; deltas adjust the totals by the exact level change.
+    fn recompute_depth(&mut self) {
+        self.depth_bid_qty = total_depth(&self.bids);
+        self.depth_ask_qty = total_depth(&self.asks);
+    }
+
     fn apply(&mut self, event: &MdEvent) -> bool {
         // At-least-once delivery: a crash between apply and commit replays the
         // batch. The per-symbol sequence makes deltas idempotent.
@@ -96,12 +117,20 @@ impl BookState {
         match event.kind {
             MdKind::Add => {
                 let price_cents = self.price_cents(event.price);
-                let level = self
-                    .side_levels_mut(event.side)
-                    .entry(price_cents)
-                    .or_default();
-                level.qty = level.qty.saturating_add(event.qty.0);
-                level.orders = level.orders.saturating_add(1);
+                let added = {
+                    let level = self
+                        .side_levels_mut(event.side)
+                        .entry(price_cents)
+                        .or_default();
+                    let before = level.qty;
+                    level.qty = level.qty.saturating_add(event.qty.0);
+                    level.orders = level.orders.saturating_add(1);
+                    // Saturating arithmetic can absorb part of the add; track
+                    // the change the map actually took, not the requested qty.
+                    level.qty - before
+                };
+                let depth = self.depth_mut(event.side);
+                *depth = depth.saturating_add(added);
                 self.orders.insert(
                     event.order_id,
                     OrderRef {
@@ -119,9 +148,18 @@ impl BookState {
                     }
                     let delta = order.qty.saturating_sub(new_qty);
                     if delta > 0 {
-                        let level = self.side_levels_mut(order.side).get_mut(&order.price_cents);
-                        if let Some(level) = level {
-                            level.qty = level.qty.saturating_sub(delta);
+                        let removed =
+                            match self.side_levels_mut(order.side).get_mut(&order.price_cents) {
+                                Some(level) => {
+                                    let before = level.qty;
+                                    level.qty = level.qty.saturating_sub(delta);
+                                    before - level.qty
+                                }
+                                None => 0,
+                            };
+                        if removed > 0 {
+                            let depth = self.depth_mut(order.side);
+                            *depth = depth.saturating_sub(removed);
                         }
                     }
                     if let Some(order) = self.orders.get_mut(&event.order_id) {
@@ -131,18 +169,30 @@ impl BookState {
             }
             MdKind::Remove => {
                 if let Some(order) = self.orders.remove(&event.order_id) {
-                    let remove_level = {
+                    let (removed, remove_level, leftover) = {
                         let levels = self.side_levels_mut(order.side);
                         if let Some(level) = levels.get_mut(&order.price_cents) {
+                            let before = level.qty;
                             level.qty = level.qty.saturating_sub(order.qty);
                             level.orders = level.orders.saturating_sub(1);
-                            level.orders == 0
+                            (before - level.qty, level.orders == 0, level.qty)
                         } else {
-                            false
+                            (0, false, 0)
                         }
                     };
                     if remove_level {
                         self.side_levels_mut(order.side).remove(&order.price_cents);
+                    }
+                    // Removing the level also drops any quantity left behind by
+                    // an inconsistent order set, so subtract that too.
+                    let removed = if remove_level {
+                        removed.saturating_add(leftover)
+                    } else {
+                        removed
+                    };
+                    if removed > 0 {
+                        let depth = self.depth_mut(order.side);
+                        *depth = depth.saturating_sub(removed);
                     }
                 }
             }
@@ -209,6 +259,7 @@ impl BookState {
                 );
             }
         }
+        self.recompute_depth();
         self.last_trade_side = None;
         if snapshot.last_trade_price.0 > 0 {
             self.last_trade_price_cents = Some(self.price_cents(snapshot.last_trade_price));
@@ -264,16 +315,16 @@ impl BookState {
             last_trade_price_cents: self.last_trade_price_cents,
             last_trade_qty: self.last_trade_qty,
             last_trade_side: self.last_trade_side,
-            depth_bid_qty: self
-                .bids
-                .values()
-                .fold(0u64, |total, level| total.saturating_add(level.qty)),
-            depth_ask_qty: self
-                .asks
-                .values()
-                .fold(0u64, |total, level| total.saturating_add(level.qty)),
+            depth_bid_qty: self.depth_bid_qty,
+            depth_ask_qty: self.depth_ask_qty,
         }
     }
+}
+
+fn total_depth(levels: &BTreeMap<i64, LevelState>) -> u64 {
+    levels
+        .values()
+        .fold(0u64, |total, level| total.saturating_add(level.qty))
 }
 
 struct HubState {
@@ -381,11 +432,25 @@ impl Metrics {
     }
 
     pub fn record_md_event(&self) {
-        self.md_events.fetch_add(1, Ordering::Relaxed);
+        self.record_md_events(1);
     }
 
     pub fn record_trade(&self) {
-        self.trades.fetch_add(1, Ordering::Relaxed);
+        self.record_trades(1);
+    }
+
+    /// Batch counterpart to repeated `record_md_event` calls. One atomic
+    /// read-modify-write per batch instead of one per event.
+    fn record_md_events(&self, count: u64) {
+        if count != 0 {
+            self.md_events.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    fn record_trades(&self, count: u64) {
+        if count != 0 {
+            self.trades.fetch_add(count, Ordering::Relaxed);
+        }
     }
 
     pub fn record_engine_command(&self) {
@@ -529,44 +594,68 @@ impl MdHub {
         self.watch.subscribe()
     }
 
+    /// Apply one delta. Thin wrapper so the batch and single-event paths can
+    /// never drift.
     pub fn apply(&self, event: &MdEvent) {
-        let Some(instrument) = self.config.instrument(event.symbol) else {
+        self.apply_batch(std::slice::from_ref(event));
+    }
+
+    /// Apply a batch of deltas under one hub-lock acquisition and one clock
+    /// read. Events are applied sequentially and in order, so per-symbol
+    /// sequence semantics are identical to repeated [`Self::apply`] calls: a
+    /// duplicate or stale event is still ignored, and only applied events
+    /// advance `sequence`, metrics, and the trade tape.
+    pub fn apply_batch(&self, events: &[MdEvent]) {
+        if events.is_empty() {
             return;
-        };
+        }
         let mut state = self.state.lock().expect("md state poisoned");
-        let (applied, price_cents) = {
+        let mut applied = 0u64;
+        let mut trades_applied = 0u64;
+        let mut max_seq = 0u64;
+        for event in events {
+            // Unknown symbols are skipped exactly as `apply` skips them.
+            let Some(instrument) = self.config.instrument(event.symbol) else {
+                continue;
+            };
             let Some(book) = state.books.get_mut(&event.symbol) else {
-                return;
+                continue;
             };
             debug_assert_eq!(book.tick_size_cents, instrument.tick_size_cents);
-            let applied = book.apply(event);
-            (applied, book.price_cents(event.price))
-        };
-        if !applied {
+            if !book.apply(event) {
+                continue;
+            }
+            // Read the price scale before touching `state.trades` so the book
+            // borrow ends here (the two fields are disjoint, but NLL needs the
+            // book borrow to be finished).
+            let price_cents = book.price_cents(event.price);
+            applied += 1;
+            max_seq = max_seq.max(event.seq.0);
+            if event.kind == MdKind::Trade {
+                trades_applied += 1;
+                if state.trades.len() == TRADE_TAPE_LEN {
+                    state.trades.pop_front();
+                }
+                state.trades.push_back(TradeView {
+                    symbol: event.symbol,
+                    price_cents,
+                    qty: event.qty.0,
+                    side: event.side,
+                    order_id: event.order_id,
+                    ts_ns: event.timestamp_ns,
+                    seq: event.seq,
+                });
+            }
+        }
+        if applied == 0 {
             return;
         }
-        self.metrics.record_md_event();
-        if event.kind == MdKind::Trade {
-            self.metrics.record_trade();
-        }
+        self.metrics.record_md_events(applied);
+        self.metrics.record_trades(trades_applied);
         state.last_update_ns = now_ns();
-        state.sequence = state.sequence.max(event.seq.0);
-        state.md_events = state.md_events.saturating_add(1);
-        if event.kind == MdKind::Trade {
-            state.trades_count = state.trades_count.saturating_add(1);
-            if state.trades.len() == TRADE_TAPE_LEN {
-                state.trades.pop_front();
-            }
-            state.trades.push_back(TradeView {
-                symbol: event.symbol,
-                price_cents,
-                qty: event.qty.0,
-                side: event.side,
-                order_id: event.order_id,
-                ts_ns: event.timestamp_ns,
-                seq: event.seq,
-            });
-        }
+        state.sequence = state.sequence.max(max_seq);
+        state.md_events = state.md_events.saturating_add(applied);
+        state.trades_count = state.trades_count.saturating_add(trades_applied);
         state.dirty = true;
     }
 
@@ -589,6 +678,58 @@ impl MdHub {
     /// /api/trades`, and the initial WebSocket frame.
     pub fn latest(&self) -> Arc<StateView> {
         self.watch.borrow().clone()
+    }
+
+    /// A per-subscription slice of the most recently published frame.
+    ///
+    /// Only the requested `symbols` are cloned, in the configured display
+    /// order (not the request order). An empty `symbols` slice means every
+    /// configured symbol, which is the full frame. `trade_limit` keeps the
+    /// first N trades of the published tape, which is newest-first; `0` keeps
+    /// the whole tape. The tape itself is global, not symbol-filtered.
+    ///
+    /// The returned frame is independent of the watch channel, so the caller
+    /// can serialize it on its own task without holding the hub lock.
+    pub fn latest_for(&self, symbols: &[Symbol], trade_limit: usize) -> Arc<StateView> {
+        let frame = self.latest();
+        if symbols.is_empty() && trade_limit == 0 {
+            // Nothing to filter: hand back the published Arc, no allocation.
+            return frame;
+        }
+        let symbols: Vec<BookView> = if symbols.is_empty() {
+            frame.symbols.clone()
+        } else {
+            self.config
+                .instruments
+                .iter()
+                .filter(|instrument| symbols.contains(&instrument.symbol))
+                .filter_map(|instrument| {
+                    frame
+                        .symbols
+                        .iter()
+                        .find(|book| book.symbol == instrument.symbol)
+                        .cloned()
+                })
+                .collect()
+        };
+        let trades: Vec<TradeView> = if trade_limit == 0 || trade_limit >= frame.trades.len() {
+            frame.trades.clone()
+        } else {
+            frame.trades[..trade_limit].to_vec()
+        };
+        Arc::new(StateView {
+            mode: frame.mode,
+            venue: frame.venue.clone(),
+            symbols,
+            trades,
+            metrics: frame.metrics.clone(),
+            freshness_ms: frame.freshness_ms,
+            sequence: frame.sequence,
+            iggy_addr: frame.iggy_addr.clone(),
+            journal: frame.journal.clone(),
+            guarantee: frame.guarantee.clone(),
+            dashboard_build: frame.dashboard_build.clone(),
+        })
     }
 
     /// Counters and latency percentiles without building a state frame.
@@ -1077,5 +1218,313 @@ mod tests {
         assert_eq!(btc.bids.len(), 3);
         assert_eq!(btc.depth_bid_qty, 44);
         assert_eq!(btc.best_bid_cents, Some(6_500_200));
+    }
+
+    fn event_at(
+        kind: MdKind,
+        symbol: Symbol,
+        seq: u64,
+        side: Side,
+        price_ticks: i64,
+        qty: u64,
+        order_id: u128,
+    ) -> MdEvent {
+        MdEvent {
+            kind,
+            symbol,
+            seq: Seq(seq),
+            cause_offset: seq,
+            timestamp_ns: seq,
+            side,
+            flags: 0,
+            price: Price(price_ticks),
+            qty: Qty(qty),
+            order_id: OrderId(order_id),
+            participant: ParticipantId(1),
+        }
+    }
+
+    fn level_signature(levels: &[LevelView]) -> Vec<(i64, u64, u32)> {
+        levels
+            .iter()
+            .map(|level| (level.price_cents, level.qty, level.orders))
+            .collect()
+    }
+
+    fn assert_book_eq(left: &BookView, right: &BookView) {
+        assert_eq!(left.symbol, right.symbol);
+        assert_eq!(left.seq, right.seq);
+        assert_eq!(level_signature(&left.bids), level_signature(&right.bids));
+        assert_eq!(level_signature(&left.asks), level_signature(&right.asks));
+        assert_eq!(left.best_bid_cents, right.best_bid_cents);
+        assert_eq!(left.best_ask_cents, right.best_ask_cents);
+        assert_eq!(left.spread_cents, right.spread_cents);
+        assert_eq!(left.mid_cents, right.mid_cents);
+        assert_eq!(left.last_trade_price_cents, right.last_trade_price_cents);
+        assert_eq!(left.last_trade_qty, right.last_trade_qty);
+        assert_eq!(left.last_trade_side, right.last_trade_side);
+        assert_eq!(left.depth_bid_qty, right.depth_bid_qty);
+        assert_eq!(left.depth_ask_qty, right.depth_ask_qty);
+    }
+
+    fn assert_state_eq(left: &StateView, right: &StateView) {
+        assert_eq!(left.sequence, right.sequence);
+        assert_eq!(left.metrics.md_events, right.metrics.md_events);
+        assert_eq!(left.metrics.trades, right.metrics.trades);
+        assert_eq!(left.symbols.len(), right.symbols.len());
+        for (left, right) in left.symbols.iter().zip(&right.symbols) {
+            assert_book_eq(left, right);
+        }
+        assert_eq!(left.trades.len(), right.trades.len());
+        for (left, right) in left.trades.iter().zip(&right.trades) {
+            assert_eq!(left.symbol, right.symbol);
+            assert_eq!(left.price_cents, right.price_cents);
+            assert_eq!(left.qty, right.qty);
+            assert_eq!(left.side, right.side);
+            assert_eq!(left.order_id, right.order_id);
+            assert_eq!(left.ts_ns, right.ts_ns);
+            assert_eq!(left.seq, right.seq);
+        }
+    }
+
+    /// A mixed stream with duplicates, stale records, an unknown symbol, an
+    /// over-reduce, and a trade per symbol.
+    fn mixed_stream() -> Vec<MdEvent> {
+        let btc = Symbol::new("BTC-USD").unwrap();
+        let eth = Symbol::new("ETH-USD").unwrap();
+        let sol = Symbol::new("SOL-USD").unwrap();
+        let unknown = Symbol::new("XRP-USD").unwrap();
+        vec![
+            event_at(MdKind::Add, btc, 1, Side::Buy, 65_000, 10, 1),
+            event_at(MdKind::Add, btc, 2, Side::Buy, 65_000, 5, 2),
+            event_at(MdKind::Add, eth, 1, Side::Sell, 15_000, 7, 3),
+            event_at(MdKind::Add, sol, 1, Side::Buy, 5_000, 9, 4),
+            event_at(MdKind::Reduce, btc, 3, Side::Buy, 65_000, 3, 1),
+            // Duplicate of the second add: ignored.
+            event_at(MdKind::Add, btc, 2, Side::Buy, 65_000, 5, 2),
+            // Stale reduce: ignored.
+            event_at(MdKind::Reduce, btc, 2, Side::Buy, 65_000, 1, 2),
+            event_at(MdKind::Trade, btc, 4, Side::Buy, 65_000, 4, 1),
+            event_at(MdKind::Trade, eth, 2, Side::Sell, 15_000, 2, 3),
+            event_at(MdKind::Remove, btc, 5, Side::Buy, 65_000, 0, 2),
+            // Unknown symbol: skipped, like `apply`.
+            event_at(MdKind::Add, unknown, 1, Side::Buy, 100, 3, 5),
+            event_at(MdKind::Add, btc, 6, Side::Buy, 65_001, 8, 6),
+            // No-op reduce (same quantity) still counts as applied.
+            event_at(MdKind::Reduce, eth, 3, Side::Sell, 15_000, 7, 3),
+            // Over-reduce: rejected after the book advances its sequence.
+            event_at(MdKind::Reduce, btc, 7, Side::Buy, 65_000, 99, 1),
+            event_at(MdKind::Add, btc, 8, Side::Buy, 65_002, 2, 7),
+            event_at(MdKind::Trade, btc, 9, Side::Sell, 65_002, 1, 7),
+            // Duplicate of the last trade: ignored.
+            event_at(MdKind::Trade, btc, 9, Side::Sell, 65_002, 1, 7),
+        ]
+    }
+
+    #[test]
+    fn apply_batch_matches_repeated_apply() {
+        let stream = mixed_stream();
+
+        let single = MdHub::new(config(), "test".into(), "memory".into(), None);
+        for event in &stream {
+            single.apply(event);
+        }
+
+        // Batch boundaries must not change the result, including when a chunk
+        // splits a duplicate from the event it replays.
+        let chunked = MdHub::new(config(), "test".into(), "memory".into(), None);
+        for chunk in stream.chunks(3) {
+            chunked.apply_batch(chunk);
+        }
+
+        let once = MdHub::new(config(), "test".into(), "memory".into(), None);
+        once.apply_batch(&stream);
+
+        let single = single.state();
+        let chunked = chunked.state();
+        let once = once.state();
+        assert_state_eq(&single, &chunked);
+        assert_state_eq(&single, &once);
+        assert_eq!(single.metrics.trades, 3);
+        assert_eq!(single.sequence, 9);
+    }
+
+    #[test]
+    fn incremental_depth_matches_full_fold() {
+        let btc = Symbol::new("BTC-USD").unwrap();
+        let mut book = BookState::new(btc, 100);
+        // Deterministic xorshift so a failure is reproducible.
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut seq = 0u64;
+        let mut next_id = 1u128;
+        // order id -> (side, price ticks, remaining qty)
+        let mut live: HashMap<u128, (Side, i64, u64)> = HashMap::new();
+        let mut history: Vec<MdEvent> = Vec::new();
+
+        for step in 0..4_000 {
+            let action = next() % 100;
+            let event = if action < 35 || live.is_empty() {
+                let side = if next() % 2 == 0 {
+                    Side::Buy
+                } else {
+                    Side::Sell
+                };
+                let price = 65_000 + (next() % 8) as i64;
+                let qty = 1 + next() % 50;
+                let id = next_id;
+                next_id += 1;
+                seq += 1;
+                live.insert(id, (side, price, qty));
+                event_at(MdKind::Add, btc, seq, side, price, qty, id)
+            } else if action < 60 {
+                let index = (next() as usize) % live.len();
+                let (&id, &(side, price, qty)) = live.iter().nth(index).unwrap();
+                let new_qty = next() % (qty + 1);
+                seq += 1;
+                if new_qty == 0 {
+                    live.remove(&id);
+                } else {
+                    live.insert(id, (side, price, new_qty));
+                }
+                event_at(MdKind::Reduce, btc, seq, side, price, new_qty, id)
+            } else if action < 80 {
+                let index = (next() as usize) % live.len();
+                let (&id, &(side, price, _)) = live.iter().nth(index).unwrap();
+                live.remove(&id);
+                seq += 1;
+                event_at(MdKind::Remove, btc, seq, side, price, 0, id)
+            } else if action < 90 && !history.is_empty() {
+                // Replay a past record: a duplicate or stale event.
+                let index = (next() as usize) % history.len();
+                history[index].clone()
+            } else {
+                // A record below the current sequence.
+                seq += 1;
+                let stale_seq = seq.saturating_sub(2);
+                event_at(
+                    MdKind::Reduce,
+                    btc,
+                    stale_seq,
+                    Side::Buy,
+                    65_000,
+                    1,
+                    u128::MAX,
+                )
+            };
+            book.apply(&event);
+            history.push(event);
+            assert_eq!(
+                book.depth_bid_qty,
+                total_depth(&book.bids),
+                "bid depth diverged at step {step}"
+            );
+            assert_eq!(
+                book.depth_ask_qty,
+                total_depth(&book.asks),
+                "ask depth diverged at step {step}"
+            );
+        }
+
+        // A snapshot rebuild must recompute the totals from scratch.
+        let mut orders: Vec<MdOrder> = live
+            .iter()
+            .map(|(&id, &(side, price, qty))| MdOrder {
+                order_id: OrderId(id),
+                side,
+                price: Price(price),
+                qty: Qty(qty),
+                participant: ParticipantId(1),
+            })
+            .collect();
+        orders.sort_by_key(|order| order.order_id.0);
+        book.apply_snapshot(&MdSnapshot {
+            symbol: btc,
+            seq: Seq(seq + 1),
+            cause_offset: 0,
+            timestamp_ns: 0,
+            last_trade_price: Price::ZERO,
+            last_trade_qty: Qty::ZERO,
+            bids: vec![],
+            asks: vec![],
+            orders,
+        });
+        assert_eq!(book.depth_bid_qty, total_depth(&book.bids));
+        assert_eq!(book.depth_ask_qty, total_depth(&book.asks));
+
+        let view = book.view();
+        assert_eq!(view.depth_bid_qty, total_depth(&book.bids));
+        assert_eq!(view.depth_ask_qty, total_depth(&book.asks));
+    }
+
+    #[test]
+    fn latest_for_clones_only_requested_symbols_and_trades() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        let btc = Symbol::new("BTC-USD").unwrap();
+        let eth = Symbol::new("ETH-USD").unwrap();
+        let sol = Symbol::new("SOL-USD").unwrap();
+
+        let mut seq = 0u64;
+        for symbol in [btc, eth, sol] {
+            for level in 0..5i64 {
+                seq += 1;
+                hub.apply(&event_at(
+                    MdKind::Add,
+                    symbol,
+                    seq,
+                    Side::Buy,
+                    100 + level,
+                    10,
+                    u128::from(seq),
+                ));
+            }
+        }
+        for index in 0..70u64 {
+            seq += 1;
+            let symbol = if index % 2 == 0 { btc } else { eth };
+            hub.apply(&event_at(
+                MdKind::Trade,
+                symbol,
+                seq,
+                Side::Buy,
+                100,
+                1,
+                1_000_000 + u128::from(index),
+            ));
+        }
+        hub.publish();
+
+        let filtered = hub.latest_for(&[eth], 60);
+        assert_eq!(filtered.symbols.len(), 1);
+        assert_eq!(filtered.symbols[0].symbol, eth);
+        assert_eq!(filtered.trades.len(), 60);
+        // The published tape is newest-first, so the limit keeps the newest.
+        assert_eq!(filtered.trades[0].seq, Seq(seq));
+        assert_eq!(filtered.trades[59].seq, Seq(seq - 59));
+
+        // Empty symbol slice means every configured symbol.
+        let all = hub.latest_for(&[], 5);
+        assert_eq!(all.symbols.len(), 3);
+        assert_eq!(all.trades.len(), 5);
+
+        // Zero means the whole tape.
+        let full_tape = hub.latest_for(&[btc], 0);
+        assert_eq!(full_tape.symbols.len(), 1);
+        assert_eq!(full_tape.trades.len(), 70);
+
+        // Request order does not matter; configured order wins.
+        let ordered = hub.latest_for(&[sol, btc], 0);
+        let order: Vec<Symbol> = ordered.symbols.iter().map(|book| book.symbol).collect();
+        assert_eq!(order, vec![btc, sol]);
+
+        // The shared full frame is untouched.
+        let latest = hub.latest();
+        assert_eq!(latest.symbols.len(), 3);
+        assert_eq!(latest.trades.len(), 70);
     }
 }

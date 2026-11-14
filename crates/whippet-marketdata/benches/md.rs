@@ -106,7 +106,7 @@ fn apply_1m(c: &mut Criterion) {
 
 /// Build the 20 Hz frame shape used by the dashboard: three symbols, 20 levels
 /// per side, and a full 250-trade tape.
-fn state_view(c: &mut Criterion) {
+fn seeded_hub() -> Arc<MdHub> {
     let hub = hub();
     let config = ExchangeConfig::default();
     let mut seq = 0u64;
@@ -151,11 +151,83 @@ fn state_view(c: &mut Criterion) {
             0,
         ));
     }
+    hub
+}
+
+fn state_view(c: &mut Criterion) {
+    let hub = seeded_hub();
 
     let mut group = c.benchmark_group("hub_state_view");
     group.sample_size(50);
     group.bench_function("3_symbols_20_levels_250_trades", |b| {
         b.iter(|| black_box(hub.state()));
+    });
+    group.finish();
+}
+
+/// The same 1M-event mixed stream as `hub_apply`, applied 256 events at a
+/// time. One hub-lock acquisition and one clock read per batch.
+fn apply_batch_1m(c: &mut Criterion) {
+    const BATCH: usize = 256;
+    let mut group = c.benchmark_group("hub_apply_batch");
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(1_000_000));
+    group.bench_function("1m_mixed_batches_of_256", |b| {
+        b.iter(|| {
+            let hub = hub();
+            let btc = symbol("BTC-USD");
+            let mut batch: Vec<MdEvent> = Vec::with_capacity(BATCH);
+            let mut seq = 0u64;
+            for order in 0..250_000u128 {
+                let price = 65_000 + (order % 1_000) as i64;
+                let side = if order % 2 == 0 {
+                    Side::Buy
+                } else {
+                    Side::Sell
+                };
+                let id = order + 1;
+
+                seq += 1;
+                batch.push(event(MdKind::Add, btc, seq, side, price, 100, id));
+                seq += 1;
+                batch.push(event(MdKind::Reduce, btc, seq, side, price, 40, id));
+                seq += 1;
+                batch.push(event(MdKind::Remove, btc, seq, side, price, 0, id));
+                seq += 1;
+                batch.push(event(
+                    MdKind::Trade,
+                    btc,
+                    seq,
+                    side.opposite(),
+                    price,
+                    10,
+                    id,
+                ));
+                if batch.len() >= BATCH {
+                    hub.apply_batch(&batch);
+                    batch.clear();
+                }
+            }
+            if !batch.is_empty() {
+                hub.apply_batch(&batch);
+            }
+            black_box(hub);
+        });
+    });
+    group.finish();
+}
+
+/// Per-subscription frame: one selected symbol and the newest 60 trades from a
+/// three-symbol, 250-trade published frame.
+fn latest_for(c: &mut Criterion) {
+    let hub = seeded_hub();
+    hub.publish();
+    let selected = [symbol("BTC-USD")];
+
+    let mut group = c.benchmark_group("hub_latest_for");
+    group.sample_size(100);
+    group.bench_function("3_symbols_1_selected_60_trades", |b| {
+        b.iter(|| black_box(hub.latest_for(&selected, 60)));
     });
     group.finish();
 }
@@ -267,6 +339,6 @@ criterion_group! {
     config = Criterion::default()
         .sample_size(10)
         .measurement_time(Duration::from_secs(8));
-    targets = apply_1m, state_view, duplicate_stale, read_path, contended_apply
+    targets = apply_1m, apply_batch_1m, state_view, latest_for, duplicate_stale, read_path, contended_apply
 }
 criterion_main!(benches);
