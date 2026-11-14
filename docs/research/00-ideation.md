@@ -132,7 +132,7 @@ Subjective notes behind the numbers:
 - Market data must fan out to many independent subscribers → consumer groups with per-consumer offsets.
 - Audit, surveillance, and backtesting are replay workloads → offset/timestamp polling, retention.
 - Retransmits and duplicate order IDs → server-side dedup.
-- Order flow confidentiality → per-stream AES-256-GCM encryption.
+- Order flow confidentiality → per-stream AES-256-GCM-SIV encryption.
 - Service identity and least privilege → PATs and per-stream permissions.
 - Failover without loss → VSR cluster with persisted durability.
 
@@ -262,7 +262,7 @@ Headers on every message: `symbol`, `seq`, `venue`, `type`, `schema`, `trace_id`
 - Multiple transports: QUIC ingress, TCP internal, WebSocket dashboard, HTTP admin
 - Retention policies per topic
 - PATs and per-stream permissions
-- AES-256-GCM stream encryption for order flow
+- AES-256-GCM-SIV stream encryption for order flow
 - 3-node VSR cluster with persisted durability and failover demo
 - Prometheus metrics; optional MCP "ops assistant" profile
 

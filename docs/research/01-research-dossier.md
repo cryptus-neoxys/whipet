@@ -160,7 +160,7 @@ Cut: stop/stop-limit, iceberg, pegged, trailing, multi-leg/spreads, pro-rata, RF
 |---|---|
 | Server | `apache/iggy:0.10.0` (pin digest) |
 | Rust SDK | `iggy = 0.12.0` |
-| Wire protocol | 0.12.2 (server and SDK must match; mixed versions are refused) |
+| Wire protocol | 0.12.0 (server and SDK must match; mixed versions are refused) |
 | Cluster compose | Do not inherit the repo's `0.9.0` default; pin explicitly |
 
 ### 4.2 Producer/consumer baseline
@@ -188,7 +188,7 @@ Cut: stop/stop-limit, iceberg, pegged, trailing, multi-leg/spreads, pro-rata, RF
 2. High-level producer topic creation cannot set segment size, offset durability, replication factor, or flush thresholds.
 3. `TopicCreateOptions` is a 12-field struct with no builder.
 4. QUIC/WebSocket TLS validation defaults to `false`; TCP defaults to `true`.
-5. `docker-compose.cluster.yml` defaults to `0.9.0` while the protocol requires 0.12.2.
+5. `docker-compose.cluster.yml` defaults to `0.9.0` while the protocol requires 0.12.0.
 6. No consumer-group offset semantics example/test across restart.
 7. No runnable idempotent-producer restart/reconnect example.
 8. `/metrics` has no producer-send or poll-latency histograms.
@@ -467,7 +467,7 @@ Tag `v0.1.0`; post once in Iggy Discord showcase with GIF + three bullets + one 
 
 | Risk | Mitigation |
 |---|---|
-| Iggy pre-1.0 churn (protocol 0.12.2, cluster young) | Pin image digest + SDK; compatibility matrix; upgrade ADR; no `latest`/`edge` |
+| Iggy pre-1.0 churn (protocol 0.12.0, cluster young) | Pin image digest + SDK; compatibility matrix; upgrade ADR; no `latest`/`edge` |
 | Dual-mode complexity | Shared engine; mode only changes seq/journal/ack path; one guarantee matrix; default `durable` |
 | UI scope | Leptos/WASM custom canvas or thin TS client; 5 pages; no framework sprawl |
 | M4 benchmark limits | Linux reproduction script; label M4 `dev-loop`; publish raw artifacts |

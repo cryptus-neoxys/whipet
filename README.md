@@ -9,6 +9,7 @@ An independent Apache Iggy showcase: a sub-millisecond matching engine with mill
 - [Ideation and selection](docs/research/00-ideation.md) — 28 concepts, top 10 ranked, top 3 chosen.
 - [Research dossier and architecture blueprint](docs/research/01-research-dossier.md) — exchange architecture, Iggy playbook, benchmark protocol, failure matrix, simulator, security, DevEx.
 - [Upstream contribution backlog](docs/research/02-upstream-backlog.md) — the Iggy gaps found during research, prioritized for Apache merit.
+- [Issue pack](docs/issues/README.md) — five ready-to-file Iggy issues, plus a dedup/coordination log for the rest.
 
 ## What Whippet will demonstrate
 
