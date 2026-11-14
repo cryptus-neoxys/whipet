@@ -7,7 +7,7 @@ is used here as a pinned upstream dependency.
 ## Decision making
 
 - The maintainer makes final decisions and is accountable for the repository.
-- Significant design changes are recorded as ADRs in [`docs/adr/`](adr/). An ADR is required for
+- Significant design changes are recorded as ADRs in [`docs/adr/`](docs/adr/). An ADR is required for
   changes to the matching semantics, the wire protocol, topic layout, durability policy, or the
   benchmark protocol.
 - Small fixes and documentation improvements use ordinary pull requests and lazy consensus.
@@ -17,10 +17,10 @@ is used here as a pinned upstream dependency.
 ## Contribution path
 
 1. Open an issue for bugs, design questions, or non-trivial features.
-2. For upstream Apache Iggy friction, follow [`docs/UPSTREAM.md`](UPSTREAM.md): reproduce on the
+2. For upstream Apache Iggy friction, follow [`docs/UPSTREAM.md`](docs/UPSTREAM.md): reproduce on the
    pinned release, search for duplicates, and file upstream before changing Whippet around it.
 3. Keep pull requests small, green, and single-purpose.
-4. Run the local checks in [`CONTRIBUTING.md`](../CONTRIBUTING.md).
+4. Run the local checks in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Maintainership
 
@@ -29,7 +29,7 @@ CLA. Contributions are accepted under the Apache License, Version 2.0.
 
 ## Code of conduct
 
-Participation is covered by [`CODE_OF_CONDUCT.md`](../CODE_OF_CONDUCT.md).
+Participation is covered by [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
 
 ## Trademarks
 

@@ -7,9 +7,14 @@ reachable at <http://localhost:8080>.
 make up
 ```
 
-If you want a clean book, run `make reset && make up` first. If the simulator
-is already running, your limit orders may match existing liquidity instead of
-resting.
+If you want a clean book, run `make reset && make up`, then stop the simulator:
+
+```sh
+docker compose -f deploy/compose.yaml stop sim
+```
+
+Otherwise the simulator may leave liquidity on the book, and your limit orders
+can match it instead of resting.
 
 ## Check the node
 
@@ -252,12 +257,12 @@ make bench
 A short manual run, useful for a first look:
 
 ```sh
-docker compose -f deploy/compose.yaml exec node \
-  whippet bench \
-    --gateway http://127.0.0.1:8080 \
-    --rate 200 --duration 10 --warmup 2 --repetitions 1 \
-    --label smoke
+make bench-smoke
 ```
+
+`make bench-smoke` runs the bench service, which mounts `./artifacts` at
+`/artifacts`, stops the simulator for a quiet measurement, and restores it
+afterwards.
 
 Expected output:
 
@@ -267,13 +272,7 @@ manifest: artifacts/bench/<run-id>.json
 ```
 
 The numbers above are illustrative. The scope is `dev-loop` on an M4 with
-Docker Desktop. The harness writes the manifest inside the node container. If
-your Compose file mounts `./artifacts`, it is also on the host. Otherwise copy
-it out:
-
-```sh
-docker compose -f deploy/compose.yaml cp node:/app/artifacts/bench ./artifacts
-```
+Docker Desktop. The manifest is written to `artifacts/bench/` on the host.
 
 Inspect it:
 

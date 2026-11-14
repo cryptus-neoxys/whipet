@@ -101,12 +101,13 @@ Raw:
 
 ```sh
 docker compose -f deploy/compose.yaml down -v
-rm -rf data artifacts/bench
+scripts/reset.sh --data   # optional: also remove host data/ and artifacts/bench
 ```
 
-This deletes the Iggy log, the consumer offsets stored in Iggy, every snapshot,
-and every local bench manifest. It does not touch the source tree or the
-dashboard build.
+`make reset` deletes the Iggy log, the consumer offsets stored in Iggy, and the
+snapshots in the named volume. It keeps host `data/`, `artifacts/`, and secrets
+unless you pass `--data`/`--all` to `scripts/reset.sh`. It does not touch the
+source tree or the dashboard build.
 
 ## Logs
 
@@ -130,7 +131,11 @@ There are no per-order log lines on the hot path.
 
 ## Health and metrics
 
-`GET /api/health` returns HTTP 200 with `status: "ok"` or `"degraded"`. The
+`GET /api/health` returns HTTP 200 with `status: "ok"` or `"degraded"`. It is
+`ok` only when the journal is reachable (or the in-memory journal is selected)
+and every shard task is alive; `shards_ok` reports the latter. A corrupt
+snapshot or a shard task panic therefore degrades health instead of leaving a
+silent "up but not matching" node. The
 node pings Iggy at startup and every five seconds. `degraded` means the last
 ping failed; it does not mean the process is down.
 

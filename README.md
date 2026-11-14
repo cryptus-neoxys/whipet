@@ -57,11 +57,12 @@ docker compose -f deploy/compose.yaml logs -f node
 docker compose -f deploy/compose.yaml down
 ```
 
-`make reset` is the destructive one. Raw form:
+`make reset` is the destructive one: it runs `down -v` and removes the named
+volumes. Raw form:
 
 ```sh
 docker compose -f deploy/compose.yaml down -v
-rm -rf data artifacts/bench
+scripts/reset.sh --data   # optional: also remove data/ and artifacts/bench
 ```
 
 Two Iggy 0.10 details are handled by `deploy/compose.yaml`, not by the app:
@@ -75,9 +76,11 @@ static assets were not built. See [DEMO.md](docs/DEMO.md#dashboard-assets-are-mi
 
 ## Five demo beats
 
-Run these against a quiet node (`make reset && make up`) so the first order
-rests instead of matching something the simulator left behind. Values that
-change per run are marked `<...>`.
+Run these against a fresh stack (`make reset && make up`). The simulator is part
+of the default stack, so the book may already have depth; use `make demo` for
+the deterministic scripted version, or stop the simulator with
+`docker compose -f deploy/compose.yaml stop sim` if you want a quiet book.
+Values that change per run are marked `<...>`.
 
 ### 1. Place an order
 
@@ -99,7 +102,7 @@ Expected shape:
   "order_id": "<32 hex chars>",
   "symbol": "BTC-USD",
   "partition": 1,
-  "offset": 0,
+  "offset": "<offset>",
   "mode": "durable",
   "status": "accepted_by_log",
   "accepted_at_ns": 1760000000000000000,

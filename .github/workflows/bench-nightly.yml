@@ -5,8 +5,9 @@ name: bench-nightly
 # job uploads manifests; it does not assert a latency threshold. Shared-runner
 # numbers are not headline results.
 on:
-  schedule:
-    - cron: "0 6 * * *"
+  # Manual only: a useful L1 run needs a Linux host with io_uring available to
+  # the Iggy container. GitHub-hosted runners may not provide it, so a nightly
+  # schedule would produce noise rather than a benchmark.
   workflow_dispatch:
 
 permissions:
@@ -15,6 +16,7 @@ permissions:
 jobs:
   bench:
     name: linux L1 benchmark
+    continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:

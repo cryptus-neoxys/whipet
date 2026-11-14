@@ -71,8 +71,11 @@ jobs:
     name: compose smoke
     # The smoke job needs Docker and builds the image, so it runs on main and
     # on manual dispatch, not on every pull request. The Rust job never needs
-    # Docker.
+    # Docker. GitHub-hosted runners may not expose io_uring to the Iggy 0.10
+    # container; this job is informative, while rust/dashboard/compose-config
+    # are the required gates.
     if: github.event_name != 'pull_request'
+    continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 45
     needs: [compose-config]
