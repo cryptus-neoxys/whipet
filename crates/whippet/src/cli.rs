@@ -48,6 +48,12 @@ pub struct BenchArgs {
     /// the Iggy default message batch.
     #[arg(long, default_value_t = 1)]
     pub batch_size: usize,
+    /// Ingress transport: `http` (default) or `tcp`.
+    #[arg(long, default_value = "http")]
+    pub transport: String,
+    /// Binary TCP ingress address, used when `--transport tcp`.
+    #[arg(long, default_value = "127.0.0.1:8081")]
+    pub tcp_addr: String,
 }
 
 pub async fn run_bench(args: BenchArgs) -> Result<()> {
@@ -72,6 +78,8 @@ pub async fn run_bench(args: BenchArgs) -> Result<()> {
         max_in_flight: args.max_in_flight,
         timeout_ms: args.timeout_ms,
         batch_size: args.batch_size,
+        transport: args.transport,
+        tcp_addr: args.tcp_addr,
         ..BenchConfig::default()
     };
     let manifest = whippet_bench::run(config).await?;

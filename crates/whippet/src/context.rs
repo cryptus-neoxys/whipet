@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use tokio::sync::watch;
-use whippet_journal::Journal;
+use whippet_journal::{GroupCommit, Journal};
 use whippet_marketdata::{MdHub, Metrics};
 
 use crate::config::NodeConfig;
@@ -16,6 +16,10 @@ use crate::snapshot::SnapshotStore;
 pub struct NodeContext {
     pub config: NodeConfig,
     pub journal: Arc<Journal>,
+    /// One writer per `(topic, partition)` for Orders ingress. Every route
+    /// (single order, batch, cancel, TCP) uses this so a partition has exactly
+    /// one append writer and log order matches arrival order.
+    pub group_commit: GroupCommit,
     pub hub: Arc<MdHub>,
     pub metrics: Arc<Metrics>,
     pub snapshots: SnapshotStore,

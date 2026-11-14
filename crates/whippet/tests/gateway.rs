@@ -55,6 +55,7 @@ fn node_with(node: &TestNode, configure: impl FnOnce(&mut NodeConfig)) -> Arc<No
     Arc::new(NodeContext {
         config,
         journal: Arc::clone(&node.ctx.journal),
+        group_commit: node.ctx.group_commit.clone(),
         hub: Arc::clone(&node.ctx.hub),
         metrics: Arc::clone(&node.ctx.metrics),
         snapshots: node.ctx.snapshots.clone(),

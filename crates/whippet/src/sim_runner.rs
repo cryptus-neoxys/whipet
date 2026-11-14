@@ -122,18 +122,26 @@ pub async fn run(args: SimArgs) -> Result<()> {
         let sent_task = Arc::clone(&sent);
         let errors_task = Arc::clone(&errors);
         tokio::spawn(async move {
+            // Serialize straight to bytes. The old path built a
+            // `serde_json::Value` and then serialized that again, so every
+            // simulated action paid two JSON passes and a tree of allocations.
             let (url, body) = match &action {
-                SimAction::New(order) => (
-                    format!("{base}/api/orders"),
-                    serde_json::to_value(order).ok(),
-                ),
+                SimAction::New(order) => {
+                    (format!("{base}/api/orders"), serde_json::to_vec(order).ok())
+                }
                 SimAction::Cancel(cancel) => (
                     format!("{base}/api/cancel"),
-                    serde_json::to_value(cancel).ok(),
+                    serde_json::to_vec(cancel).ok(),
                 ),
             };
             if let Some(body) = body {
-                match client.post(url).json(&body).send().await {
+                match client
+                    .post(url)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .send()
+                    .await
+                {
                     Ok(response) if response.status().is_success() => {
                         sent_task.fetch_add(1, Ordering::Relaxed);
                     }

@@ -107,6 +107,64 @@ impl SnapshotStore {
     }
 }
 
+/// A snapshot tagged with the sequence number it was produced at.
+///
+/// The shard loop increments the sequence for every snapshot it hands to the
+/// writer; the writer only keeps the newest one it has seen.
+#[derive(Debug, Clone)]
+pub struct SequencedSnapshot {
+    pub sequence: u64,
+    pub snapshot: ShardSnapshot,
+}
+
+/// True when `sequence` is newer than the last one written.
+///
+/// The guard is strict: re-writing the same sequence is treated as stale, so a
+/// duplicated request can never replace a file with older state.
+pub fn is_newer(last_written: Option<u64>, sequence: u64) -> bool {
+    match last_written {
+        Some(last) => sequence > last,
+        None => true,
+    }
+}
+
+/// Serialises snapshot writes and refuses to overwrite newer state.
+///
+/// `save` is blocking (temp file, fsync, rename), so this type is meant to be
+/// driven from a dedicated writer thread/task, never from the shard loop.
+pub struct SnapshotWriter {
+    store: SnapshotStore,
+    last_written: Option<u64>,
+}
+
+impl SnapshotWriter {
+    pub fn new(store: SnapshotStore) -> Self {
+        Self {
+            store,
+            last_written: None,
+        }
+    }
+
+    /// The highest sequence this writer has successfully persisted.
+    pub fn last_written(&self) -> Option<u64> {
+        self.last_written
+    }
+
+    /// Write `request` unless it is older than the last snapshot written.
+    ///
+    /// Returns `Ok(None)` when the request was dropped by the stale-sequence
+    /// guard, and `Ok(Some(path))` when it reached disk. A failed write leaves
+    /// the guard untouched so a newer snapshot can still be persisted.
+    pub fn write(&mut self, request: SequencedSnapshot) -> Result<Option<PathBuf>, SnapshotError> {
+        if !is_newer(self.last_written, request.sequence) {
+            return Ok(None);
+        }
+        let path = self.store.save(&request.snapshot)?;
+        self.last_written = Some(request.sequence);
+        Ok(Some(path))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +184,72 @@ mod tests {
         let restored = ShardEngine::from_snapshot(&exchange, loaded).unwrap();
         assert_eq!(restored.state_hash(), engine.state_hash());
         assert!(store.load(4).unwrap().is_none());
+    }
+
+    #[test]
+    fn sequence_guard_is_strictly_monotonic() {
+        assert!(is_newer(None, 1));
+        assert!(!is_newer(Some(1), 1));
+        assert!(!is_newer(Some(2), 1));
+        assert!(is_newer(Some(1), 2));
+    }
+
+    #[test]
+    fn stale_snapshot_never_overwrites_newer_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path());
+        let engine = ShardEngine::new(3, &ExchangeConfig::default());
+        let path = store.path(3);
+        let mut writer = SnapshotWriter::new(store);
+
+        let written = writer
+            .write(SequencedSnapshot {
+                sequence: 7,
+                snapshot: engine.snapshot_state(),
+            })
+            .unwrap();
+        assert_eq!(written.as_deref(), Some(path.as_path()));
+        assert!(path.exists());
+
+        // Remove the file so an accepted stale write would be observable.
+        fs::remove_file(&path).unwrap();
+        let stale = writer
+            .write(SequencedSnapshot {
+                sequence: 6,
+                snapshot: engine.snapshot_state(),
+            })
+            .unwrap();
+        assert!(stale.is_none());
+        assert!(!path.exists(), "stale sequence recreated the snapshot");
+        assert_eq!(writer.last_written(), Some(7));
+
+        // A newer sequence is persisted again.
+        let newer = writer
+            .write(SequencedSnapshot {
+                sequence: 8,
+                snapshot: engine.snapshot_state(),
+            })
+            .unwrap();
+        assert!(newer.is_some());
+        assert!(path.exists());
+        assert_eq!(writer.last_written(), Some(8));
+    }
+
+    #[test]
+    fn failed_write_does_not_advance_the_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file in the way makes `create_dir_all` fail.
+        let blocker = dir.path().join("blocked");
+        fs::write(&blocker, b"not a directory").unwrap();
+        let store = SnapshotStore::new(blocker.join("snapshots"));
+        let engine = ShardEngine::new(3, &ExchangeConfig::default());
+        let mut writer = SnapshotWriter::new(store);
+
+        let result = writer.write(SequencedSnapshot {
+            sequence: 4,
+            snapshot: engine.snapshot_state(),
+        });
+        assert!(result.is_err());
+        assert_eq!(writer.last_written(), None);
     }
 }

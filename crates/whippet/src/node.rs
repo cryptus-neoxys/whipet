@@ -10,6 +10,7 @@ use axum::serve::ListenerExt;
 use tokio::sync::watch;
 use tokio::time::sleep;
 use tracing::{info, warn};
+use whippet_journal::group::{GroupCommit, GroupCommitConfig};
 use whippet_journal::{IggyJournal, Journal};
 
 use crate::config::{JournalKind, NodeArgs, NodeConfig};
@@ -17,6 +18,7 @@ use crate::context::NodeContext;
 use crate::engine_runner::{run_engine_shard, run_md_shard};
 use crate::gateway;
 use crate::snapshot::SnapshotStore;
+use crate::tcp;
 
 pub async fn run(args: NodeArgs) -> Result<()> {
     let config = NodeConfig::from_args(args)?;
@@ -49,9 +51,20 @@ pub async fn run(args: NodeArgs) -> Result<()> {
     );
     let metrics = hub.metrics();
     let (shutdown, _) = watch::channel(false);
+    // One Orders writer per partition, shared by HTTP, TCP, and cancels.
+    // Zero linger: the writer drains whatever is already queued when it wakes,
+    // so a lone order is flushed immediately and a burst coalesces by arrival.
+    let group_commit = GroupCommit::new(
+        Arc::clone(&journal),
+        GroupCommitConfig {
+            max_batch: 256,
+            linger: Duration::ZERO,
+        },
+    );
     let ctx = Arc::new(NodeContext {
         config: config.clone(),
         journal: Arc::clone(&journal),
+        group_commit,
         hub: Arc::clone(&hub),
         metrics: Arc::clone(&metrics),
         snapshots: SnapshotStore::new(config.snapshot_dir.clone()),
@@ -91,6 +104,22 @@ pub async fn run(args: NodeArgs) -> Result<()> {
         journal = ?config.journal,
         "Whippet node started"
     );
+
+    if let Some(tcp_addr) = config.tcp_addr {
+        let tcp_ctx = Arc::clone(&ctx);
+        let mut tcp_shutdown = ctx.shutdown.subscribe();
+        tokio::spawn(async move {
+            tokio::select! {
+                result = tcp::serve(tcp_ctx, tcp_addr) => {
+                    if let Err(error) = result {
+                        tracing::error!(error = %error, "TCP ingress stopped");
+                    }
+                }
+                _ = tcp_shutdown.changed() => {}
+            }
+        });
+        info!(address = %tcp_addr, "binary TCP ingress listening");
+    }
 
     let app = gateway::router(Arc::clone(&ctx));
     let listener = tokio::net::TcpListener::bind(config.http_addr)

@@ -48,6 +48,10 @@ pub struct NodeArgs {
     /// HTTP/WebSocket listen address.
     #[arg(long, env = "WHIPPET_HTTP_ADDR", default_value = "0.0.0.0:8080")]
     pub http_addr: String,
+    /// Binary TCP order-ingress listen address. `off`, `none`, or an empty
+    /// value disables the listener; the HTTP path stays available either way.
+    #[arg(long, env = "WHIPPET_TCP_ADDR", default_value = "0.0.0.0:8081")]
+    pub tcp_addr: String,
     /// Iggy TCP address.
     #[arg(long, env = "WHIPPET_IGGY_ADDR", default_value = "127.0.0.1:8090")]
     pub iggy_addr: String,
@@ -109,6 +113,8 @@ pub struct NodeArgs {
 #[derive(Clone)]
 pub struct NodeConfig {
     pub http_addr: SocketAddr,
+    /// Binary TCP ingress address. `None` disables the listener.
+    pub tcp_addr: Option<SocketAddr>,
     pub iggy_addr: String,
     pub iggy_user: String,
     pub iggy_password: String,
@@ -136,6 +142,7 @@ impl NodeConfig {
         let http_addr: SocketAddr = args.http_addr.parse().map_err(|_| {
             ConfigError::Invalid(format!("invalid HTTP address: {}", args.http_addr))
         })?;
+        let tcp_addr = parse_tcp_addr(&args.tcp_addr)?;
         let journal = JournalKind::parse(&args.journal)?;
         let iggy_password = read_password(&args.iggy_password, args.iggy_password_file.as_deref())?;
         let mode: Mode = args.mode.parse()?;
@@ -163,6 +170,7 @@ impl NodeConfig {
 
         Ok(Self {
             http_addr,
+            tcp_addr,
             iggy_addr: args.iggy_addr,
             iggy_user: args.iggy_user,
             iggy_password,
@@ -178,6 +186,20 @@ impl NodeConfig {
             rate_limit_per_sec: args.rate_limit_per_sec,
         })
     }
+}
+
+/// Parse the optional binary TCP listen address. `off`, `none`, and an empty
+/// value all disable the listener so a deployment can run HTTP-only without
+/// changing the binary.
+fn parse_tcp_addr(value: &str) -> Result<Option<SocketAddr>, ConfigError> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    value
+        .parse()
+        .map(Some)
+        .map_err(|_| ConfigError::Invalid(format!("invalid TCP address: {value}")))
 }
 
 /// Resolve the Iggy password the same way for the node and `whippet doctor`.
@@ -330,5 +352,37 @@ mod tests {
     fn an_empty_api_participant_is_rejected() {
         let cli = Cli::parse_from(["test", "--api-participant", ""]);
         assert!(NodeConfig::from_args(cli.node).is_err());
+    }
+
+    #[test]
+    fn tcp_ingress_defaults_to_the_binary_port() {
+        let cli = Cli::parse_from(["test"]);
+        let config = NodeConfig::from_args(cli.node).unwrap();
+        assert_eq!(config.tcp_addr, Some("0.0.0.0:8081".parse().unwrap()));
+    }
+
+    #[test]
+    fn tcp_ingress_can_be_disabled() {
+        for value in ["off", "none", ""] {
+            let cli = Cli::parse_from(["test", "--tcp-addr", value]);
+            let config = NodeConfig::from_args(cli.node).unwrap();
+            assert_eq!(config.tcp_addr, None, "{value:?} disables the listener");
+        }
+    }
+
+    #[test]
+    fn tcp_ingress_address_is_parsed() {
+        let cli = Cli::parse_from(["test", "--tcp-addr", "127.0.0.1:9001"]);
+        let config = NodeConfig::from_args(cli.node).unwrap();
+        assert_eq!(config.tcp_addr, Some("127.0.0.1:9001".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_malformed_tcp_address_is_rejected() {
+        let cli = Cli::parse_from(["test", "--tcp-addr", "not-an-address"]);
+        match NodeConfig::from_args(cli.node) {
+            Ok(_) => panic!("a malformed TCP address must be rejected"),
+            Err(error) => assert!(error.to_string().contains("invalid TCP address")),
+        }
     }
 }

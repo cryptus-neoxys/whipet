@@ -44,6 +44,7 @@ impl TestNode {
         let snapshot_dir = tempdir.path().join("snapshots");
         let config = NodeConfig {
             http_addr: "127.0.0.1:0".parse().expect("valid test address"),
+            tcp_addr: None,
             iggy_addr: "127.0.0.1:8090".into(),
             iggy_user: "iggy".into(),
             iggy_password: "iggy".into(),
@@ -59,6 +60,13 @@ impl TestNode {
             rate_limit_per_sec: 0,
         };
         let journal = Arc::new(Journal::memory());
+        let group_commit = whippet_journal::group::GroupCommit::new(
+            Arc::clone(&journal),
+            whippet_journal::group::GroupCommitConfig {
+                max_batch: 256,
+                linger: std::time::Duration::ZERO,
+            },
+        );
         let hub = MdHub::new(
             config.exchange.clone(),
             config.iggy_addr.clone(),
@@ -70,6 +78,7 @@ impl TestNode {
         let ctx = Arc::new(NodeContext {
             config,
             journal,
+            group_commit,
             hub,
             metrics,
             snapshots: SnapshotStore::new(snapshot_dir),

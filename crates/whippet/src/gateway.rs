@@ -45,6 +45,7 @@ const BUCKET_IDLE: Duration = Duration::from_secs(60);
 
 pub fn router(ctx: Arc<NodeContext>) -> Router {
     let limiter = Arc::new(RateLimiter::new(ctx.config.rate_limit_per_sec));
+    let frames = Arc::new(FrameCache::default());
     let ingress = Router::new()
         .route("/api/orders", post(submit_order))
         .route("/api/orders/batch", post(submit_orders))
@@ -70,7 +71,8 @@ pub fn router(ctx: Arc<NodeContext>) -> Router {
     };
 
     let api = api
-        .layer(CompressionLayer::new().compress_when(NotForContentType::new("application/json")));
+        .layer(CompressionLayer::new().compress_when(NotForContentType::new("application/json")))
+        .layer(Extension(frames));
     let api = if http_trace_enabled() {
         api.layer(TraceLayer::new_for_http())
     } else {
@@ -182,8 +184,8 @@ async fn submit_order(
     let (order_id, message) = build_order(&validated, timestamp_ns);
     let partition = validated.symbol.partition(ctx.exchange().partitions);
     let append = ctx
-        .journal
-        .append_owned(Topic::Orders, partition, vec![message])
+        .group_commit
+        .append(Topic::Orders, partition, vec![message])
         .await
         .map_err(journal_unavailable)?;
     let elapsed = started.elapsed();
@@ -267,9 +269,12 @@ async fn submit_orders(
     }
 
     let count = messages.len() as u32;
+    // Route batches through the same per-partition writer as single orders, so
+    // one partition has exactly one append path and log order matches arrival
+    // order across transports.
     let append = ctx
-        .journal
-        .append_owned(Topic::Orders, partition, messages)
+        .group_commit
+        .append(Topic::Orders, partition, messages)
         .await
         .map_err(journal_unavailable)?;
     let elapsed = started.elapsed();
@@ -402,6 +407,25 @@ fn build_order(order: &ValidatedOrder, timestamp_ns: u64) -> (OrderId, JournalMe
     )
 }
 
+/// Shared ingress encoding for the binary TCP path. One fixed-layout command
+/// becomes one journal message with the same header set the HTTP path uses, so
+/// the engine decodes identical payloads regardless of transport.
+pub(crate) fn journal_message_for_command(command: &Command) -> JournalMessage {
+    let meta = MessageMeta::new(
+        command.symbol,
+        Seq(0),
+        "order",
+        SCHEMA_ORDER,
+        command.order_id.0,
+    );
+    JournalMessage::new(command.encode(), meta.pairs())
+}
+
+/// Constant-time bearer comparison shared by the HTTP and TCP ingress paths.
+pub(crate) fn token_matches(expected: &str, presented: &str) -> bool {
+    constant_time_eq(expected.as_bytes(), presented.as_bytes())
+}
+
 async fn cancel_order(
     State(ctx): State<Arc<NodeContext>>,
     headers: HeaderMap,
@@ -428,8 +452,8 @@ async fn cancel_order(
     );
     let message = JournalMessage::new(command.encode(), meta.pairs());
     let append = ctx
-        .journal
-        .append_owned(Topic::Orders, partition, vec![message])
+        .group_commit
+        .append(Topic::Orders, partition, vec![message])
         .await
         .map_err(journal_unavailable)?;
     Ok(Json(CancelAck {
@@ -604,7 +628,32 @@ async fn instruments(
 
 async fn prometheus(State(ctx): State<Arc<NodeContext>>) -> impl IntoResponse {
     let state = ctx.hub.latest();
-    let body = prometheus_text(&state.metrics, state.freshness_ms, state.sequence);
+    let stats = ctx.group_commit.stats();
+    let mut body = prometheus_text(&state.metrics, state.freshness_ms, state.sequence);
+    body.push_str("# HELP whippet_group_commit_batches_total Group-commit appends completed.\n");
+    body.push_str("# TYPE whippet_group_commit_batches_total counter\n");
+    body.push_str(&format!(
+        "whippet_group_commit_batches_total {}\n",
+        stats.batches
+    ));
+    body.push_str("# HELP whippet_group_commit_messages_total Messages coalesced into group-commit appends.\n");
+    body.push_str("# TYPE whippet_group_commit_messages_total counter\n");
+    body.push_str(&format!(
+        "whippet_group_commit_messages_total {}\n",
+        stats.messages
+    ));
+    body.push_str("# HELP whippet_group_commit_max_batch Largest group-commit append seen.\n");
+    body.push_str("# TYPE whippet_group_commit_max_batch gauge\n");
+    body.push_str(&format!(
+        "whippet_group_commit_max_batch {}\n",
+        stats.max_batch_seen
+    ));
+    body.push_str("# HELP whippet_group_commit_partitions Live group-commit writer tasks.\n");
+    body.push_str("# TYPE whippet_group_commit_partitions gauge\n");
+    body.push_str(&format!(
+        "whippet_group_commit_partitions {}\n",
+        ctx.group_commit.writer_count()
+    ));
     (
         [(
             header::CONTENT_TYPE,
@@ -746,26 +795,125 @@ async fn trades(
     Json(state.trades.iter().take(limit).cloned().collect())
 }
 
+#[derive(Debug, Deserialize)]
+struct WsQuery {
+    /// Cap the trade tape in the frame. `0` (the default) keeps the full tape.
+    trades: Option<usize>,
+}
+
+/// Serialized WS state frames, one per `(filter, sequence, freshness)`.
+///
+/// The publisher ticks at 20 Hz. Before this cache every subscriber cloned the
+/// whole `StateView` and ran `serde_json::to_string` independently, so N clients
+/// cost N serializations of the same bytes. Now the first subscriber builds the
+/// frame and the rest clone a refcounted buffer.
+#[derive(Default)]
+struct FrameCache {
+    inner: Mutex<FrameCacheInner>,
+}
+
+#[derive(Default)]
+struct FrameCacheInner {
+    sequence: u64,
+    freshness_ms: u64,
+    frames: HashMap<(Vec<Symbol>, usize), axum::extract::ws::Utf8Bytes>,
+}
+
+impl FrameCache {
+    fn frame(
+        &self,
+        state: &StateView,
+        symbols: &[Symbol],
+        trade_limit: usize,
+    ) -> axum::extract::ws::Utf8Bytes {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.sequence != state.sequence || inner.freshness_ms != state.freshness_ms {
+            inner.sequence = state.sequence;
+            inner.freshness_ms = state.freshness_ms;
+            inner.frames.clear();
+        }
+        let key = (symbols.to_vec(), trade_limit);
+        if let Some(frame) = inner.frames.get(&key) {
+            return frame.clone();
+        }
+        // The unfiltered, untruncated frame is the common case. Serialize the
+        // published view directly instead of cloning it first.
+        let text = if symbols.is_empty() && trade_limit == 0 {
+            serde_json::to_string(&WsServerMessage::State {
+                state: state.clone(),
+            })
+        } else {
+            let view = filtered_state(state, symbols, trade_limit);
+            serde_json::to_string(&WsServerMessage::State { state: view })
+        }
+        .unwrap_or_else(|_| {
+            "{\"type\":\"notice\",\"level\":\"error\",\"message\":\"encode failed\"}".into()
+        });
+        let frame = axum::extract::ws::Utf8Bytes::from(text);
+        inner.frames.insert(key, frame.clone());
+        frame
+    }
+}
+
+/// Build a frame with only the requested symbols and trade count. An empty
+/// symbol list means every symbol. `trade_limit == 0` keeps the full tape.
+fn filtered_state(state: &StateView, symbols: &[Symbol], trade_limit: usize) -> StateView {
+    let books = if symbols.is_empty() {
+        state.symbols.clone()
+    } else {
+        state
+            .symbols
+            .iter()
+            .filter(|book| symbols.contains(&book.symbol))
+            .cloned()
+            .collect()
+    };
+    let trades = if trade_limit == 0 || trade_limit >= state.trades.len() {
+        state.trades.clone()
+    } else {
+        state.trades.iter().take(trade_limit).cloned().collect()
+    };
+    StateView {
+        mode: state.mode,
+        venue: state.venue.clone(),
+        symbols: books,
+        trades,
+        metrics: state.metrics.clone(),
+        freshness_ms: state.freshness_ms,
+        sequence: state.sequence,
+        iggy_addr: state.iggy_addr.clone(),
+        journal: state.journal.clone(),
+        guarantee: state.guarantee.clone(),
+        dashboard_build: state.dashboard_build.clone(),
+    }
+}
+
 async fn ws_upgrade(
     ws: WebSocketUpgrade,
     State(ctx): State<Arc<NodeContext>>,
+    Extension(cache): Extension<Arc<FrameCache>>,
+    Query(query): Query<WsQuery>,
 ) -> impl IntoResponse {
+    let trade_limit = query.trades.unwrap_or(0);
     ws.max_message_size(64 * 1024)
         .max_frame_size(64 * 1024)
-        .on_upgrade(move |socket| ws_loop(socket, ctx))
+        .on_upgrade(move |socket| ws_loop(socket, ctx, cache, trade_limit))
 }
 
-async fn ws_loop(mut socket: WebSocket, ctx: Arc<NodeContext>) {
+async fn ws_loop(
+    mut socket: WebSocket,
+    ctx: Arc<NodeContext>,
+    cache: Arc<FrameCache>,
+    trade_limit: usize,
+) {
     let mut receiver = ctx.hub.subscribe();
-    if send_json(
-        &mut socket,
-        &WsServerMessage::State {
-            state: (*ctx.hub.latest()).clone(),
-        },
-    )
-    .await
-    .is_err()
-    {
+    // Empty means "all symbols", matching the dashboard's default view.
+    let mut symbols: Vec<Symbol> = Vec::new();
+    let initial = cache.frame(&ctx.hub.latest(), &symbols, trade_limit);
+    if socket.send(Message::Text(initial)).await.is_err() {
         return;
     }
 
@@ -776,7 +924,8 @@ async fn ws_loop(mut socket: WebSocket, ctx: Arc<NodeContext>) {
                     break;
                 }
                 let state = receiver.borrow().clone();
-                if send_json(&mut socket, &WsServerMessage::State { state: (*state).clone() }).await.is_err() {
+                let frame = cache.frame(&state, &symbols, trade_limit);
+                if socket.send(Message::Text(frame)).await.is_err() {
                     break;
                 }
             }
@@ -788,14 +937,24 @@ async fn ws_loop(mut socket: WebSocket, ctx: Arc<NodeContext>) {
                         }
                     }
                     Some(Ok(Message::Text(text))) => {
-                        if let Ok(WsClientMessage::Ping { sent_at_ns }) = serde_json::from_str(&text) {
-                            let message = WsServerMessage::Notice {
-                                level: "pong".into(),
-                                message: sent_at_ns.to_string(),
-                            };
-                            if send_json(&mut socket, &message).await.is_err() {
-                                break;
+                        match serde_json::from_str::<WsClientMessage>(&text) {
+                            Ok(WsClientMessage::Subscribe { symbols: requested }) => {
+                                symbols = requested;
+                                let frame = cache.frame(&ctx.hub.latest(), &symbols, trade_limit);
+                                if socket.send(Message::Text(frame)).await.is_err() {
+                                    break;
+                                }
                             }
+                            Ok(WsClientMessage::Ping { sent_at_ns }) => {
+                                let message = WsServerMessage::Notice {
+                                    level: "pong".into(),
+                                    message: sent_at_ns.to_string(),
+                                };
+                                if send_json(&mut socket, &message).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => {}
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
@@ -854,6 +1013,71 @@ mod tests {
     use super::*;
     use whippet_core::api::MetricsView;
     use whippet_core::config::Mode;
+
+    fn sample_state() -> StateView {
+        let btc = whippet_core::api::BookView {
+            symbol: Symbol::new("BTC-USD").unwrap(),
+            seq: Seq(1),
+            bids: Vec::new(),
+            asks: Vec::new(),
+            best_bid_cents: None,
+            best_ask_cents: None,
+            spread_cents: None,
+            mid_cents: None,
+            last_trade_price_cents: None,
+            last_trade_qty: 0,
+            last_trade_side: None,
+            depth_bid_qty: 0,
+            depth_ask_qty: 0,
+        };
+        let eth = whippet_core::api::BookView {
+            symbol: Symbol::new("ETH-USD").unwrap(),
+            ..btc.clone()
+        };
+        StateView {
+            mode: Mode::Durable,
+            venue: "whippet".into(),
+            symbols: vec![btc, eth],
+            trades: Vec::new(),
+            metrics: MetricsView::empty(Mode::Durable, 16),
+            freshness_ms: 3,
+            sequence: 9,
+            iggy_addr: "iggy:8090".into(),
+            journal: "iggy".into(),
+            guarantee: "durable".into(),
+            dashboard_build: None,
+        }
+    }
+
+    #[test]
+    fn filtered_state_keeps_only_requested_symbols() {
+        let state = sample_state();
+        let filtered = filtered_state(&state, &[Symbol::new("ETH-USD").unwrap()], 0);
+        assert_eq!(filtered.symbols.len(), 1);
+        assert_eq!(filtered.symbols[0].symbol.as_str(), "ETH-USD");
+        assert_eq!(filtered.sequence, state.sequence);
+    }
+
+    #[test]
+    fn empty_symbol_filter_keeps_every_symbol() {
+        let state = sample_state();
+        let filtered = filtered_state(&state, &[], 0);
+        assert_eq!(filtered.symbols.len(), 2);
+    }
+
+    #[test]
+    fn frame_cache_reuses_bytes_for_the_same_tick() {
+        let cache = FrameCache::default();
+        let state = sample_state();
+        let first = cache.frame(&state, &[], 60);
+        let second = cache.frame(&state, &[], 60);
+        assert_eq!(first, second);
+        // A new sequence invalidates the cache.
+        let mut next = state.clone();
+        next.sequence += 1;
+        let third = cache.frame(&next, &[], 60);
+        assert_ne!(first, third);
+    }
 
     #[test]
     fn prometheus_text_contains_core_series() {
