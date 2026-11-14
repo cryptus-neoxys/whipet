@@ -359,9 +359,9 @@ does not, and the edge is where the baseline knee lives.
 |---|---|---|---|
 | No allocation in the match loop | `SymbolEngine::process`, `Book` operations | Holds in steady state. Output vectors are caller-owned and reused; the arena, free list, and index are preallocated. | `Book::snapshot` and `state_hash` allocate, but only on the snapshot interval and shutdown. Journal-edge message construction allocates per event: `MessageMeta::pairs` (7 `String`s), `execution_message`/`md_message` (payload `Vec` + 7 `String`s), `build_order`. |
 | No syscall in the match loop | `SymbolEngine::process` | Holds. The matcher performs no I/O. | The shard loop around it reads the clock once per record (`Instant::now()` in `engine_runner.rs`) and the hub reads it once per MD event (`now_ns()` in `MdHub::apply`). On Linux these are vDSO clock reads, not syscalls, but they are still work on the serial path. |
-| No lock in the match loop | `SymbolEngine::process` | Holds. One task owns each partition's books; the engine crate has no lock. | `Metrics::record_match_latency_us` locks a `Mutex<Histogram>` per command in the shard loop. `MdHub` takes a global `Mutex` per MD event. Both are outside the pure matcher, but both are on a single-writer path. |
+| No lock in the match loop | `SymbolEngine::process` | Holds. One task owns each partition's books; the engine crate has no lock. | `Metrics::record_match_latency_us` locks a `Mutex<Histogram>` per command in the shard loop. `MdHub::apply_batch` takes the hub mutex once per poll batch, not per event. Both are outside the pure matcher. |
 | No async in the engine | `whippet-engine` | Holds. The crate has no Tokio dependency. The shard task awaits only at the journal edge: poll, append, commit. | None in the engine. The async boundary is the journal edge by design. |
-| Fixed headers and payload layout | Protocol and journal edge | Holds. Payloads are fixed-width little-endian with no varints, floats, or padding: 78 B command, 104 B execution, 84 B MD event. Seven string headers carry routing and diagnostics. The engine never parses headers. | `IggyJournal::read` parses headers for every record. A payload-only `read_payloads` path exists in the journal, but the engine and MD runners in this tree still call `read`. The header-key cache removes repeated `HeaderKey` parsing, but the header values are still `String`s. |
+| Fixed headers and payload layout | Protocol and journal edge | Holds. Payloads are fixed-width little-endian with no varints, floats, or padding: 78 B command, 104 B execution, 84 B MD event. Orders and MD snapshots carry the full seven headers; executions and MD events carry four routing headers. The engine never parses headers. | The engine and MD runners use the payload-only `read_payloads` path, so no header TLV parse or `String` materialisation happens on the consume path. Header keys are cached; header values are still `String`s on the produce path. |
 | Per-partition single writer | Engine task per active partition | Holds logically. One task per active partition, no concurrent writer, no lock on the book. | The task is a Tokio task on a multi-thread runtime, not a pinned OS thread. It can migrate cores between awaits. Pinning, busy-poll, and SPSC rings are later Linux work. |
 
 ### Periodic costs that are not in the per-order budget
@@ -406,19 +406,21 @@ and the seven header strings are real costs, but they are CPU work that can
 overlap with other tasks. The broker round trip is the per-order cost that does
 not amortize.
 
-**Measured.** The batch path is wired and the dev-loop sweep is above. The next
-optimization is server-side group commit for single-order clients and a binary
-TCP ingress, not another batch-size sweep:
+**Measured and addressed.** Batch ingress, per-partition group commit, and the
+binary TCP listener all landed and are measured above. The 5,000/s single-order
+path went from a standing queue to p50 ~2 ms. The next optimization is the
+dedicated shard thread with a bounded ring, which removes the remaining async
+edge between the matcher and the journal:
 
-- Gateway: `POST /api/orders/batch`, one symbol, at most 256 orders, one append,
-  all-or-nothing validation, contiguous offsets. This route is present in the
-  working tree.
-- Harness: wire `--batch-size N` to the batch body, record `workload.batch_size`,
-  and report orders/s separately from requests/s. The CLI flag exists; the
-  `BenchConfig` and manifest wiring do not yet.
-- Journal: use the payload-only read path, the owned append path, and the cached
-  header keys on the shard runners. These exist in the journal crate but are not
-  all wired into `engine_runner.rs`.
+- Gateway: `POST /api/orders/batch` and `POST /api/orders` both go through the
+  per-partition group writer; a batch is one append, all-or-nothing validation,
+  contiguous offsets.
+- Harness: `--batch-size N` drives the batch body, `workload.batch_size` is
+  recorded, and orders/s is reported separately from requests/s.
+- Journal: the shard runners use `read_payloads`, the owned append path, and
+  cached header keys; executions/MD carry routing headers.
+- Engine loop: the executions and MD appends and the next orders poll are
+  joined, so the shard overlaps matching with the broker round trip.
 
 **Expected effect.** One broker round trip per N orders instead of one per
 order. Throughput rises until the broker or disk saturates. The first order's
@@ -441,16 +443,15 @@ seven header `String`s per event. The shard loop records a match-latency sample
 through a `Mutex<Histogram>` per command. The batch endpoint is present, but the
 engine's output path still has these per-event costs.
 
-**Next optimization.** Use the fast paths that already exist, then measure:
+**Addressed.** The runners use `read_payloads`; gateway and TCP use
+`append_owned` (via group commit); executions/MD carry routing headers; the
+commit is coalesced to 256 records or 100 ms with a documented replay window;
+and the shard loop joins the output appends with the next poll.
 
-- Switch the engine and MD runners from `read` to `read_payloads`.
-- Use `append_owned` where the caller can give up the messages.
-- Pre-encode or cache header values, not just header keys.
-- Move the match-latency histogram record to the batch boundary, or use a
-  per-shard histogram that the shard task owns without a mutex.
-- Consider bounded commit coalescing (commit every K batches or every T ms).
-  This reduces round trips but widens the replay window on a crash, so it needs
-  a failure-mode review before it ships.
+**Next optimization.** Move the match-latency histogram off a global mutex: a
+per-shard histogram merged on scrape removes one lock per command. Then move
+the state-hash computation into the snapshot writer so the shard does not pay
+it on the loop.
 
 **Expected effect.** Lower CPU and allocation per event; fewer broker round
 trips per batch. Commit coalescing trades a wider at-least-once replay window
@@ -518,10 +519,13 @@ build was ~753 ns before and ~734 ns after (noise-level); `/api/state` via
 `latest()` is ~6.9 ns (an `Arc` clone), and metrics-only reads are ~109 ns
 instead of a full frame build.
 
-**Next optimization.** Build one serialized frame per tick and broadcast the
-bytes to subscribers, and filter by `WsClientMessage::Subscribe`. Move the
-clock read to the tick. If the hub lock shows contention with three MD
-consumers, shard it by symbol or use an `RwLock`.
+**Addressed.** `FrameCache` serializes one frame per `(filter, tick)` and every
+subscriber clones a refcounted buffer; `Subscribe` filters symbols and
+`?trades=N` caps the tape. `apply_batch` takes the hub lock once per poll.
+
+**Next optimization.** Build a fanout workload (1/10/100 subscribers) and
+measure frames/s and bytes/s. If the hub lock contends at 16 active shards,
+shard it by symbol or use an `RwLock`.
 
 **Expected effect.** Serialization becomes O(1) per tick instead of O(N); egress
 remains O(N). This matters at 10+ subscribers and at three or more active MD
@@ -533,23 +537,22 @@ grows.
 
 ### Rank 5 — TCP/binary ingress and background producer batching (later)
 
-**Evidence.** The only ingress is HTTP JSON. The manifest's `payload_bytes` is a
-fixed 96-byte label, not a measured request size. The manifest notes that the
-intended Linux headline path is TCP on a native host, but that path does not
-exist.
+**Evidence.** HTTP JSON was the only ingress; the manifest's `payload_bytes` is
+still a fixed label rather than a measured request size.
 
-**Next optimization.** Only after ranks 1–4 and a native Linux runner: add a
-binary TCP or QUIC ingress that writes the fixed 78-byte `Command` directly, and
-a background producer that batches appends. This is a new protocol surface with
-new framing, auth, backpressure, and failure modes.
+**Addressed in part.** Binary TCP ingress is implemented and measured (p50 598 µs
+at 10,000 orders/s, batch 10). The remaining transport work is QUIC/TLS and a
+multi-connection fan-in benchmark. Background producer batching is the
+per-partition group commit.
 
-**Expected effect.** Removes JSON parsing and HTTP overhead, and amortizes
-appends in the background. Do not claim a number: the current evidence points at
-the broker round trip, not the JSON parser, so TCP may help less than expected
-until the append path is fixed.
+**Expected effect.** TCP removes JSON parsing and HTTP framing; group commit
+amortizes the append. The dev-loop result shows the batch shape matters more
+than the transport: batch 10 amortizes the round trip, while batch 1 is limited
+by one request in flight per connection.
 
-**What would falsify it.** If batch ingress already reaches the broker or disk
-limit, TCP is not the next bottleneck. Measure first.
+**What would falsify it.** If the achieved rate is flat across transports at the
+same batch size, the broker append rate is the limit and transport work is not
+the next bottleneck. Measure on native Linux before claiming a transport win.
 
 ## Benchmark matrix: before and after
 
@@ -588,9 +591,9 @@ Notes that make the matrix honest:
   match loop get faster", not "did the exchange get faster". Keep the two
   results separate.
 - **The fanout row needs a WebSocket load generator.** The current harness is
-  HTTP-only. A `whippet fanout` tool or a `--fanout` mode must open N sockets,
-  count frames and bytes, and write a manifest with `subscribers = N`. Until
-  that exists, the fanout model is untested.
+  HTTP and TCP ingress only. A `whippet fanout` tool or a `--fanout` mode must
+  open N sockets, count frames and bytes, and write a manifest with
+  `subscribers = N`. Until that exists, the fanout model is untested.
 - **Every run needs a method card.** Use the template in
   [benchmarks/README.md](benchmarks/README.md#method-card-template). State the
   host, runtime, commit, image digest, rate, duration, repetitions, durability,
@@ -604,7 +607,7 @@ Notes that make the matrix honest:
 | Area | Why not now | What would change the answer |
 |---|---|---|
 | Cluster consensus (VSR, 3-node HA) | Not implemented. It changes the durability model and adds a replication round trip. It is Phase 3, and it is not the measured knee. | A measured single-node path that is stable at the target rate, plus a Phase 3 requirement for failover. |
-| Dashboard rendering | The browser renders a 20 Hz full-state frame. It cannot backpressure the engine: the hub uses a conflated `watch` channel and slow clients miss frames. Browser rendering is not on the durable path. | A measured browser-side frame cost that makes the UI the bottleneck. The server-side per-subscriber serialization is a separate row and is ranked 4. |
+| Dashboard rendering | The browser renders a 20 Hz full-state frame. It cannot backpressure the engine: the hub uses a conflated `watch` channel and slow clients miss frames. Browser rendering is not on the durable path. The frame cache and per-row memo work are already in. | A measured browser-side frame cost that makes the UI the bottleneck. |
 | TLS | Phase 2 security work. It adds handshake and per-byte crypto at the edge, but the baseline knee is the broker append, not the TLS record path. There is no TLS path to measure yet. | A measured ingress path where the append is no longer dominant, or a security requirement that makes TLS mandatory before the next run. |
 | Stream encryption (AES-256-GCM-SIV) | Phase 2, not implemented. Per-message crypto would add cost, but it is not on the current path and there is no measurement. | An encryption implementation and a before/after run that isolates its per-byte cost. |
 | JSON parser or SIMD JSON | No profile evidence. The append round trip is the prime suspect, and the JSON body is small. Replacing the parser before stage timers exist is guessing. | A stage timer that shows JSON parse is a material fraction of the request. |
