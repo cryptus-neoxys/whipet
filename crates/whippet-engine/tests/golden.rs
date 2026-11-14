@@ -13,7 +13,9 @@ use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Symbol};
 use whippet_core::protocol::{
     Command, CommandKind, ExecKind, ExecutionReport, OrderType, RejectReason, Side,
 };
-use whippet_engine::{Book, EngineOutput, ShardEngine, SymbolEngine};
+use whippet_engine::{
+    Book, EngineOutput, ShardEngine, SymbolEngine, fill_symbol_hashes, hash_symbol_snapshot,
+};
 use whippet_testkit::builders;
 use whippet_testkit::golden::{GOLDEN_HASH, GoldenLog, scenario_config, standard_shard};
 
@@ -339,4 +341,84 @@ fn assert_quantity_conservation(executions: &[ExecutionReport], book: &Book) {
             "order {order_id:?}: {filled} filled + {cancelled} cancelled + {resting} resting != {quantity} submitted"
         );
     }
+}
+
+#[test]
+fn snapshot_hash_reproduces_live_state_hash() {
+    let config = scenario_config();
+    let commands = GoldenLog::standard().commands().to_vec();
+    // Full replay and a handful of prefixes, including the empty book.
+    for split in [0usize, 1, 5, 17, commands.len()] {
+        let mut engine = SymbolEngine::new(config.clone());
+        let mut out = EngineOutput::with_capacity(16, 16);
+        for (offset, command) in commands.iter().enumerate().take(split) {
+            engine.process(command, offset as u64, &mut out);
+            out.clear();
+        }
+        let snapshot = engine.snapshot_state_without_hash();
+        assert_eq!(
+            snapshot.state_hash, [0; 32],
+            "split {split}: zeroed sentinel"
+        );
+        assert_eq!(
+            hash_symbol_snapshot(&snapshot),
+            engine.state_hash(),
+            "split {split}: snapshot hash diverged from live state hash"
+        );
+    }
+}
+
+#[test]
+fn shard_snapshot_hashes_fill_equals_live() {
+    let exchange = ExchangeConfig {
+        venue: "test".into(),
+        partitions: 16,
+        mode: Mode::Durable,
+        instruments: vec![scenario_config()],
+    };
+    let shard = standard_shard(&exchange);
+    let commands = GoldenLog::standard().commands().to_vec();
+
+    let mut engine = ShardEngine::new(shard, &exchange);
+    let mut out = EngineOutput::with_capacity(16, 16);
+    for (offset, command) in commands.iter().enumerate() {
+        engine.process(command, offset as u64, &mut out).unwrap();
+        out.clear();
+    }
+
+    let hashed = engine.snapshot_state();
+    let mut unhashed = engine.snapshot_state_without_hash();
+    assert!(
+        unhashed
+            .symbols
+            .iter()
+            .all(|symbol| symbol.state_hash == [0; 32]),
+        "without-hash snapshot must start zeroed"
+    );
+    fill_symbol_hashes(&mut unhashed);
+
+    assert_eq!(unhashed.shard_id, hashed.shard_id);
+    assert_eq!(unhashed.symbols.len(), hashed.symbols.len());
+    for (filled, expected) in unhashed.symbols.iter().zip(hashed.symbols.iter()) {
+        assert_eq!(filled.symbol, expected.symbol);
+        assert_eq!(filled.state_hash, expected.state_hash);
+    }
+}
+
+#[test]
+fn restored_engine_verifies_hash_computed_off_thread() {
+    let config = scenario_config();
+    let commands = GoldenLog::standard().commands().to_vec();
+
+    let mut engine = SymbolEngine::new(config.clone());
+    let mut out = EngineOutput::with_capacity(16, 16);
+    for (offset, command) in commands.iter().enumerate() {
+        engine.process(command, offset as u64, &mut out);
+        out.clear();
+    }
+
+    let mut snapshot = engine.snapshot_state_without_hash();
+    snapshot.state_hash = hash_symbol_snapshot(&snapshot);
+    let restored = SymbolEngine::from_snapshot(config, snapshot).expect("restore");
+    assert_eq!(restored.state_hash(), engine.state_hash());
 }

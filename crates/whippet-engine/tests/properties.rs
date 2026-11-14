@@ -4,7 +4,7 @@ use proptest::prelude::*;
 use whippet_core::config::InstrumentConfig;
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Symbol};
 use whippet_core::protocol::{Command, OrderType, Side};
-use whippet_engine::{EngineOutput, SymbolEngine};
+use whippet_engine::{EngineOutput, SymbolEngine, hash_symbol_snapshot};
 
 fn config() -> InstrumentConfig {
     let mut config = InstrumentConfig::new("BTC-USD", 100, 90, 120).unwrap();
@@ -167,5 +167,49 @@ proptest! {
         prop_assert_eq!(first.state_hash(), second.state_hash());
         prop_assert_eq!(first.book().best_bid(), second.book().best_bid());
         prop_assert_eq!(first.book().best_ask(), second.book().best_ask());
+    }
+
+    #[test]
+    fn snapshot_hash_matches_live_state_hash(
+        ops in proptest::collection::vec(arb_op(), 1..200)
+    ) {
+        let symbol = Symbol::new("BTC-USD").unwrap();
+        let mut engine = SymbolEngine::new(config());
+        let mut out = EngineOutput::with_capacity(16, 16);
+        for (offset, op) in ops.into_iter().enumerate() {
+            let command = match op {
+                Op::Limit { side, price, qty, participant } => Command::new_order(
+                    symbol,
+                    side,
+                    OrderType::Limit,
+                    Price(price),
+                    Qty(qty),
+                    OrderId(offset as u128 + 1),
+                    ParticipantId(participant),
+                    offset as u64,
+                ),
+                Op::Market { side, qty, participant } => Command::new_order(
+                    symbol,
+                    side,
+                    OrderType::Market,
+                    Price(0),
+                    Qty(qty),
+                    OrderId(offset as u128 + 1),
+                    ParticipantId(participant),
+                    offset as u64,
+                ),
+                Op::Cancel { id } => Command::cancel(
+                    symbol,
+                    OrderId(id),
+                    ParticipantId(1),
+                    offset as u64,
+                ),
+            };
+            engine.process(&command, offset as u64, &mut out);
+            out.clear();
+        }
+        let snapshot = engine.snapshot_state_without_hash();
+        prop_assert_eq!(snapshot.state_hash, [0; 32]);
+        prop_assert_eq!(hash_symbol_snapshot(&snapshot), engine.state_hash());
     }
 }

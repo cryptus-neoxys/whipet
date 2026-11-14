@@ -186,6 +186,22 @@ impl DedupTable {
     }
 }
 
+/// Reproduce [`DedupTable::hash_into`] over the snapshot form of the table: the
+/// entries in insertion order, as returned by [`DedupTable::entries_in_order`].
+/// The table hashes `map.len()` then walks that exact sequence, so the two are
+/// byte-identical.
+pub fn hash_dedup_entries(entries: &[(OrderId, DedupEntry)], hasher: &mut blake3::Hasher) {
+    hasher.update(b"dedup");
+    hasher.update(&(entries.len() as u64).to_le_bytes());
+    for (order_id, entry) in entries {
+        hasher.update(&order_id.0.to_le_bytes());
+        hasher.update(&[entry.status as u8]);
+        hasher.update(&entry.input_offset.to_le_bytes());
+        hasher.update(&entry.timestamp_ns.to_le_bytes());
+        hasher.update(&entry.seq.0.to_le_bytes());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -18,7 +18,7 @@ use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_mai
 use whippet_core::config::InstrumentConfig;
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty};
 use whippet_core::protocol::{Command, OrderType, Side};
-use whippet_engine::{Book, EngineOutput, SymbolEngine};
+use whippet_engine::{Book, EngineOutput, SymbolEngine, hash_symbol_snapshot};
 
 /// Total insert+cancel operations per measured iteration.
 const INSERT_CANCEL_OPS: u64 = 1_000_000;
@@ -387,11 +387,46 @@ fn bench_engine_state_hash(c: &mut Criterion) {
     group.finish();
 }
 
+/// The off-shard hash path: materialize the snapshot once, then measure only
+/// `hash_symbol_snapshot` on it. This is what the snapshot writer does after the
+/// shard thread stops stalling on `snapshot_state`.
+fn bench_snapshot_hash_off_thread(c: &mut Criterion) {
+    let mut engine = SymbolEngine::new(book_config(64_000));
+    let symbol = engine.config().symbol;
+    let mut out = EngineOutput::with_capacity(64, 64);
+    let mut id = 0u128;
+    for level in 0..200i64 {
+        for _ in 0..100 {
+            id += 1;
+            let command = Command::new_order(
+                symbol,
+                Side::Buy,
+                OrderType::Limit,
+                Price(90 + level),
+                Qty(10),
+                OrderId(id),
+                ParticipantId(1),
+                id as u64,
+            );
+            engine.process(&command, id as u64, &mut out);
+            out.clear();
+        }
+    }
+    let snapshot = engine.snapshot_state_without_hash();
+
+    let mut group = c.benchmark_group("snapshot_hash");
+    group.sample_size(20);
+    group.bench_function("from_snapshot_20k_orders_20k_dedup", |b| {
+        b.iter(|| black_box(hash_symbol_snapshot(&snapshot)));
+    });
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(2))
         .measurement_time(Duration::from_secs(5));
-    targets = bench_insert_cancel, bench_best_price, bench_aggressive_burst, bench_fok_burst, bench_snapshot_hash, bench_engine_state_hash
+    targets = bench_insert_cancel, bench_best_price, bench_aggressive_burst, bench_fok_burst, bench_snapshot_hash, bench_engine_state_hash, bench_snapshot_hash_off_thread
 }
 criterion_main!(benches);

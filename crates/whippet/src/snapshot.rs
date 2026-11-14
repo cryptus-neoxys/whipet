@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 use whippet_engine::ShardSnapshot;
 
 const MAGIC: &[u8; 8] = b"WHIPSNP1";
-const VERSION: u32 = 1;
+/// Version 2 added the per-symbol config and the book's `min_price_ticks` so
+/// the state hash can be computed from the snapshot off the shard thread.
+/// Version 1 files are rejected rather than misread.
+const VERSION: u32 = 2;
 const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]

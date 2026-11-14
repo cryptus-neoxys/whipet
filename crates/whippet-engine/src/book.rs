@@ -101,6 +101,15 @@ pub struct RestingOrder {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BookSnapshot {
     pub symbol: Symbol,
+    /// Lowest ladder index in ticks. [`Book::hash_into`] writes each level's
+    /// ladder index (`price - min_price_ticks`) rather than its absolute price,
+    /// so the snapshot stores the offset needed to reproduce that byte-for-byte.
+    ///
+    /// Schema note: this field (and `SymbolSnapshot::config`) extend the
+    /// serialized snapshot. The on-disk format is versioned by the `whippet`
+    /// crate's snapshot store (`WHIPSNP1`/version 1); an upgrade that changes
+    /// the layout must bump that version there.
+    pub min_price_ticks: i64,
     pub last_trade_price: Price,
     pub last_trade_qty: Qty,
     pub last_trade_side: Option<Side>,
@@ -709,6 +718,7 @@ impl Book {
         }
         BookSnapshot {
             symbol: self.symbol,
+            min_price_ticks: self.min_ticks,
             last_trade_price: self.last_trade_price,
             last_trade_qty: self.last_trade_qty,
             last_trade_side: self.last_trade_side,
@@ -770,6 +780,55 @@ impl Book {
                 }
                 cursor = self.next_index(side, price_idx);
             }
+        }
+    }
+}
+
+/// Reproduce [`Book::hash_into`] over a [`BookSnapshot`] instead of the live
+/// ladder. Used to compute a symbol's state hash off the shard thread.
+///
+/// `Book::snapshot` emits orders in exactly the iteration order `hash_into`
+/// walks: bids best-first, then asks best-first, FIFO within a level. So
+/// consecutive orders that share a side and price form one level, and the level
+/// header (ladder index, summed remaining quantity, order count) is rebuilt from
+/// the run. The bytes are identical to hashing the live book.
+pub fn hash_book_snapshot(snapshot: &BookSnapshot, hasher: &mut blake3::Hasher) {
+    hasher.update(b"book");
+    hasher.update(snapshot.symbol.as_bytes());
+    hasher.update(&snapshot.last_trade_price.0.to_le_bytes());
+    hasher.update(&snapshot.last_trade_qty.0.to_le_bytes());
+    hasher.update(&[match snapshot.last_trade_side {
+        None => 0,
+        Some(Side::Buy) => 1,
+        Some(Side::Sell) => 2,
+    }]);
+    hasher.update(&(snapshot.orders.len() as u64).to_le_bytes());
+
+    let orders = &snapshot.orders;
+    let mut index = 0;
+    while index < orders.len() {
+        let side = orders[index].side;
+        let price = orders[index].price;
+        let run_start = index;
+        let mut qty = 0u64;
+        let mut count = 0u32;
+        while index < orders.len() && orders[index].side == side && orders[index].price == price {
+            qty = qty.saturating_add(orders[index].remaining.0);
+            count += 1;
+            index += 1;
+        }
+        // `hash_into` writes the level header before its orders.
+        let price_idx = price.0 - snapshot.min_price_ticks;
+        hasher.update(b"L");
+        hasher.update(&(price_idx as u64).to_le_bytes());
+        hasher.update(&qty.to_le_bytes());
+        hasher.update(&count.to_le_bytes());
+        for order in &orders[run_start..index] {
+            hasher.update(b"O");
+            hasher.update(&order.order_id.0.to_le_bytes());
+            hasher.update(&order.participant.0.to_le_bytes());
+            hasher.update(&order.remaining.0.to_le_bytes());
+            hasher.update(&order.seq.to_le_bytes());
         }
     }
 }
@@ -1317,6 +1376,28 @@ mod tests {
             book.executable_qty_excluding(Side::Sell, Price(600), ParticipantId(2)),
             500_000
         );
+    }
+
+    #[test]
+    fn snapshot_hash_matches_live_book_hash() {
+        let mut config = InstrumentConfig::new("BTC-USD", 1, 95, 130).unwrap();
+        config.max_orders = 256;
+        let mut book = Book::new(&config);
+        add(&mut book, 1, Side::Buy, 100, 5);
+        add(&mut book, 2, Side::Buy, 100, 7);
+        add(&mut book, 3, Side::Buy, 104, 3);
+        add(&mut book, 4, Side::Sell, 108, 11);
+        add(&mut book, 5, Side::Sell, 108, 2);
+        add(&mut book, 6, Side::Sell, 110, 13);
+        book.reduce(book.order_index(OrderId(1)).unwrap(), Qty(2));
+        book.record_trade(Price(104), Qty(2), Side::Buy);
+
+        let snapshot = book.snapshot();
+        let mut live = blake3::Hasher::new();
+        book.hash_into(&mut live);
+        let mut from_snapshot = blake3::Hasher::new();
+        hash_book_snapshot(&snapshot, &mut from_snapshot);
+        assert_eq!(live.finalize(), from_snapshot.finalize());
     }
 
     proptest! {

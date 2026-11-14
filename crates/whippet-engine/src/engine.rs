@@ -16,8 +16,8 @@ use whippet_core::protocol::{
     MdKind, MdOrder, MdSnapshot, OrderType, RejectReason, Side,
 };
 
-use crate::book::{Book, BookError, BookSnapshot, RestingOrder};
-use crate::dedup::{DedupEntry, DedupStatus, DedupTable};
+use crate::book::{Book, BookError, BookSnapshot, RestingOrder, hash_book_snapshot};
+use crate::dedup::{DedupEntry, DedupStatus, DedupTable, hash_dedup_entries};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -65,9 +65,46 @@ impl EngineOutput {
     }
 }
 
+/// The instrument configuration fields that enter a symbol's state hash.
+///
+/// [`SymbolSnapshot`] stores these so [`hash_symbol_snapshot`] can reproduce
+/// [`SymbolEngine::state_hash`] without consulting the live [`InstrumentConfig`]
+/// (and therefore off the shard thread). `symbol` is omitted: it is already
+/// carried on [`SymbolSnapshot::symbol`] and [`BookSnapshot::symbol`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolConfigSnapshot {
+    pub tick_size_cents: i64,
+    pub min_price_ticks: i64,
+    pub max_price_ticks: i64,
+    pub max_orders: usize,
+    pub snapshot_depth: usize,
+    pub market_collar_bps: u32,
+}
+
+impl SymbolConfigSnapshot {
+    pub fn from_config(config: &InstrumentConfig) -> Self {
+        Self {
+            tick_size_cents: config.tick_size_cents,
+            min_price_ticks: config.min_price_ticks,
+            max_price_ticks: config.max_price_ticks,
+            max_orders: config.max_orders,
+            snapshot_depth: config.snapshot_depth,
+            market_collar_bps: config.market_collar_bps,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolSnapshot {
     pub symbol: Symbol,
+    /// The config fields that [`SymbolEngine::state_hash`] hashes. Present so
+    /// the snapshot can be re-hashed without the live config.
+    ///
+    /// Schema note: this field (and `BookSnapshot::min_price_ticks`) extend the
+    /// serialized snapshot. The on-disk format is versioned by the `whippet`
+    /// crate's snapshot store; an upgrade that changes the layout must bump
+    /// that version there.
+    pub config: SymbolConfigSnapshot,
     pub book: BookSnapshot,
     pub dedup: Vec<(OrderId, DedupEntry)>,
     pub exec_seq: Seq,
@@ -708,8 +745,18 @@ impl SymbolEngine {
     }
 
     pub fn snapshot_state(&self) -> SymbolSnapshot {
+        let mut snapshot = self.snapshot_state_without_hash();
+        snapshot.state_hash = self.state_hash();
+        snapshot
+    }
+
+    /// Build the same snapshot as [`SymbolEngine::snapshot_state`] but leave
+    /// `state_hash` zeroed. The caller fills it later, off the shard thread,
+    /// with [`hash_symbol_snapshot`].
+    pub fn snapshot_state_without_hash(&self) -> SymbolSnapshot {
         SymbolSnapshot {
             symbol: self.config.symbol,
+            config: SymbolConfigSnapshot::from_config(&self.config),
             book: self.book.snapshot(),
             dedup: self.dedup.entries_in_order(),
             exec_seq: self.exec_seq,
@@ -718,7 +765,7 @@ impl SymbolEngine {
             last_ts_ns: self.last_ts_ns,
             commands: self.commands,
             halted: self.halted,
-            state_hash: self.state_hash(),
+            state_hash: [0; 32],
         }
     }
 
@@ -763,6 +810,35 @@ impl SymbolEngine {
         engine.last_offset = snapshot.last_offset;
         Ok(engine)
     }
+}
+
+/// Compute a symbol's state hash from a [`SymbolSnapshot`], byte-identically to
+/// [`SymbolEngine::state_hash`].
+///
+/// This is the off-shard half of snapshot persistence: the shard thread calls
+/// [`SymbolEngine::snapshot_state_without_hash`] and hands the snapshot to the
+/// writer, which calls this (or [`fill_symbol_hashes`]) instead of walking the
+/// live ladder. The field order and the `b"whippet-engine-v1"` domain prefix
+/// match [`SymbolEngine::state_hash`] exactly.
+pub fn hash_symbol_snapshot(snapshot: &SymbolSnapshot) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"whippet-engine-v1");
+    let config = &snapshot.config;
+    hasher.update(&config.tick_size_cents.to_le_bytes());
+    hasher.update(&config.min_price_ticks.to_le_bytes());
+    hasher.update(&config.max_price_ticks.to_le_bytes());
+    hasher.update(&(config.max_orders as u64).to_le_bytes());
+    hasher.update(&(config.snapshot_depth as u64).to_le_bytes());
+    hasher.update(&u64::from(config.market_collar_bps).to_le_bytes());
+    hasher.update(&snapshot.commands.to_le_bytes());
+    hash_book_snapshot(&snapshot.book, &mut hasher);
+    hash_dedup_entries(&snapshot.dedup, &mut hasher);
+    hasher.update(&snapshot.exec_seq.0.to_le_bytes());
+    hasher.update(&snapshot.md_seq.0.to_le_bytes());
+    hasher.update(&snapshot.last_offset.to_le_bytes());
+    hasher.update(&snapshot.last_ts_ns.to_le_bytes());
+    hasher.update(&[u8::from(snapshot.halted)]);
+    *hasher.finalize().as_bytes()
 }
 
 pub struct ShardEngine {
@@ -849,6 +925,22 @@ impl ShardEngine {
         }
     }
 
+    /// Build the shard snapshot with every symbol's `state_hash` zeroed. The
+    /// hashes are filled later, off the shard thread, with
+    /// [`fill_symbol_hashes`].
+    pub fn snapshot_state_without_hash(&self) -> ShardSnapshot {
+        let mut symbols: Vec<_> = self
+            .engines
+            .values()
+            .map(SymbolEngine::snapshot_state_without_hash)
+            .collect();
+        symbols.sort_unstable_by_key(|snapshot| snapshot.symbol);
+        ShardSnapshot {
+            shard_id: self.shard_id,
+            symbols,
+        }
+    }
+
     pub fn from_snapshot(
         exchange: &ExchangeConfig,
         snapshot: ShardSnapshot,
@@ -925,6 +1017,16 @@ impl ShardEngine {
             std::mem::swap(&mut last, &mut out);
         }
         Ok(last)
+    }
+}
+
+/// Fill each symbol's `state_hash` in a [`ShardSnapshot`] with
+/// [`hash_symbol_snapshot`]. This is the off-shard counterpart to
+/// [`ShardEngine::snapshot_state_without_hash`]: the shard thread produces the
+/// unhashed snapshot, and the snapshot writer calls this before persisting.
+pub fn fill_symbol_hashes(snapshot: &mut ShardSnapshot) {
+    for symbol in &mut snapshot.symbols {
+        symbol.state_hash = hash_symbol_snapshot(symbol);
     }
 }
 
@@ -1395,6 +1497,89 @@ mod tests {
         let best_ask = engine.book().best_ask();
         if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
             assert!(bid.0 < ask.0, "crossed book: {bid:?} >= {ask:?}");
+        }
+    }
+
+    #[test]
+    fn snapshot_hash_reproduces_live_state_hash() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Sell, 105, 10, 1, 1), 0);
+        process(&mut engine, &limit(Side::Sell, 105, 5, 2, 2), 1);
+        process(&mut engine, &limit(Side::Buy, 105, 12, 3, 3), 2);
+        process(&mut engine, &limit(Side::Buy, 100, 6, 4, 4), 3);
+        let snapshot = engine.snapshot_state_without_hash();
+        assert_eq!(snapshot.state_hash, [0; 32], "sentinel is left zeroed");
+        assert_eq!(hash_symbol_snapshot(&snapshot), engine.state_hash());
+    }
+
+    #[test]
+    fn snapshot_hash_matches_full_snapshot_hash() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Sell, 104, 5, 1, 1), 0);
+        process(&mut engine, &limit(Side::Buy, 104, 7, 2, 2), 1);
+        let full = engine.snapshot_state();
+        assert_eq!(hash_symbol_snapshot(&full), full.state_hash);
+    }
+
+    #[test]
+    fn restored_engine_verifies_off_thread_hash() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Sell, 105, 10, 1, 1), 0);
+        process(&mut engine, &limit(Side::Buy, 100, 7, 2, 2), 1);
+        let mut snapshot = engine.snapshot_state_without_hash();
+        snapshot.state_hash = hash_symbol_snapshot(&snapshot);
+        let restored = SymbolEngine::from_snapshot(config(), snapshot).unwrap();
+        assert_eq!(restored.state_hash(), engine.state_hash());
+    }
+
+    #[test]
+    fn fill_symbol_hashes_matches_per_symbol_snapshots() {
+        let mut eth_config = config();
+        eth_config.symbol = Symbol::new("ETH-USD").unwrap();
+        let exchange = ExchangeConfig {
+            venue: "test".into(),
+            partitions: 2,
+            mode: whippet_core::config::Mode::Durable,
+            instruments: vec![config(), eth_config],
+        };
+        let btc = symbol();
+        let eth = Symbol::new("ETH-USD").unwrap();
+        let shard = btc.partition(exchange.partitions);
+        assert_eq!(shard, eth.partition(exchange.partitions));
+
+        let mut engine = ShardEngine::new(shard, &exchange);
+        let mut out = EngineOutput::with_capacity(8, 8);
+        let commands = [
+            (btc, Side::Buy, 100i64),
+            (eth, Side::Sell, 101),
+            (btc, Side::Sell, 102),
+            (eth, Side::Buy, 99),
+        ];
+        for (offset, (sym, side, price)) in commands.into_iter().enumerate() {
+            let command = Command::new_order(
+                sym,
+                side,
+                OrderType::Limit,
+                Price(price),
+                Qty(5),
+                OrderId(offset as u128 + 1),
+                ParticipantId(1),
+                offset as u64,
+            );
+            engine.process(&command, offset as u64, &mut out).unwrap();
+            out.clear();
+        }
+
+        let mut unhashed = engine.snapshot_state_without_hash();
+        fill_symbol_hashes(&mut unhashed);
+        assert_eq!(unhashed.shard_id, shard);
+        for symbol_snapshot in &unhashed.symbols {
+            let expected = engine
+                .engine(symbol_snapshot.symbol)
+                .expect("symbol engine")
+                .snapshot_state()
+                .state_hash;
+            assert_eq!(symbol_snapshot.state_hash, expected);
         }
     }
 }
