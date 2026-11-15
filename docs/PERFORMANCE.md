@@ -1048,6 +1048,14 @@ wall-clock claims:
   instead of `BATCH_CAPACITY` (1024) on every batch. At batch-10 ingress that
   removes roughly 230 KB of fixed vector allocation per batch; large batches
   still grow to their real size.
+- Named header values are inline (`[u8; 40]`), so a message allocates one
+  `Vec` for its header set instead of a `Vec` plus one `String` per value. A
+  matched order that emits two executions and two MD events removes roughly
+  16 header-value allocations. The named and string-pair representations are
+  asserted to read back identically, so the wire bytes are unchanged.
+- Match-latency sampling is one command in 32; the batch stage records one
+  wall-clock sample per batch. Two clock reads per command on the serial
+  matcher were more expensive than the matching work they measured.
 - Turbo acks are sent immediately after `process` returns, before execution
   and MD messages are encoded, so the ~1 µs message-construction edge is no
   longer between the match and the client ack.
