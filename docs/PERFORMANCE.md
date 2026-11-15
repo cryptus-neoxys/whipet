@@ -203,8 +203,8 @@ single-order path was p50 838 ms with 40k errors before the tranche.
 
 The 5,000/s single-order path was p50 838 ms with 40k errors before group
 commit. The replay proof was rerun after the tranche: full and snapshot-seeded
-replay both end at `4690bb5d6a7a759dd03163613a834c78b68dd7d3639235e919ae56f5c2ea8182`
-from snapshot offset 67038 (tail 358).
+replay both end at `0f90672d75d2af2e028f3a0532836a361d24b85c03cad8636a3ad89c0d29e218`
+from snapshot offset 17038 (tail 16600).
 
 ### Phase 1.5c (implemented; dev-loop measured)
 

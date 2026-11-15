@@ -508,8 +508,8 @@ mode, not a latency result.
 
 The replay proof was rerun after the change. Full replay and snapshot-seeded
 replay both end at
-`4690bb5d6a7a759dd03163613a834c78b68dd7d3639235e919ae56f5c2ea8182` from
-snapshot offset 67038 (tail 358). This is a correctness check, not a latency
+`0f90672d75d2af2e028f3a0532836a361d24b85c03cad8636a3ad89c0d29e218` from
+snapshot offset 17038 (tail 16600). This is a correctness check, not a latency
 measurement.
 
 ## TCP-ingress sweep (dev-loop measured, headline pending)
@@ -884,6 +884,10 @@ A 1 GiB WAL plus a 200 µs WAL group-commit delay reduced the 120 s run to
 p50 1.2 → 3.0 ms and p99 4.7 → 227 ms. The default stack keeps the cleaner
 off and the larger WAL because both were measured better here; re-measure on
 native Linux before treating them as tuned.
+
+A cold first run after `make reset` can be much slower than the next one
+(6.2 ms p50 / 810 ms p99 versus 1.3 ms / 7.3 ms for the same workload): the
+1 GiB WAL allocation and page cache are cold. Warm the stack before measuring.
 
 The honest reading: the durable path is **not steady-state at 5,000/s for
 minutes on Docker Desktop**. The next work is per-role Iggy clients (ingress vs
