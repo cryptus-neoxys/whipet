@@ -244,6 +244,21 @@ invariants (ADR 0021). `Book::check_invariants`,
 `DedupTable::check_invariants`, and `SymbolEngine::check_invariants` are
 test-only diagnostics; readiness is the per-shard rule above.
 
+## Ledger projection
+
+`whippet ledger --partition N [--symbols ...] [--participant ID] [--json]`
+reads the orders and executions logs from offset 0 and prints double-entry
+cash/position accounts. It is read-only, posts four legs per attributed fill,
+and excludes a trade whose aggressor or maker cannot be attributed (the
+unresolved counters say how many). It is T+0 simulation, not settlement: no
+fees, funding, margin, or clearing. Its cash/position balances reconcile with
+`whippet positions` over complete trades.
+
+`MemoryJournal` (the test backend) enforces the commit contract: a commit is
+the inclusive last-applied offset, monotonic and at most the log head; a
+violation asserts in debug and stores nothing in release. An ahead-of-head
+claim is ignored rather than clamped, so a restart replays more, never less.
+
 ## Instrument control plane
 
 Halt and resume are operator-only HTTP endpoints:

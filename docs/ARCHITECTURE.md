@@ -402,8 +402,11 @@ explicit state machines: the snapshot writer (save-time structural and hash
 invariants, rename-only advance), the commit watermark/retry (committed never
 ahead of applied, bounded drift, retries that never stop), and the turbo
 admission window (Queued to Completed/Abandoned, exactly-once permit release)
-(ADR 0021). The full catalogue and what remains unproven is
-[INVARIANTS.md](INVARIANTS.md).
+(ADR 0021). The journal enforces its offset/commit contract in the test backend
+(ADR 0023), the MD hub refuses book-state deltas until a baseline image seeds
+the symbol, and `whippet ledger` folds the logs into a double-entry projection
+whose balances reconcile with positions (ADR 0022). The full catalogue and what
+remains unproven is [INVARIANTS.md](INVARIANTS.md).
 
 ## Observability
 

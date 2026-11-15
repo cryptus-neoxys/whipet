@@ -49,6 +49,18 @@ Whippet is pre-1.0; minor releases may change internal APIs.
 
 ### Added
 
+- `whippet ledger`: a deterministic double-entry cash/position projection over
+  the orders and executions logs, with four postings per fill, all-or-nothing
+  attribution, conservation checks, and reconciliation against `whippet
+  positions` (ADR 0022).
+- Market-data baseline phase: a book-state delta before the producer's image
+  is refused and counted without advancing `seq`; reduce-to-zero is a cancel,
+  add overflow is refused, and `BookState`/`MdHub::check_invariants` cover
+  depth, refs, tape, and feed counters (ADR 0023).
+- Journal commit contract: contiguous offsets, monotonic commits bounded by
+  the head, non-decreasing timestamps, and last-wins header folding in the
+  memory backend; an ahead-of-head claim stores nothing. Contract tests run in
+  debug and release (ADR 0023).
 - Durable-path state machines (ADR 0021): a snapshot is structurally validated
   and hashed before any temp file exists and `last_written` advances only after
   the rename; `CommitWatermark`/`CommitRetry` enforce `committed <= applied`,

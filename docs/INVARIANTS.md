@@ -131,6 +131,15 @@ failure paths that mark only the failing role.
   (256 records / 100 ms). `CommitRetry` retries with 100 ms–2 s backoff and a
   30-attempt diagnostic budget; it never stops retrying, so a broker outage
   costs commit lag, not availability. See ADR 0021.
+- The journal offset contract is explicit on both backends: offsets are
+  contiguous from zero per `(topic, partition)`, timestamps are non-decreasing,
+  and a commit is the inclusive last-applied offset. Commits are monotonic and
+  bounded by the head; a commit on an empty/unknown partition, a backwards
+  commit, or an ahead-of-head claim stores nothing (debug: panic with the
+  reason; release: drop/warn). An ahead-of-head claim is never clamped to the
+  head, because the caller may not have applied that record. Rejecting stores
+  replays more, never less. `MemoryJournal::check_invariants` verifies the log
+  and every commit; header keys fold last-wins like Iggy. See ADR 0023.
 - The reader rejects a gap/overlap in a batch and fails the shard closed.
 - The turbo write-behind appends exactly one order record per seq in order;
   seq == broker offset is the startup/proof precondition; admissions are
@@ -162,7 +171,55 @@ failure paths that mark only the failing role.
 - Config invalids fail startup: partitions outside 1–256, turbo without Iggy,
   inverted disk thresholds, malformed token pairs, unknown symbols.
 
-## 7. What is not proven
+## 8. Market-data hub and feed
+
+- Each symbol has a monotonic `BookPhase`:
+  `AwaitingSnapshot -> Seeded`. A book-state delta (`Add`/`Reduce`/`Remove`/
+  `Trade`/`Bbo`) before a baseline image is refused, counted by
+  `events_without_baseline`, and does not advance `seq`; `seq` advances iff the
+  event applied. `Status` may apply before the image (it carries no depth).
+  A snapshot at the current seq is accepted while awaiting (a replayed status
+  may have advanced seq without depth); a stale snapshot is refused.
+- Starting the MD consumer at `committed + 1` can replay up to 256 records /
+  100 ms of deltas into a fresh hub before the producer's new image reaches the
+  head. Dropping them is lossless: the new image's seq covers them; a fresh
+  log always starts with the image.
+- `BookState::check_invariants` requires positive level quantities and order
+  counts, tick-grid prices, best bid < best ask, depth totals equal to level
+  sums, and, for a complete order snapshot, level aggregates equal to the refs
+  posted at that price. Reduce-to-zero is a cancel (the ref and empty level
+  leave); an add overflow is refused whole, not saturated.
+- `MdHub::check_invariants` requires configured symbols/ticks, every book
+  valid, `state.sequence == max(book.seq)`, a bounded tape whose per-symbol
+  seq strictly increases (the tape is global; seq spaces are per symbol), and
+  `feed_sent == 0` when no subscriber ever attached. Every accepted event is
+  one feed frame; a refused event is not a hole because seq did not advance.
+- `check_invariants` is test-only; the gate and counter are the production
+  behavior.
+
+## 9. Double-entry ledger projection
+
+`whippet ledger` folds the decoded `orders` and `executions` logs into accounts;
+it is a projection, not settlement. For every attributed fill report:
+
+- identity is the engine `seq`; `cause_offset` links it to the input command;
+- exactly four postings: buyer cash `-price*qty`, seller cash `+price*qty`,
+  buyer position `+qty`, seller position `-qty`;
+- attribution is all-or-nothing: an unknown aggressor or maker (including
+  `maker_order_id == 0`) posts neither leg and increments the matching
+  unresolved counter;
+- postings sum to zero per entry per asset; report-wide cash and each symbol's
+  position sum to zero;
+- entries are ordered by `seq`; a repeated seq keeps a canonical first entry,
+  so input order cannot change the result;
+- every account balance/count equals a checked direct fold of the postings.
+  `ledger_with_journal` refuses to print a report that fails.
+
+Over complete trades, ledger cash/position balances equal `positions`
+`cash_cents`/`net_qty`. The model is T+0 simulation: no fees, funding,
+deposits, withdrawals, margin, or clearing. See ADR 0022.
+
+## 10. What is not proven
 
 - Engine invariants are checked in tests, not on the release hot path.
 - Snapshot writer invariants are structural and verified by a rebuild on the
@@ -173,7 +230,14 @@ failure paths that mark only the failing role.
   retry cadence, and only a restart proves what was acknowledged.
 - The ingress risk guard is bypassable by a direct log producer; engine-level
   exposure/account state is not implemented.
-- Position reconstruction is not settlement: no balances, fees, margin, or
-  clearing, and unknown maker legs are reported rather than inferred.
+- Position reconstruction and the ledger are projections, not settlement: no
+  fees, funding, margin, or clearing; unknown legs are reported rather than
+  inferred, and the ledger excludes a whole trade with an unresolved leg.
+- The MD baseline counter is not yet wired to `/api/health` or `/metrics`; a
+  failed initial image append leaves the hub empty and counted, and matching
+  is unaffected, but an operator must read the accessor.
+- The Iggy journal backend cannot locally validate a commit against its head;
+  the memory backend is the enforced contract and the engine only commits
+  applied offsets.
 - Retention deletion, TLS, consumer groups, multi-node HA, and native-Linux
   steady state remain future work.
