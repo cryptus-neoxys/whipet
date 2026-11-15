@@ -196,6 +196,26 @@ only, so a transient mount problem cannot stop ingress. The gauges
 `whippet_storage_critical` expose the state; see
 [the metrics table](#prometheus-metrics).
 
+### Retention plan (read-only)
+
+`whippet retention-plan` computes the oldest orders-log offset that is safe to
+delete from the live evidence: the engine consumer's committed offset and the
+newest **verified** snapshot. It never deletes, trims, commits, or appends.
+
+```sh
+docker compose -f deploy/compose.yaml exec -T node \
+  whippet retention-plan --snapshot-dir /data/snapshots --partitions 16
+```
+
+The boundary is `min(engine committed, verified snapshot max last_offset)`;
+`safe_through = boundary - WHIPPET_RETENTION_SAFETY_MARGIN_RECORDS` (default
+10,000). It blocks when there is no committed engine consumer, no verified
+snapshot, a boundary at offset 0, the head is behind the boundary, or the
+margin consumes the window. The MD consumer's offset is shown as `md-topic`
+for diagnostics and is **not** part of the orders boundary. A `blocked` plan is
+a valid result and exits 0; only connect/snapshot errors fail. `--json` emits
+one object per shard with `"action": "none"`.
+
 This is a guard, not retention. It refuses work before the volume fills and
 gives the operator time to act; it never trims segments. The safe response is
 to pause ingress (the critical state does it), preserve the volume, run
@@ -383,6 +403,7 @@ Series:
 | `whippet_ingress_window_p50_us` / `whippet_ingress_window_p99_us` | gauge | Rolling 10 s gateway ingress percentiles; use these to detect a recent degradation. |
 | `whippet_match_window_p50_us` / `whippet_match_window_p99_us` | gauge | Rolling 10 s matcher service-time percentiles. |
 | `whippet_latency_window_secs` | gauge | Length of the rolling latency window. |
+| `whippet_iggy_log_bytes{topic}` / `whippet_iggy_log_messages{topic}` | gauge | Broker-reported bytes and message count for `orders`, `executions`, and `md`, refreshed every five seconds. |
 | `whippet_disk_free_bytes{volume="whippet"|"iggy"}` / `whippet_disk_used_pct{volume=...}` | gauge | Free bytes and used percentage of the monitored data volumes. |
 | `whippet_disk_monitor_ok{volume}` | gauge | 1 when the volume usage was read; 0 means the mount is unreadable (warn only, ingress stays open). |
 | `whippet_storage_warning` / `whippet_storage_critical` | gauge | 1 when a volume is at or above the warning/critical threshold. Critical refuses new orders and fails readiness. |

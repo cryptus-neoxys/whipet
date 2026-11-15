@@ -323,7 +323,7 @@ are in [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Turbo mode | Implemented | `WHIPPET_MODE=turbo`: match-complete ack (`matched_unjournaled`), bounded window; see [ADR 0013](docs/adr/0013-turbo-mode.md). |
 | Scoped tokens + metrics auth | Implemented | `WHIPPET_API_TOKENS` binds each token to one participant; `WHIPPET_METRICS_TOKEN` can protect `/metrics`. |
 | Consumer groups | Planned | Named consumers with manual offsets today; groups are Phase 2 work. |
-| Retention enforcement | Planned | Policies are recorded but the cleaner is off; replay-safe retention is still to design. |
+| Retention enforcement | Planned | Policies are recorded but the cleaner is off; ADR 0014 defines the replay-safe rule, and the read-only `whippet retention-plan` computes the safe boundary from consumer commits + a verified snapshot. Nothing deletes segments yet. |
 | Surveillance / audit archive | Planned | Phase 2. |
 | HA / 3-node VSR | Planned | Phase 3; single node today. |
 | TLS | Planned | Phase 2; localhost default today. |

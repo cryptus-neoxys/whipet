@@ -36,6 +36,8 @@ enum Commands {
     Replay(whippet::cli::ReplayArgs),
     /// Read-only preflight: Iggy topics, snapshot hashes, and node health.
     Doctor(whippet::cli::DoctorArgs),
+    /// Plan the oldest order-log offset that is safe to delete per partition. Read-only.
+    RetentionPlan(whippet::cli::RetentionPlanArgs),
 }
 
 #[tokio::main]
@@ -60,5 +62,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Verify(args) => whippet::cli::run_verify(args),
         Commands::Replay(args) => whippet::cli::run_replay(args).await,
         Commands::Doctor(args) => whippet::cli::run_doctor(args).await,
+        Commands::RetentionPlan(args) => whippet::cli::run_retention_plan(args).await,
     }
 }

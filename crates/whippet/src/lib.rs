@@ -10,6 +10,7 @@ pub mod engine_runner;
 pub mod gateway;
 pub mod node;
 pub mod ratelimit;
+pub mod retention;
 pub mod sim_runner;
 pub mod snapshot;
 pub mod storage;

@@ -17,6 +17,7 @@ use whippet_journal::{IggyJournal, Journal, Topic};
 
 use crate::config::{exchange_config, read_password};
 use crate::engine_runner::resume_offset;
+use crate::retention::{RetentionDecision, RetentionInput, evaluate, explain};
 use crate::snapshot::SnapshotStore;
 
 #[derive(Args, Debug, Clone)]
@@ -735,4 +736,243 @@ pub async fn run_doctor(args: DoctorArgs) -> Result<()> {
         }
         bail!("{} hard failure(s)", failures.len())
     }
+}
+
+/// Printed with every retention plan, in the table header and in each JSON row.
+pub const RETENTION_PLAN_NOTICE: &str = "read-only plan; this command never deletes data.";
+
+#[derive(Args, Debug, Clone)]
+pub struct RetentionPlanArgs {
+    #[arg(long, env = "WHIPPET_IGGY_ADDR", default_value = "127.0.0.1:8090")]
+    pub iggy_addr: String,
+    #[arg(long, env = "WHIPPET_IGGY_USER", default_value = "iggy")]
+    pub iggy_user: String,
+    #[arg(long, env = "WHIPPET_IGGY_PASSWORD", default_value = "iggy")]
+    pub iggy_password: String,
+    /// Read the Iggy password from a file, as the node does.
+    #[arg(long, env = "WHIPPET_IGGY_PASSWORD_FILE")]
+    pub iggy_password_file: Option<PathBuf>,
+    #[arg(long, default_value = "data/snapshots")]
+    pub snapshot_dir: PathBuf,
+    /// Partition count the log and snapshots were written with.
+    #[arg(long, default_value_t = 16)]
+    pub partitions: u32,
+    /// Comma-separated symbols the node was started with. Defaults to the
+    /// built-in BTC-USD,ETH-USD,SOL-USD set. Pass the node's
+    /// `WHIPPET_SYMBOLS` when it ran a different universe.
+    #[arg(long, env = "WHIPPET_SYMBOLS")]
+    pub symbols: Option<String>,
+    /// Records retained behind the oldest consumer/snapshot boundary as a
+    /// recovery cushion. `0` plans deletion right up to the boundary.
+    #[arg(
+        long,
+        env = "WHIPPET_RETENTION_SAFETY_MARGIN_RECORDS",
+        default_value_t = 10_000
+    )]
+    pub safety_margin_records: u64,
+    /// Print one JSON object per shard instead of a table.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// One shard's retention plan, as observed from the live journal.
+///
+/// Read-only by construction: the row carries the verdict and the evidence
+/// behind it, and `action` is always `none`. This command has no delete, trim,
+/// commit, or append path.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RetentionPlanRow {
+    pub partition: u32,
+    pub head: u64,
+    pub engine_consumer: String,
+    pub engine_committed: Option<u64>,
+    pub md_consumer: String,
+    /// The MD consumer's committed offset on the `md` topic. Diagnostic only:
+    /// MD offsets live in a different space and never bound the orders log.
+    pub md_topic_committed: Option<u64>,
+    /// Maximum `last_offset` of the newest snapshot, after verification.
+    pub snapshot_offset: Option<u64>,
+    /// `eligible` or `blocked`.
+    pub decision: &'static str,
+    /// Inclusive offset a future trimmer may delete through, when eligible.
+    pub safe_through: Option<u64>,
+    pub reason: String,
+    /// Always `none`: the plan never deletes.
+    pub action: &'static str,
+    pub notice: &'static str,
+}
+
+/// Connect to Iggy and print the plan. The Iggy read path never commits.
+pub async fn run_retention_plan(args: RetentionPlanArgs) -> Result<()> {
+    let password = read_password(&args.iggy_password, args.iggy_password_file.as_deref())?;
+    let journal = Journal::Iggy(
+        IggyJournal::connect(&args.iggy_addr, &args.iggy_user, &password)
+            .await
+            .with_context(|| format!("connecting to Iggy at {}", args.iggy_addr))?,
+    );
+    retention_plan_with_journal(args, &journal)
+        .await
+        .map(|_| ())
+}
+
+/// The plan core, with the journal injected so the read-only behaviour can be
+/// tested on the in-memory journal. `run_retention_plan` supplies the Iggy
+/// journal.
+///
+/// Returns the rows that were printed, so tests can assert on the verdicts and
+/// offsets without scraping stdout. `Blocked` is a valid result and not an
+/// error: only I/O, connect, and snapshot-load/verify failures are.
+#[doc(hidden)]
+pub async fn retention_plan_with_journal(
+    args: RetentionPlanArgs,
+    journal: &Journal,
+) -> Result<Vec<RetentionPlanRow>> {
+    if args.partitions == 0 {
+        bail!("--partitions must be at least 1");
+    }
+    let exchange = snapshot_exchange(args.partitions, args.symbols.as_deref())?;
+    let store = SnapshotStore::new(args.snapshot_dir.clone());
+    // Only shards that own a configured symbol have an active engine consumer.
+    let mut shards: Vec<u32> = exchange
+        .instruments
+        .iter()
+        .map(|instrument| instrument.symbol.partition(exchange.partitions))
+        .collect();
+    shards.sort_unstable();
+    shards.dedup();
+
+    // Say it on every run and repeat it in each JSON row: this is a proof, not
+    // an action.
+    eprintln!("{RETENTION_PLAN_NOTICE}");
+    if !args.json {
+        println!(
+            "{:>9}  {:>10}  {:>10}  {:>10}  {:>10}  {:<8}  {:>12}  reason",
+            "partition", "head", "engine", "md-topic", "snapshot", "decision", "safe_through"
+        );
+    }
+    let mut rows = Vec::with_capacity(shards.len());
+    for shard in shards {
+        let engine_consumer = format!("whippet-engine-p{shard}");
+        let md_consumer = format!("whippet-md-p{shard}");
+        let engine_committed = journal
+            .committed(Topic::Orders, shard, &engine_consumer)
+            .await
+            .with_context(|| format!("reading committed offset for {engine_consumer}"))?;
+        // The head is the last offset in the partition, inclusive. `lag` counts
+        // the records after the committed offset, so committed + lag is the
+        // head on both journal backends, exactly as `replay` computes it.
+        let head = {
+            let committed = engine_committed.unwrap_or(0);
+            let lag = journal
+                .lag(Topic::Orders, shard, committed)
+                .await
+                .with_context(|| format!("reading lag for partition {shard}"))?;
+            committed.saturating_add(lag)
+        };
+        // The MD consumer commits on the MD topic, whose offsets are a
+        // different space from the orders log. It is a diagnostic column only:
+        // it must not constrain the orders deletion boundary.
+        let md_topic_committed = journal
+            .committed(Topic::Md, shard, &md_consumer)
+            .await
+            .with_context(|| format!("reading committed offset for {md_consumer}"))?;
+        // Verify before trusting: a corrupt snapshot is an I/O-class failure,
+        // not a boundary the planner may use.
+        let snapshot_offset = match store
+            .load(shard)
+            .with_context(|| format!("loading snapshot for shard {shard}"))?
+        {
+            Some(snapshot) => {
+                ShardEngine::from_snapshot(&exchange, snapshot.clone())
+                    .with_context(|| format!("verifying snapshot for shard {shard}"))?;
+                snapshot
+                    .symbols
+                    .iter()
+                    .map(|symbol| symbol.last_offset)
+                    .max()
+            }
+            None => None,
+        };
+
+        // The orders-log boundary is the engine consumer plus the verified
+        // orders snapshot. A missing engine commit is unprovable, so it blocks;
+        // a missing MD commit says nothing about the orders log.
+        let (decision, reason) = match engine_committed {
+            Some(engine) => {
+                let input = RetentionInput {
+                    head,
+                    consumers: vec![(engine_consumer.clone(), engine)],
+                    snapshot_offset,
+                    safety_margin_records: args.safety_margin_records,
+                };
+                let decision = evaluate(&input);
+                let reason = match &decision {
+                    RetentionDecision::Blocked { reason, .. } => reason.clone(),
+                    RetentionDecision::Eligible { .. } => explain(&input),
+                };
+                (decision, reason)
+            }
+            None => {
+                let reason = format!(
+                    "no committed consumer: {engine_consumer} has no committed offset, so the \
+                     plan cannot prove what it has consumed"
+                );
+                let decision = RetentionDecision::Blocked {
+                    reason: reason.clone(),
+                    safe_through: None,
+                };
+                (decision, reason)
+            }
+        };
+
+        let row = RetentionPlanRow {
+            partition: shard,
+            head,
+            engine_consumer,
+            engine_committed,
+            md_consumer,
+            md_topic_committed,
+            snapshot_offset,
+            decision: if decision.is_eligible() {
+                "eligible"
+            } else {
+                "blocked"
+            },
+            safe_through: decision.safe_through(),
+            reason,
+            action: "none",
+            notice: RETENTION_PLAN_NOTICE,
+        };
+        if args.json {
+            println!("{}", serde_json::to_string(&row)?);
+        } else {
+            println!(
+                "{:>9}  {:>10}  {:>10}  {:>10}  {:>10}  {:<8}  {:>12}  {}",
+                row.partition,
+                row.head,
+                offset_cell(row.engine_committed),
+                offset_cell(row.md_topic_committed),
+                offset_cell(row.snapshot_offset),
+                row.decision,
+                offset_cell(row.safe_through),
+                row.reason
+            );
+        }
+        rows.push(row);
+    }
+
+    if !args.json {
+        let eligible = rows.iter().filter(|row| row.decision == "eligible").count();
+        println!(
+            "{} shard(s): {eligible} eligible, {} blocked; nothing was deleted",
+            rows.len(),
+            rows.len() - eligible
+        );
+    }
+    Ok(rows)
+}
+
+/// Render an optional offset for the table; a missing value is `-`, never 0.
+fn offset_cell(offset: Option<u64>) -> String {
+    offset.map_or_else(|| "-".to_string(), |offset| offset.to_string())
 }

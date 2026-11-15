@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 COMPOSE := docker compose -f deploy/compose.yaml
 
-.PHONY: help secrets up down demo bench bench-smoke bench-sweep bench-tcp bench-fanout bench-matcher soak crash-test crash-matrix verify verify-strict verify-dev replay replay-strict replay-dev doctor reset logs build dashboard ci obs chaos ha ps
+.PHONY: help secrets up down demo bench bench-smoke bench-sweep bench-tcp bench-fanout bench-matcher soak crash-test crash-matrix retention-plan verify verify-strict verify-dev replay replay-strict replay-dev doctor reset logs build dashboard ci obs chaos ha ps
 
 help:
 	@printf '%s\n' \
@@ -17,6 +17,7 @@ help:
 		'make soak         10-minute steady-state soak' \
 		'make crash-test   kill/restart/replay proof (Docker stack)' \
 		'make crash-matrix Rust failure-injection tests (append-before-commit, writer failure)' \
+		'make retention-plan read-only safe-deletion plan (never deletes)' \
 		'make verify      healthcheck, crossing pair, snapshot hash check (lenient dev path; WHIPPET_PARTITIONS overrides 16)' \
 		'make verify-strict fail-closed verify: exit non-zero when no snapshot exists (WHIPPET_PARTITIONS)' \
 		'make verify-dev  alias for the lenient verify path' \
@@ -75,6 +76,10 @@ crash-test:
 # Deterministic failure-injection tests: no Docker required.
 crash-matrix:
 	cargo test -p whippet --test crash_idempotency --test shard_failures
+
+# Read-only retention plan: consumers + verified snapshot -> safe offset.
+retention-plan:
+	@$(COMPOSE) exec -T node /usr/local/bin/whippet retention-plan --snapshot-dir /data/snapshots --partitions $${WHIPPET_PARTITIONS:-16}
 
 # Criterion microbenchmarks. Developer tools, not CI gates.
 bench-matcher:
