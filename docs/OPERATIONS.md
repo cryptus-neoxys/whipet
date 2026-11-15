@@ -174,6 +174,24 @@ are enforced only by the messages cleaner — and the default stack disables
 it, so nothing trims the log. See
 [Log growth and retention](#log-growth-and-retention) for the exact state.
 
+## Surveillance indicators (read-only)
+
+`whippet surveillance` scans the orders and executions logs for one partition
+and reports per-participant, windowed indicators: a high cancel ratio, large
+cancelled orders with no fill, self-trade-prevention events, and duplicate
+order-id retries. It is deterministic and read-only, and its output is
+explicitly **educational, not a regulatory finding**.
+
+```sh
+whippet surveillance --partition 1 --window-secs 3600
+whippet surveillance --partition 1 --min-orders 50 --cancel-ratio-bps 8000 --json
+```
+
+The window uses the newest event timestamp in the scanned log as "now"; no
+wall clock is read. `--fail-on-findings` exits non-zero when any participant
+is flagged (for monitoring/CI), while an empty window is a successful exit.
+See `docs/RUNBOOK.md` for the operator sequence.
+
 ## Instrument control plane
 
 Halt and resume are operator-only HTTP endpoints:

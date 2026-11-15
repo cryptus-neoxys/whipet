@@ -323,6 +323,7 @@ are in [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Turbo mode | Implemented | `WHIPPET_MODE=turbo`: match-complete ack (`matched_unjournaled`), bounded window; see [ADR 0013](docs/adr/0013-turbo-mode.md). |
 | Scoped tokens + metrics auth | Implemented | `WHIPPET_API_TOKENS` binds each token to one participant; `WHIPPET_METRICS_TOKEN` can protect `/metrics`. |
 | Consumer groups | Planned | Named consumers with manual offsets today; groups are Phase 2 work. |
+| Surveillance indicators | Implemented (educational) | `whippet surveillance` reports windowed cancel-ratio, large-cancel-without-fill, self-trade-prevention, and duplicate-id indicators per participant. Read-only; not a regulatory finding. |
 | Sequenced market-data feed | Implemented | `GET /ws/md?symbol=...` sends a full-depth price-level snapshot, then every delta with a per-symbol `seq`, and resyncs a lagged consumer with a fresh snapshot. Separate from the conflated dashboard `/ws`. |
 | Instrument halt/resume | Implemented | Operator-only HTTP control plane (`WHIPPET_OPERATOR_TOKENS`), log-ordered with orders, audited in the `audit` topic, `halted` in `/api/state` and the dashboard. Cancels remain allowed; new orders reject with `halted`. |
 | Retention enforcement | Planned | Policies are recorded but the cleaner is off; ADR 0014 defines the replay-safe rule, and the read-only `whippet retention-plan` computes the safe boundary from consumer commits + a verified snapshot. Nothing deletes segments yet. |

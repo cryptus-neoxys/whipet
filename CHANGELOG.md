@@ -49,6 +49,11 @@ Whippet is pre-1.0; minor releases may change internal APIs.
 
 ### Added
 
+- Read-only surveillance indicators: `whippet surveillance` scans one
+  partition's orders/executions window and reports per-participant
+  cancel-ratio, large-cancelled-without-fill, self-trade-prevention, and
+  duplicate-id retry indicators. Deterministic, educational, and explicitly
+  not a regulatory finding; `--fail-on-findings` for monitoring.
 - Sequenced price-level market-data feed: `GET /ws/md?symbol=...` sends a
   full-depth snapshot at the current per-symbol sequence, then every accepted
   delta in order, and resyncs a lagged subscriber with a fresh snapshot. The

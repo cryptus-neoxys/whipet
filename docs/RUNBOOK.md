@@ -228,6 +228,12 @@ whippet order-trace --partition 1 --order-id <decimal|0xhex> --verify
 ```
 
 `audit` scans the four audit-topic partitions from offset 0 and never commits.
+`whippet surveillance --partition 1 --window-secs 3600` adds educational
+per-participant indicators (cancel ratio, large cancelled orders with no fill,
+self-trade-prevention events, duplicate-id retries). It is read-only and
+explicitly not a regulatory finding; `--fail-on-findings` makes it a
+monitoring gate.
+
 `order-trace` decodes the orders and executions logs for one partition,
 matches the order's own and maker-side events, and reports the stable
 `(symbol, cause_offset, seq, kind)` identities; `--verify` fails when a

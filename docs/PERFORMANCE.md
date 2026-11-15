@@ -1039,6 +1039,29 @@ weaken the gate. A native Linux run and a replay-safe retention/archive path
 are required before this gate can pass. The window series, disk gauges, and
 log-size gauges introduced in this slice are what make the failure legible.
 
+## Matcher message edge and ingress micro-costs
+
+Small changes landed after the audit, with allocation counts rather than
+wall-clock claims:
+
+- The matcher now sizes its per-batch output vectors to the input batch
+  instead of `BATCH_CAPACITY` (1024) on every batch. At batch-10 ingress that
+  removes roughly 230 KB of fixed vector allocation per batch; large batches
+  still grow to their real size.
+- Turbo acks are sent immediately after `process` returns, before execution
+  and MD messages are encoded, so the ~1 µs message-construction edge is no
+  longer between the match and the client ack.
+- `DedupTable::update` uses one hash probe instead of two; it runs on every
+  fill, rest, cancel, and reject.
+- Missing `client_order_id` values use the UUID's 128 random bits directly
+  instead of formatting the UUID to a string and BLAKE3-hashing it; the
+  gateway batch counter is one atomic per batch, not one per order.
+- The MD apply loop no longer does a linear instrument lookup per event in
+  release builds; the lookup existed only for a `debug_assert`.
+
+No stage-timing claim is made for these; the durable path is append-bound and
+the existing dev-loop tables already carry the measurement caveat.
+
 ## Guardrails
 
 A performance change is admissible only if it preserves the correctness story:
