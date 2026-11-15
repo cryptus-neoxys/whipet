@@ -16,6 +16,7 @@ use whippet_engine::ShardEngine;
 use whippet_journal::{IggyJournal, Journal, Topic};
 
 use crate::config::{exchange_config, read_password};
+use crate::engine_runner::resume_offset;
 use crate::snapshot::SnapshotStore;
 
 #[derive(Args, Debug, Clone)]
@@ -133,12 +134,26 @@ pub async fn run_health(args: HealthArgs) -> Result<()> {
 pub struct VerifyArgs {
     #[arg(long, default_value = "data/snapshots")]
     pub snapshot_dir: PathBuf,
+    /// Partition count the snapshots were written with. `from_snapshot` checks
+    /// each symbol's shard against this count, so a 4-partition snapshot must
+    /// be verified with `--partitions 4`, not the 16-partition default.
     #[arg(long, default_value_t = 16)]
     pub partitions: u32,
+    /// Exit non-zero when the directory holds no snapshots instead of reporting
+    /// that nothing was verified. Use for CI and release proof; leave unset for
+    /// the lenient dev path.
+    #[arg(long)]
+    pub require_snapshot: bool,
 }
 
 pub fn run_verify(args: VerifyArgs) -> Result<()> {
-    let exchange = ExchangeConfig::default();
+    if args.partitions == 0 {
+        bail!("--partitions must be at least 1");
+    }
+    let exchange = ExchangeConfig {
+        partitions: args.partitions,
+        ..ExchangeConfig::default()
+    };
     let store = SnapshotStore::new(args.snapshot_dir.clone());
     let mut found = 0;
     for shard in 0..args.partitions {
@@ -170,8 +185,17 @@ pub fn run_verify(args: VerifyArgs) -> Result<()> {
         found += 1;
     }
     if found == 0 {
+        // Lenient by default so a fresh checkout can run `verify` without a
+        // snapshot; `--require-snapshot` turns "nothing was checked" into a
+        // failure, because a vacuous pass is not a proof.
+        if args.require_snapshot {
+            bail!(
+                "no snapshots in {}; nothing verified (--require-snapshot)",
+                args.snapshot_dir.display()
+            );
+        }
         println!(
-            "no snapshots in {} (the node writes one every N commands)",
+            "no snapshots in {}; nothing verified (the node writes one every N commands)",
             args.snapshot_dir.display()
         );
     } else {
@@ -210,50 +234,160 @@ pub struct ReplayArgs {
     pub snapshot_dir: PathBuf,
     #[arg(long, default_value_t = 16)]
     pub exchange_partitions: u32,
+    /// Fail unless the replay is seeded from a snapshot that was found, is a
+    /// real resume point (applied commands > 0), sits before the log head, and
+    /// is not ahead of the engine's committed offset. Without it a missing
+    /// snapshot silently degrades to a full replay from zero.
+    #[arg(long)]
+    pub require_snapshot: bool,
     /// Fail unless the final state hash equals this value.
     #[arg(long)]
     pub expect_hash: Option<String>,
 }
 
 pub async fn run_replay(args: ReplayArgs) -> Result<()> {
-    let exchange = ExchangeConfig {
-        partitions: args.exchange_partitions,
-        ..ExchangeConfig::default()
-    };
-    let store = SnapshotStore::new(args.snapshot_dir.clone());
-    let snapshot = store.load(args.partition)?;
-    // An explicit --from means a clean replay from that offset. Without it,
-    // seed from the snapshot and replay only the tail. Never do both: that
-    // would apply the tail twice.
-    let use_snapshot = args.from.is_none() && snapshot.is_some();
-    let (mut engine, snapshot_offset, seeded) = match (use_snapshot, &snapshot) {
-        (true, Some(snapshot)) => {
-            let mut engine = ShardEngine::from_snapshot(&exchange, snapshot.clone())
-                .with_context(|| format!("restoring shard {}", args.partition))?;
-            engine.set_snapshot_interval(u64::MAX);
-            let offset = snapshot
-                .symbols
-                .iter()
-                .map(|symbol| symbol.last_offset)
-                .max()
-                .unwrap_or(0);
-            (engine, Some(offset), true)
-        }
-        _ => (
-            ShardEngine::new_with_snapshot_interval(args.partition, &exchange, u64::MAX),
-            None,
-            false,
-        ),
-    };
-
-    let start = args
-        .from
-        .unwrap_or_else(|| snapshot_offset.map_or(0, |offset| offset.saturating_add(1)));
     let journal = Journal::Iggy(
         IggyJournal::connect(&args.iggy_addr, &args.iggy_user, &args.iggy_password)
             .await
             .with_context(|| format!("connecting to Iggy at {}", args.iggy_addr))?,
     );
+    replay_with_journal(args, journal).await.map(|_| ())
+}
+
+/// The replay core, with the journal injected so the fail-closed rules can be
+/// tested on the in-memory journal. `run_replay` supplies the Iggy journal.
+///
+/// Returns the summary that was printed, so tests can assert on the reported
+/// offsets without scraping stdout.
+#[doc(hidden)]
+pub async fn replay_with_journal(args: ReplayArgs, journal: Journal) -> Result<serde_json::Value> {
+    if args.exchange_partitions == 0 {
+        bail!("--exchange-partitions must be at least 1");
+    }
+    let exchange = ExchangeConfig {
+        partitions: args.exchange_partitions,
+        ..ExchangeConfig::default()
+    };
+    let store = SnapshotStore::new(args.snapshot_dir.clone());
+    let snapshot = store
+        .load(args.partition)
+        .with_context(|| format!("loading snapshot for partition {}", args.partition))?;
+    let snapshot_found = snapshot.is_some();
+    // The node's resume rule, reused verbatim: a snapshot from a shard that
+    // never applied a command is not a resume point. Treating its
+    // `last_offset: 0` as one would skip the first order.
+    let snapshot_resume = snapshot.as_ref().and_then(resume_offset);
+
+    // The engine consumer is the authority for how far the live node has
+    // applied the log. Replay reads under its own consumer and never commits,
+    // so this is a read-only observation.
+    let engine_consumer = format!("whippet-engine-p{}", args.partition);
+    let committed_offset = journal
+        .committed(Topic::Orders, args.partition, &engine_consumer)
+        .await
+        .with_context(|| format!("reading committed offset for {engine_consumer}"))?;
+    // Head is the last offset in the partition, inclusive. `lag` reports the
+    // records after the committed offset, so committed + lag is the head on
+    // both journal backends.
+    let head = match committed_offset {
+        Some(committed) => {
+            let lag = journal
+                .lag(Topic::Orders, args.partition, committed)
+                .await
+                .with_context(|| format!("reading lag for partition {}", args.partition))?;
+            Some(committed.saturating_add(lag))
+        }
+        None => None,
+    };
+
+    // An explicit --from means a clean replay from that offset. Without it,
+    // seed from the snapshot and replay only the tail. Never do both: that
+    // would apply the tail twice.
+    let use_snapshot = args.from.is_none() && snapshot_resume.is_some();
+    let (mut engine, snapshot_offset, seeded) = match (use_snapshot, snapshot) {
+        (true, Some(snapshot)) => {
+            let mut engine = ShardEngine::from_snapshot(&exchange, snapshot)
+                .with_context(|| format!("restoring shard {}", args.partition))?;
+            engine.set_snapshot_interval(u64::MAX);
+            (engine, snapshot_resume, true)
+        }
+        (_, snapshot) => {
+            // Lenient mode may reach here with a snapshot file that has no
+            // applied commands; say so rather than looking seeded to an
+            // operator reading the summary.
+            if snapshot.is_some() && snapshot_resume.is_none() {
+                eprintln!(
+                    "replay: partition {} has a snapshot with no applied commands; \
+                     it is not a resume point, replaying from offset 0",
+                    args.partition
+                );
+            }
+            (
+                ShardEngine::new_with_snapshot_interval(args.partition, &exchange, u64::MAX),
+                None,
+                false,
+            )
+        }
+    };
+
+    if args.require_snapshot {
+        if let Some(from) = args.from {
+            bail!(
+                "--require-snapshot: --from {from} starts a clean replay; the run cannot \
+                 be seeded from a snapshot"
+            );
+        }
+        let Some(offset) = snapshot_offset else {
+            bail!(
+                "--require-snapshot: no usable snapshot for partition {} in {} ({}); \
+                 refusing to fall back to a full replay",
+                args.partition,
+                args.snapshot_dir.display(),
+                if snapshot_found {
+                    "the file has no applied commands"
+                } else {
+                    "no snapshot file"
+                }
+            );
+        };
+        if !seeded {
+            bail!(
+                "--require-snapshot: the replay was not seeded from the snapshot at \
+                 offset {offset}"
+            );
+        }
+        let Some(committed) = committed_offset else {
+            bail!(
+                "--require-snapshot: {engine_consumer} has no committed offset; \
+                 cannot prove snapshot offset {offset} is behind the log"
+            );
+        };
+        if offset > committed {
+            bail!(
+                "--require-snapshot: snapshot offset {offset} is ahead of the engine \
+                 committed offset {committed} for {engine_consumer}; the snapshot cannot \
+                 be a resume point"
+            );
+        }
+        let Some(head) = head else {
+            bail!(
+                "--require-snapshot: could not read the log head for partition {}; \
+                 cannot prove snapshot offset {offset} is before it",
+                args.partition
+            );
+        };
+        if offset >= head {
+            bail!(
+                "--require-snapshot: snapshot offset {offset} is not before the log head \
+                 {head} on partition {}; there is no tail to replay",
+                args.partition
+            );
+        }
+    }
+
+    let start = args
+        .from
+        .unwrap_or_else(|| snapshot_offset.map_or(0, |offset| offset.saturating_add(1)));
     let consumer = format!("whippet-replay-p{}", args.partition);
     let mut offset = start;
     let mut decoded = 0u64;
@@ -316,10 +450,20 @@ pub async fn run_replay(args: ReplayArgs) -> Result<()> {
     }
 
     let hash = hex(&engine.state_hash());
+    // tail is the number of orders after the snapshot. It is only defined for
+    // a seeded run; a full replay has no snapshot to measure from.
+    let tail = match (head, snapshot_offset) {
+        (Some(head), Some(snapshot_offset)) => Some(head.saturating_sub(snapshot_offset)),
+        _ => None,
+    };
     let summary = serde_json::json!({
         "partition": args.partition,
         "seeded_from_snapshot": seeded,
         "snapshot_offset": snapshot_offset,
+        "engine_consumer": engine_consumer,
+        "committed_offset": committed_offset,
+        "head": head,
+        "tail": tail,
         "from": start,
         "to": args.to,
         "last_offset": last_offset,
@@ -335,7 +479,7 @@ pub async fn run_replay(args: ReplayArgs) -> Result<()> {
         }
         println!("state hash matches expectation");
     }
-    Ok(())
+    Ok(summary)
 }
 
 /// Read-only preflight. It never creates topics or snapshots; it reports what

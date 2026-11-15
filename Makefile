@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 COMPOSE := docker compose -f deploy/compose.yaml
 
-.PHONY: help secrets up down demo bench bench-smoke bench-sweep bench-tcp bench-fanout soak crash-test verify replay doctor reset logs build dashboard ci obs chaos ha ps
+.PHONY: help secrets up down demo bench bench-smoke bench-sweep bench-tcp bench-fanout soak crash-test verify verify-strict verify-dev replay replay-strict replay-dev doctor reset logs build dashboard ci obs chaos ha ps
 
 help:
 	@printf '%s\n' \
@@ -15,8 +15,12 @@ help:
 		'make bench-fanout WebSocket fanout (1/10/100 subscribers)' \
 		'make soak         10-minute steady-state soak' \
 		'make crash-test   kill/restart/replay proof' \
-		'make verify      healthcheck, crossing pair, snapshot hash check' \
-		'make replay      full vs snapshot-seeded replay; hashes must match' \
+		'make verify      healthcheck, crossing pair, snapshot hash check (lenient dev path)' \
+		'make verify-strict fail-closed verify: exit non-zero when no snapshot exists' \
+		'make verify-dev  alias for the lenient verify path' \
+		'make replay      full vs snapshot-seeded replay; seeded run must be seeded' \
+		'make replay-strict alias for replay (fail-closed proof)' \
+		'make replay-dev  lenient replay: allows a full replay as the seeded run' \
 		'make doctor      read-only preflight: Iggy topics, snapshots, health' \
 		'make reset       down -v (keeps local files and secrets)' \
 		'make logs        follow default stack logs' \
@@ -66,13 +70,30 @@ soak:
 crash-test:
 	@scripts/crash-test.sh
 
+# `verify` stays lenient so a fresh stack can be inspected before the first
+# snapshot is written; it prints "no snapshots; nothing verified". Use
+# `verify-strict` (or `make verify-strict`) for the fail-closed proof.
 verify:
 	@$(COMPOSE) exec -T node /usr/local/bin/whippet healthcheck --gateway http://127.0.0.1:8080
 	@scripts/verify-demo.sh
 	@$(COMPOSE) exec -T node /usr/local/bin/whippet verify --snapshot-dir /data/snapshots --partitions 16
 
+verify-dev: verify
+
+verify-strict:
+	@$(COMPOSE) exec -T node /usr/local/bin/whippet healthcheck --gateway http://127.0.0.1:8080
+	@scripts/verify-demo.sh
+	@$(COMPOSE) exec -T node /usr/local/bin/whippet verify --snapshot-dir /data/snapshots --partitions 16 --require-snapshot
+
+# scripts/replay.sh is fail-closed by default: the seeded replay passes
+# --require-snapshot and the comparison rejects an unseeded run.
 replay:
 	@scripts/replay.sh
+
+replay-strict: replay
+
+replay-dev:
+	@WHIPPET_REPLAY_REQUIRE_SNAPSHOT=0 scripts/replay.sh
 
 doctor:
 	@$(COMPOSE) exec -T node /usr/local/bin/whippet doctor
