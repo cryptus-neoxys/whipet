@@ -443,6 +443,8 @@ pub struct Metrics {
     partition_count: AtomicU64,
     ingress: Mutex<Histogram<u64>>,
     match_latency: Mutex<Histogram<u64>>,
+    /// Gateway receive -> turbo match ack. Empty in durable mode.
+    turbo_ack: Mutex<Histogram<u64>>,
     /// One histogram per [`Stage`]. Indexed by `Stage::index`.
     stages: [Mutex<Histogram<u64>>; STAGE_COUNT],
     rate: Mutex<RateState>,
@@ -471,6 +473,7 @@ impl Metrics {
             partition_count: AtomicU64::new(u64::from(partitions)),
             ingress: Mutex::new(new_histogram()),
             match_latency: Mutex::new(new_histogram()),
+            turbo_ack: Mutex::new(new_histogram()),
             stages: std::array::from_fn(|_| Mutex::new(new_histogram())),
             rate: Mutex::new(RateState {
                 at: Instant::now(),
@@ -509,6 +512,16 @@ impl Metrics {
 
     pub fn record_match_latency_us(&self, micros: u64) {
         record(&self.match_latency, micros);
+    }
+
+    /// Turbo acknowledgement latency: gateway receive to match-complete ack.
+    pub fn record_turbo_ack_latency_us(&self, micros: u64) {
+        record(&self.turbo_ack, micros);
+    }
+
+    /// One lock acquisition for the turbo ack percentiles and sample count.
+    pub fn turbo_ack_summary(&self) -> LatencySummary {
+        latency_summary(&self.turbo_ack)
     }
 
     /// Record one stage sample in microseconds.

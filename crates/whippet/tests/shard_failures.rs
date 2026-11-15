@@ -9,16 +9,17 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, watch};
 use whippet::engine_runner::{
-    APPEND_MAX_ATTEMPTS, InputBatch, JournalOps, OutputBatch, SHARD_RING_CAPACITY, join_matcher,
-    read_orders, run_matcher, run_writer,
+    APPEND_MAX_ATTEMPTS, InputBatch, JournalOps, OutputBatch, SHARD_RING_CAPACITY,
+    TurboJournalRecord, join_matcher, read_orders, run_matcher, run_writer,
 };
+use whippet::turbo::{TurboConfig, TurboWindow, now_ns};
 use whippet_core::config::ExchangeConfig;
 use whippet_engine::ShardEngine;
 use whippet_journal::{
@@ -40,10 +41,14 @@ struct FakeJournal {
     /// Executions appends that fail before one succeeds. `usize::MAX` keeps
     /// failing forever (the "wedged output topic" case).
     executions_failures: AtomicUsize,
+    /// Orders appends that fail before one succeeds; `usize::MAX` keeps
+    /// failing (the turbo write-behind's "journal down" case).
+    orders_failures: AtomicUsize,
     attempts: AtomicUsize,
     events: Mutex<Vec<Event>>,
     committed: Mutex<Option<u64>>,
     executions_log: Mutex<Vec<Vec<u8>>>,
+    orders_log: Mutex<Vec<Vec<u8>>>,
     /// Shared with the writer under test so a failure can record how far the
     /// applied offset had advanced at that moment.
     appended: Arc<AtomicU64>,
@@ -51,36 +56,54 @@ struct FakeJournal {
     /// When set, every poll returns this fixed batch; `None` returns empty.
     reader_offsets: Option<Vec<u64>>,
     polls: AtomicUsize,
+    /// When set, an orders append parks here until the test frees a permit, so
+    /// the window slot can be observed while the append is still in flight.
+    orders_gate: Option<Arc<tokio::sync::Semaphore>>,
+    orders_started: AtomicBool,
 }
 
 impl FakeJournal {
     fn failing_executions_once(appended: Arc<AtomicU64>) -> Self {
-        Self::new(appended, 1, None)
+        Self::new(appended, 1, 0, None, None)
     }
 
     fn failing_executions_forever(appended: Arc<AtomicU64>) -> Self {
-        Self::new(appended, usize::MAX, None)
+        Self::new(appended, usize::MAX, 0, None, None)
+    }
+
+    fn failing_orders_forever(appended: Arc<AtomicU64>) -> Self {
+        Self::new(appended, 0, usize::MAX, None, None)
+    }
+
+    fn gated_on_orders(appended: Arc<AtomicU64>, gate: Arc<tokio::sync::Semaphore>) -> Self {
+        Self::new(appended, 0, 0, None, Some(gate))
     }
 
     fn with_reader(offsets: Vec<u64>) -> Self {
-        Self::new(Arc::new(AtomicU64::new(0)), 0, Some(offsets))
+        Self::new(Arc::new(AtomicU64::new(0)), 0, 0, Some(offsets), None)
     }
 
     fn new(
         appended: Arc<AtomicU64>,
         executions_failures: usize,
+        orders_failures: usize,
         reader_offsets: Option<Vec<u64>>,
+        orders_gate: Option<Arc<tokio::sync::Semaphore>>,
     ) -> Self {
         Self {
             executions_failures: AtomicUsize::new(executions_failures),
+            orders_failures: AtomicUsize::new(orders_failures),
             attempts: AtomicUsize::new(0),
             events: Mutex::new(Vec::new()),
             committed: Mutex::new(None),
             executions_log: Mutex::new(Vec::new()),
+            orders_log: Mutex::new(Vec::new()),
             appended,
             appended_at_failure: Mutex::new(Vec::new()),
             reader_offsets,
             polls: AtomicUsize::new(0),
+            orders_gate,
+            orders_started: AtomicBool::new(false),
         }
     }
 
@@ -100,12 +123,32 @@ impl FakeJournal {
         self.executions_log.lock().unwrap().clone()
     }
 
+    fn orders(&self) -> Vec<Vec<u8>> {
+        self.orders_log.lock().unwrap().clone()
+    }
+
     fn appended_at_failure(&self) -> Vec<u64> {
         self.appended_at_failure.lock().unwrap().clone()
     }
 
     fn polls(&self) -> usize {
         self.polls.load(Ordering::SeqCst)
+    }
+
+    fn orders_started(&self) -> bool {
+        self.orders_started.load(Ordering::SeqCst)
+    }
+}
+
+impl FakeJournal {
+    /// Shared failure bookkeeping for an append that must fail.
+    fn fail(&self, topic: Topic) -> JournalResult<AppendResult> {
+        self.appended_at_failure
+            .lock()
+            .unwrap()
+            .push(self.appended.load(Ordering::SeqCst));
+        self.events.lock().unwrap().push(Event::AppendFailed(topic));
+        Err(JournalError::NotConnected)
     }
 }
 
@@ -123,12 +166,22 @@ impl JournalOps for FakeJournal {
                 if left != usize::MAX {
                     self.executions_failures.fetch_sub(1, Ordering::SeqCst);
                 }
-                self.appended_at_failure
-                    .lock()
-                    .unwrap()
-                    .push(self.appended.load(Ordering::SeqCst));
-                self.events.lock().unwrap().push(Event::AppendFailed(topic));
-                return Err(JournalError::NotConnected);
+                return self.fail(topic);
+            }
+        }
+        if topic == Topic::Orders {
+            if let Some(gate) = &self.orders_gate {
+                self.orders_started.store(true, Ordering::SeqCst);
+                // Held to the end of the call: the test releases it to let the
+                // append land.
+                let _permit = gate.acquire().await;
+            }
+            let left = self.orders_failures.load(Ordering::SeqCst);
+            if left > 0 {
+                if left != usize::MAX {
+                    self.orders_failures.fetch_sub(1, Ordering::SeqCst);
+                }
+                return self.fail(topic);
             }
         }
 
@@ -140,6 +193,12 @@ impl JournalOps for FakeJournal {
             }
         }
         drop(log);
+        if topic == Topic::Orders {
+            let mut orders = self.orders_log.lock().unwrap();
+            for message in messages {
+                orders.push(message.payload.to_vec());
+            }
+        }
         self.events.lock().unwrap().push(Event::AppendOk(topic));
         Ok(AppendResult {
             partition,
@@ -218,6 +277,7 @@ fn output_batch(last_offset: u64, final_batch: bool) -> OutputBatch {
     OutputBatch {
         executions: vec![JournalMessage::new(vec![1, 2, 3], Vec::new())],
         md: Vec::new(),
+        orders: Vec::new(),
         last_offset,
         snapshot: None,
         final_batch,
@@ -225,13 +285,11 @@ fn output_batch(last_offset: u64, final_batch: bool) -> OutputBatch {
 }
 
 fn input_batch(offset: u64) -> InputBatch {
-    InputBatch {
-        records: vec![PayloadRecord {
-            offset,
-            timestamp_ns: 0,
-            payload: Bytes::from_static(b"not-a-command"),
-        }],
-    }
+    InputBatch::durable(vec![PayloadRecord {
+        offset,
+        timestamp_ns: 0,
+        payload: Bytes::from_static(b"not-a-command"),
+    }])
 }
 
 #[tokio::test(start_paused = true)]
@@ -391,7 +449,11 @@ async fn full_rings_block_producers_instead_of_growing() {
 
     let matcher = std::thread::Builder::new()
         .name("ring-test-matcher".to_string())
-        .spawn(move || run_matcher(ctx, 0, engine, input_rx, output_tx, recycle_tx, appended, 0))
+        .spawn(move || {
+            run_matcher(
+                ctx, 0, engine, input_rx, output_tx, recycle_tx, appended, 0, 0,
+            )
+        })
         .expect("spawn the matcher");
 
     // Two batches fill the output ring; the third parks the matcher in
@@ -494,4 +556,161 @@ async fn reader_gap_or_overlap_fails_the_shard_and_stops_polling() {
             "a bad batch is never forwarded to the matcher"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_durable_order_record_releases_the_turbo_window_slot() {
+    // The window slot is the crash-loss bound, so it must stay held until the
+    // write-behind's orders append lands. The gated journal parks that append
+    // while the test observes the slot.
+    let node = TestNode::new();
+    let ctx = Arc::clone(&node.ctx);
+    let appended = Arc::new(AtomicU64::new(0));
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let journal = Arc::new(FakeJournal::gated_on_orders(
+        Arc::clone(&appended),
+        Arc::clone(&gate),
+    ));
+    let (snapshot_tx, snapshot_writer) = snapshot_sink();
+    let (output_tx, output_rx) = mpsc::channel(SHARD_RING_CAPACITY);
+
+    let window = TurboWindow::new(TurboConfig::new(1, 50).unwrap());
+    let admission = window.try_admit(now_ns()).expect("one window permit");
+    assert_eq!(window.in_flight(), 1);
+
+    output_tx
+        .send(OutputBatch {
+            executions: vec![JournalMessage::new(vec![9], Vec::new())],
+            md: Vec::new(),
+            orders: vec![TurboJournalRecord {
+                message: JournalMessage::new(vec![7], Vec::new()),
+                admission,
+            }],
+            last_offset: 4,
+            snapshot: None,
+            final_batch: true,
+        })
+        .await
+        .unwrap();
+    drop(output_tx);
+
+    let writer = {
+        let ctx = Arc::clone(&ctx);
+        let journal = Arc::clone(&journal);
+        tokio::spawn(async move {
+            run_writer(
+                ctx,
+                journal.as_ref(),
+                0,
+                "test-consumer".to_string(),
+                None,
+                output_rx,
+                snapshot_tx,
+                snapshot_writer,
+                appended,
+            )
+            .await
+        })
+    };
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !journal.orders_started() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the writer must attempt the orders append");
+    assert_eq!(
+        window.in_flight(),
+        1,
+        "the window slot stays held while the order record is not durable"
+    );
+
+    gate.add_permits(1);
+    writer
+        .await
+        .expect("the writer task runs")
+        .expect("the write-behind drains");
+
+    assert_eq!(
+        window.in_flight(),
+        0,
+        "a durable order record releases the window slot"
+    );
+    assert_eq!(journal.orders(), vec![vec![7]], "the command is journaled");
+    assert_eq!(journal.committed(), Some(4));
+    let events = journal.events();
+    let orders_at = events
+        .iter()
+        .position(|event| *event == Event::AppendOk(Topic::Orders))
+        .expect("the orders append is recorded");
+    let commit_at = events
+        .iter()
+        .position(|event| matches!(event, Event::Commit(4)))
+        .expect("the offset is committed");
+    assert!(
+        orders_at < commit_at,
+        "the commit must follow the orders append: {events:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_order_append_stops_the_shard_without_committing() {
+    let node = TestNode::new();
+    let ctx = Arc::clone(&node.ctx);
+    let appended = Arc::new(AtomicU64::new(0));
+    let journal = FakeJournal::failing_orders_forever(Arc::clone(&appended));
+    let (snapshot_tx, snapshot_writer) = snapshot_sink();
+    let (output_tx, output_rx) = mpsc::channel(SHARD_RING_CAPACITY);
+
+    let window = TurboWindow::new(TurboConfig::new(1, 50).unwrap());
+    let admission = window.try_admit(now_ns()).expect("one window permit");
+    output_tx
+        .send(OutputBatch {
+            executions: vec![JournalMessage::new(vec![9], Vec::new())],
+            md: Vec::new(),
+            orders: vec![TurboJournalRecord {
+                message: JournalMessage::new(vec![7], Vec::new()),
+                admission,
+            }],
+            last_offset: 4,
+            snapshot: None,
+            final_batch: true,
+        })
+        .await
+        .unwrap();
+    drop(output_tx);
+
+    let error = run_writer(
+        Arc::clone(&ctx),
+        &journal,
+        0,
+        "test-consumer".to_string(),
+        None,
+        output_rx,
+        snapshot_tx,
+        snapshot_writer,
+        Arc::clone(&appended),
+    )
+    .await
+    .expect_err("a permanently failing write-behind must stop the shard");
+
+    assert!(
+        error.to_string().contains("output append failed"),
+        "unexpected error: {error}"
+    );
+    assert!(!ctx.shards_ok(), "the shard is marked failed");
+    assert_eq!(
+        appended.load(Ordering::SeqCst),
+        0,
+        "the applied offset never advances past a lost order record"
+    );
+    assert_eq!(journal.committed(), None, "no offset is committed");
+    assert!(
+        journal
+            .events()
+            .iter()
+            .all(|event| !matches!(event, Event::Commit(_))),
+        "no commit is issued on the failure path"
+    );
 }

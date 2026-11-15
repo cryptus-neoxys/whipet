@@ -8,6 +8,8 @@ use whippet_core::config::{ExchangeConfig, Mode, default_instruments};
 use whippet_core::error::CoreError;
 use whippet_core::ids::Symbol;
 
+use crate::turbo::TurboConfig;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JournalKind {
     Iggy,
@@ -113,6 +115,20 @@ pub struct NodeArgs {
     /// from one host.
     #[arg(long, env = "WHIPPET_WS_PER_IP", default_value_t = 0)]
     pub ws_per_ip: usize,
+    /// Turbo only: commands allowed in one shard's uncommitted window.
+    #[arg(
+        long,
+        env = "WHIPPET_TURBO_WINDOW_COMMANDS",
+        default_value_t = crate::turbo::DEFAULT_WINDOW_COMMANDS
+    )]
+    pub turbo_window_commands: usize,
+    /// Turbo only: maximum age of the oldest unjournaled command, in ms.
+    #[arg(
+        long,
+        env = "WHIPPET_TURBO_WINDOW_MS",
+        default_value_t = crate::turbo::DEFAULT_WINDOW_MS
+    )]
+    pub turbo_window_ms: u64,
 }
 
 #[derive(Clone)]
@@ -138,6 +154,9 @@ pub struct NodeConfig {
     pub rate_limit_per_sec: u32,
     /// 0 disables the per-IP WebSocket sub-limit.
     pub ws_per_ip: usize,
+    /// Turbo window limits. Validated even in durable mode so a bad value
+    /// fails at startup, not when an operator flips `WHIPPET_MODE`.
+    pub turbo: TurboConfig,
 }
 
 impl NodeConfig {
@@ -153,9 +172,11 @@ impl NodeConfig {
         let journal = JournalKind::parse(&args.journal)?;
         let iggy_password = read_password(&args.iggy_password, args.iggy_password_file.as_deref())?;
         let mode: Mode = args.mode.parse()?;
-        if mode == Mode::Turbo {
+        let turbo = TurboConfig::new(args.turbo_window_commands, args.turbo_window_ms)
+            .map_err(ConfigError::Invalid)?;
+        if mode == Mode::Turbo && journal != JournalKind::Iggy {
             return Err(ConfigError::Invalid(
-                "turbo mode is Phase 2; the durable slice is the default and only enabled path in this release"
+                "turbo mode requires the Iggy journal; the in-memory journal is a test backend, not a supported deployment"
                     .into(),
             ));
         }
@@ -192,6 +213,7 @@ impl NodeConfig {
             api_participant,
             rate_limit_per_sec: args.rate_limit_per_sec,
             ws_per_ip: args.ws_per_ip,
+            turbo,
         })
     }
 }
@@ -296,12 +318,34 @@ mod tests {
     }
 
     #[test]
-    fn turbo_is_rejected_with_a_clear_message() {
+    fn turbo_defaults_are_bounded() {
         let cli = Cli::parse_from(["test", "--mode", "turbo"]);
+        let config = NodeConfig::from_args(cli.node).expect("turbo is accepted with Iggy");
+        assert_eq!(config.mode, Mode::Turbo);
+        assert_eq!(
+            config.turbo,
+            TurboConfig {
+                window_commands: crate::turbo::DEFAULT_WINDOW_COMMANDS,
+                window_ms: crate::turbo::DEFAULT_WINDOW_MS,
+            }
+        );
+    }
+
+    #[test]
+    fn turbo_rejects_the_memory_journal() {
+        let cli = Cli::parse_from(["test", "--mode", "turbo", "--journal", "memory"]);
         match NodeConfig::from_args(cli.node) {
-            Ok(_) => panic!("turbo mode must be rejected"),
-            Err(error) => assert!(error.to_string().contains("Phase 2")),
+            Ok(_) => panic!("turbo must require the Iggy journal"),
+            Err(error) => assert!(error.to_string().contains("requires the Iggy journal")),
         }
+    }
+
+    #[test]
+    fn turbo_window_knobs_are_validated_in_every_mode() {
+        let cli = Cli::parse_from(["test", "--turbo-window-commands", "0"]);
+        assert!(NodeConfig::from_args(cli.node).is_err());
+        let cli = Cli::parse_from(["test", "--turbo-window-ms", "0"]);
+        assert!(NodeConfig::from_args(cli.node).is_err());
     }
 
     #[test]

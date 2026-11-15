@@ -37,6 +37,7 @@ use whippet_journal::{GroupCommit, Topic};
 use crate::context::NodeContext;
 use crate::gateway::{journal_message_for_command, token_matches};
 use crate::ratelimit::RateLimiter;
+use crate::turbo::EnqueueError;
 
 /// Idle connections are dropped after this long without a complete frame.
 /// A client that wants to keep a connection warm can send a `Ping`.
@@ -311,6 +312,77 @@ async fn handle_submit(
     }
     let count = messages.len() as u32;
 
+    if let Some(turbo) = &ctx.turbo {
+        // Enqueue the whole batch before awaiting any ack, so the shard
+        // matches it as one run instead of one serialized round trip each.
+        let mut receivers = Vec::with_capacity(commands.len());
+        for (command, message) in commands.into_iter().zip(messages) {
+            match turbo.enqueue(partition, command, message) {
+                Ok(receiver) => receivers.push(receiver),
+                Err(EnqueueError::WindowFull) => {
+                    return (
+                        error_response(
+                            TcpErrorCode::WindowFull,
+                            "turbo uncommitted window is full; retry shortly",
+                        ),
+                        false,
+                    );
+                }
+                Err(EnqueueError::ShardUnavailable) => {
+                    return (
+                        error_response(
+                            TcpErrorCode::JournalUnavailable,
+                            "the matching shard is not running",
+                        ),
+                        false,
+                    );
+                }
+            }
+        }
+        let acks = futures_util::future::join_all(receivers.into_iter().map(|receiver| async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), receiver)
+                .await
+                .ok()
+                .and_then(Result::ok)
+        }))
+        .await;
+        let Some(first) = acks.iter().flatten().next().map(|ack| ack.seq) else {
+            return (
+                error_response(
+                    TcpErrorCode::JournalUnavailable,
+                    "the matching shard did not acknowledge the batch",
+                ),
+                false,
+            );
+        };
+        if acks.iter().any(Option::is_none) {
+            return (
+                error_response(
+                    TcpErrorCode::JournalUnavailable,
+                    "the matching shard did not acknowledge every command",
+                ),
+                false,
+            );
+        }
+        let elapsed = started.elapsed();
+        for _ in 0..count {
+            ctx.metrics.record_ingress();
+        }
+        ctx.metrics
+            .record_ingress_latency_us(elapsed.as_micros() as u64);
+        ctx.metrics
+            .record_turbo_ack_latency_us(elapsed.as_micros() as u64);
+        return (
+            TcpResponse::SubmitAck {
+                partition,
+                base_offset: first,
+                count,
+                server_ns: now_ns(),
+            },
+            false,
+        );
+    }
+
     match group.append(Topic::Orders, partition, messages).await {
         Ok(append) => {
             let elapsed = started.elapsed();
@@ -482,6 +554,7 @@ mod tests {
             api_participant: "api".into(),
             rate_limit_per_sec: per_sec,
             ws_per_ip: 0,
+            turbo: crate::turbo::TurboConfig::default(),
         };
         let journal = Arc::new(Journal::memory());
         let hub = MdHub::new(exchange, config.iggy_addr.clone(), "memory".into(), None);
@@ -511,6 +584,7 @@ mod tests {
             rate_limiter,
             ws_connections,
             snapshot_lock: Arc::new(std::sync::Mutex::new(())),
+            turbo: None,
         });
         TestNode { ctx, _dir: dir }
     }

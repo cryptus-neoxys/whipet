@@ -12,13 +12,16 @@ use tracing::{error, info, warn};
 use whippet_core::headers::{
     HeaderMode, MessageMeta, SCHEMA_EXECUTION, SCHEMA_MD_EVENT, SCHEMA_MD_SNAPSHOT,
 };
-use whippet_core::protocol::{Command, ExecKind, ExecutionReport, MdEvent, MdKind, MdSnapshot};
+use whippet_core::protocol::{
+    Command, ExecKind, ExecutionReport, MdEvent, MdKind, MdSnapshot, RejectReason,
+};
 use whippet_engine::{EngineOutput, ShardEngine};
 use whippet_journal::{AppendResult, Journal, JournalMessage, PayloadRecord, Topic};
 use whippet_marketdata::{ShardMetrics, Stage};
 
 use crate::context::NodeContext;
 use crate::snapshot::{SequencedSnapshot, SnapshotWriter};
+use crate::turbo::{TurboAck, TurboAdmission, TurboEntry};
 
 /// How many records a shard applies between consumer-offset commits.
 const COMMIT_INTERVAL_RECORDS: u64 = 256;
@@ -48,6 +51,15 @@ const BATCH_CAPACITY: usize = 1_024;
 
 /// Snapshot requests in flight between the shard loop and the writer.
 const SNAPSHOT_QUEUE_CAPACITY: usize = 2;
+
+/// Turbo write-behind: how many order records one append call carries. A
+/// single request stays bounded even when the window hands over a full slice,
+/// and the shard has exactly one writer, so chunk order is append order.
+const ORDER_APPEND_CHUNK: usize = 256;
+
+/// Consumer name used only by the startup probe that asks whether the orders
+/// partition already holds records.
+const TURBO_ANCHOR_PROBE_CONSUMER: &str = "whippet-turbo-anchor";
 
 /// Batches buffered between the reader and the matcher, and between the matcher
 /// and the writer. Small on purpose: this is the backpressure boundary.
@@ -99,6 +111,15 @@ fn snapshot_min_interval_from(secs: Option<u64>) -> Duration {
 /// has to fit inside that budget.
 const FINAL_SNAPSHOT_SEND_TIMEOUT: Duration = Duration::from_millis(1_000);
 const FINAL_SNAPSHOT_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How many matcher output batches the writer merges into one set of appends.
+///
+/// The matcher hands over a batch every time the input ring wakes, which at
+/// batch-10 ingress is a ten-order group. Appending once per group makes the
+/// write-behind the bottleneck and fills the turbo window on a burst. Draining
+/// what is already queued amortizes the round trip the same way durable group
+/// commit does; the cap bounds the writer's memory and the commit delay.
+const WRITER_COALESCE_BATCHES: usize = 8;
 
 /// The journal operations a shard performs.
 ///
@@ -215,14 +236,32 @@ impl JournalOps for Journal {
 
 /// Owns one partition's books. The single writer is this task; the engine is a
 /// pure state machine and never awaits.
-pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
+///
+/// `turbo` is the shard's ingress lane in turbo mode and `None` in durable
+/// mode. The durable path is unchanged: `read_orders` polls the orders log and
+/// the matcher applies decoded records. In turbo the matcher is fed from the
+/// lane and is the only sequencer; the writer appends the commands to the
+/// orders log behind the match.
+pub async fn run_engine_shard(
+    ctx: Arc<NodeContext>,
+    shard_id: u32,
+    turbo: Option<mpsc::Receiver<TurboEntry>>,
+) -> Result<()> {
+    // Mode is fixed at startup and never falls back: a turbo node whose shard
+    // lost its lane must stop, not quietly start reading the log as durable
+    // after the gateway already acknowledged matches on process-local state.
+    if ctx.turbo.is_some() && turbo.is_none() {
+        anyhow::bail!(
+            "turbo mode is configured but shard {shard_id} has no ingress lane; refusing to fall back to the durable reader"
+        );
+    }
     let exchange = ctx.exchange();
     let loaded = ctx
         .snapshots
         .load(shard_id)
         .with_context(|| format!("loading snapshot for shard {shard_id}"))?;
     let snapshot_last_offset = loaded.as_ref().and_then(resume_offset);
-    let engine = match loaded {
+    let mut engine = match loaded {
         Some(snapshot) => {
             let mut engine = ShardEngine::from_snapshot(exchange, snapshot)
                 .with_context(|| format!("restoring shard {shard_id}"))?;
@@ -276,11 +315,74 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
             );
         }
     }
-    let next_offset = match snapshot_last_offset {
+    // Turbo anchors the local seq domain on the orders log: the write-behind
+    // appends exactly one order record per seq from an empty log, so the seq
+    // the matcher assigns equals the broker offset of the same command. That
+    // anchor exists only when the partition started empty, or when a snapshot
+    // already carries the seq domain forward (the check above). A non-empty
+    // log without either would let this boot assign seqs over records it is
+    // not replaying, duplicating cause_offsets; that is a startup error, never
+    // a silent seq reset.
+    if turbo.is_some() && snapshot_last_offset.is_none() {
+        let head = journal.lag(Topic::Orders, shard_id, 0).await.unwrap_or(0);
+        // `head` alone cannot tell an empty partition from one record at
+        // offset 0 on either backend, so ask for offset 0 explicitly. The head
+        // still matters: it catches a log whose first records retention has
+        // already removed.
+        let mut probe = Vec::new();
+        let first = journal
+            .read_payloads_into(
+                Topic::Orders,
+                shard_id,
+                TURBO_ANCHOR_PROBE_CONSUMER,
+                0,
+                1,
+                0,
+                &mut probe,
+            )
+            .await
+            .with_context(|| format!("probing the orders log for shard {shard_id}"))?;
+        if first > 0 || head > 0 {
+            anyhow::bail!(
+                "turbo cannot anchor the local seq domain on a non-empty orders log (shard {shard_id}, head {head}); reset or restore a snapshot"
+            );
+        }
+    }
+    // A turbo restart with a snapshot behind the log head must replay the
+    // tail before it accepts ingress. Otherwise the engine would start at the
+    // snapshot while records it has not seen already sit above it, and the
+    // write-behind would append duplicate seqs over them. The replay uses the
+    // broker offsets directly: the turbo seq domain is anchored to the log, so
+    // seq == offset.
+    let mut resume_offset = snapshot_last_offset;
+    if turbo.is_some()
+        && let Some(snapshot_offset) = snapshot_last_offset
+    {
+        let head = journal.lag(Topic::Orders, shard_id, 0).await.unwrap_or(0);
+        if head > snapshot_offset {
+            replay_turbo_tail(
+                journal.as_ref(),
+                shard_id,
+                &mut engine,
+                snapshot_offset.saturating_add(1),
+                head,
+            )
+            .await?;
+            info!(
+                shard = shard_id,
+                from = snapshot_offset.saturating_add(1),
+                to = head,
+                "replayed the journaled turbo tail before accepting ingress"
+            );
+            resume_offset = Some(head);
+        }
+    }
+
+    let next_offset = match resume_offset {
         Some(offset) => offset.saturating_add(1),
         None => 0,
     };
-    let committed_offset = match (snapshot_last_offset, journal_committed) {
+    let committed_offset = match (resume_offset, journal_committed) {
         (Some(snapshot), Some(journal)) => Some(snapshot.max(journal)),
         (Some(snapshot), None) => Some(snapshot),
         (None, journal) => journal,
@@ -338,16 +440,29 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
     // first append.
     let appended_offset = Arc::new(AtomicU64::new(committed_offset.unwrap_or(u64::MAX)));
 
-    let reader = tokio::spawn(read_orders(
-        Arc::clone(&ctx),
-        Arc::clone(&journal),
-        shard_id,
-        consumer.clone(),
-        next_offset,
-        input_tx,
-        recycle_rx,
-        ctx.shutdown.subscribe(),
-    ));
+    // The input edge is the only mode-specific part of the shard. Durable polls
+    // the orders log; turbo batches the admitted lane entries. Both hand the
+    // matcher an `InputBatch` through the same bounded ring, so the ring stays
+    // the single backpressure boundary and the shutdown handshake (producer
+    // drops its sender -> matcher builds the final snapshot) is unchanged.
+    let reader = match turbo {
+        Some(turbo_rx) => {
+            // The write-behind owns the orders log; the reader's buffer
+            // recycler has no user in this mode.
+            drop(recycle_rx);
+            tokio::spawn(feed_turbo(turbo_rx, input_tx, ctx.shutdown.subscribe()))
+        }
+        None => tokio::spawn(read_orders(
+            Arc::clone(&ctx),
+            Arc::clone(&journal),
+            shard_id,
+            consumer.clone(),
+            next_offset,
+            input_tx,
+            recycle_rx,
+            ctx.shutdown.subscribe(),
+        )),
+    };
 
     let matcher_ctx = Arc::clone(&ctx);
     let matcher_appended = Arc::clone(&appended_offset);
@@ -363,6 +478,7 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
                 recycle_tx,
                 matcher_appended,
                 next_offset.saturating_sub(1),
+                next_offset,
             )
         })
         .with_context(|| format!("spawning matcher thread for shard {shard_id}"))?;
@@ -419,10 +535,105 @@ pub(crate) fn resume_offset(snapshot: &whippet_engine::ShardSnapshot) -> Option<
         .max()
 }
 
-/// One poll's worth of orders, handed to the matcher thread.
+/// One poll's worth of shard input, handed to the matcher thread.
+///
+/// Replay the journaled commands a turbo snapshot does not cover.
+///
+/// Runs before the matcher thread starts and before the turbo lane is read, so
+/// every command the log already contains is applied exactly once, in offset
+/// order, with the same `engine.process` call the live path uses. Outputs are
+/// discarded: they were appended before the crash and replay must not append
+/// them again. A gap (fewer records than the head promises) is fatal.
+async fn replay_turbo_tail<J: JournalOps + ?Sized>(
+    journal: &J,
+    shard_id: u32,
+    engine: &mut ShardEngine,
+    mut offset: u64,
+    head: u64,
+) -> Result<()> {
+    let consumer = format!("whippet-turbo-replay-p{shard_id}");
+    let mut records: Vec<whippet_journal::PayloadRecord> = Vec::with_capacity(BATCH_CAPACITY);
+    let mut out = EngineOutput::with_capacity(BATCH_CAPACITY, BATCH_CAPACITY);
+    while offset <= head {
+        records.clear();
+        let read = journal
+            .read_payloads_into(
+                Topic::Orders,
+                shard_id,
+                &consumer,
+                offset,
+                BATCH_CAPACITY as u32,
+                0,
+                &mut records,
+            )
+            .await
+            .with_context(|| {
+                format!("replaying turbo tail at offset {offset} for shard {shard_id}")
+            })?;
+        if read == 0 {
+            break;
+        }
+        for record in &records {
+            if record.offset > head {
+                break;
+            }
+            match Command::decode(&record.payload) {
+                Ok(command) => {
+                    if let Err(error) = engine.process(&command, record.offset, &mut out) {
+                        anyhow::bail!(
+                            "turbo tail replay rejected offset {} for shard {shard_id}: {error}",
+                            record.offset
+                        );
+                    }
+                    out.clear();
+                }
+                Err(error) => {
+                    warn!(
+                        shard = shard_id,
+                        offset = record.offset,
+                        error = %error,
+                        "skipping undecodable order during turbo tail replay"
+                    );
+                }
+            }
+            offset = record.offset.saturating_add(1);
+        }
+    }
+    if offset <= head {
+        anyhow::bail!(
+            "turbo tail replay ended at offset {} before the log head {head} for shard {shard_id}; the log has a gap",
+            offset.saturating_sub(1)
+        );
+    }
+    Ok(())
+}
+
+/// A shard runs one mode for its lifetime, so `records` and `turbo` never mix:
+/// durable batches carry decoded order-log records, turbo batches carry admitted
+/// lane entries. The two constructors keep that invariant visible at every call
+/// site.
 #[doc(hidden)]
 pub struct InputBatch {
-    pub records: Vec<whippet_journal::PayloadRecord>,
+    pub records: Vec<PayloadRecord>,
+    pub turbo: Vec<TurboEntry>,
+}
+
+impl InputBatch {
+    /// A durable-path batch from the orders log.
+    pub fn durable(records: Vec<PayloadRecord>) -> Self {
+        Self {
+            records,
+            turbo: Vec::new(),
+        }
+    }
+
+    /// A turbo batch from the shard's ingress lane.
+    pub fn turbo(entries: Vec<TurboEntry>) -> Self {
+        Self {
+            records: Vec::new(),
+            turbo: entries,
+        }
+    }
 }
 
 /// A snapshot handed to the writer, with whether to pay for the full rebuild.
@@ -435,11 +646,26 @@ pub struct SnapshotJob {
     pub queued_at: Instant,
 }
 
+/// One turbo command to journal, plus the window claim it holds.
+///
+/// The admission stays attached until the writer has appended the order record
+/// and both output topics, so a command counts against the uncommitted bound
+/// from admission until it is durable. Dropping it early would let ingress
+/// admit work for a window that has not drained.
+#[doc(hidden)]
+pub struct TurboJournalRecord {
+    pub message: JournalMessage,
+    pub admission: TurboAdmission,
+}
+
 /// One batch of matcher output, handed to the async writer.
 #[doc(hidden)]
 pub struct OutputBatch {
     pub executions: Vec<JournalMessage>,
     pub md: Vec<JournalMessage>,
+    /// Turbo only: commands to append to `Topic::Orders`, in seq order, each
+    /// holding its window permit until that append lands.
+    pub orders: Vec<TurboJournalRecord>,
     pub last_offset: u64,
     pub snapshot: Option<SequencedSnapshot>,
     /// The matcher is exiting: flush the final snapshot and commit.
@@ -529,7 +755,43 @@ pub async fn read_orders<J: JournalOps + 'static>(
             .last()
             .map(|record| record.offset.saturating_add(1))
             .unwrap_or(next_offset);
-        if sender.send(InputBatch { records }).await.is_err() {
+        if sender.send(InputBatch::durable(records)).await.is_err() {
+            break;
+        }
+    }
+}
+
+/// Collect admitted turbo entries from one shard's lane and hand them to the
+/// matcher through the same input ring `read_orders` uses.
+///
+/// This is the reader's mirror, not a second matcher: it batches whatever has
+/// already been admitted (each entry holds a window permit before it is queued)
+/// and awaits the ring, so the ring is the backpressure boundary in both modes.
+/// On shutdown it stops taking new work and drops the sender, which closes the
+/// matcher's input exactly as the durable reader does.
+#[doc(hidden)]
+pub async fn feed_turbo(
+    mut turbo: mpsc::Receiver<TurboEntry>,
+    sender: mpsc::Sender<InputBatch>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        let mut entries: Vec<TurboEntry> = Vec::with_capacity(BATCH_CAPACITY);
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            received = turbo.recv() => match received {
+                Some(entry) => entries.push(entry),
+                // Every ingress sender is gone; the node is stopping.
+                None => break,
+            },
+        }
+        while entries.len() < BATCH_CAPACITY {
+            match turbo.try_recv() {
+                Ok(entry) => entries.push(entry),
+                Err(_) => break,
+            }
+        }
+        if sender.send(InputBatch::turbo(entries)).await.is_err() {
             break;
         }
     }
@@ -538,6 +800,11 @@ pub async fn read_orders<J: JournalOps + 'static>(
 /// The matcher: a pure, blocking loop that owns the engine. No await, no I/O,
 /// no lock. It records match latency and builds output messages, then hands
 /// the batch to the writer.
+///
+/// In durable mode the record's log offset is the engine's per-record offset.
+/// In turbo the matcher is the only sequencer: `start_turbo_seq` is the first
+/// local seq (0 on an empty log, `snapshot_last_offset + 1` after a restore)
+/// and every turbo command consumes exactly one seq, in arrival order.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn run_matcher(
@@ -549,6 +816,7 @@ pub fn run_matcher(
     recycle: mpsc::Sender<Vec<whippet_journal::PayloadRecord>>,
     appended_offset: Arc<AtomicU64>,
     start_last_offset: u64,
+    start_turbo_seq: u64,
 ) {
     let mut out = EngineOutput::with_capacity(BATCH_CAPACITY, BATCH_CAPACITY);
     // Per-shard recorder: no global lock on the match path. It is merged into
@@ -558,6 +826,7 @@ pub fn run_matcher(
     let mut snapshot_sequence: u64 = 0;
     let mut last_snapshot_at = Instant::now();
     let mut last_offset = start_last_offset;
+    let mut next_turbo_seq = start_turbo_seq;
     let snapshot_interval = snapshot_min_interval();
     info!(
         shard = shard_id,
@@ -571,6 +840,7 @@ pub fn run_matcher(
     while let Some(batch) = input.blocking_recv() {
         let mut executions: Vec<JournalMessage> = Vec::with_capacity(BATCH_CAPACITY);
         let mut md_messages: Vec<JournalMessage> = Vec::with_capacity(BATCH_CAPACITY);
+        let mut orders: Vec<TurboJournalRecord> = Vec::with_capacity(BATCH_CAPACITY);
         let mut snapshot_due = false;
         let mut process_us: u64 = 0;
         // If a snapshot was deferred, this boundary is a candidate: the state
@@ -639,6 +909,66 @@ pub fn run_matcher(
             last_offset = record.offset;
         }
 
+        // Turbo input: the command is already typed and its journal message is
+        // already built, so the matcher assigns the seq and processes it exactly
+        // as it would a decoded durable record. The ack goes out before the
+        // writer sees anything: turbo acknowledges the match, not the journal.
+        for entry in batch.turbo {
+            let seq = next_turbo_seq;
+            next_turbo_seq = next_turbo_seq.saturating_add(1);
+            let started = Instant::now();
+            let ack = match engine.process(&entry.command, seq, &mut out) {
+                Ok(()) => {
+                    let elapsed = started.elapsed().as_micros() as u64;
+                    process_us = process_us.saturating_add(elapsed);
+                    shard_metrics.record_match_latency_us(elapsed);
+                    shard_metrics.record_engine_command();
+                    for execution in &out.executions {
+                        shard_metrics.record_execution();
+                        if matches!(execution.kind, ExecKind::Accepted | ExecKind::Rejected) {
+                            shard_metrics
+                                .record_order_outcome(execution.kind == ExecKind::Rejected);
+                        }
+                        executions.push(execution_message(execution));
+                    }
+                    for event in &out.md {
+                        md_messages.push(md_message(event));
+                    }
+                    snapshot_due |= out.state_snapshot_due;
+                    for snapshot in &out.snapshots {
+                        md_messages.push(snapshot_message(snapshot));
+                    }
+                    turbo_ack(seq, &entry.command, &out)
+                }
+                Err(error) => {
+                    // A command routed to the wrong shard: no state changed and
+                    // no execution was emitted. The command is still journaled
+                    // at its assigned seq so the log keeps one record per seq;
+                    // the client is told the match did not happen.
+                    warn!(
+                        shard = shard_id,
+                        seq,
+                        symbol = %entry.command.symbol,
+                        error = %error,
+                        "engine rejected a turbo command for this shard"
+                    );
+                    TurboAck {
+                        seq,
+                        accepted: false,
+                        reject: RejectReason::Internal,
+                    }
+                }
+            };
+            // A client that gave up closed the receiver; the command was still
+            // matched and is still journaled, so the shard continues.
+            let _ = entry.ack.send(ack);
+            orders.push(TurboJournalRecord {
+                message: entry.message,
+                admission: entry.admission,
+            });
+            last_offset = seq;
+        }
+
         if snapshot.is_none() && snapshot_due {
             let durable = appended_offset.load(Ordering::Acquire);
             if durable != u64::MAX
@@ -674,6 +1004,7 @@ pub fn run_matcher(
             .blocking_send(OutputBatch {
                 executions,
                 md: md_messages,
+                orders,
                 last_offset,
                 snapshot,
                 final_batch: false,
@@ -722,10 +1053,65 @@ pub fn run_matcher(
     let _ = output.blocking_send(OutputBatch {
         executions: Vec::new(),
         md: Vec::new(),
+        orders: Vec::new(),
         last_offset,
         snapshot: final_snapshot,
         final_batch: true,
     });
+}
+
+/// Turn one processed turbo command into its acknowledgement.
+///
+/// The engine reports a refusal as a `Rejected` execution carrying the incoming
+/// order id and the reason; an acceptance is an `Accepted` execution for the
+/// same id. A cancel that succeeded emits only a `Cancelled` execution, so the
+/// default is "accepted with no reject reason". Maker-side events (fills,
+/// cancelled resting orders) carry other ids or kinds and are ignored.
+fn turbo_ack(seq: u64, command: &Command, out: &EngineOutput) -> TurboAck {
+    for execution in &out.executions {
+        if execution.order_id != command.order_id {
+            continue;
+        }
+        match execution.kind {
+            ExecKind::Accepted => {
+                return TurboAck {
+                    seq,
+                    accepted: true,
+                    reject: RejectReason::None,
+                };
+            }
+            ExecKind::Rejected => {
+                return TurboAck {
+                    seq,
+                    accepted: false,
+                    reject: execution.reason,
+                };
+            }
+            _ => {}
+        }
+    }
+    TurboAck {
+        seq,
+        accepted: true,
+        reject: RejectReason::None,
+    }
+}
+
+/// Merge a later matcher batch into the writer's current group.
+///
+/// Batches arrive in seq order, so extending preserves order and the last one
+/// carries the highest offset. A later snapshot supersedes an earlier one; a
+/// batch without a snapshot leaves the earlier one queued, and `last_written`
+/// still rejects an out-of-order write.
+fn merge_output_batch(into: &mut OutputBatch, next: OutputBatch) {
+    into.executions.extend(next.executions);
+    into.md.extend(next.md);
+    into.orders.extend(next.orders);
+    if next.snapshot.is_some() {
+        into.snapshot = next.snapshot;
+    }
+    into.last_offset = next.last_offset;
+    into.final_batch |= next.final_batch;
 }
 
 /// Clone the engine state for the snapshot writer and log what it cost the
@@ -794,6 +1180,7 @@ pub async fn run_writer<J: JournalOps + ?Sized>(
 
     let mut shutdown_exec = ctx.shutdown.subscribe();
     let mut shutdown_md = ctx.shutdown.subscribe();
+    let mut shutdown_orders = ctx.shutdown.subscribe();
     // Flush the commit watermark while idle. Without this tick the committed
     // offset sits behind the applied offset until the next order arrives,
     // because the reader discards empty polls and never wakes the writer.
@@ -802,7 +1189,7 @@ pub async fn run_writer<J: JournalOps + ?Sized>(
     commit_tick.tick().await;
 
     loop {
-        let batch = tokio::select! {
+        let mut batch = tokio::select! {
             batch = output.recv() => match batch {
                 Some(batch) => batch,
                 None => break,
@@ -820,24 +1207,88 @@ pub async fn run_writer<J: JournalOps + ?Sized>(
                 continue;
             }
         };
+        // Coalesce whatever the matcher has already produced. Appending once
+        // per 10-order batch makes the write-behind the bottleneck; merging
+        // up to eight batches restores the durable path's amortization while
+        // keeping the window's latency bound meaningful.
+        let mut coalesced = 1usize;
+        while coalesced < WRITER_COALESCE_BATCHES && !batch.final_batch {
+            match output.try_recv() {
+                Ok(next) => {
+                    merge_output_batch(&mut batch, next);
+                    coalesced += 1;
+                }
+                Err(_) => break,
+            }
+        }
         // Executions and MD are independent topics: join them so the shard
         // pays one overlapped round trip per batch, not two sequential ones.
+        //
+        // Turbo adds the write-behind's orders append to the same join. The
+        // commands were acked at match time, so their only durable record is
+        // this append; a batch with no order records (the durable path) keeps
+        // the exact two-way join above.
         let append_started = Instant::now();
-        let (execution_result, md_result) = tokio::join!(
-            append_with_retry(
-                journal,
-                Topic::Executions,
-                shard_id,
-                &batch.executions,
-                &mut shutdown_exec,
-            ),
-            append_with_retry(journal, Topic::Md, shard_id, &batch.md, &mut shutdown_md),
-        );
-        // Do not advance the applied offset or commit unless both outputs are
+        let (order_messages, admissions): (Vec<JournalMessage>, Vec<TurboAdmission>) = batch
+            .orders
+            .into_iter()
+            .map(|record| (record.message, record.admission))
+            .unzip();
+        // The orders append is the window contract: release the permits as
+        // soon as that append is durable, without waiting for the derived
+        // execution/MD appends. The outputs still have to land before the
+        // applied offset and commit advance; they run concurrently so the
+        // writer pays one overlapped round trip per group.
+        let orders_future = append_orders(journal, shard_id, &order_messages, &mut shutdown_orders);
+        let outputs_future = async {
+            tokio::join!(
+                append_with_retry(
+                    journal,
+                    Topic::Executions,
+                    shard_id,
+                    &batch.executions,
+                    &mut shutdown_exec,
+                ),
+                append_with_retry(journal, Topic::Md, shard_id, &batch.md, &mut shutdown_md),
+            )
+        };
+        tokio::pin!(orders_future);
+        tokio::pin!(outputs_future);
+        // `admissions` is taken when the orders append settles. The empty
+        // durable batch has nothing to release.
+        let mut admissions = (!order_messages.is_empty()).then_some(admissions);
+        let mut orders_result = order_messages.is_empty().then_some(Ok(()));
+        let mut outputs_result = None;
+        while orders_result.is_none() || outputs_result.is_none() {
+            tokio::select! {
+                result = &mut orders_future, if orders_result.is_none() => {
+                    // Release on failure too: the shard is about to stop, and
+                    // a leaked permit would shrink the window while it drains.
+                    drop(admissions.take());
+                    orders_result = Some(result);
+                }
+                result = &mut outputs_future, if outputs_result.is_none() => {
+                    outputs_result = Some(result);
+                }
+            }
+        }
+        let (execution_result, md_result) = outputs_result.expect("outputs future completed");
+        let orders_result = orders_result.expect("orders future completed");
+        drop(admissions.take());
+        // Do not advance the applied offset or commit unless every output is
         // durable. Advancing here would let a restart skip orders whose
-        // executions/MD never reached the log.
-        if execution_result.is_err() || md_result.is_err() {
+        // executions/MD never reached the log. A failed orders append is worse:
+        // the matched commands are not in the log at all, so the shard stops
+        // rather than keep acking work whose write-behind can never drain.
+        if orders_result.is_err() || execution_result.is_err() || md_result.is_err() {
             ctx.mark_shard_failed();
+            if let Err(error) = orders_result {
+                error!(
+                    shard = shard_id,
+                    error = %error,
+                    "order write-behind failed; shard stopped"
+                );
+            }
             if let Err(error) = execution_result {
                 error!(shard = shard_id, error = %error, "execution publish failed; shard stopped");
             }
@@ -848,7 +1299,6 @@ pub async fn run_writer<J: JournalOps + ?Sized>(
                 "shard {shard_id} stopped after an output append failed; orders are not being matched"
             );
         }
-
         writer_metrics.record_stage_us(
             Stage::EngineAppend,
             append_started.elapsed().as_micros() as u64,
@@ -1395,6 +1845,25 @@ fn spawn_snapshot_writer(
             }
         }
     })
+}
+
+/// Append one turbo slice of order commands in seq order.
+///
+/// Each call carries at most [`ORDER_APPEND_CHUNK`] messages so a single request
+/// is bounded. The shard has exactly one writer and appends slices in the order
+/// the matcher produced them, so log order equals seq order and `seq == offset`
+/// holds. Any failure propagates: retrying past the budget, or skipping a
+/// chunk, would leave a gap in the seq domain the log can no longer derive.
+async fn append_orders<J: JournalOps + ?Sized>(
+    journal: &J,
+    shard_id: u32,
+    messages: &[JournalMessage],
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    for chunk in messages.chunks(ORDER_APPEND_CHUNK) {
+        append_with_retry(journal, Topic::Orders, shard_id, chunk, shutdown).await?;
+    }
+    Ok(())
 }
 
 #[doc(hidden)]

@@ -26,8 +26,8 @@ use tower_http::trace::TraceLayer;
 use tracing::warn;
 use whippet_core::api::{
     ApiError, BatchOrderAck, BatchOrderRequest, BatchOrderRequestRef, CancelAck, CancelRequest,
-    HealthView, MAX_BATCH_ORDERS, OrderAck, OrderRequest, OrderRequestRef, StateView, TradeView,
-    WsClientMessage, WsServerMessage,
+    GUARANTEE_DURABLE, GUARANTEE_TURBO, HealthView, MAX_BATCH_ORDERS, OrderAck, OrderRequest,
+    OrderRequestRef, StateView, TradeView, WsClientMessage, WsServerMessage,
 };
 use whippet_core::headers::{HeaderMode, MessageMeta, SCHEMA_ORDER};
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Seq, Symbol};
@@ -37,6 +37,12 @@ use whippet_marketdata::{LatencySummary, Metrics, Stage};
 
 use crate::context::NodeContext;
 use crate::ratelimit::RateLimiter;
+use crate::turbo::{self, TurboAck};
+
+/// How long a turbo request waits for the shard's match ack before the gateway
+/// reports the shard unavailable. The match itself is microseconds; this bound
+/// only catches a stopped or wedged shard thread.
+const TURBO_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
 
@@ -269,6 +275,56 @@ fn ensure_shards_ready(ctx: &NodeContext) -> Result<(), (StatusCode, Json<ApiErr
     }
 }
 
+fn window_full() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiError::new(
+            "window_full",
+            "turbo uncommitted window is full; retry shortly",
+        )),
+    )
+}
+
+fn shard_unavailable() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiError::new(
+            "shard_unavailable",
+            "the matching shard did not acknowledge the command",
+        )),
+    )
+}
+
+/// Admit and enqueue one turbo command without waiting for its match.
+///
+/// The window permit is taken before the send, so a full window is rejected
+/// before any queue slot or validation work is spent, and a rejected send
+/// releases the permit through `TurboAdmission`'s drop.
+fn turbo_enqueue(
+    ctx: &NodeContext,
+    partition: u32,
+    command: Command,
+    message: JournalMessage,
+) -> Result<tokio::sync::oneshot::Receiver<TurboAck>, (StatusCode, Json<ApiError>)> {
+    let turbo = ctx.turbo.as_ref().ok_or_else(shard_unavailable)?;
+    turbo
+        .enqueue(partition, command, message)
+        .map_err(|error| match error {
+            turbo::EnqueueError::WindowFull => window_full(),
+            turbo::EnqueueError::ShardUnavailable => shard_unavailable(),
+        })
+}
+
+async fn turbo_await(
+    receiver: tokio::sync::oneshot::Receiver<TurboAck>,
+) -> Result<TurboAck, (StatusCode, Json<ApiError>)> {
+    match tokio::time::timeout(TURBO_ACK_TIMEOUT, receiver).await {
+        Ok(Ok(ack)) => Ok(ack),
+        Ok(Err(_)) => Err(shard_unavailable()),
+        Err(_) => Err(shard_unavailable()),
+    }
+}
+
 async fn submit_order(
     State(ctx): State<Arc<NodeContext>>,
     Extension(participants): Extension<Arc<ParticipantCache>>,
@@ -316,10 +372,34 @@ async fn submit_order(
         .record_stage_us(Stage::GatewayValidate, split_elapsed(&mut stage_at));
     let validated = validated?;
     let timestamp_ns = now_ns();
-    let (order_id, message) = build_order(&validated, timestamp_ns);
+    let (order_id, command, message) = build_order(&validated, timestamp_ns);
     let partition = validated.symbol.partition(ctx.exchange().partitions);
     ctx.metrics
         .record_stage_us(Stage::GatewayEncode, split_elapsed(&mut stage_at));
+    if ctx.turbo.is_some() {
+        let receiver = turbo_enqueue(&ctx, partition, command, message)?;
+        let ack = turbo_await(receiver).await?;
+        ctx.metrics
+            .record_stage_us(Stage::GatewayAppend, split_elapsed(&mut stage_at));
+        let elapsed = started.elapsed();
+        ctx.metrics.record_ingress();
+        ctx.metrics
+            .record_ingress_latency_us(elapsed.as_micros() as u64);
+        ctx.metrics
+            .record_turbo_ack_latency_us(elapsed.as_micros() as u64);
+        return Ok(Json(OrderAck {
+            order_id,
+            symbol: validated.symbol,
+            partition,
+            offset: ack.seq,
+            mode: ctx.config.mode,
+            status: if ack.accepted { "matched" } else { "rejected" }.into(),
+            guarantee: GUARANTEE_TURBO.into(),
+            reject: (!ack.accepted).then(|| ack.reject.as_str().to_string()),
+            accepted_at_ns: timestamp_ns,
+            durable_ack_ms: elapsed.as_secs_f64() * 1_000.0,
+        }));
+    }
     let append = ctx
         .group_commit
         .append(Topic::Orders, partition, vec![message])
@@ -338,7 +418,9 @@ async fn submit_order(
         partition: append.partition,
         offset: append.base_offset,
         mode: ctx.config.mode,
-        status: "accepted_by_log".into(),
+        status: GUARANTEE_DURABLE.into(),
+        guarantee: GUARANTEE_DURABLE.into(),
+        reject: None,
         accepted_at_ns: timestamp_ns,
         durable_ack_ms: elapsed.as_secs_f64() * 1_000.0,
     }))
@@ -445,16 +527,75 @@ async fn submit_orders(
     // Pass 2: encode one command and header set per order.
     let timestamp_ns = now_ns();
     let mut messages = Vec::with_capacity(validated.len());
+    let mut commands = Vec::with_capacity(validated.len());
     let mut order_ids = Vec::with_capacity(validated.len());
     for order in &validated {
-        let (order_id, message) = build_order(order, timestamp_ns);
+        let (order_id, command, message) = build_order(order, timestamp_ns);
         order_ids.push(order_id);
+        commands.push(command);
         messages.push(message);
     }
 
     let count = messages.len() as u32;
     ctx.metrics
         .record_stage_us(Stage::GatewayEncode, split_elapsed(&mut stage_at));
+    if ctx.turbo.is_some() {
+        // Admit and enqueue every command before awaiting any ack: a batch is
+        // one round of concurrent matching, not N serialized ones.
+        let mut receivers = Vec::with_capacity(commands.len());
+        for (command, message) in commands.into_iter().zip(messages) {
+            receivers.push(
+                turbo_enqueue(&ctx, partition, command, message)
+                    .map_err(IntoResponse::into_response)?,
+            );
+        }
+        let acks: Vec<TurboAck> =
+            futures_util::future::join_all(receivers.into_iter().map(turbo_await))
+                .await
+                .into_iter()
+                .collect::<Result<_, _>>()
+                .map_err(IntoResponse::into_response)?;
+        let elapsed = started.elapsed();
+        let ack_ms = elapsed.as_secs_f64() * 1_000.0;
+        for _ in &validated {
+            ctx.metrics.record_ingress();
+        }
+        ctx.metrics
+            .record_ingress_latency_us(elapsed.as_micros() as u64);
+        ctx.metrics
+            .record_turbo_ack_latency_us(elapsed.as_micros() as u64);
+        let base_offset = acks.first().map(|ack| ack.seq).unwrap_or(0);
+        let orders = if include_acks {
+            validated
+                .iter()
+                .zip(order_ids)
+                .zip(acks)
+                .map(|((order, order_id), ack)| OrderAck {
+                    order_id,
+                    symbol: order.symbol,
+                    partition,
+                    offset: ack.seq,
+                    mode: ctx.config.mode,
+                    status: if ack.accepted { "matched" } else { "rejected" }.into(),
+                    guarantee: GUARANTEE_TURBO.into(),
+                    reject: (!ack.accepted).then(|| ack.reject.as_str().to_string()),
+                    accepted_at_ns: timestamp_ns,
+                    durable_ack_ms: ack_ms,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        return Ok(Json(BatchOrderAck {
+            partition,
+            base_offset,
+            count,
+            mode: ctx.config.mode,
+            guarantee: GUARANTEE_TURBO.into(),
+            durable_ack_ms: ack_ms,
+            orders,
+        }));
+    }
     // Route batches through the same per-partition writer as single orders, so
     // one partition has exactly one append path and log order matches arrival
     // order across transports.
@@ -488,7 +629,9 @@ async fn submit_orders(
                 partition: append.partition,
                 offset: append.base_offset + index as u64,
                 mode: ctx.config.mode,
-                status: "accepted_by_log".into(),
+                status: GUARANTEE_DURABLE.into(),
+                guarantee: GUARANTEE_DURABLE.into(),
+                reject: None,
                 accepted_at_ns: timestamp_ns,
                 durable_ack_ms,
             })
@@ -502,6 +645,7 @@ async fn submit_orders(
         base_offset: append.base_offset,
         count,
         mode: ctx.config.mode,
+        guarantee: GUARANTEE_DURABLE.into(),
         durable_ack_ms,
         orders,
     }))
@@ -679,7 +823,7 @@ fn validate_fields(
     })
 }
 
-fn build_order(order: &ValidatedOrder, timestamp_ns: u64) -> (OrderId, JournalMessage) {
+fn build_order(order: &ValidatedOrder, timestamp_ns: u64) -> (OrderId, Command, JournalMessage) {
     let command = Command::new_order(
         order.symbol,
         order.side,
@@ -697,10 +841,8 @@ fn build_order(order: &ValidatedOrder, timestamp_ns: u64) -> (OrderId, JournalMe
         SCHEMA_ORDER,
         order.order_id.0,
     );
-    (
-        order.order_id,
-        JournalMessage::new_named(command.encode(), meta.named_pairs(HeaderMode::Full)),
-    )
+    let message = JournalMessage::new_named(command.encode(), meta.named_pairs(HeaderMode::Full));
+    (order.order_id, command, message)
 }
 
 /// Shared ingress encoding for the binary TCP path. One fixed-layout command
@@ -732,6 +874,7 @@ async fn cancel_order(
     let caller = authenticate(&ctx, &headers)?;
     // One clock for the whole cancel, the same shape as the order paths: no
     // per-order stamps, just consecutive slices of this request.
+    let started = Instant::now();
     let mut stage_at = Instant::now();
     // Use the same body contract as the order paths instead of axum's `Json`
     // extractor, whose syntax-error rejection is a bare 400. A malformed cancel
@@ -758,6 +901,31 @@ async fn cancel_order(
     let message = JournalMessage::new_named(command.encode(), meta.named_pairs(HeaderMode::Full));
     ctx.metrics
         .record_stage_us(Stage::GatewayEncode, split_elapsed(&mut stage_at));
+    if ctx.turbo.is_some() {
+        let receiver = turbo_enqueue(&ctx, partition, command, message)?;
+        let ack = turbo_await(receiver).await?;
+        ctx.metrics
+            .record_stage_us(Stage::GatewayAppend, split_elapsed(&mut stage_at));
+        let elapsed = started.elapsed();
+        ctx.metrics.record_ingress();
+        ctx.metrics
+            .record_ingress_latency_us(elapsed.as_micros() as u64);
+        ctx.metrics
+            .record_turbo_ack_latency_us(elapsed.as_micros() as u64);
+        return Ok(Json(CancelAck {
+            order_id: request.order_id,
+            symbol: request.symbol,
+            partition,
+            offset: ack.seq,
+            mode: ctx.config.mode,
+            status: if ack.accepted {
+                "cancel_matched".into()
+            } else {
+                "cancel_rejected".into()
+            },
+            guarantee: GUARANTEE_TURBO.into(),
+        }));
+    }
     let append = ctx
         .group_commit
         .append(Topic::Orders, partition, vec![message])
@@ -772,6 +940,7 @@ async fn cancel_order(
         offset: append.base_offset,
         mode: ctx.config.mode,
         status: "cancel_accepted_by_log".into(),
+        guarantee: GUARANTEE_DURABLE.into(),
     }))
 }
 
@@ -999,6 +1168,48 @@ async fn prometheus(
         "whippet_group_commit_partitions {}\n",
         ctx.group_commit.writer_count()
     ));
+    if let Some(turbo) = &ctx.turbo {
+        // The window is read live from each shard's admission gate. In this
+        // design the uncommitted window and the journal lag are the same set:
+        // every admitted command is matched and waiting for its orders append.
+        body.push_str("# HELP whippet_turbo_uncommitted_window Commands matched and acknowledged but not yet journaled, per shard.\n");
+        body.push_str("# TYPE whippet_turbo_uncommitted_window gauge\n");
+        body.push_str("# HELP whippet_turbo_journal_lag Matcher seq minus last journaled seq, per shard (commands).\n");
+        body.push_str("# TYPE whippet_turbo_journal_lag gauge\n");
+        for (shard, lane) in turbo.shards() {
+            let in_flight = lane.window.in_flight();
+            body.push_str(&format!(
+                "whippet_turbo_uncommitted_window{{shard=\"{shard}\"}} {in_flight}\n"
+            ));
+            body.push_str(&format!(
+                "whippet_turbo_journal_lag{{shard=\"{shard}\"}} {in_flight}\n"
+            ));
+        }
+        body.push_str("# HELP whippet_turbo_window_drops_total Commands rejected because the turbo window was full, by binding bound.\n");
+        body.push_str("# TYPE whippet_turbo_window_drops_total counter\n");
+        let (count_drops, age_drops) = turbo.drop_reasons();
+        body.push_str(&format!(
+            "whippet_turbo_window_drops_total{{reason=\"count\"}} {count_drops}\n"
+        ));
+        body.push_str(&format!(
+            "whippet_turbo_window_drops_total{{reason=\"age\"}} {age_drops}\n"
+        ));
+        let ack = ctx.metrics.turbo_ack_summary();
+        body.push_str("# HELP whippet_turbo_ack_latency_microseconds Gateway receive to match-complete ack.\n");
+        body.push_str("# TYPE whippet_turbo_ack_latency_microseconds summary\n");
+        body.push_str(&format!(
+            "whippet_turbo_ack_latency_microseconds{{quantile=\"0.5\"}} {}\n",
+            ack.p50_us
+        ));
+        body.push_str(&format!(
+            "whippet_turbo_ack_latency_microseconds{{quantile=\"0.99\"}} {}\n",
+            ack.p99_us
+        ));
+        body.push_str(&format!(
+            "whippet_turbo_ack_latency_microseconds_count {}\n",
+            ack.samples
+        ));
+    }
     (
         [(
             header::CONTENT_TYPE,

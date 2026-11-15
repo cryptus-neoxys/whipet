@@ -59,6 +59,7 @@ impl TestNode {
             api_participant: "api".into(),
             rate_limit_per_sec: 0,
             ws_per_ip: 0,
+            turbo: whippet::turbo::TurboConfig::default(),
         };
         let journal = Arc::new(Journal::memory());
         // The test pool is one shared memory journal: every entry is the same
@@ -97,6 +98,7 @@ impl TestNode {
             rate_limiter,
             ws_connections,
             snapshot_lock: Arc::new(std::sync::Mutex::new(())),
+            turbo: None,
         });
         Self { ctx, tempdir }
     }

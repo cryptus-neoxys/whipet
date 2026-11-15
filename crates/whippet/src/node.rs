@@ -23,6 +23,7 @@ use crate::gateway;
 use crate::ratelimit::RateLimiter;
 use crate::snapshot::SnapshotStore;
 use crate::tcp;
+use crate::turbo::TurboIngress;
 
 pub async fn run(args: NodeArgs) -> Result<()> {
     let config = NodeConfig::from_args(args)?;
@@ -93,6 +94,34 @@ pub async fn run(args: NodeArgs) -> Result<()> {
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_WS_CONNECTIONS);
     let ws_connections = Arc::new(Semaphore::new(ws_cap));
+    // Turbo builds one bounded lane per active shard before the context, so
+    // the gateway and TCP listener can resolve a partition to its lane. The
+    // matching receivers move into the shard tasks below.
+    let active_shards = {
+        let mut shards: Vec<u32> = config
+            .exchange
+            .instruments
+            .iter()
+            .map(|instrument| instrument.symbol.partition(config.exchange.partitions))
+            .collect();
+        shards.sort_unstable();
+        shards.dedup();
+        shards
+    };
+    let (turbo, mut turbo_receivers) = if config.mode == whippet_core::config::Mode::Turbo {
+        let (ingress, receivers) = TurboIngress::new(config.turbo, active_shards.iter().copied());
+        (Some(ingress), receivers)
+    } else {
+        (None, std::collections::HashMap::new())
+    };
+    if let Some(turbo) = &turbo {
+        info!(
+            shards = turbo.shards().count(),
+            window_commands = config.turbo.window_commands,
+            window_ms = config.turbo.window_ms,
+            "turbo ingress ready: acknowledgements are match-complete, not journal-durable"
+        );
+    }
     let ctx = Arc::new(NodeContext {
         config: config.clone(),
         journal: Arc::clone(&journal),
@@ -108,6 +137,7 @@ pub async fn run(args: NodeArgs) -> Result<()> {
         rate_limiter,
         ws_connections,
         snapshot_lock: Arc::new(std::sync::Mutex::new(())),
+        turbo,
     });
 
     hub.spawn_publisher();
@@ -116,8 +146,9 @@ pub async fn run(args: NodeArgs) -> Result<()> {
     let mut handles = Vec::new();
     for shard in ctx.active_shards() {
         let engine_ctx = Arc::clone(&ctx);
+        let turbo_rx = turbo_receivers.remove(&shard);
         handles.push(tokio::spawn(async move {
-            let result = run_engine_shard(Arc::clone(&engine_ctx), shard).await;
+            let result = run_engine_shard(Arc::clone(&engine_ctx), shard, turbo_rx).await;
             if let Err(error) = &result {
                 tracing::error!(shard, error = %error, "engine shard stopped unexpectedly");
                 engine_ctx.mark_shard_failed();

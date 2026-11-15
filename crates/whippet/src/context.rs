@@ -11,6 +11,7 @@ use whippet_marketdata::{MdHub, Metrics};
 use crate::config::NodeConfig;
 use crate::ratelimit::RateLimiter;
 use crate::snapshot::SnapshotStore;
+use crate::turbo::TurboIngress;
 
 /// Caps the engine journal pool. Each entry is one Iggy connection; 16
 /// matches the demo partition count. Nodes with more shards wrap around via
@@ -112,6 +113,8 @@ pub struct NodeContext {
     /// Serializes snapshot serialization/fsync across shards. Three shard
     /// writers fsyncing at once contend with Iggy's WAL on the same volume.
     pub snapshot_lock: Arc<std::sync::Mutex<()>>,
+    /// Turbo ingress lanes and per-shard windows. `None` in durable mode.
+    pub turbo: Option<Arc<TurboIngress>>,
 }
 
 impl NodeContext {

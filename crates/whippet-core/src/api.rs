@@ -84,9 +84,14 @@ pub struct BatchOrderRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchOrderAck {
     pub partition: u32,
+    /// Durable: the broker offset of the first order. Turbo: the local seq of
+    /// the first order; the per-order `offset` fields are authoritative and
+    /// are not necessarily contiguous across concurrent batches.
     pub base_offset: u64,
     pub count: u32,
     pub mode: Mode,
+    /// `accepted_by_log` (durable) or `matched_unjournaled` (turbo).
+    pub guarantee: String,
     pub durable_ack_ms: f64,
     /// One ack per input order, with offsets `base_offset + i`.
     pub orders: Vec<OrderAck>,
@@ -100,16 +105,29 @@ pub struct CancelRequest {
     pub participant: Option<String>,
 }
 
+/// Durable ack label: the order record is in the Iggy log.
+pub const GUARANTEE_DURABLE: &str = "accepted_by_log";
+
+/// Turbo ack label: the order was matched, but its record is still in the
+/// write-behind window and can be lost on a crash.
+pub const GUARANTEE_TURBO: &str = "matched_unjournaled";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderAck {
     pub order_id: OrderId,
     pub symbol: Symbol,
     pub partition: u32,
+    /// Durable: the broker offset. Turbo: the local match sequence.
     pub offset: u64,
     pub mode: Mode,
     pub status: String,
+    /// `accepted_by_log` (durable) or `matched_unjournaled` (turbo).
+    pub guarantee: String,
+    /// Engine reject reason for a turbo ack; `None` when accepted.
+    pub reject: Option<String>,
     pub accepted_at_ns: u64,
-    /// Milliseconds the gateway spent getting the Iggy acknowledgement.
+    /// Milliseconds the gateway spent getting the acknowledgement: the Iggy
+    /// append in durable mode, the match in turbo mode.
     pub durable_ack_ms: f64,
 }
 
@@ -121,6 +139,7 @@ pub struct CancelAck {
     pub offset: u64,
     pub mode: Mode,
     pub status: String,
+    pub guarantee: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

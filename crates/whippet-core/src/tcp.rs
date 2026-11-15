@@ -91,6 +91,9 @@ pub enum TcpErrorCode {
     JournalUnavailable = 6,
     RateLimited = 7,
     Internal = 8,
+    /// Turbo admission rejected the command because the bounded uncommitted
+    /// window is full. Retry shortly; nothing was journaled.
+    WindowFull = 9,
 }
 
 impl TcpErrorCode {

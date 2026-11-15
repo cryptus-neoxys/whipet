@@ -83,6 +83,7 @@ fn node_with_ws_cap(
         rate_limiter,
         ws_connections: Arc::new(tokio::sync::Semaphore::new(ws_cap)),
         snapshot_lock: Arc::new(std::sync::Mutex::new(())),
+        turbo: None,
     })
 }
 
@@ -1662,6 +1663,7 @@ fn ctx_with_engine_pool(
         rate_limiter: Arc::clone(&node.ctx.rate_limiter),
         ws_connections: Arc::clone(&node.ctx.ws_connections),
         snapshot_lock: Arc::clone(&node.ctx.snapshot_lock),
+        turbo: None,
     })
 }
 
