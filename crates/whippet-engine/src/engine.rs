@@ -157,9 +157,19 @@ fn commands_until(every: u64, commands: u64) -> u64 {
     }
 }
 
+/// Soft cap on the dedup table per symbol. The table is the idempotency
+/// window, not an audit log: at 5,000 commands/s this is roughly 20 seconds of
+/// history. Keeping it bounded keeps the snapshot proportional to the window
+/// instead of to the whole run (a 500k-entry snapshot took ~570 ms to write).
+const DEDUP_WINDOW: usize = 100_000;
+
+fn dedup_capacity(config: &InstrumentConfig) -> usize {
+    config.max_orders.saturating_mul(2).min(DEDUP_WINDOW)
+}
+
 impl SymbolEngine {
     pub fn new(config: InstrumentConfig) -> Self {
-        let dedup_capacity = config.max_orders.saturating_mul(2);
+        let dedup_capacity = dedup_capacity(&config);
         let book = Book::new(&config);
         let mut engine = Self {
             config,
@@ -773,7 +783,7 @@ impl SymbolEngine {
         config: InstrumentConfig,
         snapshot: SymbolSnapshot,
     ) -> Result<Self, EngineError> {
-        let dedup_capacity = config.max_orders.saturating_mul(2);
+        let dedup_capacity = dedup_capacity(&config);
         let book = Book::from_snapshot(&config, snapshot.book)?;
         let mut engine = Self {
             config,

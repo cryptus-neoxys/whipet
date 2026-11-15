@@ -190,6 +190,24 @@ mod tests {
     }
 
     #[test]
+    fn version_one_snapshot_is_rejected_not_misread() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path());
+        let path = store.path(3);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(MAGIC).unwrap();
+        file.write_all(&1u32.to_le_bytes()).unwrap();
+        file.write_all(&[0u8; 8]).unwrap();
+        drop(file);
+
+        match store.load(3) {
+            Err(SnapshotError::BadVersion(1)) => {}
+            other => panic!("expected BadVersion(1), got {other:?}"),
+        }
+    }
+
+    #[test]
     fn sequence_guard_is_strictly_monotonic() {
         assert!(is_newer(None, 1));
         assert!(!is_newer(Some(1), 1));

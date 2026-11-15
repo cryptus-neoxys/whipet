@@ -241,20 +241,27 @@ async fn shutdown_signal() {
 }
 
 async fn refresh_lag(ctx: &NodeContext) {
-    let mut total = 0u64;
-    for shard in ctx.active_shards() {
-        let consumer = format!("whippet-engine-p{shard}");
-        if let Ok(Some(committed)) = ctx
-            .journal
-            .committed(whippet_journal::Topic::Orders, shard, &consumer)
-            .await
-            && let Ok(lag) = ctx
+    // Each `committed`/`lag` pair is one round trip, so walking the shards
+    // sequentially costs two round trips per shard every cycle (32 at 16
+    // shards). Issue every shard's pair concurrently and sum the results;
+    // error handling is unchanged — a shard that fails either call contributes
+    // nothing to the total.
+    let per_shard =
+        futures_util::future::join_all(ctx.active_shards().iter().map(|&shard| async move {
+            let consumer = format!("whippet-engine-p{shard}");
+            let Ok(Some(committed)) = ctx
                 .journal
+                .committed(whippet_journal::Topic::Orders, shard, &consumer)
+                .await
+            else {
+                return 0u64;
+            };
+            ctx.journal
                 .lag(whippet_journal::Topic::Orders, shard, committed)
                 .await
-        {
-            total = total.saturating_add(lag);
-        }
-    }
+                .unwrap_or(0)
+        }))
+        .await;
+    let total = per_shard.into_iter().fold(0u64, u64::saturating_add);
     ctx.metrics.set_consumer_lag(total);
 }

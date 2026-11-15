@@ -258,6 +258,16 @@ async fn handle_submit(
         );
     }
 
+    if !ctx.shards_ok() {
+        return (
+            error_response(
+                TcpErrorCode::JournalUnavailable,
+                "the matching shard is not running; orders are not being accepted",
+            ),
+            false,
+        );
+    }
+
     if !state.limiter.check(state.peer) {
         return (
             error_response(
