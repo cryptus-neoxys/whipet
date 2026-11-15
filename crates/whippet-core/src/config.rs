@@ -32,9 +32,7 @@ impl Mode {
 
     pub fn guarantee(self) -> &'static str {
         match self {
-            Self::Durable => {
-                "Acknowledged after the Iggy write. Replayable from the log; low-single-digit-ms on Linux."
-            }
+            Self::Durable => "Acknowledged after the Iggy write. Replayable from the log.",
             Self::Turbo => {
                 "Acknowledged after matching. Iggy is write-behind; the in-flight window can be lost."
             }
