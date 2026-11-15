@@ -28,8 +28,8 @@ use tracing::warn;
 use whippet_core::api::{
     AdminAck, AdminRequest, ApiError, BatchOrderAck, BatchOrderRequest, BatchOrderRequestRef,
     CancelAck, CancelRequest, GUARANTEE_DURABLE, GUARANTEE_TURBO, HealthView, MAX_BATCH_ORDERS,
-    MdFeedMessage, MdFeedResync, OrderAck, OrderRequest, OrderRequestRef, SessionRequest,
-    ShardHealthView, StateView, TradeView, WsClientMessage, WsServerMessage,
+    MdFeedMessage, MdFeedResync, OrderAck, OrderRequest, OrderRequestRef, RiskRequest,
+    SessionRequest, ShardHealthView, StateView, TradeView, WsClientMessage, WsServerMessage,
 };
 use whippet_core::headers::{HeaderMode, MessageMeta, SCHEMA_ORDER};
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Seq, Symbol};
@@ -91,6 +91,10 @@ pub fn router(ctx: Arc<NodeContext>) -> Router {
         .route(
             "/api/admin/instruments/{symbol}/session",
             post(admin_session),
+        )
+        .route(
+            "/api/admin/instruments/{symbol}/risk",
+            post(admin_risk),
         )
         .layer(middleware::from_fn_with_state(limiter, rate_limit));
 
@@ -1114,6 +1118,7 @@ async fn admin_session(
             // `halted` field is documented as halt/resume-only.
             halted: None,
             session: Some(request.state),
+            risk: None,
             reason: request.reason,
         },
         operator,
@@ -1123,17 +1128,97 @@ async fn admin_session(
     .await
 }
 
+/// `POST /api/admin/instruments/{symbol}/risk`: operator risk limits.
+///
+/// The body names one participant and both bounds. The command is appended to
+/// the same ordered Orders log as client traffic, so the engine enforces the
+/// limits from that log position onward and replay reaches the same state.
+/// Replacing the limits preserves existing exposure: tightening a bound gates
+/// new risk without inventing or erasing a position already taken.
+async fn admin_risk(
+    State(ctx): State<Arc<NodeContext>>,
+    Path(symbol): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> ApiResult<AdminAck> {
+    // 403 first, exactly like halt/resume: with no operator credentials
+    // configured the node must refuse every caller before it says anything
+    // about tokens it does not have.
+    let operator = authenticate_operator(&ctx, &headers)?;
+    let started = Instant::now();
+    let mut stage_at = Instant::now();
+    let symbol = parse_configured_symbol(&ctx, &symbol)?;
+    let bytes = read_json_body(&headers, body).await?;
+    let request: RiskRequest = serde_json::from_slice(&bytes).map_err(invalid_json)?;
+    ctx.metrics
+        .record_stage_us(Stage::GatewayParse, split_elapsed(&mut stage_at));
+    // Mirror the configured-participant bound rather than normalising the
+    // name: the derived id is a hash of the exact bytes, and silently trimming
+    // would attribute limits to a different desk than the one written.
+    if request.participant.is_empty() || request.participant.len() > 64 {
+        return Err(bad_request(
+            "invalid_participant",
+            "participant must be between 1 and 64 bytes",
+        ));
+    }
+    let notional = i64::try_from(request.max_open_buy_notional_cents).map_err(|_| {
+        bad_request(
+            "invalid_notional",
+            "max_open_buy_notional_cents exceeds the engine's signed bound",
+        )
+    })?;
+    let timestamp_ns = now_ns();
+    let command = Command::set_risk(
+        symbol,
+        ParticipantId::derive(&request.participant),
+        request.max_net_qty,
+        notional,
+        timestamp_ns,
+    );
+    admin_execute(
+        &ctx,
+        symbol,
+        OperatorAction {
+            action: "set_risk",
+            command,
+            halted: None,
+            session: None,
+            risk: Some(RiskSpec {
+                participant: request.participant,
+                max_net_qty: request.max_net_qty,
+                max_open_buy_notional_cents: request.max_open_buy_notional_cents,
+            }),
+            reason: request.reason,
+        },
+        operator,
+        started,
+        stage_at,
+    )
+    .await
+}
+
+/// The risk limits one operator request sets, kept in the presented form for
+/// the ack and the audit record.
+struct RiskSpec {
+    participant: String,
+    max_net_qty: u64,
+    max_open_buy_notional_cents: u64,
+}
+
 /// What one accepted operator request appends: the ordered command and the
 /// state it puts the instrument in, for the ack and the audit record.
 struct OperatorAction {
-    /// `halt`, `resume`, or `set_session`; also the journal header name.
+    /// `halt`, `resume`, `set_session`, or `set_risk`; also the journal header
+    /// name.
     action: &'static str,
     command: Command,
     /// Halt state after the action; `None` when the action does not touch the
-    /// halt flag (a session change).
+    /// halt flag (a session or risk change).
     halted: Option<bool>,
-    /// Session after the action; `None` for halt/resume.
+    /// Session after the action; `None` for every other action.
     session: Option<SessionState>,
+    /// Risk limits after the action; `None` for every other action.
+    risk: Option<RiskSpec>,
     /// Free-text reason, recorded verbatim in the audit record.
     reason: Option<String>,
 }
@@ -1179,6 +1264,7 @@ async fn admin_control(
             command,
             halted: Some(action.halted()),
             session: None,
+            risk: None,
             reason: request.reason,
         },
         operator,
@@ -1253,6 +1339,14 @@ async fn admin_execute(
     if let Some(session) = request.session {
         audit["session"] = Value::String(session.as_str().into());
     }
+    // A risk record names the target participant and both bounds in the units
+    // the operator wrote, so the audit is readable without decoding the
+    // command's fixed layout.
+    if let Some(risk) = &request.risk {
+        audit["participant"] = Value::String(risk.participant.clone());
+        audit["max_net_qty"] = Value::from(risk.max_net_qty);
+        audit["max_open_buy_notional_cents"] = Value::from(risk.max_open_buy_notional_cents);
+    }
     // A serialized `Value` cannot fail, but the conversion stays total without
     // an `expect` on the request path.
     let payload = serde_json::to_vec(&audit).map_err(|error| {
@@ -1304,6 +1398,12 @@ async fn admin_execute(
         action: request.action.into(),
         halted: request.halted.unwrap_or(false),
         session: request.session,
+        participant: request.risk.as_ref().map(|risk| risk.participant.clone()),
+        max_net_qty: request.risk.as_ref().map(|risk| risk.max_net_qty),
+        max_open_buy_notional_cents: request
+            .risk
+            .as_ref()
+            .map(|risk| risk.max_open_buy_notional_cents),
         partition,
         offset,
         operator: operator.to_string(),

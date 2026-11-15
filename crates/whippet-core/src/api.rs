@@ -160,7 +160,27 @@ pub struct SessionRequest {
     pub reason: Option<String>,
 }
 
-/// Halt/resume ack.
+/// Operator risk-limit request body:
+/// `{"participant":"desk-a","max_net_qty":500,"max_open_buy_notional_cents":25000000}`
+/// plus an optional free-text `reason`.
+///
+/// Both bounds are required so one request states the whole replacement:
+/// omitting a field would otherwise silently disable that bound. Zero
+/// disables a bound explicitly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RiskRequest {
+    /// Stable participant name; derived to the engine's integer id at the
+    /// edge, exactly as order ingress does.
+    pub participant: String,
+    /// Absolute net-position bound in quantity units; zero disables.
+    pub max_net_qty: u64,
+    /// Resting buy notional bound in quote cents; zero disables.
+    pub max_open_buy_notional_cents: u64,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Halt/resume/session/risk ack.
 ///
 /// `offset` is the command's position in the Orders log (durable) or the
 /// matcher's local seq (turbo) — the same offset domain the order acks use.
@@ -168,7 +188,7 @@ pub struct SessionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminAck {
     pub symbol: Symbol,
-    /// `halt`, `resume`, or `set_session`.
+    /// `halt`, `resume`, `set_session`, or `set_risk`.
     pub action: String,
     /// The instrument's halt state after a `halt`/`resume` command. A
     /// `set_session` command does not touch the halt flag, so its ack always
@@ -176,9 +196,20 @@ pub struct AdminAck {
     /// the MD feed instead of this field.
     pub halted: bool,
     /// The instrument's session after a `set_session` command; `None` for
-    /// halt/resume, which do not change the session.
+    /// every other action, which does not change the session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionState>,
+    /// `set_risk` only: the participant the limits apply to, as presented.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participant: Option<String>,
+    /// `set_risk` only: absolute net-position bound after the command; zero
+    /// means the bound is disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_net_qty: Option<u64>,
+    /// `set_risk` only: resting buy notional bound in quote cents after the
+    /// command; zero means the bound is disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_open_buy_notional_cents: Option<u64>,
     pub partition: u32,
     pub offset: u64,
     /// The operator identity the presented token acted as.
@@ -505,6 +536,9 @@ mod tests {
             action: "halt".into(),
             halted: true,
             session: None,
+            participant: None,
+            max_net_qty: None,
+            max_open_buy_notional_cents: None,
             partition: 3,
             offset: 4,
             operator: "ops-lead".into(),
@@ -518,11 +552,43 @@ mod tests {
             action: "set_session".into(),
             halted: false,
             session: Some(SessionState::PreOpen),
-            ..halt
+            ..halt.clone()
         };
         let json = serde_json::to_value(&ack).unwrap();
         assert_eq!(json["session"], "pre_open");
         assert_eq!(json["halted"], false);
+
+        let risk = AdminAck {
+            action: "set_risk".into(),
+            halted: false,
+            session: None,
+            participant: Some("desk-a".into()),
+            max_net_qty: Some(500),
+            max_open_buy_notional_cents: Some(25_000_000),
+            ..halt
+        };
+        let json = serde_json::to_value(&risk).unwrap();
+        assert_eq!(json["participant"], "desk-a");
+        assert_eq!(json["max_net_qty"], 500);
+        assert_eq!(json["max_open_buy_notional_cents"], 25_000_000);
+        assert!(json.get("session").is_none());
+    }
+
+    #[test]
+    fn risk_request_requires_both_bounds_and_ignores_an_absent_reason() {
+        let request: RiskRequest = serde_json::from_str(
+            r#"{"participant":"desk-a","max_net_qty":500,"max_open_buy_notional_cents":0}"#,
+        )
+        .unwrap();
+        assert_eq!(request.participant, "desk-a");
+        assert_eq!(request.max_net_qty, 500);
+        assert_eq!(request.max_open_buy_notional_cents, 0);
+        assert_eq!(request.reason, None);
+        assert!(
+            serde_json::from_str::<RiskRequest>(r#"{"participant":"desk-a","max_net_qty":500}"#)
+                .is_err(),
+            "an omitted bound must not silently become zero"
+        );
     }
 
     #[test]

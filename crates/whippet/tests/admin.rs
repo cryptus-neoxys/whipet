@@ -791,6 +791,183 @@ async fn set_session_gates_orders_through_the_log() {
     }
 }
 
+/// Risk limits are appended as one `SetRisk` command and enforced by the
+/// engine from that log position onward, not by the gateway's static ingress
+/// guard.
+#[tokio::test]
+async fn set_risk_limits_orders_through_the_log() {
+    let node = TestNode::new();
+    let app = gateway::router(node_with_operator(&node));
+    let operator_ingress = Some(OPERATOR_TOKEN);
+
+    let (status, body) = post_admin(
+        &app,
+        "risk",
+        "BTC-USD",
+        Some(json!({
+            "participant": "alice",
+            "max_net_qty": 1,
+            "max_open_buy_notional_cents": 0,
+            "reason": "desk limit"
+        })),
+        operator_ingress,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ack: AdminAck = serde_json::from_value(body).expect("risk ack");
+    assert_eq!(ack.symbol, symbol());
+    assert_eq!(ack.action, "set_risk");
+    assert_eq!(ack.participant.as_deref(), Some("alice"));
+    assert_eq!(ack.max_net_qty, Some(1));
+    assert_eq!(ack.max_open_buy_notional_cents, Some(0));
+    assert_eq!(ack.session, None, "a risk change does not claim a session");
+    assert!(!ack.halted, "a risk change does not claim a halt state");
+    assert_eq!(ack.partition, symbol().partition(16), "BTC-USD partition");
+    assert_eq!(ack.operator, OPERATOR_NAME);
+    assert_eq!(ack.offset, 0, "the ack offset is the command's log offset");
+
+    // The fixed command layout carries the target participant, the net bound
+    // in `qty`, and the notional bound in `price`.
+    let records = node.orders(symbol());
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].offset, 0);
+    assert_eq!(records[0].header("type"), Some("set_risk"));
+    let command = Command::decode(&records[0].payload).expect("risk payload");
+    assert_eq!(command.kind, CommandKind::SetRisk);
+    assert_eq!(command.symbol, symbol());
+    assert_eq!(command.participant, ParticipantId::derive("alice"));
+    assert_eq!(command.qty.0, 1);
+    assert_eq!(command.price.0, 0);
+
+    // The audit names the participant and both bounds in operator units.
+    let audits = audit_records(&node, symbol());
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].offset, ack.audit_offset);
+    let audit: Value = serde_json::from_slice(&audits[0].payload).expect("audit json");
+    assert_eq!(audit["operator"], OPERATOR_NAME);
+    assert_eq!(audit["action"], "set_risk");
+    assert_eq!(audit["symbol"], "BTC-USD");
+    assert_eq!(audit["participant"], "alice");
+    assert_eq!(audit["max_net_qty"], 1);
+    assert_eq!(audit["max_open_buy_notional_cents"], 0);
+    assert_eq!(audit["order_offset"], 0);
+    assert_eq!(audit["reason"], "desk limit");
+    assert!(
+        audit.get("halted").is_none() && audit.get("session").is_none(),
+        "a risk record claims only what it changed"
+    );
+
+    // Two orders behind the command: the first fits the one-lot bound, the
+    // second would leave a two-lot worst case and is refused by the engine.
+    for (client_order_id, offset) in [("risk-1", 1), ("risk-2", 2)] {
+        let (status, body) = submit_order(&app, client_order_id).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["offset"], offset);
+    }
+    let processed = node.process_orders(symbol());
+    assert_eq!(
+        processed.engine.book().order_count(),
+        1,
+        "only the first order may rest"
+    );
+    assert!(
+        processed
+            .executions
+            .iter()
+            .any(|exec| exec.kind == ExecKind::Rejected && exec.reason == RejectReason::RiskLimit),
+        "the engine must reject the order that breaches the log-ordered limit"
+    );
+    assert_eq!(
+        processed
+            .engine
+            .risk_table()
+            .entry(ParticipantId::derive("alice"))
+            .limits
+            .max_net_qty,
+        1
+    );
+}
+
+/// A malformed risk request is refused before any append: both bounds are
+/// required, the participant must fit the configured bound, and the notional
+/// must fit the engine's signed field.
+#[tokio::test]
+async fn risk_rejects_bad_bodies_before_any_append() {
+    let node = TestNode::new();
+    let app = gateway::router(node_with_operator(&node));
+    let operator_ingress = Some(OPERATOR_TOKEN);
+
+    let cases = [
+        (
+            json!({ "participant": "alice", "max_net_qty": 1 }),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_json",
+        ),
+        (
+            json!({
+                "participant": "",
+                "max_net_qty": 1,
+                "max_open_buy_notional_cents": 0
+            }),
+            StatusCode::BAD_REQUEST,
+            "invalid_participant",
+        ),
+        (
+            json!({
+                "participant": "a".repeat(65),
+                "max_net_qty": 1,
+                "max_open_buy_notional_cents": 0
+            }),
+            StatusCode::BAD_REQUEST,
+            "invalid_participant",
+        ),
+        (
+            json!({
+                "participant": "alice",
+                "max_net_qty": 1,
+                "max_open_buy_notional_cents": u64::MAX
+            }),
+            StatusCode::BAD_REQUEST,
+            "invalid_notional",
+        ),
+    ];
+    for (body, expected_status, expected_code) in cases {
+        let (status, response) = post_admin(
+            &app,
+            "risk",
+            "BTC-USD",
+            Some(body.clone()),
+            operator_ingress,
+        )
+        .await;
+        assert_eq!(status, expected_status, "{body}: {response}");
+        assert_eq!(response["code"], expected_code, "{body}");
+    }
+
+    let (status, response) = post_admin(
+        &app,
+        "risk",
+        "BTC-USD",
+        Some(json!({
+            "participant": "alice",
+            "max_net_qty": 1,
+            "max_open_buy_notional_cents": 0
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{response}");
+
+    assert!(
+        node.orders(symbol()).is_empty(),
+        "refused risk requests must not reach the order log"
+    );
+    assert!(
+        audit_records(&node, symbol()).is_empty(),
+        "refused risk requests must not reach the audit log"
+    );
+}
+
 /// A body without one of the three documented states is a 422, never a silent
 /// default; an unknown symbol is a 400 before anything is appended.
 #[tokio::test]
