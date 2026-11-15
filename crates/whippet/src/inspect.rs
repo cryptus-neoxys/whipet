@@ -27,9 +27,10 @@ pub const AUDIT_TOPIC_PARTITIONS: u32 = 4;
 /// The JSON object the gateway appends to the `audit` topic.
 ///
 /// The field set is the gateway's: `operator`, `action`, `symbol`, `halted`
-/// (halt/resume only), `session` (set_session only), `reason`, `order_offset`,
-/// `timestamp_ns`, `service`. Unknown fields are ignored, so adding a field to
-/// the record does not break an older reader.
+/// (halt/resume only), `session` (set_session only), `participant`,
+/// `max_net_qty`, `max_open_buy_notional_cents` (set_risk only), `reason`,
+/// `order_offset`, `timestamp_ns`, `service`. Unknown fields are ignored, so
+/// adding a field to the record does not break an older reader.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditPayload {
     pub operator: String,
@@ -39,9 +40,19 @@ pub struct AuditPayload {
     /// because a session change does not claim the halt flag.
     #[serde(default)]
     pub halted: Option<bool>,
-    /// Session changed by a `set_session` record; absent on halt/resume.
+    /// Session changed by a `set_session` record; absent on other actions.
     #[serde(default)]
     pub session: Option<String>,
+    /// Participant targeted by a `set_risk` record; absent on other actions.
+    #[serde(default)]
+    pub participant: Option<String>,
+    /// Net-position bound set by a `set_risk` record; zero disables.
+    #[serde(default)]
+    pub max_net_qty: Option<u64>,
+    /// Resting buy notional bound in quote cents set by a `set_risk` record;
+    /// zero disables.
+    #[serde(default)]
+    pub max_open_buy_notional_cents: Option<u64>,
     /// Operator-supplied free text; the gateway writes JSON `null` when absent.
     #[serde(default)]
     pub reason: Option<String>,
@@ -163,6 +174,7 @@ pub enum OrderEventKind {
     Halt,
     Resume,
     SetSession,
+    SetRisk,
 }
 
 impl OrderEventKind {
@@ -173,6 +185,7 @@ impl OrderEventKind {
             Self::Halt => "halt",
             Self::Resume => "resume",
             Self::SetSession => "set_session",
+            Self::SetRisk => "set_risk",
         }
     }
 }
@@ -185,6 +198,7 @@ impl From<CommandKind> for OrderEventKind {
             CommandKind::Halt => Self::Halt,
             CommandKind::Resume => Self::Resume,
             CommandKind::SetSession => Self::SetSession,
+            CommandKind::SetRisk => Self::SetRisk,
         }
     }
 }
@@ -292,7 +306,8 @@ pub fn build_order_trace(
             OrderEventKind::Cancel
             | OrderEventKind::Halt
             | OrderEventKind::Resume
-            | OrderEventKind::SetSession => (None, None),
+            | OrderEventKind::SetSession
+            | OrderEventKind::SetRisk => (None, None),
         };
         order_events.push(OrderEvent {
             offset: *offset,
@@ -459,6 +474,9 @@ mod tests {
                 symbol: symbol.into(),
                 halted: Some(action == "halt"),
                 session: None,
+                participant: None,
+                max_net_qty: None,
+                max_open_buy_notional_cents: None,
                 reason: None,
                 order_offset: offset * 10,
                 timestamp_ns: offset,
@@ -514,6 +532,29 @@ mod tests {
         let record = AuditRecord::decode(0, 0, null_reason.as_bytes()).expect("forward-compatible");
         assert_eq!(record.payload.reason, None);
         assert_eq!(record.payload.halted, Some(false));
+    }
+
+    #[test]
+    fn audit_decodes_a_risk_record_with_both_bounds() {
+        let raw = r#"{
+            "operator": "lead",
+            "action": "set_risk",
+            "symbol": "BTC-USD",
+            "participant": "desk-a",
+            "max_net_qty": 500,
+            "max_open_buy_notional_cents": 25000000,
+            "reason": "desk limit",
+            "order_offset": 9,
+            "timestamp_ns": 10,
+            "service": "whippet"
+        }"#;
+        let record = AuditRecord::decode(1, 2, raw.as_bytes()).expect("valid audit JSON");
+        assert_eq!(record.payload.action, "set_risk");
+        assert_eq!(record.payload.participant.as_deref(), Some("desk-a"));
+        assert_eq!(record.payload.max_net_qty, Some(500));
+        assert_eq!(record.payload.max_open_buy_notional_cents, Some(25_000_000));
+        assert_eq!(record.payload.halted, None);
+        assert_eq!(record.payload.session, None);
     }
 
     #[test]

@@ -242,7 +242,7 @@ fn sequence_is_monotonic_and_a_failed_write_does_not_advance() {
 }
 
 #[test]
-fn a_v4_file_is_rejected_as_bad_version() {
+fn an_older_file_is_rejected_as_bad_version() {
     let dir = tempfile::tempdir().unwrap();
     let store = SnapshotStore::new(dir.path());
     let path = store.path(3);
@@ -250,12 +250,12 @@ fn a_v4_file_is_rejected_as_bad_version() {
     let mut file = fs::File::create(&path).unwrap();
     use std::io::Write;
     file.write_all(b"WHIPSNP1").unwrap();
-    file.write_all(&4u32.to_le_bytes()).unwrap();
+    file.write_all(&5u32.to_le_bytes()).unwrap();
     file.write_all(&[0u8; 8]).unwrap();
     drop(file);
 
     match store.load(3) {
-        Err(SnapshotError::BadVersion(4)) => {}
-        other => panic!("expected BadVersion(4), got {other:?}"),
+        Err(SnapshotError::BadVersion(5)) => {}
+        other => panic!("expected BadVersion(5), got {other:?}"),
     }
 }

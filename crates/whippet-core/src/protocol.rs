@@ -225,15 +225,15 @@ impl TradingStatus {
     }
 }
 
-/// Input command kinds. Cancel, halt, resume and session control reuse the
-/// fixed `Command` layout so the journal, gateway, and replay tooling have one
-/// decoder.
+/// Input command kinds. Cancel, halt, resume, session control, and risk limits
+/// reuse the fixed `Command` layout so the journal, gateway, and replay tooling
+/// have one decoder.
 ///
-/// `Halt`, `Resume` and `SetSession` are operator commands on the same input
-/// log as client traffic. Being ordered commands is what makes them
-/// replayable: a restored engine reaches the same halt and session state by
-/// replaying the log, and the audit trail is just the record that carried the
-/// command.
+/// `Halt`, `Resume`, `SetSession`, and `SetRisk` are operator commands on the
+/// same input log as client traffic. Being ordered commands is what makes them
+/// replayable: a restored engine reaches the same halt, session, and risk state
+/// by replaying the log, and the audit trail is just the record that carried
+/// the command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandKind {
     NewOrder = 1,
@@ -241,9 +241,14 @@ pub enum CommandKind {
     Halt = 3,
     Resume = 4,
     SetSession = 5,
+    SetRisk = 6,
 }
 
 impl CommandKind {
+    pub fn as_code(self) -> u8 {
+        self as u8
+    }
+
     pub fn from_code(code: u8) -> Result<Self> {
         match code {
             1 => Ok(Self::NewOrder),
@@ -251,11 +256,29 @@ impl CommandKind {
             3 => Ok(Self::Halt),
             4 => Ok(Self::Resume),
             5 => Ok(Self::SetSession),
+            6 => Ok(Self::SetRisk),
             other => Err(CoreError::UnknownDiscriminant {
                 kind: "CommandKind",
                 value: other,
             }),
         }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NewOrder => "new_order",
+            Self::Cancel => "cancel",
+            Self::Halt => "halt",
+            Self::Resume => "resume",
+            Self::SetSession => "set_session",
+            Self::SetRisk => "set_risk",
+        }
+    }
+}
+
+impl fmt::Display for CommandKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -366,6 +389,33 @@ impl Command {
             )));
         }
         SessionState::from_code(self.flags as u8)
+    }
+
+    /// Operator command: set or clear the per-participant risk limit on
+    /// `symbol`.
+    ///
+    /// Reuses the fixed `Command` layout without changing
+    /// [`COMMAND_ENCODED_LEN`]:
+    /// - `symbol` is the target instrument,
+    /// - `participant` is the target participant,
+    /// - `qty` carries `max_net_qty` (absolute net position bound; `0`
+    ///   disables),
+    /// - `price` carries `max_open_buy_notional_cents` in quote cents (`0`
+    ///   disables; negative is invalid),
+    /// - `side` (`Buy`), `order_type` (`Limit`), `order_id` (`0`), `nonce`
+    ///   (`0`), and `flags` (`0`) are unused and keep their canonical control
+    ///   values.
+    pub fn set_risk(
+        symbol: Symbol,
+        participant: ParticipantId,
+        max_net_qty: u64,
+        max_open_buy_notional_cents: i64,
+        timestamp_ns: u64,
+    ) -> Self {
+        let mut command = Self::control(CommandKind::SetRisk, symbol, participant, timestamp_ns);
+        command.qty = Qty(max_net_qty);
+        command.price = Price(max_open_buy_notional_cents);
+        command
     }
 
     fn control(
@@ -501,6 +551,7 @@ pub enum RejectReason {
     Halted = 10,
     Internal = 11,
     SessionNotOpen = 12,
+    RiskLimit = 13,
 }
 
 impl RejectReason {
@@ -523,6 +574,7 @@ impl RejectReason {
             10 => Ok(Self::Halted),
             11 => Ok(Self::Internal),
             12 => Ok(Self::SessionNotOpen),
+            13 => Ok(Self::RiskLimit),
             other => Err(CoreError::InvalidValue(format!(
                 "unknown RejectReason code {other}"
             ))),
@@ -544,6 +596,7 @@ impl RejectReason {
             Self::Halted => "halted",
             Self::Internal => "internal",
             Self::SessionNotOpen => "session_not_open",
+            Self::RiskLimit => "risk_limit",
         }
     }
 }
@@ -1027,17 +1080,46 @@ mod tests {
 
     #[test]
     fn command_kind_from_code_covers_every_kind() {
-        for kind in [
-            CommandKind::NewOrder,
-            CommandKind::Cancel,
-            CommandKind::Halt,
-            CommandKind::Resume,
-            CommandKind::SetSession,
+        for (kind, code, name) in [
+            (CommandKind::NewOrder, 1u8, "new_order"),
+            (CommandKind::Cancel, 2, "cancel"),
+            (CommandKind::Halt, 3, "halt"),
+            (CommandKind::Resume, 4, "resume"),
+            (CommandKind::SetSession, 5, "set_session"),
+            (CommandKind::SetRisk, 6, "set_risk"),
         ] {
-            assert_eq!(CommandKind::from_code(kind as u8).unwrap(), kind);
+            assert_eq!(kind.as_code(), code);
+            assert_eq!(CommandKind::from_code(code).unwrap(), kind);
+            assert_eq!(kind.as_str(), name);
+            assert_eq!(kind.to_string(), name);
         }
         assert!(CommandKind::from_code(0).is_err());
-        assert!(CommandKind::from_code(6).is_err());
+        assert!(CommandKind::from_code(7).is_err());
+    }
+
+    #[test]
+    fn set_risk_round_trip() {
+        let command = Command::set_risk(
+            symbol(),
+            ParticipantId(7),
+            500,
+            25_000_000,
+            1_700_000_000_000_000_004,
+        );
+        assert_eq!(command.kind, CommandKind::SetRisk);
+        assert_eq!(command.symbol, symbol());
+        assert_eq!(command.participant, ParticipantId(7));
+        assert_eq!(command.qty, Qty(500));
+        assert_eq!(command.price, Price(25_000_000));
+        assert_eq!(command.side, Side::Buy);
+        assert_eq!(command.order_type, OrderType::Limit);
+        assert_eq!(command.order_id, OrderId(0));
+        assert_eq!(command.nonce, 0);
+        assert_eq!(command.flags, 0);
+
+        let bytes = command.encode();
+        assert_eq!(bytes.len(), COMMAND_ENCODED_LEN);
+        assert_eq!(Command::decode(&bytes).unwrap(), command);
     }
 
     #[test]
@@ -1153,13 +1235,16 @@ mod tests {
             RejectReason::Halted,
             RejectReason::Internal,
             RejectReason::SessionNotOpen,
+            RejectReason::RiskLimit,
         ];
         for reason in reasons {
             assert_eq!(RejectReason::from_code(reason.as_code()).unwrap(), reason);
         }
         assert_eq!(RejectReason::SessionNotOpen.as_code(), 12);
         assert_eq!(RejectReason::SessionNotOpen.as_str(), "session_not_open");
-        assert!(RejectReason::from_code(13).is_err());
+        assert_eq!(RejectReason::RiskLimit.as_code(), 13);
+        assert_eq!(RejectReason::RiskLimit.as_str(), "risk_limit");
+        assert!(RejectReason::from_code(14).is_err());
     }
 
     #[test]

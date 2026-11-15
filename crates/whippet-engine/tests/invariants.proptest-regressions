@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3de58c29662ee5e7700ab9c0abb424c7c965c506b1af9bf5cb0f74fa2f0ac903 # shrinks to commands = [Command { kind: NewOrder, symbol: Symbol(BTC-USD), side: Buy, order_type: Limit, price: Price(97), qty: Qty(93), order_id: OrderId(00000000000000000000000000000001), participant: ParticipantId(2), timestamp_ns: 0, nonce: 0, flags: 0 }, Command { kind: NewOrder, symbol: Symbol(BTC-USD), side: Buy, order_type: Limit, price: Price(96), qty: Qty(3), order_id: OrderId(00000000000000000000000000000002), participant: ParticipantId(1), timestamp_ns: 1, nonce: 0, flags: 0 }, Command { kind: NewOrder, symbol: Symbol(BTC-USD), side: Buy, order_type: Limit, price: Price(92), qty: Qty(3), order_id: OrderId(00000000000000000000000000000003), participant: ParticipantId(2), timestamp_ns: 2, nonce: 0, flags: 0 }, Command { kind: NewOrder, symbol: Symbol(BTC-USD), side: Sell, order_type: Limit, price: Price(90), qty: Qty(96), order_id: OrderId(00000000000000000000000000000004), participant: ParticipantId(3), timestamp_ns: 3, nonce: 0, flags: 0 }, Command { kind: NewOrder, symbol: Symbol(BTC-USD), side: Sell, order_type: Market, price: Price(0), qty: Qty(3), order_id: OrderId(00000000000000000000000000000005), participant: ParticipantId(1), timestamp_ns: 4, nonce: 0, flags: 0 }]

@@ -11,6 +11,8 @@ use whippet_core::ids::Symbol;
 use whippet_engine::{ShardEngine, ShardSnapshot, SymbolSnapshot, fill_symbol_hashes};
 
 const MAGIC: &[u8; 8] = b"WHIPSNP1";
+/// Version 6 added the per-symbol `risk` table, so a restored engine enforces
+/// the same limits and resumes the same exposure without replaying `SetRisk`.
 /// Version 5 added the per-symbol `session` field (`SessionState`), so a
 /// restored engine knows whether new orders are admitted without replaying the
 /// session command again. Version 4 stores the dedup terminal-eviction queue as
@@ -20,7 +22,7 @@ const MAGIC: &[u8; 8] = b"WHIPSNP1";
 /// order; version 2 added the per-symbol config and the book's
 /// `min_price_ticks`. Older versions are rejected rather than misread: every
 /// layout change is a hard cut, not a compatibility shim.
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -383,6 +385,14 @@ fn check_symbol(shard: u32, symbol: &SymbolSnapshot) -> Result<(), SnapshotError
         }
     }
     check_terminal_indices(shard, symbol)?;
+    symbol
+        .risk
+        .check_invariants()
+        .map_err(|detail| invalid(format!("risk table: {detail}")))?;
+    symbol
+        .risk
+        .check_against_orders(&symbol.book.orders, symbol.config.tick_size_cents)
+        .map_err(|detail| invalid(format!("risk exposure: {detail}")))?;
     if symbol.state_hash == [0u8; 32] {
         return Err(SnapshotError::UnhashedSymbol {
             shard,
@@ -962,7 +972,7 @@ mod tests {
         // for it and must fail loudly rather than deserialize into the new
         // layout. v4 itself changed the dedup terminal payload from `OrderId`s
         // to `u32` indices, which v3 files would read as ids.
-        for version in [1u32, 2, 3, 4] {
+        for version in [1u32, 2, 3, 4, 5] {
             let dir = tempfile::tempdir().unwrap();
             let store = SnapshotStore::new(dir.path());
             let path = store.path(3);

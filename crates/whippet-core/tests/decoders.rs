@@ -855,14 +855,14 @@ fn every_unknown_discriminant_is_a_typed_error() {
         );
         assert_eq!(
             CommandKind::from_code(code).is_ok(),
-            (1u8..=5).contains(&code)
+            (1u8..=6).contains(&code)
         );
         assert_eq!(ExecKind::from_code(code).is_ok(), (1u8..=5).contains(&code));
         assert_eq!(MdKind::from_code(code).is_ok(), (1u8..=7).contains(&code));
         assert_eq!(SessionState::from_code(code).is_ok(), code <= 2);
     }
     for code in 0..=u16::MAX {
-        assert_eq!(RejectReason::from_code(code).is_ok(), code <= 12);
+        assert_eq!(RejectReason::from_code(code).is_ok(), code <= 13);
     }
 
     // A patch to the kind byte must be caught, not ignored.

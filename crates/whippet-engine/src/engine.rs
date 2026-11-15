@@ -18,6 +18,7 @@ use whippet_core::protocol::{
 
 use crate::book::{Book, BookError, BookSnapshot, RestingOrder, hash_book_snapshot};
 use crate::dedup::{DedupEntry, DedupStatus, DedupTable, hash_dedup_entries};
+use crate::risk::{RiskLimits, RiskTable};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -941,6 +942,9 @@ pub struct SymbolSnapshot {
     /// [`CommandKind::SetSession`], so replay and restore agree on whether new
     /// orders are admitted. Added by snapshot-store version 5.
     pub session: SessionState,
+    /// Per-participant risk limits and exposure, log-ordered through
+    /// [`CommandKind::SetRisk`]. Added by snapshot-store version 6.
+    pub risk: RiskTable,
     pub state_hash: [u8; 32],
 }
 
@@ -963,6 +967,10 @@ pub struct SymbolEngine {
     /// Instrument session. `Open` is the pre-session default, so an engine
     /// that never sees a [`CommandKind::SetSession`] behaves as before.
     session: SessionState,
+    /// Engine-enforced per-participant limits and their live exposure. Limits
+    /// arrive through [`CommandKind::SetRisk`]; exposure moves with the book
+    /// and the fills, never from an out-of-band mutation.
+    risk: RiskTable,
     /// How often the node should persist engine state (book + dedup). This
     /// does not emit a market-data snapshot.
     snapshot_every: u64,
@@ -1013,6 +1021,7 @@ impl SymbolEngine {
             commands: 0,
             halted: false,
             session: SessionState::Open,
+            risk: RiskTable::default(),
             snapshot_every: 10_000,
             md_snapshot_every: 100_000,
             until_state_snapshot: 0,
@@ -1085,6 +1094,13 @@ impl SymbolEngine {
         self.session
     }
 
+    /// The live risk table. Diagnostic and operator read path; mutations go
+    /// through [`CommandKind::SetRisk`] and the book's fills, never this
+    /// accessor.
+    pub fn risk_table(&self) -> &RiskTable {
+        &self.risk
+    }
+
     /// The halt and session fields as one value. This is the single admission
     /// predicate and MD flag encoding; the engine keeps the fields separate
     /// only because the snapshot layout stores them separately.
@@ -1110,6 +1126,7 @@ impl SymbolEngine {
             // Session control is dispatched before the order path: it changes
             // admission for every later command in the log, exactly like halt.
             CommandKind::SetSession => self.process_set_session(command, out),
+            CommandKind::SetRisk => self.process_set_risk(command, out),
             CommandKind::Halt => self.process_halt(command, out),
             CommandKind::Resume => self.process_resume(command, out),
             CommandKind::Cancel => self.process_cancel(command, out),
@@ -1179,6 +1196,30 @@ impl SymbolEngine {
         self.push_status(out, command);
     }
 
+    /// Set or clear one participant's limits.
+    ///
+    /// `SetRisk` is an ordered operator command: the engine applies it at the
+    /// command's log position, so a replay sees every order accepted under the
+    /// old limits and every later order under the new ones. The command is a
+    /// no-op when its `price` (the notional limit) is negative or its symbol is
+    /// not this engine's instrument; both are unreachable through the gateway,
+    /// which validates before append, and a corrupt log must not make the
+    /// deterministic outcome a panic.
+    ///
+    /// Limits apply to the participant carried by the command; existing
+    /// exposure is preserved, so tightening a limit immediately gates new risk
+    /// without inventing or erasing the position already taken.
+    fn process_set_risk(&mut self, command: &Command, _out: &mut EngineOutput) {
+        if command.symbol != self.config.symbol || command.price.0 < 0 {
+            return;
+        }
+        let limits = RiskLimits {
+            max_net_qty: command.qty.0,
+            max_open_buy_notional_cents: command.price.0 as u64,
+        };
+        self.risk.set_limits(command.participant, limits);
+    }
+
     /// The MD status bits for the current venue state: the halt flag plus the
     /// session code. Both live in one byte so a Status event (and the trailing
     /// snapshot byte) is a complete venue-status view.
@@ -1220,6 +1261,12 @@ impl SymbolEngine {
             return;
         };
 
+        self.risk.on_cancel(
+            removed.participant,
+            removed.side,
+            self.quote_cents(removed.price),
+            removed.remaining.0,
+        );
         self.dedup.update(removed.order_id, DedupStatus::Cancelled);
         self.push_exec(
             out,
@@ -1323,6 +1370,30 @@ impl SymbolEngine {
             return;
         }
 
+        // Pre-trade risk runs after the order's own validity and fillability
+        // checks and before the id is accepted: a refused order must not leave
+        // a live dedup entry or any book/MD mutation. The candidate is charged
+        // its full quantity, and a limit order that can rest is charged its
+        // full buy notional even if it would cross, so admission never relies
+        // on an execution that has not happened yet.
+        let may_rest = matches!(command.order_type, OrderType::Limit | OrderType::PostOnly);
+        if self
+            .risk
+            .check_new_order(
+                command.participant,
+                command.side,
+                command.qty.0,
+                self.quote_cents(command.price),
+                may_rest,
+            )
+            .is_err()
+        {
+            // The rejection reason is the only client-visible signal; the
+            // exact bound that tripped is operator telemetry, not wire data.
+            self.reject(out, command, RejectReason::RiskLimit);
+            return;
+        }
+
         let entry = DedupEntry {
             status: DedupStatus::Accepted,
             input_offset: self.last_offset,
@@ -1379,6 +1450,12 @@ impl SymbolEngine {
             // price-time priority at its own level if it later rests.
             if maker.participant == command.participant {
                 if let Some(removed) = self.book.cancel(maker.order_id, None) {
+                    self.risk.on_cancel(
+                        removed.participant,
+                        removed.side,
+                        self.quote_cents(removed.price),
+                        removed.remaining.0,
+                    );
                     self.dedup.update(maker.order_id, DedupStatus::Cancelled);
                     self.push_maker_exec(
                         out,
@@ -1406,6 +1483,17 @@ impl SymbolEngine {
             let maker_fully_filled = self.book.reduce(head, fill);
             remaining = remaining.saturating_sub(fill);
             self.book.record_trade(maker_price, fill, command.side);
+            // Both legs move risk: the taker takes a position, and the maker's
+            // resting quantity leaves the book (leaving its net position in its
+            // place). A partial maker fill therefore reduces open exposure by
+            // exactly the filled quantity.
+            self.risk.on_take(command.participant, command.side, fill.0);
+            self.risk.on_maker_fill(
+                maker.participant,
+                maker.side,
+                self.quote_cents(maker_price),
+                fill.0,
+            );
 
             let kind = if remaining.is_zero() {
                 ExecKind::Filled
@@ -1477,6 +1565,12 @@ impl SymbolEngine {
                 self.exec_seq.0,
             ) {
                 Ok(_) => {
+                    self.risk.on_rest(
+                        command.participant,
+                        command.side,
+                        self.quote_cents(command.price),
+                        remaining.0,
+                    );
                     self.dedup.update(command.order_id, DedupStatus::Resting);
                     self.push_md(
                         out,
@@ -1532,6 +1626,18 @@ impl SymbolEngine {
                 accepted_flags,
             );
         }
+    }
+
+    /// Convert a tick price to quote cents for the risk table.
+    ///
+    /// The engine stores tick indices; risk limits are quoted in cents because
+    /// operators reason about money. Prices are validated before this runs, so
+    /// the conversion is a saturating multiply rather than a fallible one; a
+    /// non-positive tick size is rejected when the instrument is configured.
+    fn quote_cents(&self, price: Price) -> u128 {
+        u128::try_from(price.0)
+            .unwrap_or_default()
+            .saturating_mul(u128::try_from(self.config.tick_size_cents).unwrap_or_default())
     }
 
     fn within_collar(&self, side: Side, price: Price) -> bool {
@@ -1696,7 +1802,7 @@ impl SymbolEngine {
 
     pub fn state_hash(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"whippet-engine-v1");
+        hasher.update(b"whippet-engine-v2");
         hasher.update(&self.config.tick_size_cents.to_le_bytes());
         hasher.update(&self.config.min_price_ticks.to_le_bytes());
         hasher.update(&self.config.max_price_ticks.to_le_bytes());
@@ -1715,6 +1821,10 @@ impl SymbolEngine {
         // restored pre-open/closed instrument hash differently from an open
         // one, so replay cannot lose a session change.
         hasher.update(&[u8::from(self.halted), self.session.as_code()]);
+        // Risk limits and exposure are engine state: a restored engine with a
+        // dropped `SetRisk` must hash differently. Version 2 of the domain
+        // covers this tail.
+        self.risk.hash_into(&mut hasher);
         *hasher.finalize().as_bytes()
     }
 
@@ -1742,6 +1852,10 @@ impl SymbolEngine {
         self.dedup
             .check_invariants()
             .map_err(|err| format!("dedup: {err}"))?;
+
+        self.risk
+            .check_invariants()
+            .map_err(|err| format!("risk: {err}"))?;
 
         let snapshot = self.book.snapshot();
         let mut resting_in_book = 0usize;
@@ -1803,6 +1917,9 @@ impl SymbolEngine {
                 self.dedup.len()
             ));
         }
+        self.risk
+            .check_against_orders(&snapshot.orders, self.config.tick_size_cents)
+            .map_err(|err| format!("risk: {err}"))?;
         Ok(())
     }
 
@@ -1966,6 +2083,7 @@ impl SymbolEngine {
             commands: self.commands,
             halted: self.halted,
             session: self.session,
+            risk: self.risk.clone(),
             state_hash: [0; 32],
         }
     }
@@ -1992,6 +2110,7 @@ impl SymbolEngine {
             commands: snapshot.commands,
             halted: snapshot.halted,
             session: snapshot.session,
+            risk: snapshot.risk,
             snapshot_every: 10_000,
             md_snapshot_every: 100_000,
             until_state_snapshot: 0,
@@ -2014,6 +2133,10 @@ impl SymbolEngine {
                 actual: hex(&canonical.state_hash),
             });
         }
+        // The hash proves the bytes agree with the writer; the structural
+        // checks prove the bytes describe an engine that can keep trading.
+        // Restore is cold, so the O(book + dedup) walk is affordable.
+        engine.check_invariants().map_err(EngineError::Snapshot)?;
         engine.last_offset = snapshot.last_offset;
         Ok(engine)
     }
@@ -2051,7 +2174,7 @@ fn hash_dedup_snapshot(snapshot: &SymbolSnapshot, hasher: &mut blake3::Hasher) {
 
 pub fn hash_symbol_snapshot(snapshot: &SymbolSnapshot) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"whippet-engine-v1");
+    hasher.update(b"whippet-engine-v2");
     let config = &snapshot.config;
     hasher.update(&config.tick_size_cents.to_le_bytes());
     hasher.update(&config.min_price_ticks.to_le_bytes());
@@ -2067,6 +2190,7 @@ pub fn hash_symbol_snapshot(snapshot: &SymbolSnapshot) -> [u8; 32] {
     hasher.update(&snapshot.last_offset.to_le_bytes());
     hasher.update(&snapshot.last_ts_ns.to_le_bytes());
     hasher.update(&[u8::from(snapshot.halted), snapshot.session.as_code()]);
+    snapshot.risk.hash_into(&mut hasher);
     *hasher.finalize().as_bytes()
 }
 
@@ -3945,5 +4069,144 @@ mod tests {
             );
         }
         assert_eq!(first.state_hash(), second.state_hash());
+    }
+
+    fn set_risk(participant: u64, max_net_qty: u64, max_notional_cents: i64) -> Command {
+        Command::set_risk(
+            symbol(),
+            ParticipantId(participant),
+            max_net_qty,
+            max_notional_cents,
+            1,
+        )
+    }
+
+    #[test]
+    fn risk_limit_rejects_before_acceptance_and_leaves_no_trace() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &set_risk(1, 5, 0), 0);
+
+        let out = process(&mut engine, &limit(Side::Buy, 100, 6, 1, 1), 1);
+        assert_eq!(out.executions.len(), 1);
+        assert_eq!(out.executions[0].kind, ExecKind::Rejected);
+        assert_eq!(out.executions[0].reason, RejectReason::RiskLimit);
+        assert!(
+            out.md.is_empty(),
+            "a creation rejection mutates no market data"
+        );
+        assert_eq!(engine.book().order_count(), 0);
+        assert_eq!(
+            engine.dedup().status(OrderId(1)),
+            Some(DedupStatus::Rejected)
+        );
+        engine
+            .check_invariants()
+            .expect("a rejected order leaves no exposure");
+    }
+
+    #[test]
+    fn risk_exposure_tracks_resting_fills_and_cancels() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &set_risk(2, 10, 0), 0);
+        // Participant 1 provides liquidity and is unconstrained.
+        process(&mut engine, &limit(Side::Sell, 150, 10, 10, 1), 1);
+
+        // A taker buy of 4 leaves a 4-lot net long; a resting buy of 7 would
+        // make the worst case 11, one over the bound.
+        let out = process(&mut engine, &limit(Side::Buy, 150, 4, 11, 2), 2);
+        assert_eq!(out.executions.last().unwrap().kind, ExecKind::Filled);
+        let out = process(&mut engine, &limit(Side::Buy, 120, 7, 12, 2), 3);
+        assert_eq!(out.executions[0].reason, RejectReason::RiskLimit);
+
+        // A resting buy of 6 reaches the bound exactly and is allowed.
+        let out = process(&mut engine, &limit(Side::Buy, 120, 6, 13, 2), 4);
+        assert_eq!(out.executions[0].kind, ExecKind::Accepted);
+        assert_eq!(out.executions[0].remaining, Qty(6));
+        engine
+            .check_invariants()
+            .expect("open buy is mirrored by the book");
+
+        // Cancelling it frees the room again: the same 6-lot buy is admitted.
+        process(
+            &mut engine,
+            &Command::cancel(symbol(), OrderId(13), ParticipantId(2), 5),
+            5,
+        );
+        let out = process(&mut engine, &limit(Side::Buy, 120, 6, 14, 2), 6);
+        assert_eq!(out.executions[0].kind, ExecKind::Accepted);
+        engine
+            .check_invariants()
+            .expect("the cancel freed the exposure");
+    }
+
+    #[test]
+    fn buy_notional_limit_uses_quote_cents() {
+        // The instrument's tick is 100 cents, so one tick is 10,000 cents of
+        // notional for a one-unit order.
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &set_risk(1, 0, 10_000), 0);
+
+        process(&mut engine, &limit(Side::Buy, 100, 1, 1, 1), 1);
+        let out = process(&mut engine, &limit(Side::Buy, 100, 1, 2, 1), 2);
+        assert_eq!(out.executions[0].reason, RejectReason::RiskLimit);
+
+        // A sell adds no buy notional, and a market buy cannot rest.
+        let out = process(&mut engine, &limit(Side::Sell, 110, 1, 3, 1), 3);
+        assert_eq!(out.executions[0].kind, ExecKind::Accepted);
+        let mut market = limit(Side::Buy, 0, 1, 4, 1);
+        market.order_type = OrderType::Market;
+        let out = process(&mut engine, &market, 4);
+        assert_eq!(out.executions[0].kind, ExecKind::Accepted);
+        engine
+            .check_invariants()
+            .expect("resting and market legs stay consistent");
+    }
+
+    #[test]
+    fn risk_is_log_ordered_and_survives_a_snapshot() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &set_risk(1, 5, 0), 0);
+        process(&mut engine, &limit(Side::Buy, 120, 5, 1, 1), 1);
+
+        let snapshot = engine.snapshot_state();
+        let mut restored = SymbolEngine::from_snapshot(config(), snapshot).expect("restore");
+        assert_eq!(restored.state_hash(), engine.state_hash());
+        assert_eq!(
+            restored
+                .risk_table()
+                .entry(ParticipantId(1))
+                .limits
+                .max_net_qty,
+            5
+        );
+        let out = process(&mut restored, &limit(Side::Buy, 120, 1, 2, 1), 2);
+        assert_eq!(out.executions[0].reason, RejectReason::RiskLimit);
+
+        // Clearing the limit is the same ordered command: subsequent orders
+        // are admitted and the risk entry is pruned once exposure is flat.
+        process(&mut restored, &set_risk(1, 0, 0), 3);
+        process(
+            &mut restored,
+            &Command::cancel(symbol(), OrderId(1), ParticipantId(1), 4),
+            4,
+        );
+        assert!(restored.risk_table().is_empty());
+        process(&mut restored, &limit(Side::Buy, 120, 1, 3, 1), 5);
+        restored
+            .check_invariants()
+            .expect("cleared risk stays consistent");
+    }
+
+    #[test]
+    fn a_negative_notional_limit_is_ignored_on_replay() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &set_risk(1, 10, -1), 0);
+        assert!(engine.risk_table().is_empty());
+        // The command still advances the log clock, but it configures nothing:
+        // a crafted log cannot set a negative notional by wrapping it.
+        assert_eq!(
+            engine.risk_table().entry(ParticipantId(1)).limits,
+            RiskLimits::default()
+        );
     }
 }

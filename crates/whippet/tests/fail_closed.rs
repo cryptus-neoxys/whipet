@@ -96,12 +96,12 @@ fn write_raw_snapshot(dir: &Path, exchange: &ExchangeConfig, symbol: Symbol, app
         out.clear();
     }
 
-    // Format: `WHIPSNP1`, little-endian u32 version (5), bincode snapshot.
+    // Format: `WHIPSNP1`, little-endian u32 version (6), bincode snapshot.
     // The constants are private to the store on purpose; only the reader trust
     // boundary is under test here.
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"WHIPSNP1");
-    bytes.extend_from_slice(&5u32.to_le_bytes());
+    bytes.extend_from_slice(&6u32.to_le_bytes());
     bytes.extend_from_slice(
         &bincode::serialize(&engine.snapshot_state()).expect("snapshot serializes"),
     );
@@ -267,8 +267,8 @@ async fn replay_require_snapshot_rejects_a_snapshot_with_no_applied_commands() {
     // The node's resume rule: a snapshot from a shard that never applied a
     // command is not a resume point, so it must not satisfy --require-snapshot.
     //
-    // The writer refuses to persist this state, so the test writes the raw v5
-    // bytes directly. That is the legacy/hand-written file the reader must
+    // The writer refuses to persist this state, so the test writes the raw
+    // snapshot bytes directly. That is the hand-written file the reader must
     // still reject; going through `write_snapshot` would only prove the
     // writer-side guard.
     write_raw_snapshot(dir.path(), &exchange, symbol, 0);

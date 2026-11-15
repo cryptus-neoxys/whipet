@@ -35,13 +35,15 @@ use crate::builders;
 /// updating this value deliberately (see the module docs).
 ///
 /// History:
-/// - 2026-11-15: moved for the session-state field. `SymbolEngine::state_hash`
-///   now hashes two status bytes (`halted`, `session`) instead of one, and the
-///   golden scenario runs in the default `SessionState::Open`. No matching,
-///   sequencing, or MD output changed: every command in the standard log is
-///   admitted exactly as before. The previous pin was
-///   `98e70d85d2c55bc4f52ad51facf92b92062ac21f43a0d25598b62931627f7f34`.
-pub const GOLDEN_HASH: &str = "60d6e929d350354cc6cc73dd59e15d77810be26e56090972d928cac88b1ffe3a";
+/// - 2026-11-15: moved for the risk table and the `whippet-engine-v2` hash
+///   domain. `SymbolEngine::state_hash` now appends the per-symbol risk table
+///   (participants, limits, exposure), and the domain string was bumped so an
+///   old pin can never be compared against a hash that omits risk state. The
+///   standard log contains no `SetRisk` command, so the table is empty and the
+///   only movement is the deliberate domain/table change; matching,
+///   sequencing, and MD output are unchanged. The previous pin was
+///   `60d6e929d350354cc6cc73dd59e15d77810be26e56090972d928cac88b1ffe3a`.
+pub const GOLDEN_HASH: &str = "de04580c7fbed4559cc2f2b9ae4b17f9b1a36390da5604b88c6c9f4e094a5b7e";
 
 /// The instrument configuration used for the golden hash.
 ///
