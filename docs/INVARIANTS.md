@@ -59,6 +59,28 @@ Cross-structure invariants (`SymbolEngine::check_invariants`):
 The BookFull flow was corrected to store `Cancelled` (the report the client
 sees), not `Rejected`.
 
+Execution output (`EngineOutput::check_invariants` and
+`SymbolEngine::check_output_invariants`, test-only):
+
+- execution and MD seqs are nonzero and strictly increasing in their own
+  spaces, and the last seq is one below the engine's next counter;
+- one output is one command: every event carries that command's `cause_offset`
+  (MD events carry the venue timestamp), symbols match;
+- one `Accepted` per order id before any terminal; a terminal is last and only
+  one is emitted; a rejection is the sole report, has no MD, zero qty,
+  zero maker id, and a reason;
+- every fill is positive, taker-side, `FLAG_TAKER`, has a nonzero maker id, and
+  has exactly one `Trade` MD event (same offset/price/qty/side) and one
+  maker-side `Reduce`/`Remove`;
+- accepted quantity is conserved: fills plus an `Add` remainder, or one
+  terminal cancel remainder, equal the accepted qty;
+- role flags are exclusive; `Accepted` is TAKER or RESTED; an STP maker cancel
+  is `FLAG_MAKER`; a client cancel reports the removed order's side/price.
+
+It found and fixed two bugs: a cancel report used the fixed-layout command side
+instead of the removed order's side, and a post-acceptance cancel hardcoded
+`FLAG_TAKER` for a passively admitted order. See ADR 0024.
+
 ## 3. Instrument status (`whippet-core::protocol`)
 
 `TradingStatus { session, halted }` is the single definition of the combination:

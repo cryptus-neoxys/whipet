@@ -10,6 +10,13 @@ Whippet is pre-1.0; minor releases may change internal APIs.
 
 ### Fixed
 
+- A successful cancel report now carries the removed order's side (the fixed
+  cancel layout's side is always `Buy`), and a post-acceptance BookFull /
+  remainder cancel keeps the admission's role flag instead of claiming
+  `FLAG_TAKER`. Both were found by the new execution-output invariants (ADR
+  0024).
+- An empty shutdown batch no longer claims offset 0 of an empty orders log as
+  applied, so a fresh shard does not commit a nonexistent record.
 - Snapshot terminal indices are validated on restore: out-of-range,
   non-terminal, and missing entries are rejected instead of silently skipped,
   while repeated indices for the same id are allowed. The terminal-eviction
