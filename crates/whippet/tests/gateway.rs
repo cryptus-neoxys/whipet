@@ -51,11 +51,25 @@ struct Ingress {
 /// A second context over the same in-memory journal, with config overrides.
 /// This keeps auth/rate-limit tests honest without changing the shared harness.
 fn node_with(node: &TestNode, configure: impl FnOnce(&mut NodeConfig)) -> Arc<NodeContext> {
+    node_with_ws_cap(node, node.ctx.ws_connections.available_permits(), configure)
+}
+
+/// Same as [`node_with`], but with a fresh WebSocket subscriber semaphore so a
+/// test can use a small cap instead of the node's default.
+fn node_with_ws_cap(
+    node: &TestNode,
+    ws_cap: usize,
+    configure: impl FnOnce(&mut NodeConfig),
+) -> Arc<NodeContext> {
     let mut config = node.ctx.config.clone();
     configure(&mut config);
+    let rate_limiter = Arc::new(whippet::ratelimit::RateLimiter::new(
+        config.rate_limit_per_sec,
+    ));
     Arc::new(NodeContext {
         config,
         journal: Arc::clone(&node.ctx.journal),
+        engine_journal: Arc::clone(&node.ctx.engine_journal),
         group_commit: node.ctx.group_commit.clone(),
         hub: Arc::clone(&node.ctx.hub),
         metrics: Arc::clone(&node.ctx.metrics),
@@ -63,6 +77,8 @@ fn node_with(node: &TestNode, configure: impl FnOnce(&mut NodeConfig)) -> Arc<No
         started: node.ctx.started,
         shutdown: node.ctx.shutdown.clone(),
         shards_ok: Arc::clone(&node.ctx.shards_ok),
+        rate_limiter,
+        ws_connections: Arc::new(tokio::sync::Semaphore::new(ws_cap)),
     })
 }
 
@@ -125,6 +141,77 @@ async fn post_with(
 async fn get(app: &Router, uri: &str) -> (StatusCode, Value) {
     let (status, _, value) = send(app, Method::GET, uri, None, Ingress::default()).await;
     (status, value)
+}
+
+/// Send a raw body so tests can exercise the size and content-type checks the
+/// typed `send` helper cannot express.
+async fn post_raw(
+    app: &Router,
+    uri: &str,
+    content_type: Option<&str>,
+    declared_len: Option<usize>,
+    body: Vec<u8>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder().method(Method::POST).uri(uri);
+    if let Some(content_type) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    if let Some(declared_len) = declared_len {
+        builder = builder.header(header::CONTENT_LENGTH, declared_len);
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::from(body)).expect("valid request"))
+        .await
+        .expect("router responds");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body collects")
+        .to_bytes();
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).expect("json response")
+    };
+    (status, value)
+}
+
+/// Perform a raw WebSocket handshake against a live server. The returned socket
+/// must stay alive: dropping it frees the subscriber permit.
+async fn open_websocket(addr: SocketAddr) -> (tokio::net::TcpStream, u16) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to the test server");
+    let request = format!(
+        "GET /ws HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write the handshake");
+
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 1_024];
+    loop {
+        let read = stream.read(&mut chunk).await.expect("read the handshake");
+        assert!(read > 0, "the server closed before answering the handshake");
+        response.extend_from_slice(&chunk[..read]);
+        if response.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let status = String::from_utf8_lossy(&response)
+        .split_whitespace()
+        .nth(1)
+        .and_then(|status| status.parse().ok())
+        .expect("a status line");
+    (stream, status)
 }
 
 #[test]
@@ -647,6 +734,120 @@ async fn per_ip_rate_limit_returns_429_with_retry_after() {
         post_with(&app, "/api/orders", limit_order("rl-3", "alice"), other).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(node.orders(symbol()).len(), 2, "the 429 must not append");
+}
+
+#[tokio::test]
+async fn malformed_bodies_share_one_rejection_contract() {
+    let node = TestNode::new();
+    let app = gateway::router(Arc::clone(&node.ctx));
+    let malformed = br#"{"symbol":"BTC-USD","side":"#.to_vec();
+
+    // Truncated JSON: every ingress route answers the same 422, not axum's
+    // bare-text 400 on `/api/cancel`.
+    for uri in ["/api/orders", "/api/orders/batch", "/api/cancel"] {
+        let (status, body) =
+            post_raw(&app, uri, Some("application/json"), None, malformed.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{uri} must reject malformed JSON as 422: {body}"
+        );
+        assert_eq!(body["code"], "invalid_json", "{uri}");
+    }
+
+    // A non-JSON content type is the same 415 on every route.
+    for uri in ["/api/orders", "/api/orders/batch", "/api/cancel"] {
+        let (status, body) = post_raw(&app, uri, Some("text/plain"), None, b"{}".to_vec()).await;
+        assert_eq!(
+            status,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "{uri} must reject a non-JSON content type as 415: {body}"
+        );
+        assert_eq!(body["code"], "unsupported_media_type", "{uri}");
+    }
+
+    assert!(
+        node.orders(symbol()).is_empty(),
+        "rejected bodies must not reach the journal"
+    );
+}
+
+#[tokio::test]
+async fn oversize_bodies_are_413_not_400() {
+    let node = TestNode::new();
+    let app = gateway::router(Arc::clone(&node.ctx));
+    let limit = 2 * 1024 * 1024;
+
+    // Exactly at the cap the body is buffered; it fails JSON parsing (422),
+    // not the size check.
+    let (status, body) = post_raw(
+        &app,
+        "/api/orders",
+        Some("application/json"),
+        None,
+        vec![b' '; limit],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "invalid_json");
+
+    // One byte over the cap is a payload-size rejection, not a malformed body.
+    let (status, body) = post_raw(
+        &app,
+        "/api/orders",
+        Some("application/json"),
+        None,
+        vec![b' '; limit + 1],
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["code"], "payload_too_large");
+
+    // A declared length over the cap is refused before the body is read.
+    let (status, body) = post_raw(
+        &app,
+        "/api/orders",
+        Some("application/json"),
+        Some(limit + 1),
+        b"{}".to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["code"], "payload_too_large");
+
+    assert!(
+        node.orders(symbol()).is_empty(),
+        "oversize bodies must not reach the journal"
+    );
+}
+
+#[tokio::test]
+async fn websocket_upgrades_are_capped() {
+    let node = TestNode::new();
+    // A small test-only cap keeps the test cheap; the production cap is 512 and
+    // the guard reads it from the shared semaphore.
+    let cap = 2;
+    let app = gateway::router(node_with_ws_cap(&node, cap, |_| {}));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a test listener");
+    let addr = listener.local_addr().expect("local address");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    // Hold every accepted subscriber open: the permit lives with the socket, so
+    // the upgrade above the cap must fail.
+    let mut live = Vec::new();
+    for index in 0..cap {
+        let (stream, status) = open_websocket(addr).await;
+        assert_eq!(status, 101, "upgrade {index} under the cap is accepted");
+        live.push(stream);
+    }
+    let (overflow, status) = open_websocket(addr).await;
+    assert_eq!(status, 503, "the upgrade above the cap must be refused");
+    drop(overflow);
+    assert_eq!(live.len(), cap);
 }
 
 #[tokio::test]

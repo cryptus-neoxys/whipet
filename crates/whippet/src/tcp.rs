@@ -35,7 +35,8 @@ use whippet_core::tcp::{TCP_BATCH_MAX, TcpErrorCode, TcpRequest, TcpResponse, bo
 use whippet_journal::{GroupCommit, Topic};
 
 use crate::context::NodeContext;
-use crate::gateway::{RateLimiter, journal_message_for_command, token_matches};
+use crate::gateway::{journal_message_for_command, token_matches};
+use crate::ratelimit::RateLimiter;
 
 /// Idle connections are dropped after this long without a complete frame.
 /// A client that wants to keep a connection warm can send a `Ping`.
@@ -68,7 +69,7 @@ pub async fn serve(ctx: Arc<NodeContext>, addr: SocketAddr) -> anyhow::Result<()
 
     // Same per-IP token bucket as HTTP ingress; the binary path is not a way
     // around the rate limit. A semaphore bounds concurrent connections.
-    let limiter = Arc::new(RateLimiter::new(ctx.config.rate_limit_per_sec));
+    let limiter = Arc::clone(&ctx.rate_limiter);
     let connections = Arc::new(Semaphore::new(MAX_TCP_CONNECTIONS));
 
     loop {
@@ -215,6 +216,18 @@ fn handle_hello(
     state: &mut ConnectionState,
     token: &str,
 ) -> (TcpResponse, bool) {
+    // Rate limit at the handshake, before the token comparison: otherwise a
+    // token-guessing client gets unlimited attempts, and `Hello` would be the
+    // one ingress frame that skips the shared budget.
+    if !state.limiter.check(state.peer) {
+        return (
+            error_response(
+                TcpErrorCode::RateLimited,
+                "ingress rate limit exceeded; retry shortly",
+            ),
+            false,
+        );
+    }
     // A hello after authorization is a no-op ack: the connection is already
     // trusted, so a second handshake cannot downgrade it.
     if state.authorized {
@@ -268,7 +281,11 @@ async fn handle_submit(
         );
     }
 
-    if !state.limiter.check(state.peer) {
+    // Charge for the whole batch, not one token per frame.
+    if !state
+        .limiter
+        .charge(state.peer, commands.len().max(1) as u32)
+    {
         return (
             error_response(
                 TcpErrorCode::RateLimited,
@@ -414,7 +431,11 @@ mod tests {
     use std::net::TcpListener as StdTcpListener;
     use std::sync::atomic::AtomicBool;
 
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::http::{Request, StatusCode, header};
     use tokio::sync::watch;
+    use tower::ServiceExt;
     use whippet_core::config::{ExchangeConfig, Mode};
     use whippet_core::ids::{OrderId, ParticipantId, Price, Qty};
     use whippet_core::protocol::{OrderType, Side};
@@ -435,6 +456,12 @@ mod tests {
     }
 
     fn test_node(api_token: Option<&str>) -> TestNode {
+        test_node_with_rate_limit(api_token, 0)
+    }
+
+    /// A node whose shared HTTP/TCP limiter allows `per_sec` frames per second
+    /// per source address; `0` disables it.
+    fn test_node_with_rate_limit(api_token: Option<&str>, per_sec: u32) -> TestNode {
         let dir = tempfile::tempdir().expect("temp dir");
         let exchange = ExchangeConfig::default();
         let config = NodeConfig {
@@ -452,7 +479,7 @@ mod tests {
             build: "test".into(),
             api_token: api_token.map(str::to_string),
             api_participant: "api".into(),
-            rate_limit_per_sec: 0,
+            rate_limit_per_sec: per_sec,
         };
         let journal = Arc::new(Journal::memory());
         let hub = MdHub::new(exchange, config.iggy_addr.clone(), "memory".into(), None);
@@ -465,9 +492,12 @@ mod tests {
                 linger: Duration::ZERO,
             },
         );
+        let rate_limiter = Arc::new(crate::ratelimit::RateLimiter::new(per_sec));
+        let ws_connections = Arc::new(Semaphore::new(512));
         let ctx = Arc::new(NodeContext {
             config,
-            journal,
+            journal: Arc::clone(&journal),
+            engine_journal: journal,
             group_commit,
             hub,
             metrics,
@@ -475,6 +505,8 @@ mod tests {
             started: Instant::now(),
             shutdown,
             shards_ok: Arc::new(AtomicBool::new(true)),
+            rate_limiter,
+            ws_connections,
         });
         TestNode { ctx, _dir: dir }
     }
@@ -661,6 +693,193 @@ mod tests {
             }
             other => panic!("expected Pong, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn hello_attempts_are_rate_limited() {
+        let node = test_node(Some("s3cret"));
+        let limiter = Arc::new(RateLimiter::new(1));
+        let peer = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+        // The first guess spends the one token and is refused the normal way.
+        let mut state = ConnectionState::with_peer(&node.ctx, peer, Arc::clone(&limiter));
+        let (response, close) = handle_request(
+            &node.ctx,
+            &node.ctx.group_commit,
+            &mut state,
+            TcpRequest::Hello {
+                token: "wrong".into(),
+            },
+        )
+        .await;
+        assert!(close, "a mismatched hello must close the connection");
+        assert_eq!(
+            response,
+            TcpResponse::HelloAck {
+                ok: false,
+                message: "unauthorized".into(),
+            }
+        );
+
+        // Guessing cannot continue at wire speed: the next attempt is refused
+        // before the token comparison, on a fresh connection from the same IP.
+        let mut state = ConnectionState::with_peer(&node.ctx, peer, Arc::clone(&limiter));
+        let (response, close) = handle_request(
+            &node.ctx,
+            &node.ctx.group_commit,
+            &mut state,
+            TcpRequest::Hello {
+                token: "wrong".into(),
+            },
+        )
+        .await;
+        assert!(!close, "a rate-limited hello keeps the connection open");
+        assert_eq!(
+            error_code(&response),
+            Some(TcpErrorCode::RateLimited.as_u16())
+        );
+        assert!(!state.authorized);
+
+        // Even the right token is not compared while the budget is spent.
+        let mut state = ConnectionState::with_peer(&node.ctx, peer, Arc::clone(&limiter));
+        let (response, close) = handle_request(
+            &node.ctx,
+            &node.ctx.group_commit,
+            &mut state,
+            TcpRequest::Hello {
+                token: "s3cret".into(),
+            },
+        )
+        .await;
+        assert!(!close);
+        assert_eq!(
+            error_code(&response),
+            Some(TcpErrorCode::RateLimited.as_u16())
+        );
+        assert!(!state.authorized);
+    }
+
+    #[tokio::test]
+    async fn ping_stays_available_after_the_budget_is_spent() {
+        let node = test_node(Some("s3cret"));
+        let limiter = Arc::new(RateLimiter::new(1));
+        let peer = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let mut state = ConnectionState::with_peer(&node.ctx, peer, Arc::clone(&limiter));
+
+        // Spend the budget on a handshake attempt.
+        let (response, _) = handle_request(
+            &node.ctx,
+            &node.ctx.group_commit,
+            &mut state,
+            TcpRequest::Hello {
+                token: "wrong".into(),
+            },
+        )
+        .await;
+        assert_eq!(error_code(&response), None);
+
+        // `Ping` is deliberately unrated: a client must always be able to
+        // measure clock offset, even from a throttled address.
+        let (response, close) = handle_request(
+            &node.ctx,
+            &node.ctx.group_commit,
+            &mut state,
+            TcpRequest::Ping { client_ns: 5 },
+        )
+        .await;
+        assert!(!close);
+        match response {
+            TcpResponse::Pong {
+                client_ns,
+                server_ns,
+            } => {
+                assert_eq!(client_ns, 5);
+                assert!(server_ns > 0);
+            }
+            other => panic!("expected Pong, got {other:?}"),
+        }
+    }
+
+    /// One valid order through the real router, from `peer`, so the shared
+    /// limiter sees the same source address as the TCP frames below.
+    async fn post_order(
+        ctx: Arc<NodeContext>,
+        peer: SocketAddr,
+        client_order_id: &str,
+    ) -> StatusCode {
+        let app = crate::gateway::router(ctx);
+        let body = format!(
+            r#"{{"symbol":"BTC-USD","side":"buy","price_cents":6500000,"qty":1,"client_order_id":"{client_order_id}","participant":"alice"}}"#
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/orders")
+            .header(header::CONTENT_TYPE, "application/json")
+            .extension(ConnectInfo(peer))
+            .body(Body::from(body))
+            .expect("valid request");
+        app.oneshot(request)
+            .await
+            .expect("router responds")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn http_and_tcp_share_one_rate_limit_budget() {
+        let node = test_node_with_rate_limit(None, 1);
+        let peer: SocketAddr = "203.0.113.7:4000".parse().expect("peer address");
+        assert_eq!(
+            post_order(Arc::clone(&node.ctx), peer, "shared-http").await,
+            StatusCode::OK
+        );
+
+        // Same context, so the same limiter instance and the same source IP:
+        // the HTTP request already spent the one token.
+        let mut state =
+            ConnectionState::with_peer(&node.ctx, peer.ip(), Arc::clone(&node.ctx.rate_limiter));
+        let (response, close) = handle_request(
+            &node.ctx,
+            &node.ctx.group_commit,
+            &mut state,
+            TcpRequest::Submit {
+                commands: vec![command("BTC-USD", 1)],
+            },
+        )
+        .await;
+        assert!(!close);
+        assert_eq!(
+            error_code(&response),
+            Some(TcpErrorCode::RateLimited.as_u16()),
+            "the HTTP request already spent the shared budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_submit_spends_the_budget_for_http() {
+        let node = test_node_with_rate_limit(None, 1);
+        let peer: SocketAddr = "203.0.113.8:4000".parse().expect("peer address");
+        let mut state =
+            ConnectionState::with_peer(&node.ctx, peer.ip(), Arc::clone(&node.ctx.rate_limiter));
+        let (response, _) = handle_request(
+            &node.ctx,
+            &node.ctx.group_commit,
+            &mut state,
+            TcpRequest::Submit {
+                commands: vec![command("BTC-USD", 1)],
+            },
+        )
+        .await;
+        assert_eq!(
+            error_code(&response),
+            None,
+            "the first submit fits the budget"
+        );
+
+        assert_eq!(
+            post_order(Arc::clone(&node.ctx), peer, "shared-tcp").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the TCP submit already spent the shared budget"
+        );
     }
 
     #[tokio::test]

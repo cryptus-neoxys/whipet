@@ -75,9 +75,12 @@ impl TestNode {
         );
         let metrics = hub.metrics();
         let (shutdown, _) = watch::channel(false);
+        let rate_limiter = Arc::new(whippet::ratelimit::RateLimiter::new(0));
+        let ws_connections = Arc::new(tokio::sync::Semaphore::new(512));
         let ctx = Arc::new(NodeContext {
             config,
-            journal,
+            journal: Arc::clone(&journal),
+            engine_journal: journal,
             group_commit,
             hub,
             metrics,
@@ -85,6 +88,8 @@ impl TestNode {
             started: Instant::now(),
             shutdown,
             shards_ok: Arc::new(AtomicBool::new(true)),
+            rate_limiter,
+            ws_connections,
         });
         Self { ctx, tempdir }
     }

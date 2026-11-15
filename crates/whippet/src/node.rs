@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use axum::serve::ListenerExt;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::time::sleep;
 use tracing::{info, warn};
 use whippet_journal::group::{GroupCommit, GroupCommitConfig};
@@ -17,25 +17,18 @@ use crate::config::{JournalKind, NodeArgs, NodeConfig};
 use crate::context::NodeContext;
 use crate::engine_runner::{run_engine_shard, run_md_shard};
 use crate::gateway;
+use crate::ratelimit::RateLimiter;
 use crate::snapshot::SnapshotStore;
 use crate::tcp;
 
 pub async fn run(args: NodeArgs) -> Result<()> {
     let config = NodeConfig::from_args(args)?;
-    let journal = match config.journal {
-        JournalKind::Iggy => {
-            info!(
-                address = %config.iggy_addr,
-                "connecting to Apache Iggy"
-            );
-            Arc::new(connect_iggy(&config).await?)
-        }
-        JournalKind::Memory => {
-            warn!(
-                "using the in-memory journal; this is a developer escape hatch, not the demo path"
-            );
-            Arc::new(Journal::memory())
-        }
+    let journal = open_journal(&config).await?;
+    // The engine gets its own connection. Ingress and matching then cannot
+    // block each other on one Iggy client's response loop.
+    let engine_journal = match config.journal {
+        JournalKind::Iggy => open_journal(&config).await?,
+        JournalKind::Memory => Arc::clone(&journal),
     };
     journal
         .ensure_topics(&config.exchange)
@@ -61,9 +54,19 @@ pub async fn run(args: NodeArgs) -> Result<()> {
             linger: Duration::ZERO,
         },
     );
+    let rate_limiter = Arc::new(RateLimiter::new(config.rate_limit_per_sec));
+    // The fanout sweep goes to 1,000 subscribers; the cap is a guard, not a
+    // product limit. Override it for a larger fanout run.
+    let ws_cap = std::env::var("WHIPPET_MAX_WS_CONNECTIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_WS_CONNECTIONS);
+    let ws_connections = Arc::new(Semaphore::new(ws_cap));
     let ctx = Arc::new(NodeContext {
         config: config.clone(),
         journal: Arc::clone(&journal),
+        engine_journal,
         group_commit,
         hub: Arc::clone(&hub),
         metrics: Arc::clone(&metrics),
@@ -71,6 +74,8 @@ pub async fn run(args: NodeArgs) -> Result<()> {
         started: Instant::now(),
         shutdown,
         shards_ok: Arc::new(AtomicBool::new(true)),
+        rate_limiter,
+        ws_connections,
     });
 
     hub.spawn_publisher();
@@ -165,6 +170,28 @@ pub async fn run(args: NodeArgs) -> Result<()> {
     Ok(())
 }
 
+/// Caps concurrent WebSocket subscribers. Each holds a task and an egress
+/// stream; this is a memory/bandwidth guard, not a user limit.
+const DEFAULT_WS_CONNECTIONS: usize = 2_048;
+
+async fn open_journal(config: &NodeConfig) -> Result<Arc<Journal>> {
+    Ok(match config.journal {
+        JournalKind::Iggy => {
+            info!(
+                address = %config.iggy_addr,
+                "connecting to Apache Iggy"
+            );
+            Arc::new(connect_iggy(config).await?)
+        }
+        JournalKind::Memory => {
+            warn!(
+                "using the in-memory journal; this is a developer escape hatch, not the demo path"
+            );
+            Arc::new(Journal::memory())
+        }
+    })
+}
+
 async fn connect_iggy(config: &NodeConfig) -> Result<Journal> {
     let mut delay = Duration::from_millis(250);
     for attempt in 1..=120 {
@@ -196,21 +223,33 @@ async fn connect_iggy(config: &NodeConfig) -> Result<Journal> {
 fn spawn_health_monitor(ctx: Arc<NodeContext>) {
     tokio::spawn(async move {
         let mut shutdown = ctx.shutdown.subscribe();
-        let connected = ctx.journal.is_iggy() && ctx.journal.ping().await;
+        // Both connections matter: an ingress link that is up while the engine
+        // link is down still means orders are accepted and never matched.
+        let connected = if ctx.journal.is_iggy() {
+            ctx.journal.ping().await && ctx.engine_journal.ping().await
+        } else {
+            true
+        };
         ctx.metrics.set_iggy_connected(connected);
         refresh_lag(&ctx).await;
         loop {
             tokio::select! {
-                _ = shutdown.changed() => return,
-                _ = sleep(Duration::from_secs(5)) => {
-                    let connected = ctx.journal.is_iggy() && ctx.journal.ping().await;
-                    ctx.metrics.set_iggy_connected(connected);
-                    refresh_lag(&ctx).await;
-                    if !connected {
-                        warn!("Iggy health check failed");
+                    _ = shutdown.changed() => return,
+                    _ = sleep(Duration::from_secs(5)) => {
+                        // Both connections matter: an ingress link that is up while the engine
+            // link is down still means orders are accepted and never matched.
+            let connected = if ctx.journal.is_iggy() {
+                ctx.journal.ping().await && ctx.engine_journal.ping().await
+            } else {
+                true
+            };
+                        ctx.metrics.set_iggy_connected(connected);
+                        refresh_lag(&ctx).await;
+                        if !connected {
+                            warn!("Iggy health check failed");
+                        }
                     }
                 }
-            }
         }
     });
 }
@@ -250,13 +289,13 @@ async fn refresh_lag(ctx: &NodeContext) {
         futures_util::future::join_all(ctx.active_shards().iter().map(|&shard| async move {
             let consumer = format!("whippet-engine-p{shard}");
             let Ok(Some(committed)) = ctx
-                .journal
+                .engine_journal
                 .committed(whippet_journal::Topic::Orders, shard, &consumer)
                 .await
             else {
                 return 0u64;
             };
-            ctx.journal
+            ctx.engine_journal
                 .lag(whippet_journal::Topic::Orders, shard, committed)
                 .await
                 .unwrap_or(0)

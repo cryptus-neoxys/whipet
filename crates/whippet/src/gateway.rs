@@ -1,9 +1,9 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use axum::Json;
 use axum::Router;
@@ -34,6 +34,7 @@ use whippet_journal::{JournalMessage, Topic};
 use whippet_marketdata::{LatencySummary, Metrics, Stage};
 
 use crate::context::NodeContext;
+use crate::ratelimit::RateLimiter;
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
 
@@ -47,16 +48,18 @@ fn split_elapsed(cursor: &mut Instant) -> u64 {
     micros
 }
 
-/// Upper bound on tracked source addresses. The limiter fails closed (429)
-/// when the table is full of live entries, so a spoofed-IP flood cannot grow
-/// memory without bound.
-const MAX_TRACKED_IPS: usize = 10_000;
-
-/// Buckets idle longer than this are dropped when the table is full.
-const BUCKET_IDLE: Duration = Duration::from_secs(60);
+/// Per-request tracing is off by default: at several thousand requests per
+/// second the span overhead buys little over the metrics and the node's own
+/// structured logs. Set `WHIPPET_HTTP_TRACE=1` when debugging the gateway.
+fn http_trace_enabled() -> bool {
+    std::env::var("WHIPPET_HTTP_TRACE")
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
 
 pub fn router(ctx: Arc<NodeContext>) -> Router {
-    let limiter = Arc::new(RateLimiter::new(ctx.config.rate_limit_per_sec));
+    // One limiter shared by HTTP and TCP, so switching transport does not buy
+    // a second budget.
+    let limiter = Arc::clone(&ctx.rate_limiter);
     let frames = Arc::new(FrameCache::new(Arc::clone(&ctx.metrics)));
     let participants = Arc::new(ParticipantCache::default());
     let ingress = Router::new()
@@ -93,70 +96,6 @@ pub fn router(ctx: Arc<NodeContext>) -> Router {
         api
     };
     api.with_state(ctx)
-}
-
-/// Per-request tracing is off by default: at several thousand requests per
-/// second the span overhead buys little over the metrics and the node's own
-/// structured logs. Set `WHIPPET_HTTP_TRACE=1` when debugging the gateway.
-fn http_trace_enabled() -> bool {
-    std::env::var("WHIPPET_HTTP_TRACE")
-        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-}
-
-/// A per-IP token bucket. One second of burst, refilled continuously. This is
-/// deliberately small: it is an ingress guard, not a quota system.
-pub(crate) struct RateLimiter {
-    per_sec: u32,
-    buckets: Mutex<HashMap<IpAddr, Bucket>>,
-}
-
-struct Bucket {
-    tokens: f64,
-    last_seen: Instant,
-}
-
-impl RateLimiter {
-    pub(crate) fn new(per_sec: u32) -> Self {
-        Self {
-            per_sec,
-            buckets: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// `true` when the request may proceed.
-    pub(crate) fn check(&self, ip: IpAddr) -> bool {
-        if self.per_sec == 0 {
-            return true;
-        }
-        let now = Instant::now();
-        let mut buckets = self
-            .buckets
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !buckets.contains_key(&ip) && buckets.len() >= MAX_TRACKED_IPS {
-            buckets
-                .retain(|_, bucket| now.saturating_duration_since(bucket.last_seen) < BUCKET_IDLE);
-            if buckets.len() >= MAX_TRACKED_IPS {
-                return false;
-            }
-        }
-        let rate = f64::from(self.per_sec);
-        let bucket = buckets.entry(ip).or_insert_with(|| Bucket {
-            tokens: rate,
-            last_seen: now,
-        });
-        let elapsed = now
-            .saturating_duration_since(bucket.last_seen)
-            .as_secs_f64();
-        bucket.tokens = (bucket.tokens + elapsed * rate).min(rate);
-        bucket.last_seen = now;
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
-    }
 }
 
 async fn rate_limit(
@@ -240,6 +179,16 @@ impl ParticipantCache {
 /// `serde_json::from_slice` so `&str` fields borrow from this buffer.
 const JSON_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
+fn payload_too_large() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(ApiError::new(
+            "payload_too_large",
+            format!("request body must be at most {JSON_BODY_LIMIT} bytes"),
+        )),
+    )
+}
+
 async fn read_json_body(
     headers: &HeaderMap,
     body: Body,
@@ -258,9 +207,31 @@ async fn read_json_body(
             )),
         ));
     }
-    axum::body::to_bytes(body, JSON_BODY_LIMIT)
-        .await
-        .map_err(|_| bad_request("invalid_body", "failed to buffer the request body"))
+    // A declared length over the cap is refused before reading the body. A
+    // chunked body declares nothing, so the loop below enforces the cap.
+    if headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|declared| declared > JSON_BODY_LIMIT)
+    {
+        return Err(payload_too_large());
+    }
+    // Buffer explicitly instead of calling `axum::body::to_bytes`: it reports a
+    // limit breach as an opaque body error, so the size case would be
+    // indistinguishable from a transport failure (400) without string
+    // matching. Reading the stream keeps the 413 explicit.
+    let mut stream = body.into_data_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|_| bad_request("invalid_body", "failed to buffer the request body"))?;
+        if bytes.len() + chunk.len() > JSON_BODY_LIMIT {
+            return Err(payload_too_large());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(axum::body::Bytes::from(bytes))
 }
 
 fn invalid_json(error: serde_json::Error) -> (StatusCode, Json<ApiError>) {
@@ -364,6 +335,7 @@ async fn submit_order(
 async fn submit_orders(
     State(ctx): State<Arc<NodeContext>>,
     Extension(participants): Extension<Arc<ParticipantCache>>,
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     Query(query): Query<BatchQuery>,
     body: Body,
@@ -404,6 +376,20 @@ async fn submit_orders(
     ctx.metrics
         .record_stage_us(Stage::GatewayParse, split_elapsed(&mut stage_at));
     let (partition, validated) = validated?;
+    // The middleware charged one token for the request; charge the rest of the
+    // batch so a 256-order request cannot bypass the per-second budget.
+    if let Some(Extension(ConnectInfo(address))) = connect {
+        let extra = validated.len().saturating_sub(1) as u32;
+        if extra > 0 && !ctx.rate_limiter.charge(address.ip(), extra) {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ApiError::new(
+                    "rate_limited",
+                    "ingress rate limit exceeded; retry shortly",
+                )),
+            ));
+        }
+    }
 
     // Pass 2: encode one command and header set per order.
     let timestamp_ns = now_ns();
@@ -669,10 +655,15 @@ async fn cancel_order(
     State(ctx): State<Arc<NodeContext>>,
     Extension(participants): Extension<Arc<ParticipantCache>>,
     headers: HeaderMap,
-    Json(request): Json<CancelRequest>,
+    body: Body,
 ) -> ApiResult<CancelAck> {
     ensure_shards_ready(&ctx)?;
     let caller = authenticate(&ctx, &headers)?;
+    // Use the same body contract as the order paths instead of axum's `Json`
+    // extractor, whose syntax-error rejection is a bare 400. A malformed cancel
+    // body must be the same 422 `invalid_json` an order body gets.
+    let bytes = read_json_body(&headers, body).await?;
+    let request: CancelRequest = serde_json::from_slice(&bytes).map_err(invalid_json)?;
     ctx.exchange().instrument(request.symbol).ok_or_else(|| {
         bad_request(
             "unknown_symbol",
@@ -859,7 +850,9 @@ struct ReadinessView {
 /// Machine readiness: 200 only when the journal answers and every shard is
 /// alive. `/api/health` stays the human-readable JSON view.
 async fn readyz(State(ctx): State<Arc<NodeContext>>) -> impl IntoResponse {
-    let journal = ctx.journal.ping().await;
+    let ingress = ctx.journal.ping().await;
+    let engine = ctx.engine_journal.ping().await;
+    let journal = ingress && engine;
     let shards_ok = ctx.shards_ok();
     let ready = journal && shards_ok;
     let status = if ready {
@@ -1217,11 +1210,26 @@ async fn ws_upgrade(
     State(ctx): State<Arc<NodeContext>>,
     Extension(cache): Extension<Arc<FrameCache>>,
     Query(query): Query<WsQuery>,
-) -> impl IntoResponse {
+) -> Response {
+    // Mirror the TCP connection cap: each subscriber holds a task and an
+    // egress stream, so an unbounded upgrade path is a memory/bandwidth DoS.
+    let permit = match Arc::clone(&ctx.ws_connections).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "websocket connection cap reached",
+            )
+                .into_response();
+        }
+    };
     let trade_limit = query.trades.unwrap_or(0);
     ws.max_message_size(64 * 1024)
         .max_frame_size(64 * 1024)
-        .on_upgrade(move |socket| ws_loop(socket, ctx, cache, trade_limit))
+        .on_upgrade(move |socket| async move {
+            let _permit = permit;
+            ws_loop(socket, ctx, cache, trade_limit).await;
+        })
 }
 
 async fn ws_loop(
