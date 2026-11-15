@@ -119,6 +119,11 @@ proptest! {
                 ),
             };
             engine.process(&command, offset as u64, &mut out);
+            engine
+                .check_output_invariants(&command, offset as u64, &out)
+                .unwrap_or_else(|error| {
+                    panic!("output invariants after command {offset}: {error}")
+                });
             check_invariants(&engine);
             out.clear();
         }
@@ -165,7 +170,18 @@ proptest! {
         let mut out = EngineOutput::with_capacity(16, 16);
         for (offset, command) in commands.iter().enumerate() {
             first.process(command, offset as u64, &mut out);
+            first
+                .check_output_invariants(command, offset as u64, &out)
+                .unwrap_or_else(|error| {
+                    panic!("output invariants after command {offset}: {error}")
+                });
+            out.clear();
             second.process(command, offset as u64, &mut out);
+            second
+                .check_output_invariants(command, offset as u64, &out)
+                .unwrap_or_else(|error| {
+                    panic!("output invariants after command {offset}: {error}")
+                });
             out.clear();
         }
         prop_assert_eq!(first.state_hash(), second.state_hash());
@@ -213,6 +229,11 @@ proptest! {
                 ),
             };
             engine.process(&command, offset as u64, &mut out);
+            engine
+                .check_output_invariants(&command, offset as u64, &out)
+                .unwrap_or_else(|error| {
+                    panic!("output invariants after command {offset}: {error}")
+                });
             out.clear();
         }
         let snapshot = engine.snapshot_state_without_hash();

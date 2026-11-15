@@ -35,7 +35,7 @@ pub enum EngineError {
 /// bound; the engine also enforces it because the journal is a trust boundary.
 pub const MAX_ORDER_QTY: u64 = 1_000_000_000;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct EngineOutput {
     pub executions: Vec<ExecutionReport>,
     pub md: Vec<MdEvent>,
@@ -62,6 +62,824 @@ impl EngineOutput {
         self.md.clear();
         self.snapshots.clear();
         self.state_snapshot_due = false;
+    }
+}
+
+/// Per-order scratch state used by [`EngineOutput::check_invariants`].
+#[derive(Default)]
+struct OutputOrderState {
+    accepted_qty: Option<Qty>,
+    /// The admission role carried by the `Accepted` report: exactly one of
+    /// [`FLAG_TAKER`] or [`FLAG_RESTED`].
+    accepted_role: Option<u16>,
+    accepted_side: Option<Side>,
+    filled_qty: u64,
+    last_fill: Option<ExecKind>,
+    add_qty: Option<Qty>,
+    cancel_qty: Option<Qty>,
+    terminal: Option<ExecKind>,
+}
+
+/// Per-order scratch state for the market-data walk.
+#[derive(Default)]
+struct MdOrderState {
+    last_qty: Option<Qty>,
+    added: bool,
+    reduced: bool,
+    removed: bool,
+}
+
+/// Key that pairs a fill report with the `Trade` event it must emit.
+///
+/// The engine emits one `Trade` per fill, named by the taker's order id and
+/// side. Including both in the key makes the pairing exact instead of merely
+/// numeric: a trade whose id or side drifted cannot hide behind an equal
+/// price/quantity.
+type FillTradeKey = (u64, Price, Qty, Side, OrderId);
+
+/// Check that `seq` values are nonzero and strictly increasing.
+fn check_monotonic_seq<I>(what: &str, seqs: I) -> Result<(), String>
+where
+    I: Iterator<Item = Seq>,
+{
+    let mut previous: Option<Seq> = None;
+    for (index, seq) in seqs.enumerate() {
+        if seq.0 == 0 {
+            return Err(format!(
+                "{what} seq 0 at index {index}: sequence numbers start at 1"
+            ));
+        }
+        if let Some(previous) = previous
+            && seq.0 <= previous.0
+        {
+            return Err(format!(
+                "{what} seq {seq} at index {index} does not strictly increase past {previous}"
+            ));
+        }
+        previous = Some(seq);
+    }
+    Ok(())
+}
+
+impl EngineOutput {
+    /// Check the cross-checks between one command's execution reports, its
+    /// market-data events, and the book mutation they encode.
+    ///
+    /// This is a diagnostic for tests and replay verification: it allocates,
+    /// walks the whole output once, and is **never** called from `process`.
+    /// Its cost is O(`executions` + `md` + `snapshots`). The companion
+    /// [`SymbolEngine::check_output_invariants`] adds the provenance checks that
+    /// need the command and the engine clock.
+    ///
+    /// An output is the complete result of one `process` call. The invariants
+    /// are:
+    ///
+    /// - `executions` and `md` each carry their own sequence space; within each
+    ///   vector `seq` is nonzero and strictly increasing.
+    /// - Every execution report, market-data event, and snapshot names the same
+    ///   `cause_offset` (one output is one command). Every execution report
+    ///   carries the same `timestamp_ns`. Every market-data event and snapshot
+    ///   carries the same timestamp.
+    /// - An order id has at most one `Accepted`, it precedes every fill and
+    ///   cancel for that id, and a terminal kind (`Filled`, `Cancelled`,
+    ///   `Rejected`) is the last report for that id in the output.
+    /// - A fill (`PartiallyFilled`, `Filled`) has `qty > 0`, `price > 0`, its
+    ///   `side` is the taker's side, it carries [`FLAG_TAKER`], and it names a
+    ///   nonzero `maker_order_id`. Its `remaining` is positive exactly for
+    ///   `PartiallyFilled`, zero for `Filled`, and `remaining + qty` never
+    ///   exceeds the `Accepted` quantity. Fills belong to an order accepted in
+    ///   this same output: the maker leg is represented by `maker_order_id`,
+    ///   never by a second fill report (see the exception notes below).
+    /// - Every fill has exactly one `MdKind::Trade` with the same cause offset,
+    ///   price, quantity, side, and taker order id, the counts are equal, and
+    ///   no `Trade` exists without a fill.
+    /// - Every fill has exactly one `MdKind::Remove` or `MdKind::Reduce` for
+    ///   its `maker_order_id`.
+    /// - `MdKind::Add` has `qty > 0`, a nonzero order id, and follows an
+    ///   `Accepted` for that id. It is not preceded by a `Remove`/`Reduce` for
+    ///   that id, and an id is added at most once.
+    /// - `MdKind::Reduce` carries the order's new remaining quantity (`qty >
+    ///   0`), never grows, and never follows a `Remove` for that id.
+    ///   `MdKind::Remove` carries `qty == 0` and a nonzero order id, and an id
+    ///   is removed at most once. A `Remove`/`Reduce` for an order accepted in
+    ///   an earlier command has no preceding `Add` in this output; its trigger
+    ///   (a fill naming it as maker, or a `Cancelled` report) and its
+    ///   side/price are still checked. A self-trade-prevention maker cancel and
+    ///   a client-cancel `Cancelled` report each have exactly one `Remove` event
+    ///   for their order id.
+    /// - `MdKind::Status` carries no order id, price, or quantity.
+    /// - A `Rejected` report is the only execution report in its output and the
+    ///   output has no market-data deltas (`md`): creation-time rejections happen
+    ///   before any book mutation. A cadence snapshot on `snapshots` may still be
+    ///   attached to the same command.
+    /// - At most one role flag (`FLAG_TAKER`, `FLAG_RESTED`, `FLAG_MAKER`) is
+    ///   set on an execution report. `Accepted` carries exactly one of
+    ///   `FLAG_TAKER`/`FLAG_RESTED`; market/IOC/FOK carry `FLAG_TAKER` and
+    ///   post-only carries `FLAG_RESTED`. A fill carries `FLAG_TAKER`. A
+    ///   self-trade-prevention maker cancel carries `FLAG_MAKER` and reason
+    ///   `SelfTradePrevention`. A successful client cancel carries no role flag.
+    /// - The accepted quantity is conserved: fills + the resting `Add` (or the
+    ///   terminal `Cancelled` remainder) equal the accepted quantity.
+    ///
+    /// Legitimate exceptions, documented rather than papered over:
+    ///
+    /// - **The maker fill is not a separate report.** The engine reports one
+    ///   fill per trade, stamped with the taker's id and side, and names the
+    ///   resting order in `maker_order_id`. The maker's book-side mutation is
+    ///   the paired `Remove`/`Reduce` event. A checker therefore requires every
+    ///   fill's `order_id` to have an `Accepted` in this output, while the maker
+    ///   id has no fill report of its own.
+    /// - **`FLAG_RESTED` is an admission-time role, not a promise to rest.** A
+    ///   limit order that crosses is accepted as `FLAG_TAKER` even if self-trade
+    ///   prevention clears the opposite side and the order later rests, and a
+    ///   partially filled order keeps `FLAG_TAKER` on its resting remainder.
+    ///   The checks therefore require "fills imply the taker role", not the
+    ///   converse.
+    /// - **A maker `Remove` carries quantity 0.** The quantity removed was
+    ///   already carried by the preceding `Trade` (and, for a partial maker
+    ///   fill, the `Reduce` carries the new remaining quantity). Consumers must
+    ///   not expect a quantity on `Remove`.
+    /// - **The two timestamp sources differ by design.** Execution reports carry
+    ///   the command's own `timestamp_ns`; market data carries the venue clock
+    ///   (`SymbolEngine::last_ts_ns`, a running maximum). On a non-monotone
+    ///   input log the market-data timestamp can legitimately exceed the
+    ///   command's. [`SymbolEngine::check_output_invariants`] checks each
+    ///   against its own source.
+    /// - **A `Cancelled` from a client cancel has no role flag.** It describes
+    ///   neither a taker nor a maker; the removed order's side and price are
+    ///   still reported so it agrees with the `Remove` event.
+    pub fn check_invariants(&self) -> Result<(), String> {
+        check_monotonic_seq("execution", self.executions.iter().map(|exec| exec.seq))?;
+        check_monotonic_seq("market-data", self.md.iter().map(|event| event.seq))?;
+
+        // One output is one command: every event names the same input offset.
+        let expected_offset = self
+            .executions
+            .first()
+            .map(|exec| exec.cause_offset)
+            .or_else(|| self.md.first().map(|event| event.cause_offset))
+            .or_else(|| self.snapshots.first().map(|snapshot| snapshot.cause_offset));
+        if let Some(expected) = expected_offset {
+            for exec in &self.executions {
+                if exec.cause_offset != expected {
+                    return Err(format!(
+                        "execution seq {} ({} {}) has cause_offset {} but the output is for offset {expected}: one output is one command",
+                        exec.seq,
+                        exec.kind.as_str(),
+                        exec.order_id,
+                        exec.cause_offset
+                    ));
+                }
+            }
+            for event in &self.md {
+                if event.cause_offset != expected {
+                    return Err(format!(
+                        "market-data seq {} ({:?}) has cause_offset {} but the output is for offset {expected}",
+                        event.seq, event.kind, event.cause_offset
+                    ));
+                }
+            }
+            for snapshot in &self.snapshots {
+                if snapshot.cause_offset != expected {
+                    return Err(format!(
+                        "snapshot has cause_offset {} but the output is for offset {expected}",
+                        snapshot.cause_offset
+                    ));
+                }
+            }
+        }
+
+        // Execution reports carry the command's timestamp.
+        if let Some(expected) = self.executions.first().map(|exec| exec.timestamp_ns) {
+            for exec in &self.executions {
+                if exec.timestamp_ns != expected {
+                    return Err(format!(
+                        "execution seq {} has timestamp {} but the output's reports carry {expected}: every report carries the command's timestamp",
+                        exec.seq, exec.timestamp_ns
+                    ));
+                }
+            }
+        }
+
+        // Market data and snapshots carry the venue clock.
+        if let Some(expected) = self
+            .md
+            .first()
+            .map(|event| event.timestamp_ns)
+            .or_else(|| self.snapshots.first().map(|snapshot| snapshot.timestamp_ns))
+        {
+            for event in &self.md {
+                if event.timestamp_ns != expected {
+                    return Err(format!(
+                        "market-data seq {} has timestamp {} but the output's events carry {expected}: market data carries the venue clock",
+                        event.seq, event.timestamp_ns
+                    ));
+                }
+            }
+            for snapshot in &self.snapshots {
+                if snapshot.timestamp_ns != expected {
+                    return Err(format!(
+                        "snapshot has timestamp {} but the output's market data carries {expected}",
+                        snapshot.timestamp_ns
+                    ));
+                }
+            }
+        }
+
+        let mut summaries: FxHashMap<OrderId, OutputOrderState> = FxHashMap::default();
+        let mut fill_reports: Vec<&ExecutionReport> = Vec::new();
+        let mut fills_by_maker: FxHashMap<OrderId, &ExecutionReport> = FxHashMap::default();
+        let mut cancels_by_order: FxHashMap<OrderId, &ExecutionReport> = FxHashMap::default();
+
+        for (index, exec) in self.executions.iter().enumerate() {
+            let role = exec.flags & (FLAG_TAKER | FLAG_RESTED | FLAG_MAKER);
+            if role.count_ones() > 1 {
+                return Err(format!(
+                    "execution seq {} ({}) sets more than one role flag (flags {:#06x}); FLAG_TAKER, FLAG_RESTED and FLAG_MAKER are exclusive",
+                    exec.seq,
+                    exec.kind.as_str(),
+                    exec.flags
+                ));
+            }
+
+            let summary = summaries.entry(exec.order_id).or_default();
+            match exec.kind {
+                ExecKind::Accepted => {
+                    if summary.accepted_qty.is_some() {
+                        return Err(format!(
+                            "order {} is Accepted twice in one output; an order id is admitted at most once",
+                            exec.order_id
+                        ));
+                    }
+                    if summary.terminal.is_some() {
+                        return Err(format!(
+                            "order {} has an Accepted report after a terminal report; Accepted must come first",
+                            exec.order_id
+                        ));
+                    }
+                    if exec.flags != FLAG_TAKER && exec.flags != FLAG_RESTED {
+                        return Err(format!(
+                            "Accepted order {} carries flags {:#06x}; an acceptance must carry exactly one of FLAG_TAKER or FLAG_RESTED",
+                            exec.order_id, exec.flags
+                        ));
+                    }
+                    match exec.order_type {
+                        OrderType::Market | OrderType::Ioc | OrderType::Fok => {
+                            if exec.flags != FLAG_TAKER {
+                                return Err(format!(
+                                    "Accepted {} order {} carries flags {:#06x}; a {:?} order is a taker",
+                                    exec.order_type.as_str(),
+                                    exec.order_id,
+                                    exec.flags,
+                                    exec.order_type
+                                ));
+                            }
+                        }
+                        OrderType::PostOnly => {
+                            if exec.flags != FLAG_RESTED {
+                                return Err(format!(
+                                    "Accepted post-only order {} carries flags {:#06x}; a post-only order that was admitted is resting",
+                                    exec.order_id, exec.flags
+                                ));
+                            }
+                        }
+                        OrderType::Limit => {}
+                    }
+                    if exec.qty.is_zero() {
+                        return Err(format!(
+                            "Accepted order {} has zero quantity",
+                            exec.order_id
+                        ));
+                    }
+                    if exec.remaining != exec.qty {
+                        return Err(format!(
+                            "Accepted order {} reports remaining {} but quantity {}; nothing has traded yet",
+                            exec.order_id, exec.remaining, exec.qty
+                        ));
+                    }
+                    if exec.maker_order_id != OrderId(0) {
+                        return Err(format!(
+                            "Accepted order {} names maker {}; an acceptance has no maker leg",
+                            exec.order_id, exec.maker_order_id
+                        ));
+                    }
+                    if exec.reason != RejectReason::None {
+                        return Err(format!(
+                            "Accepted order {} carries reject reason {:?}",
+                            exec.order_id, exec.reason
+                        ));
+                    }
+                    summary.accepted_qty = Some(exec.qty);
+                    summary.accepted_role = Some(exec.flags);
+                    summary.accepted_side = Some(exec.side);
+                }
+                ExecKind::PartiallyFilled | ExecKind::Filled => {
+                    let Some(accepted_qty) = summary.accepted_qty else {
+                        return Err(format!(
+                            "execution {index} ({} {}) is a fill but the output has no Accepted report for that order; a fill is always the taker's and the maker leg is carried by maker_order_id",
+                            exec.kind.as_str(),
+                            exec.order_id
+                        ));
+                    };
+                    if summary.terminal.is_some() {
+                        return Err(format!(
+                            "order {} has a fill after a terminal report; terminal kinds must come last for an id",
+                            exec.order_id
+                        ));
+                    }
+                    if exec.flags != FLAG_TAKER {
+                        return Err(format!(
+                            "fill for order {} carries flags {:#06x}; a fill must carry FLAG_TAKER",
+                            exec.order_id, exec.flags
+                        ));
+                    }
+                    if summary.accepted_role != Some(FLAG_TAKER) {
+                        return Err(format!(
+                            "order {} was accepted with role flags {:#06x} but filled; a resting order cannot take liquidity",
+                            exec.order_id,
+                            summary.accepted_role.unwrap_or(0)
+                        ));
+                    }
+                    if summary.accepted_side != Some(exec.side) {
+                        return Err(format!(
+                            "fill for order {} reports side {} but the order was accepted as {}; a fill is on the taker's side",
+                            exec.order_id,
+                            exec.side,
+                            summary
+                                .accepted_side
+                                .map_or("unknown".to_string(), |side| side.to_string())
+                        ));
+                    }
+                    if exec.qty.is_zero() {
+                        return Err(format!(
+                            "fill for order {} has zero quantity",
+                            exec.order_id
+                        ));
+                    }
+                    if exec.price.0 <= 0 {
+                        return Err(format!(
+                            "fill for order {} has non-positive price {}",
+                            exec.order_id, exec.price
+                        ));
+                    }
+                    match exec.kind {
+                        ExecKind::PartiallyFilled if exec.remaining.is_zero() => {
+                            return Err(format!(
+                                "order {} is PartiallyFilled with zero remaining; a zero remainder is Filled",
+                                exec.order_id
+                            ));
+                        }
+                        ExecKind::Filled if !exec.remaining.is_zero() => {
+                            return Err(format!(
+                                "order {} is Filled with remaining {}; a Filled report must leave nothing",
+                                exec.order_id, exec.remaining
+                            ));
+                        }
+                        _ => {}
+                    }
+                    if exec.maker_order_id == OrderId(0) {
+                        return Err(format!(
+                            "fill for order {} names maker_order_id 0; every fill consumes a nonzero resting order",
+                            exec.order_id
+                        ));
+                    }
+                    if exec.remaining.0.saturating_add(exec.qty.0) > accepted_qty.0 {
+                        return Err(format!(
+                            "fill for order {} reports remaining {} + qty {} above the accepted quantity {}",
+                            exec.order_id, exec.remaining, exec.qty, accepted_qty
+                        ));
+                    }
+                    summary.filled_qty = summary.filled_qty.saturating_add(exec.qty.0);
+                    summary.last_fill = Some(exec.kind);
+                    if exec.kind == ExecKind::Filled {
+                        summary.terminal = Some(ExecKind::Filled);
+                    }
+                    fill_reports.push(exec);
+                    fills_by_maker.insert(exec.maker_order_id, exec);
+                }
+                ExecKind::Cancelled => {
+                    if summary.terminal.is_some() {
+                        return Err(format!(
+                            "order {} has a second terminal report; the first terminal kind must come last",
+                            exec.order_id
+                        ));
+                    }
+                    if !exec.remaining.is_zero() {
+                        return Err(format!(
+                            "Cancelled order {} reports remaining {}; a cancellation leaves nothing",
+                            exec.order_id, exec.remaining
+                        ));
+                    }
+                    if exec.qty.is_zero() {
+                        return Err(format!(
+                            "Cancelled order {} has zero quantity; a cancellation reports the cancelled remainder",
+                            exec.order_id
+                        ));
+                    }
+                    if exec.maker_order_id != OrderId(0) {
+                        return Err(format!(
+                            "Cancelled order {} names maker {}; a cancellation has no maker leg",
+                            exec.order_id, exec.maker_order_id
+                        ));
+                    }
+                    let is_maker = exec.flags & FLAG_MAKER != 0;
+                    if is_maker {
+                        if exec.reason != RejectReason::SelfTradePrevention {
+                            return Err(format!(
+                                "maker cancel for order {} carries reason {:?}; a maker-only cancel is self-trade prevention",
+                                exec.order_id, exec.reason
+                            ));
+                        }
+                        if exec.flags != FLAG_MAKER {
+                            return Err(format!(
+                                "maker cancel for order {} carries flags {:#06x}; a maker-only cancel carries exactly FLAG_MAKER",
+                                exec.order_id, exec.flags
+                            ));
+                        }
+                        if exec.price.0 <= 0 {
+                            return Err(format!(
+                                "maker cancel for order {} has non-positive price {}",
+                                exec.order_id, exec.price
+                            ));
+                        }
+                    } else if exec.reason == RejectReason::SelfTradePrevention {
+                        return Err(format!(
+                            "order {} carries reason SelfTradePrevention without FLAG_MAKER",
+                            exec.order_id
+                        ));
+                    }
+                    if let Some(role) = summary.accepted_role {
+                        let cancelled_role = exec.flags & (FLAG_TAKER | FLAG_RESTED);
+                        if cancelled_role != role {
+                            return Err(format!(
+                                "order {} was accepted with role flags {role:#06x} but cancelled with {cancelled_role:#06x}; the terminal report must agree with its acceptance",
+                                exec.order_id
+                            ));
+                        }
+                    }
+                    summary.terminal = Some(ExecKind::Cancelled);
+                    summary.cancel_qty = Some(exec.qty);
+                    cancels_by_order.insert(exec.order_id, exec);
+                }
+                ExecKind::Rejected => {
+                    if index != 0 || self.executions.len() != 1 || !self.md.is_empty() {
+                        return Err(format!(
+                            "output mixes a Rejected report for order {} with other reports or market data; a rejection is the only result of its command",
+                            exec.order_id
+                        ));
+                    }
+                    if !exec.qty.is_zero() {
+                        return Err(format!(
+                            "Rejected order {} has quantity {}; a rejection carries no quantity",
+                            exec.order_id, exec.qty
+                        ));
+                    }
+                    if !exec.remaining.is_zero() {
+                        return Err(format!(
+                            "Rejected order {} has remaining {}; a rejection leaves nothing",
+                            exec.order_id, exec.remaining
+                        ));
+                    }
+                    if exec.maker_order_id != OrderId(0) {
+                        return Err(format!(
+                            "Rejected order {} names maker {}; a rejection has no maker leg",
+                            exec.order_id, exec.maker_order_id
+                        ));
+                    }
+                    if exec.flags != 0 {
+                        return Err(format!(
+                            "Rejected order {} carries flags {:#06x}; a rejection has no role",
+                            exec.order_id, exec.flags
+                        ));
+                    }
+                    if exec.reason == RejectReason::None {
+                        return Err(format!(
+                            "Rejected order {} carries no reason",
+                            exec.order_id
+                        ));
+                    }
+                    summary.terminal = Some(ExecKind::Rejected);
+                }
+            }
+        }
+
+        let mut md_states: FxHashMap<OrderId, MdOrderState> = FxHashMap::default();
+        let mut trade_events: FxHashMap<FillTradeKey, usize> = FxHashMap::default();
+        let mut removes_by_order: FxHashMap<OrderId, &MdEvent> = FxHashMap::default();
+
+        for (index, event) in self.md.iter().enumerate() {
+            match event.kind {
+                MdKind::Add => {
+                    if event.order_id == OrderId(0) {
+                        return Err(format!("market-data Add at index {index} has order id 0"));
+                    }
+                    if event.qty.is_zero() {
+                        return Err(format!(
+                            "market-data Add for order {} has zero quantity",
+                            event.order_id
+                        ));
+                    }
+                    if event.price.0 <= 0 {
+                        return Err(format!(
+                            "market-data Add for order {} has non-positive price {}",
+                            event.order_id, event.price
+                        ));
+                    }
+                    let state = md_states.entry(event.order_id).or_default();
+                    if state.added {
+                        return Err(format!(
+                            "order {} is added more than once in one output",
+                            event.order_id
+                        ));
+                    }
+                    if state.reduced || state.removed {
+                        return Err(format!(
+                            "market-data Add for order {} follows a Remove/Reduce for the same id",
+                            event.order_id
+                        ));
+                    }
+                    state.added = true;
+                    state.last_qty = Some(event.qty);
+                    match summaries.get_mut(&event.order_id) {
+                        Some(summary) if summary.accepted_qty.is_some() => {
+                            if summary.terminal.is_some() {
+                                return Err(format!(
+                                    "market-data Add for order {} follows its terminal report",
+                                    event.order_id
+                                ));
+                            }
+                            if summary.add_qty.is_some() {
+                                return Err(format!(
+                                    "order {} has two Add events in one output",
+                                    event.order_id
+                                ));
+                            }
+                            summary.add_qty = Some(event.qty);
+                        }
+                        _ => {
+                            return Err(format!(
+                                "market-data Add for order {} has no Accepted report in this output",
+                                event.order_id
+                            ));
+                        }
+                    }
+                }
+                MdKind::Reduce => {
+                    if event.order_id == OrderId(0) {
+                        return Err(format!(
+                            "market-data Reduce at index {index} has order id 0"
+                        ));
+                    }
+                    if event.qty.is_zero() {
+                        return Err(format!(
+                            "market-data Reduce for order {} has zero remaining quantity; a zero remainder is a Remove",
+                            event.order_id
+                        ));
+                    }
+                    if event.price.0 <= 0 {
+                        return Err(format!(
+                            "market-data Reduce for order {} has non-positive price {}",
+                            event.order_id, event.price
+                        ));
+                    }
+                    let state = md_states.entry(event.order_id).or_default();
+                    if state.removed {
+                        return Err(format!(
+                            "market-data Reduce for order {} follows a Remove for the same id",
+                            event.order_id
+                        ));
+                    }
+                    if let Some(previous) = state.last_qty
+                        && event.qty.0 > previous.0
+                    {
+                        return Err(format!(
+                            "market-data Reduce for order {} grows the remaining quantity from {previous} to {}",
+                            event.order_id, event.qty
+                        ));
+                    }
+                    state.reduced = true;
+                    state.last_qty = Some(event.qty);
+                }
+                MdKind::Remove => {
+                    if event.order_id == OrderId(0) {
+                        return Err(format!(
+                            "market-data Remove at index {index} has order id 0"
+                        ));
+                    }
+                    if !event.qty.is_zero() {
+                        return Err(format!(
+                            "market-data Remove for order {} carries quantity {}; Remove carries no quantity",
+                            event.order_id, event.qty
+                        ));
+                    }
+                    let state = md_states.entry(event.order_id).or_default();
+                    if state.removed {
+                        return Err(format!(
+                            "order {} is removed more than once in one output",
+                            event.order_id
+                        ));
+                    }
+                    state.removed = true;
+                    state.last_qty = Some(Qty::ZERO);
+                    removes_by_order.insert(event.order_id, event);
+                }
+                MdKind::Trade => {
+                    if event.order_id == OrderId(0) {
+                        return Err(format!("market-data Trade at index {index} has order id 0"));
+                    }
+                    if event.qty.is_zero() {
+                        return Err(format!(
+                            "market-data Trade for order {} has zero quantity",
+                            event.order_id
+                        ));
+                    }
+                    if event.price.0 <= 0 {
+                        return Err(format!(
+                            "market-data Trade for order {} has non-positive price {}",
+                            event.order_id, event.price
+                        ));
+                    }
+                    *trade_events
+                        .entry((
+                            event.cause_offset,
+                            event.price,
+                            event.qty,
+                            event.side,
+                            event.order_id,
+                        ))
+                        .or_default() += 1;
+                }
+                MdKind::Status => {
+                    if event.order_id != OrderId(0) || !event.qty.is_zero() || event.price.0 != 0 {
+                        return Err(format!(
+                            "market-data Status seq {} carries order {} price {} qty {}; a status event carries none of them",
+                            event.seq, event.order_id, event.price, event.qty
+                        ));
+                    }
+                }
+                // The engine never emits these on `EngineOutput::md`; snapshots
+                // travel separately and BBO is a derived book view.
+                MdKind::Bbo | MdKind::Snapshot => {}
+            }
+        }
+
+        // Every fill has exactly one Trade with the same identity, and every
+        // Trade has a fill.
+        let mut fill_trades: FxHashMap<FillTradeKey, usize> = FxHashMap::default();
+        for fill in &fill_reports {
+            *fill_trades
+                .entry((
+                    fill.cause_offset,
+                    fill.price,
+                    fill.qty,
+                    fill.side,
+                    fill.order_id,
+                ))
+                .or_default() += 1;
+        }
+        for (key, fills) in &fill_trades {
+            let events = trade_events.get(key).copied().unwrap_or(0);
+            if events != *fills {
+                return Err(format!(
+                    "{fills} fill report(s) for order {} side {} price {} qty {} at offset {} have {events} matching Trade event(s)",
+                    key.4, key.3, key.1, key.2, key.0
+                ));
+            }
+        }
+        for (key, events) in &trade_events {
+            if !fill_trades.contains_key(key) {
+                return Err(format!(
+                    "{events} Trade event(s) for order {} side {} price {} qty {} at offset {} have no matching fill report",
+                    key.4, key.3, key.1, key.2, key.0
+                ));
+            }
+        }
+
+        // Every fill has exactly one maker-side Remove/Reduce.
+        let mut maker_md_counts: FxHashMap<OrderId, usize> = FxHashMap::default();
+        for event in &self.md {
+            if matches!(event.kind, MdKind::Reduce | MdKind::Remove) {
+                *maker_md_counts.entry(event.order_id).or_default() += 1;
+            }
+        }
+        for fill in &fill_reports {
+            let count = maker_md_counts
+                .get(&fill.maker_order_id)
+                .copied()
+                .unwrap_or(0);
+            if count != 1 {
+                return Err(format!(
+                    "fill for order {} names maker {} but the output has {count} Remove/Reduce events for it; every fill emits exactly one maker-side event",
+                    fill.order_id, fill.maker_order_id
+                ));
+            }
+        }
+
+        // A self-trade-prevention cancel removes a resting order outright, and a
+        // client cancel of an order accepted in an earlier command does too, so
+        // both must carry exactly one Remove event. A taker remainder cancel has
+        // its Accepted in this output and never rested, so it emits no Remove.
+        for exec in &self.executions {
+            if exec.reason == RejectReason::SelfTradePrevention
+                && !removes_by_order.contains_key(&exec.order_id)
+            {
+                return Err(format!(
+                    "self-trade-prevention cancel for order {} has no Remove market-data event",
+                    exec.order_id
+                ));
+            }
+            if exec.kind == ExecKind::Cancelled
+                && exec.flags & FLAG_MAKER == 0
+                && summaries
+                    .get(&exec.order_id)
+                    .is_none_or(|state| state.accepted_qty.is_none())
+                && !removes_by_order.contains_key(&exec.order_id)
+            {
+                return Err(format!(
+                    "Cancelled order {} has no Remove market-data event in this output",
+                    exec.order_id
+                ));
+            }
+        }
+
+        // Every Remove/Reduce is triggered by a fill naming it, or by a
+        // Cancelled report for it, and agrees with that trigger on side/price.
+        for event in &self.md {
+            if !matches!(event.kind, MdKind::Reduce | MdKind::Remove) {
+                continue;
+            }
+            let trigger = fills_by_maker
+                .get(&event.order_id)
+                .copied()
+                .or_else(|| cancels_by_order.get(&event.order_id).copied());
+            let Some(trigger) = trigger else {
+                return Err(format!(
+                    "market-data {:?} for order {} has no fill or Cancelled report in this output",
+                    event.kind, event.order_id
+                ));
+            };
+            let (expected_side, expected_price) = if trigger.kind == ExecKind::Cancelled {
+                (trigger.side, trigger.price)
+            } else {
+                (trigger.side.opposite(), trigger.price)
+            };
+            if event.side != expected_side || event.price != expected_price {
+                return Err(format!(
+                    "market-data {:?} for order {} has side {} price {} but its trigger ({} seq {}) says side {} price {}",
+                    event.kind,
+                    event.order_id,
+                    event.side,
+                    event.price,
+                    trigger.kind.as_str(),
+                    trigger.seq,
+                    expected_side,
+                    expected_price
+                ));
+            }
+        }
+
+        // The accepted quantity is fully accounted for.
+        for (order_id, state) in &summaries {
+            let Some(accepted_qty) = state.accepted_qty else {
+                continue;
+            };
+            if state.add_qty.is_some() && state.cancel_qty.is_some() {
+                return Err(format!(
+                    "order {order_id} both rests (Add) and terminates (Cancelled) in one output"
+                ));
+            }
+            let added = state.add_qty.map_or(0, |qty| qty.0);
+            let cancelled = state.cancel_qty.map_or(0, |qty| qty.0);
+            if state.filled_qty + added + cancelled != accepted_qty.0 {
+                return Err(format!(
+                    "order {order_id} was accepted for {accepted_qty} but the output accounts for {} filled + {added} added + {cancelled} cancelled",
+                    state.filled_qty
+                ));
+            }
+            match state.last_fill {
+                Some(ExecKind::PartiallyFilled)
+                    if state.add_qty.is_none() && state.cancel_qty.is_none() =>
+                {
+                    return Err(format!(
+                        "order {order_id} was partially filled and left a remainder with no Add or Cancelled report"
+                    ));
+                }
+                Some(ExecKind::Filled) if state.filled_qty != accepted_qty.0 => {
+                    return Err(format!(
+                        "order {order_id} is Filled but only {} of {accepted_qty} traded",
+                        state.filled_qty
+                    ));
+                }
+                None if state.add_qty.is_none() && state.cancel_qty.is_none() => {
+                    return Err(format!(
+                        "order {order_id} was accepted but neither filled, added, nor cancelled"
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -391,6 +1209,7 @@ impl SymbolEngine {
                 out,
                 ExecKind::Rejected,
                 command,
+                command.side,
                 Price::ZERO,
                 Qty::ZERO,
                 Qty::ZERO,
@@ -406,6 +1225,11 @@ impl SymbolEngine {
             out,
             ExecKind::Cancelled,
             command,
+            // The report describes the cancelled order, not the cancel
+            // request: a fixed-layout cancel command always carries side Buy.
+            // Reporting the request's side would disagree with the `Remove`
+            // market-data event for the same order id.
+            removed.side,
             removed.price,
             removed.remaining,
             Qty::ZERO,
@@ -520,6 +1344,7 @@ impl SymbolEngine {
             out,
             ExecKind::Accepted,
             command,
+            command.side,
             command.price,
             command.qty,
             command.qty,
@@ -591,6 +1416,7 @@ impl SymbolEngine {
                 out,
                 kind,
                 command,
+                command.side,
                 maker_price,
                 fill,
                 remaining,
@@ -669,17 +1495,23 @@ impl SymbolEngine {
                     // terminal status matches the report the client sees
                     // (`Cancelled`/`Internal`). `Rejected` is only written by
                     // the creation path, where no accepted report existed.
+                    //
+                    // The terminal report carries the order's admission role
+                    // (`accepted_flags`), not an unconditional taker bit: a
+                    // passive limit order that could not rest never took
+                    // liquidity, and its cancel must agree with its acceptance.
                     self.dedup.update(command.order_id, DedupStatus::Cancelled);
                     self.push_exec(
                         out,
                         ExecKind::Cancelled,
                         command,
+                        command.side,
                         command.price,
                         remaining,
                         Qty::ZERO,
                         OrderId(0),
                         RejectReason::Internal,
-                        FLAG_TAKER,
+                        accepted_flags,
                     );
                 }
             }
@@ -691,12 +1523,13 @@ impl SymbolEngine {
                 out,
                 ExecKind::Cancelled,
                 command,
+                command.side,
                 command.price,
                 remaining,
                 Qty::ZERO,
                 OrderId(0),
                 RejectReason::None,
-                FLAG_TAKER,
+                accepted_flags,
             );
         }
     }
@@ -731,6 +1564,7 @@ impl SymbolEngine {
             out,
             ExecKind::Rejected,
             command,
+            command.side,
             command.price,
             Qty::ZERO,
             Qty::ZERO,
@@ -746,6 +1580,7 @@ impl SymbolEngine {
         out: &mut EngineOutput,
         kind: ExecKind,
         command: &Command,
+        side: Side,
         price: Price,
         qty: Qty,
         remaining: Qty,
@@ -757,7 +1592,7 @@ impl SymbolEngine {
         out.executions.push(ExecutionReport {
             kind,
             symbol: command.symbol,
-            side: command.side,
+            side,
             order_type: command.order_type,
             price,
             qty,
@@ -966,6 +1801,125 @@ impl SymbolEngine {
             return Err(format!(
                 "dedup holds {} ids but {resting_in_dedup} Resting + {terminal} terminal",
                 self.dedup.len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Check one command's [`EngineOutput`] against the command that produced it.
+    ///
+    /// This is the provenance half of the output diagnostic: the output-only
+    /// checks live in [`EngineOutput::check_invariants`], and this method adds
+    /// the facts that need the input command and the engine clocks:
+    ///
+    /// - every execution report and market-data event carries
+    ///   `cause_offset == input_offset`;
+    /// - every execution report carries the command's `timestamp_ns`;
+    /// - every market-data event (and snapshot) carries
+    ///   [`SymbolEngine::last_timestamp_ns`], the monotone venue clock;
+    /// - every execution report names the command's symbol, and every
+    ///   market-data event names this engine's instrument;
+    /// - the last execution and market-data `seq` in the output are one below
+    ///   the engine's next sequence, so the per-symbol sequence has no gap
+    ///   between consecutive calls.
+    ///
+    /// The sequence-continuity check reads the engine's live counters, so
+    /// `out` must be the output of the `process` call that immediately
+    /// preceded this check (the same rule as calling it after every command).
+    /// The method allocates O(output), is a diagnostic for tests and replay
+    /// verification, and is never called from `process`.
+    ///
+    /// The market-data timestamp is deliberately *not* compared to the
+    /// command's: a non-monotone input log leaves the venue clock ahead of the
+    /// command, and market data carries the venue clock while execution reports
+    /// carry the command's own stamp.
+    pub fn check_output_invariants(
+        &self,
+        command: &Command,
+        input_offset: u64,
+        out: &EngineOutput,
+    ) -> Result<(), String> {
+        out.check_invariants()?;
+
+        for exec in &out.executions {
+            if exec.cause_offset != input_offset {
+                return Err(format!(
+                    "execution seq {} ({} {}) has cause_offset {} but the command is at offset {input_offset}",
+                    exec.seq,
+                    exec.kind.as_str(),
+                    exec.order_id,
+                    exec.cause_offset
+                ));
+            }
+            if exec.timestamp_ns != command.timestamp_ns {
+                return Err(format!(
+                    "execution seq {} ({} {}) has timestamp {} but the command's timestamp is {}",
+                    exec.seq,
+                    exec.kind.as_str(),
+                    exec.order_id,
+                    exec.timestamp_ns,
+                    command.timestamp_ns
+                ));
+            }
+            if exec.symbol != command.symbol {
+                return Err(format!(
+                    "execution seq {} names symbol {} but the command is for {}",
+                    exec.seq, exec.symbol, command.symbol
+                ));
+            }
+        }
+
+        let venue_timestamp = self.last_ts_ns;
+        for event in &out.md {
+            if event.cause_offset != input_offset {
+                return Err(format!(
+                    "market-data seq {} ({:?}) has cause_offset {} but the command is at offset {input_offset}",
+                    event.seq, event.kind, event.cause_offset
+                ));
+            }
+            if event.timestamp_ns != venue_timestamp {
+                return Err(format!(
+                    "market-data seq {} ({:?}) has timestamp {} but the venue clock is {venue_timestamp}",
+                    event.seq, event.kind, event.timestamp_ns
+                ));
+            }
+            if event.symbol != self.config.symbol {
+                return Err(format!(
+                    "market-data seq {} names symbol {} but this engine owns {}",
+                    event.seq, event.symbol, self.config.symbol
+                ));
+            }
+        }
+
+        for snapshot in &out.snapshots {
+            if snapshot.cause_offset != input_offset {
+                return Err(format!(
+                    "snapshot has cause_offset {} but the command is at offset {input_offset}",
+                    snapshot.cause_offset
+                ));
+            }
+            if snapshot.timestamp_ns != venue_timestamp {
+                return Err(format!(
+                    "snapshot has timestamp {} but the venue clock is {venue_timestamp}",
+                    snapshot.timestamp_ns
+                ));
+            }
+        }
+
+        if let Some(last) = out.executions.last()
+            && last.seq.0.checked_add(1) != Some(self.exec_seq.0)
+        {
+            return Err(format!(
+                "last execution seq {} does not precede the engine's next seq {}; the sequence must be continuous between outputs",
+                last.seq, self.exec_seq
+            ));
+        }
+        if let Some(last) = out.md.last()
+            && last.seq.0.checked_add(1) != Some(self.md_seq.0)
+        {
+            return Err(format!(
+                "last market-data seq {} does not precede the engine's next seq {}; the sequence must be continuous between outputs",
+                last.seq, self.md_seq
             ));
         }
         Ok(())
@@ -1359,7 +2313,47 @@ mod tests {
     fn process(engine: &mut SymbolEngine, command: &Command, offset: u64) -> EngineOutput {
         let mut out = EngineOutput::with_capacity(8, 8);
         engine.process(command, offset, &mut out);
+        engine
+            .check_output_invariants(command, offset, &out)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "output invariants after offset {offset} ({:?}): {error}",
+                    command.kind
+                )
+            });
         out
+    }
+
+    /// Assert an output the checker must reject, named by the substring that
+    /// makes the violation identifiable.
+    #[track_caller]
+    fn assert_output_violation(out: &EngineOutput, needle: &str) {
+        match out.check_invariants() {
+            Ok(()) => panic!("expected an output invariant violation mentioning {needle:?}"),
+            Err(error) => assert!(
+                error.contains(needle),
+                "error {error:?} does not mention {needle:?}"
+            ),
+        }
+    }
+
+    /// Two resting asks, then a buy that takes 5 from the first and 5 from the
+    /// second: the output has two fills, two trades, one remove, one reduce.
+    fn fill_output() -> EngineOutput {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Sell, 100, 5, 1, 1), 0);
+        process(&mut engine, &limit(Side::Sell, 100, 7, 2, 2), 1);
+        process(&mut engine, &limit(Side::Buy, 100, 10, 3, 3), 2)
+    }
+
+    /// A buy IOC that takes 4 of an available 4 and has a 6-lot remainder: the
+    /// output has a partial fill, a trade, a remove, and a terminal cancel.
+    fn ioc_remainder_output() -> EngineOutput {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Sell, 100, 4, 1, 1), 0);
+        let mut ioc = limit(Side::Buy, 100, 10, 2, 2);
+        ioc.order_type = OrderType::Ioc;
+        process(&mut engine, &ioc, 1)
     }
 
     #[test]
@@ -2446,6 +3440,10 @@ mod tests {
         assert_eq!(last.reason, RejectReason::Internal);
         assert_eq!(last.order_id, OrderId(2));
         assert_eq!(
+            last.flags, FLAG_RESTED,
+            "a passive order that could not rest keeps its admission role"
+        );
+        assert_eq!(
             engine.dedup().status(OrderId(2)),
             Some(DedupStatus::Cancelled)
         );
@@ -2509,5 +3507,443 @@ mod tests {
             .check_invariants()
             .expect_err("Accepted is transient");
         assert!(error.contains("Accepted"), "{error}");
+    }
+
+    fn resting_output() -> EngineOutput {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Buy, 100, 10, 1, 1), 0)
+    }
+
+    fn rejection_output() -> EngineOutput {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Buy, 100, 10, 1, 1), 0);
+        // Same id: the second order is a duplicate rejection.
+        process(&mut engine, &limit(Side::Buy, 100, 10, 1, 1), 1)
+    }
+
+    fn stp_output() -> EngineOutput {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Sell, 100, 10, 1, 1), 0);
+        process(&mut engine, &limit(Side::Buy, 100, 5, 2, 1), 1)
+    }
+
+    #[test]
+    fn output_check_accepts_a_rejection_with_a_cadence_snapshot() {
+        let mut engine = SymbolEngine::new(config()).with_md_snapshot_interval(1);
+        let mut out = EngineOutput::with_capacity(4, 4);
+        let command = limit(Side::Buy, 100, 10, 1, 1);
+        engine.process(&command, 0, &mut out);
+        engine
+            .check_output_invariants(&command, 0, &out)
+            .expect("first command");
+        out.clear();
+
+        // A duplicate id is rejected, and the cadence still emits a snapshot:
+        // snapshots are not market-data deltas and are allowed with a rejection.
+        engine.process(&command, 1, &mut out);
+        assert_eq!(out.executions[0].kind, ExecKind::Rejected);
+        assert!(out.md.is_empty());
+        assert_eq!(out.snapshots.len(), 1);
+        engine
+            .check_output_invariants(&command, 1, &out)
+            .expect("a rejection may carry a cadence snapshot");
+    }
+
+    #[test]
+    fn output_check_accepts_real_flows() {
+        for out in [
+            resting_output(),
+            fill_output(),
+            ioc_remainder_output(),
+            rejection_output(),
+            stp_output(),
+        ] {
+            out.check_invariants()
+                .unwrap_or_else(|error| panic!("a real output was rejected: {error}"));
+        }
+    }
+
+    #[test]
+    fn output_check_rejects_a_non_increasing_execution_seq() {
+        let mut out = fill_output();
+        out.executions[1].seq = out.executions[0].seq;
+        assert_output_violation(&out, "execution seq");
+    }
+
+    #[test]
+    fn output_check_rejects_a_zero_execution_seq() {
+        let mut out = fill_output();
+        out.executions[0].seq = Seq(0);
+        assert_output_violation(&out, "seq 0");
+    }
+
+    #[test]
+    fn output_check_rejects_a_non_increasing_md_seq() {
+        let mut out = fill_output();
+        out.md[1].seq = out.md[0].seq;
+        assert_output_violation(&out, "market-data seq");
+    }
+
+    #[test]
+    fn output_check_rejects_a_foreign_cause_offset() {
+        let mut out = resting_output();
+        out.md[0].cause_offset += 1;
+        assert_output_violation(&out, "cause_offset");
+    }
+
+    #[test]
+    fn output_check_rejects_a_foreign_execution_timestamp() {
+        let mut out = fill_output();
+        out.executions[1].timestamp_ns += 1;
+        assert_output_violation(&out, "timestamp");
+    }
+
+    #[test]
+    fn output_check_rejects_a_fill_before_its_acceptance() {
+        let mut out = fill_output();
+        out.executions.swap(0, 1);
+        // Keep the reports' sequence increasing so only the ordering rule fires.
+        out.executions[0].seq = Seq(1);
+        out.executions[1].seq = Seq(2);
+        assert_output_violation(&out, "no Accepted");
+    }
+
+    #[test]
+    fn output_check_rejects_a_second_acceptance() {
+        let mut out = resting_output();
+        let mut duplicate = out.executions[0].clone();
+        duplicate.seq = Seq(out.executions[0].seq.0 + 1);
+        out.executions.push(duplicate);
+        assert_output_violation(&out, "Accepted twice");
+    }
+
+    #[test]
+    fn output_check_rejects_a_rejection_mixed_with_a_fill() {
+        let mut out = rejection_output();
+        let mut fill = fill_output().executions[1].clone();
+        fill.seq = Seq(out.executions[0].seq.0 + 1);
+        // Match the rejection's provenance so the mixing rule, not the
+        // one-command rule, is what fires.
+        fill.cause_offset = out.executions[0].cause_offset;
+        fill.timestamp_ns = out.executions[0].timestamp_ns;
+        out.executions.push(fill);
+        assert_output_violation(&out, "Rejected");
+    }
+
+    #[test]
+    fn output_check_rejects_a_fill_after_a_terminal_report() {
+        let mut out = ioc_remainder_output();
+        let mut late = out.executions[1].clone();
+        late.seq = Seq(out.executions.last().expect("a cancel").seq.0 + 1);
+        out.executions.push(late);
+        assert_output_violation(&out, "terminal");
+    }
+
+    #[test]
+    fn output_check_rejects_a_zero_quantity_fill() {
+        let mut out = fill_output();
+        out.executions[1].qty = Qty::ZERO;
+        assert_output_violation(&out, "zero quantity");
+    }
+
+    #[test]
+    fn output_check_rejects_a_zero_price_fill() {
+        let mut out = fill_output();
+        out.executions[1].price = Price::ZERO;
+        assert_output_violation(&out, "non-positive price");
+    }
+
+    #[test]
+    fn output_check_rejects_a_fill_on_the_wrong_side() {
+        let mut out = fill_output();
+        out.executions[1].side = Side::Sell;
+        assert_output_violation(&out, "taker's side");
+    }
+
+    #[test]
+    fn output_check_rejects_a_fill_without_the_taker_flag() {
+        let mut out = fill_output();
+        out.executions[1].flags = 0;
+        assert_output_violation(&out, "FLAG_TAKER");
+    }
+
+    #[test]
+    fn output_check_rejects_a_fill_without_a_maker_id() {
+        let mut out = fill_output();
+        out.executions[1].maker_order_id = OrderId(0);
+        assert_output_violation(&out, "maker_order_id 0");
+    }
+
+    #[test]
+    fn output_check_rejects_a_fill_above_the_accepted_quantity() {
+        let mut out = fill_output();
+        out.executions[1].qty = Qty(100);
+        assert_output_violation(&out, "above the accepted quantity");
+    }
+
+    #[test]
+    fn output_check_rejects_a_fill_with_no_trade_event() {
+        let mut out = fill_output();
+        out.md.remove(0);
+        assert_output_violation(&out, "matching Trade");
+    }
+
+    #[test]
+    fn output_check_rejects_an_extra_trade_for_a_fill() {
+        let mut out = fill_output();
+        let mut extra = out.md[0].clone();
+        extra.seq = Seq(out.md.last().expect("market data").seq.0 + 1);
+        out.md.push(extra);
+        assert_output_violation(&out, "matching Trade");
+    }
+
+    #[test]
+    fn output_check_rejects_a_trade_without_a_fill() {
+        let mut out = fill_output();
+        let mut extra = out.md[0].clone();
+        extra.seq = Seq(out.md.last().expect("market data").seq.0 + 1);
+        extra.qty = Qty(999);
+        out.md.push(extra);
+        assert_output_violation(&out, "no matching fill");
+    }
+
+    #[test]
+    fn output_check_rejects_a_trade_with_the_wrong_price() {
+        let mut out = fill_output();
+        out.md[0].price = Price(101);
+        assert_output_violation(&out, "matching Trade");
+    }
+
+    #[test]
+    fn output_check_rejects_an_add_after_a_remove() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Sell, 100, 10, 1, 1), 0);
+        let mut out = process(
+            &mut engine,
+            &Command::cancel(symbol(), OrderId(1), ParticipantId(1), 2),
+            1,
+        );
+        let mut add = out.md[0].clone();
+        add.kind = MdKind::Add;
+        add.qty = Qty(10);
+        add.seq = Seq(out.md[0].seq.0 + 1);
+        out.md.push(add);
+        assert_output_violation(&out, "Remove/Reduce");
+    }
+
+    #[test]
+    fn output_check_rejects_a_zero_quantity_add() {
+        let mut out = resting_output();
+        out.md[0].qty = Qty::ZERO;
+        assert_output_violation(&out, "zero quantity");
+    }
+
+    #[test]
+    fn output_check_rejects_a_zero_id_add() {
+        let mut out = resting_output();
+        out.md[0].order_id = OrderId(0);
+        assert_output_violation(&out, "order id 0");
+    }
+
+    #[test]
+    fn output_check_rejects_a_zero_id_remove() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Buy, 100, 10, 1, 1), 0);
+        let mut out = process(
+            &mut engine,
+            &Command::cancel(symbol(), OrderId(1), ParticipantId(1), 2),
+            1,
+        );
+        out.md[0].order_id = OrderId(0);
+        assert_output_violation(&out, "order id 0");
+    }
+
+    #[test]
+    fn output_check_rejects_a_growing_reduce() {
+        let mut out = resting_output();
+        let mut reduce = out.md[0].clone();
+        reduce.kind = MdKind::Reduce;
+        reduce.qty = Qty(11);
+        reduce.seq = Seq(out.md[0].seq.0 + 1);
+        out.md.push(reduce);
+        assert_output_violation(&out, "grows the remaining quantity");
+    }
+
+    #[test]
+    fn output_check_rejects_a_rejection_with_quantity_state() {
+        let mut out = rejection_output();
+        out.executions[0].qty = Qty(1);
+        assert_output_violation(&out, "no quantity");
+
+        let mut out = rejection_output();
+        out.executions[0].remaining = Qty(1);
+        assert_output_violation(&out, "leaves nothing");
+
+        let mut out = rejection_output();
+        out.executions[0].maker_order_id = OrderId(1);
+        assert_output_violation(&out, "no maker leg");
+    }
+
+    #[test]
+    fn output_check_rejects_a_rejection_with_market_data() {
+        let mut out = rejection_output();
+        let mut event = resting_output().md[0].clone();
+        event.seq = Seq(1);
+        event.cause_offset = out.executions[0].cause_offset;
+        event.timestamp_ns = out.executions[0].timestamp_ns;
+        out.md.push(event);
+        assert_output_violation(&out, "market data");
+    }
+
+    #[test]
+    fn output_check_rejects_combined_maker_and_taker_flags() {
+        let mut out = stp_output();
+        let maker = out
+            .executions
+            .iter_mut()
+            .find(|exec| exec.reason == RejectReason::SelfTradePrevention)
+            .expect("an STP cancel");
+        maker.flags = FLAG_MAKER | FLAG_TAKER;
+        assert_output_violation(&out, "more than one role flag");
+    }
+
+    #[test]
+    fn output_check_rejects_an_stp_cancel_without_the_maker_flag() {
+        let mut out = stp_output();
+        let maker = out
+            .executions
+            .iter_mut()
+            .find(|exec| exec.reason == RejectReason::SelfTradePrevention)
+            .expect("an STP cancel");
+        maker.flags = 0;
+        assert_output_violation(&out, "without FLAG_MAKER");
+    }
+
+    #[test]
+    fn output_check_rejects_an_acceptance_without_a_role() {
+        let mut out = resting_output();
+        out.executions[0].flags = 0;
+        assert_output_violation(&out, "exactly one of FLAG_TAKER or FLAG_RESTED");
+    }
+
+    #[test]
+    fn output_check_rejects_a_cancel_role_that_disagrees_with_the_acceptance() {
+        // A book-full failure happens after acceptance: the terminal report must
+        // keep the passive role the acceptance reported, not claim a taker leg.
+        let mut config = config();
+        config.max_orders = 1;
+        let mut engine = SymbolEngine::new(config);
+        process(&mut engine, &limit(Side::Buy, 100, 5, 1, 1), 0);
+        let mut out = process(&mut engine, &limit(Side::Buy, 100, 5, 2, 2), 1);
+        let last = out.executions.last_mut().expect("a terminal cancel");
+        assert_eq!(last.kind, ExecKind::Cancelled);
+        last.flags = FLAG_TAKER;
+        assert_output_violation(&out, "must agree with its acceptance");
+    }
+
+    #[test]
+    fn cancel_report_side_matches_the_removed_order_and_the_remove_event() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Sell, 100, 10, 1, 1), 0);
+        let out = process(
+            &mut engine,
+            &Command::cancel(symbol(), OrderId(1), ParticipantId(1), 2),
+            1,
+        );
+        assert_eq!(out.executions[0].kind, ExecKind::Cancelled);
+        assert_eq!(out.executions[0].side, Side::Sell);
+        assert_eq!(out.md[0].kind, MdKind::Remove);
+        assert_eq!(out.md[0].side, Side::Sell);
+
+        let mut corrupt = out.clone();
+        corrupt.executions[0].side = Side::Buy;
+        assert_output_violation(&corrupt, "trigger");
+    }
+
+    #[test]
+    fn output_check_rejects_a_fill_without_a_maker_side_event() {
+        let mut out = fill_output();
+        // Drop the Remove for the first maker; the second fill keeps its Reduce.
+        let first_maker = out
+            .executions
+            .iter()
+            .find(|exec| exec.kind == ExecKind::PartiallyFilled)
+            .expect("a partial fill")
+            .maker_order_id;
+        out.md
+            .retain(|event| event.kind != MdKind::Remove || event.order_id != first_maker);
+        assert_output_violation(&out, "exactly one maker-side event");
+    }
+
+    #[test]
+    fn output_check_rejects_a_remainder_without_a_terminal_report() {
+        let mut out = ioc_remainder_output();
+        out.executions.pop();
+        assert_output_violation(&out, "accounts for");
+    }
+
+    #[test]
+    fn output_check_rejects_a_second_terminal_report() {
+        let mut out = ioc_remainder_output();
+        let mut duplicate = out.executions.last().expect("a cancel").clone();
+        duplicate.seq = Seq(duplicate.seq.0 + 1);
+        out.executions.push(duplicate);
+        assert_output_violation(&out, "second terminal");
+    }
+
+    #[test]
+    fn output_check_rejects_an_stp_cancel_without_a_remove_event() {
+        let mut out = stp_output();
+        out.md.retain(|event| event.kind != MdKind::Remove);
+        assert_output_violation(&out, "no Remove market-data event");
+    }
+
+    #[test]
+    fn output_check_rejects_a_client_cancel_without_a_remove_event() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Buy, 100, 10, 1, 1), 0);
+        let mut out = process(
+            &mut engine,
+            &Command::cancel(symbol(), OrderId(1), ParticipantId(1), 2),
+            1,
+        );
+        out.md.clear();
+        assert_output_violation(&out, "has no Remove market-data event");
+    }
+
+    #[test]
+    fn two_runs_of_the_same_flow_emit_identical_executions_and_md() {
+        let mut commands = vec![
+            limit(Side::Sell, 100, 5, 1, 1),
+            limit(Side::Sell, 100, 7, 2, 2),
+            limit(Side::Buy, 100, 10, 3, 3),
+            Command::cancel(symbol(), OrderId(1), ParticipantId(1), 4),
+            limit(Side::Sell, 105, 4, 4, 4),
+            // Self-trade prevention: the taker removes the resting ask.
+            limit(Side::Buy, 105, 4, 5, 4),
+            Command::halt(symbol(), ParticipantId(9), 6),
+            Command::resume(symbol(), ParticipantId(9), 7),
+        ];
+        let mut ioc = limit(Side::Buy, 106, 9, 6, 5);
+        ioc.order_type = OrderType::Ioc;
+        commands.push(ioc);
+
+        // The flow mixes monotone timestamps (operator commands) with the test
+        // helper's fixed stamp of 1, so the venue clock can lead the command.
+        let mut first = SymbolEngine::new(config());
+        let mut second = SymbolEngine::new(config());
+        for (offset, command) in commands.iter().enumerate() {
+            let out_first = process(&mut first, command, offset as u64);
+            let out_second = process(&mut second, command, offset as u64);
+            assert_eq!(
+                out_first.executions, out_second.executions,
+                "offset {offset}: execution reports (including seq) diverged"
+            );
+            assert_eq!(
+                out_first.md, out_second.md,
+                "offset {offset}: market data (including seq) diverged"
+            );
+        }
+        assert_eq!(first.state_hash(), second.state_hash());
     }
 }

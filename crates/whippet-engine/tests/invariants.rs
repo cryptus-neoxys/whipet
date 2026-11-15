@@ -92,6 +92,14 @@ proptest! {
         let mut out = EngineOutput::with_capacity(16, 16);
         for (offset, command) in commands.iter().enumerate() {
             engine.process(command, offset as u64, &mut out);
+            engine
+                .check_output_invariants(command, offset as u64, &out)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "output invariants after command {offset} ({:?}): {error}",
+                        command.kind
+                    )
+                });
             out.clear();
             check_book(&engine, depth);
         }
@@ -250,6 +258,14 @@ fn randomized_workload_keeps_every_engine_invariant() {
 
     for (offset, command) in commands.iter().enumerate() {
         engine.process(command, offset as u64, &mut out);
+        engine
+            .check_output_invariants(command, offset as u64, &out)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "output invariants violated after command {offset} ({:?}): {error}",
+                    command.kind
+                )
+            });
         for exec in &out.executions {
             match (exec.kind, exec.reason) {
                 (ExecKind::Accepted, _) => accepted += 1,
