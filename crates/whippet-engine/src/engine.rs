@@ -660,7 +660,11 @@ impl SymbolEngine {
                 }
                 Err(_) => {
                     // A full book is an operational failure, not a silent drop.
-                    self.dedup.update(command.order_id, DedupStatus::Rejected);
+                    // The order was already accepted and reported, so its
+                    // terminal status matches the report the client sees
+                    // (`Cancelled`/`Internal`). `Rejected` is only written by
+                    // the creation path, where no accepted report existed.
+                    self.dedup.update(command.order_id, DedupStatus::Cancelled);
                     self.push_exec(
                         out,
                         ExecKind::Cancelled,
@@ -872,6 +876,94 @@ impl SymbolEngine {
         // one, so replay cannot lose a session change.
         hasher.update(&[u8::from(self.halted), self.session.as_code()]);
         *hasher.finalize().as_bytes()
+    }
+
+    /// Check every book, dedup, and cross-structure invariant that must hold
+    /// between commands.
+    ///
+    /// This is a diagnostic for tests; it allocates O(book) for the snapshot and
+    /// is O(book + dedup window). It is never called from `process`.
+    ///
+    /// In addition to [`Book::check_invariants`] and
+    /// [`DedupTable::check_invariants`] it requires the two structures to agree:
+    ///
+    /// - no id is left `Accepted`: that state only exists inside a single
+    ///   `process` call, between admission and the transition that resolves it;
+    /// - every `Resting` id has a book order and every book order has a
+    ///   `Resting` id, with equal counts;
+    /// - every terminal (`Filled`/`Cancelled`/`Rejected`) id is absent from the
+    ///   book;
+    /// - every live id is exactly one of `Resting` or terminal, so
+    ///   `dedup.len() == resting + terminal`.
+    pub fn check_invariants(&self) -> Result<(), String> {
+        self.book
+            .check_invariants()
+            .map_err(|err| format!("book: {err}"))?;
+        self.dedup
+            .check_invariants()
+            .map_err(|err| format!("dedup: {err}"))?;
+
+        let snapshot = self.book.snapshot();
+        let mut resting_in_book = 0usize;
+        for order in &snapshot.orders {
+            match self.dedup.status(order.order_id) {
+                Some(DedupStatus::Resting) => resting_in_book += 1,
+                other => {
+                    return Err(format!(
+                        "book order {} has dedup status {other:?}, expected Resting",
+                        order.order_id
+                    ));
+                }
+            }
+        }
+
+        let mut resting_in_dedup = 0usize;
+        let mut terminal = 0usize;
+        for (order_id, entry) in self.dedup.iter() {
+            match entry.status {
+                DedupStatus::Accepted => {
+                    return Err(format!(
+                        "id {order_id} is still Accepted after the command completed"
+                    ));
+                }
+                DedupStatus::Resting => {
+                    if self.book.order_index(order_id).is_none() {
+                        return Err(format!(
+                            "dedup id {order_id} is Resting but the book does not hold it"
+                        ));
+                    }
+                    resting_in_dedup += 1;
+                }
+                status if status.is_terminal() => {
+                    if self.book.order_index(order_id).is_some() {
+                        return Err(format!(
+                            "terminal id {order_id} ({status:?}) is still in the book"
+                        ));
+                    }
+                    terminal += 1;
+                }
+                other => return Err(format!("id {order_id} has unknown status {other:?}")),
+            }
+        }
+
+        if resting_in_dedup != resting_in_book {
+            return Err(format!(
+                "dedup has {resting_in_dedup} Resting ids but the book holds {resting_in_book} orders"
+            ));
+        }
+        if resting_in_book != self.book.order_count() {
+            return Err(format!(
+                "book order_count is {} but its snapshot lists {resting_in_book}",
+                self.book.order_count()
+            ));
+        }
+        if resting_in_dedup + terminal != self.dedup.len() {
+            return Err(format!(
+                "dedup holds {} ids but {resting_in_dedup} Resting + {terminal} terminal",
+                self.dedup.len()
+            ));
+        }
+        Ok(())
     }
 
     /// Snapshot after compacting the dedup queues.
@@ -2260,5 +2352,123 @@ mod tests {
                 .state_hash;
             assert_eq!(symbol_snapshot.state_hash, expected);
         }
+    }
+
+    #[test]
+    fn check_invariants_accepts_a_mixed_flow() {
+        let mut engine = SymbolEngine::new(config());
+        engine
+            .check_invariants()
+            .expect("a fresh engine is consistent");
+
+        process(&mut engine, &limit(Side::Sell, 100, 5, 1, 1), 0);
+        engine.check_invariants().expect("a resting maker");
+
+        process(&mut engine, &limit(Side::Buy, 100, 8, 2, 2), 1);
+        engine
+            .check_invariants()
+            .expect("a fill plus a resting remainder");
+
+        process(
+            &mut engine,
+            &Command::cancel(symbol(), OrderId(2), ParticipantId(2), 2),
+            2,
+        );
+        engine.check_invariants().expect("a cancelled remainder");
+
+        // Out of band: a create-time rejection, which is terminal and absent
+        // from the book.
+        process(&mut engine, &limit(Side::Buy, 99, 1, 3, 3), 3);
+        engine.check_invariants().expect("a rejected order");
+
+        // Self-trade prevention cancels the resting order.
+        process(&mut engine, &limit(Side::Sell, 110, 4, 4, 4), 4);
+        process(&mut engine, &limit(Side::Buy, 110, 4, 5, 4), 5);
+        engine
+            .check_invariants()
+            .expect("after self-trade prevention");
+    }
+
+    #[test]
+    fn full_book_after_acceptance_is_recorded_as_cancelled() {
+        // A BookFull failure happens after the order was accepted and reported,
+        // so the dedup record must be terminal `Cancelled`, matching the
+        // `Cancelled`/`Internal` report the client sees. `Rejected` is reserved
+        // for the creation path, where no accepted report was emitted.
+        let mut config = config();
+        config.max_orders = 1;
+        let mut engine = SymbolEngine::new(config);
+        process(&mut engine, &limit(Side::Buy, 100, 5, 1, 1), 0);
+        assert_eq!(engine.book().order_count(), 1);
+
+        let out = process(&mut engine, &limit(Side::Buy, 100, 5, 2, 2), 1);
+        let last = out.executions.last().expect("a report");
+        assert_eq!(last.kind, ExecKind::Cancelled);
+        assert_eq!(last.reason, RejectReason::Internal);
+        assert_eq!(last.order_id, OrderId(2));
+        assert_eq!(
+            engine.dedup().status(OrderId(2)),
+            Some(DedupStatus::Cancelled)
+        );
+        assert_eq!(
+            engine.dedup().status(OrderId(1)),
+            Some(DedupStatus::Resting)
+        );
+        engine
+            .check_invariants()
+            .expect("an internal failure still leaves a consistent engine");
+    }
+
+    #[test]
+    fn check_invariants_detects_a_resting_id_whose_order_is_gone() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Buy, 100, 10, 1, 1), 0);
+        // Remove the book order behind the table's back: only the cross-check
+        // can see the split, the individual structures stay valid.
+        engine
+            .book
+            .cancel(OrderId(1), None)
+            .expect("the order rests");
+        let error = engine
+            .check_invariants()
+            .expect_err("dedup still says Resting");
+        assert!(error.contains("Resting"), "{error}");
+    }
+
+    #[test]
+    fn check_invariants_detects_a_terminal_id_still_in_the_book() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Buy, 100, 10, 1, 1), 0);
+        // A legal lifecycle transition, applied while the order still rests:
+        // exactly the split the cross-check exists to catch.
+        engine.dedup.update(OrderId(1), DedupStatus::Filled);
+        let error = engine
+            .check_invariants()
+            .expect_err("a terminal id is still resting");
+        assert!(
+            error.contains("Filled") || error.contains("still in the book"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn check_invariants_detects_a_dangling_accepted_entry() {
+        let mut engine = SymbolEngine::new(config());
+        // `Accepted` is only legal inside a single `process` call. The dedup
+        // table alone accepts this creation, so only the engine cross-check
+        // rejects it.
+        engine.dedup.insert(
+            OrderId(7),
+            DedupEntry {
+                status: DedupStatus::Accepted,
+                input_offset: 0,
+                timestamp_ns: 0,
+                seq: Seq(1),
+            },
+        );
+        let error = engine
+            .check_invariants()
+            .expect_err("Accepted is transient");
+        assert!(error.contains("Accepted"), "{error}");
     }
 }

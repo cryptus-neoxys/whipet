@@ -751,6 +751,312 @@ impl Book {
         Ok(book)
     }
 
+    /// Check every structural invariant of the book, returning the first
+    /// violation.
+    ///
+    /// This is a diagnostic for tests: it walks the whole ladder, arena, free
+    /// list, and order-id index, so it is O(ladder + capacity). It never
+    /// panics, and it is never called from a matching or snapshot path.
+    ///
+    /// Invariants checked:
+    ///
+    /// - `min_ticks <= max_ticks`, both sides have exactly `ladder_len` levels,
+    ///   and both occupancy bitmaps have `ladder_len.div_ceil(64)` words with no
+    ///   bits set past the ladder;
+    /// - `order_count`, the order-id index length, and the number of active
+    ///   slots agree, and no index entry points at an inactive or foreign slot;
+    /// - every active slot has `1 <= remaining <= qty`, sits on the side and
+    ///   ladder index of the level that links it, and is reachable from that
+    ///   level's `head` exactly once through `next` (no cycles, no shared
+    ///   slots) with matching `prev` links, ending at [`NONE`] at the level's
+    ///   `tail`;
+    /// - each level's `orders` and `qty` equal the count and sum of `remaining`
+    ///   over its list, an empty level has no list, and a level carries its
+    ///   bitmap bit exactly when it is occupied;
+    /// - the free list holds every inactive slot exactly once and no active
+    ///   slot; the arena therefore has no leaked slots;
+    /// - `best_bid_idx`/`best_ask_idx` equal the bitmap-derived best (highest
+    ///   occupied bid, lowest occupied ask), or `None` on an empty side;
+    /// - the last trade is either entirely unset or has a positive quantity and
+    ///   a price inside the ladder.
+    pub fn check_invariants(&self) -> Result<(), String> {
+        if self.min_ticks > self.max_ticks {
+            return Err(format!(
+                "ladder bounds are inverted: min {} > max {}",
+                self.min_ticks, self.max_ticks
+            ));
+        }
+        let ladder_len = self
+            .max_ticks
+            .checked_sub(self.min_ticks)
+            .and_then(|span| span.checked_add(1))
+            .and_then(|len| usize::try_from(len).ok())
+            .ok_or_else(|| {
+                format!(
+                    "ladder [{}..={}] does not fit in a usize",
+                    self.min_ticks, self.max_ticks
+                )
+            })?;
+        if self.bids.len() != ladder_len || self.asks.len() != ladder_len {
+            return Err(format!(
+                "ladder length mismatch: bounds need {ladder_len} levels, bids has {}, asks has {}",
+                self.bids.len(),
+                self.asks.len()
+            ));
+        }
+        let words = ladder_len.div_ceil(64);
+        if self.bid_bitmap.len() != words || self.ask_bitmap.len() != words {
+            return Err(format!(
+                "bitmap word mismatch: the ladder needs {words} words, bids has {}, asks has {}",
+                self.bid_bitmap.len(),
+                self.ask_bitmap.len()
+            ));
+        }
+        if ladder_len % 64 != 0 {
+            // Bits past the ladder must never be set: a stale bit there would
+            // make `next_index`/`bitmap_best_index` disagree with the ladder.
+            let valid = (1u64 << (ladder_len % 64)) - 1;
+            let tail_set = |bitmap: &[u64]| match bitmap.last() {
+                Some(word) => *word & !valid != 0,
+                None => false,
+            };
+            if tail_set(&self.bid_bitmap) || tail_set(&self.ask_bitmap) {
+                return Err("occupancy bitmap sets bits past the end of the ladder".into());
+            }
+        }
+        if self.order_count > self.slots.len() {
+            return Err(format!(
+                "order_count {} exceeds the arena capacity {}",
+                self.order_count,
+                self.slots.len()
+            ));
+        }
+        if self.index.len() != self.order_count {
+            return Err(format!(
+                "order_count {} does not match the order-id index length {}",
+                self.order_count,
+                self.index.len()
+            ));
+        }
+
+        // `visited[i]` is set for every slot reached from a level head. A
+        // second visit is a cycle or a slot shared between levels.
+        let mut visited = vec![false; self.slots.len()];
+        let mut active_slots = 0usize;
+
+        for side in [Side::Buy, Side::Sell] {
+            let levels = self.levels(side);
+            let bitmap = self.bitmap(side);
+            for (price_idx, level) in levels.iter().enumerate() {
+                let word = bitmap
+                    .get(price_idx / 64)
+                    .ok_or_else(|| format!("{side:?} level {price_idx} has no bitmap word"))?;
+                let occupied_bit = (word >> (price_idx % 64)) & 1 == 1;
+                let occupied = level.orders > 0;
+                if occupied != occupied_bit {
+                    return Err(format!(
+                        "{side:?} level {price_idx}: orders {} but bitmap bit {}",
+                        level.orders,
+                        u8::from(occupied_bit)
+                    ));
+                }
+                if !occupied {
+                    if level.head != NONE || level.tail != NONE || level.qty != 0 {
+                        return Err(format!(
+                            "{side:?} level {price_idx} is empty but has head {}, tail {}, qty {}",
+                            level.head, level.tail, level.qty
+                        ));
+                    }
+                    continue;
+                }
+                if level.head == NONE || level.tail == NONE {
+                    return Err(format!(
+                        "{side:?} level {price_idx} is occupied but its list is missing a head or tail"
+                    ));
+                }
+
+                let mut cursor = level.head;
+                let mut prev = NONE;
+                let mut count = 0u32;
+                let mut qty = 0u64;
+                while cursor != NONE {
+                    let slot_index = cursor as usize;
+                    let slot = self.slots.get(slot_index).ok_or_else(|| {
+                        format!("{side:?} level {price_idx} links out-of-range slot {cursor}")
+                    })?;
+                    if !slot.active {
+                        return Err(format!(
+                            "{side:?} level {price_idx} links inactive slot {cursor}"
+                        ));
+                    }
+                    if std::mem::replace(&mut visited[slot_index], true) {
+                        return Err(format!(
+                            "{side:?} level {price_idx} reaches slot {cursor} twice (cycle or shared slot)"
+                        ));
+                    }
+                    if slot.side != side {
+                        return Err(format!(
+                            "{side:?} level {price_idx} links slot {cursor} of side {:?}",
+                            slot.side
+                        ));
+                    }
+                    if slot.price_idx as usize != price_idx {
+                        return Err(format!(
+                            "{side:?} level {price_idx} links slot {cursor} at index {}",
+                            slot.price_idx
+                        ));
+                    }
+                    if slot.prev != prev {
+                        return Err(format!(
+                            "{side:?} level {price_idx}: slot {cursor} has prev {} but the walk came from {prev}",
+                            slot.prev
+                        ));
+                    }
+                    if slot.remaining.0 == 0 || slot.remaining.0 > slot.qty.0 {
+                        return Err(format!(
+                            "{side:?} level {price_idx}: slot {cursor} has remaining {} outside 1..={} (qty)",
+                            slot.remaining.0, slot.qty.0
+                        ));
+                    }
+                    match self.index.get(&slot.order_id) {
+                        Some(index) if *index == cursor => {}
+                        other => {
+                            return Err(format!(
+                                "{side:?} level {price_idx}: slot {cursor} (id {}) maps to {other:?}, not back to itself",
+                                slot.order_id
+                            ));
+                        }
+                    }
+                    count = count
+                        .checked_add(1)
+                        .ok_or_else(|| "level order count overflow".to_string())?;
+                    qty = qty
+                        .checked_add(slot.remaining.0)
+                        .ok_or_else(|| format!("{side:?} level {price_idx} quantity overflow"))?;
+                    prev = cursor;
+                    cursor = slot.next;
+                }
+                if level.tail != prev {
+                    return Err(format!(
+                        "{side:?} level {price_idx} tail is {} but the list ends at {prev}",
+                        level.tail
+                    ));
+                }
+                if level.orders != count {
+                    return Err(format!(
+                        "{side:?} level {price_idx} claims {} orders but its list has {count}",
+                        level.orders
+                    ));
+                }
+                if level.qty != qty {
+                    return Err(format!(
+                        "{side:?} level {price_idx} qty is {} but its orders sum to {qty}",
+                        level.qty
+                    ));
+                }
+                active_slots = active_slots
+                    .checked_add(count as usize)
+                    .ok_or_else(|| "active slot count overflow".to_string())?;
+            }
+        }
+
+        if active_slots != self.order_count {
+            return Err(format!(
+                "order_count is {} but {active_slots} active slots are linked into levels",
+                self.order_count
+            ));
+        }
+        for (slot_index, slot) in self.slots.iter().enumerate() {
+            if slot.active && !visited[slot_index] {
+                return Err(format!(
+                    "active slot {slot_index} (id {}) is not linked into any level",
+                    slot.order_id
+                ));
+            }
+        }
+
+        // Free list: every inactive slot exactly once, no active slot.
+        let mut freed = vec![false; self.slots.len()];
+        for &slot_index in &self.free {
+            let Some(slot) = self.slots.get(slot_index as usize) else {
+                return Err(format!("free list holds out-of-range slot {slot_index}"));
+            };
+            if std::mem::replace(&mut freed[slot_index as usize], true) {
+                return Err(format!("free list holds slot {slot_index} more than once"));
+            }
+            if slot.active {
+                return Err(format!("free list holds active slot {slot_index}"));
+            }
+        }
+        let expected_free = self
+            .slots
+            .len()
+            .checked_sub(active_slots)
+            .ok_or_else(|| "active slots exceed the arena".to_string())?;
+        if self.free.len() != expected_free {
+            return Err(format!(
+                "free list has {} slots but the arena has {expected_free} inactive slots",
+                self.free.len()
+            ));
+        }
+
+        // Index entries must point back at their own active slot. Combined with
+        // the length check above, this makes the mapping a bijection.
+        for (&order_id, &slot_index) in &self.index {
+            let Some(slot) = self.slots.get(slot_index as usize) else {
+                return Err(format!(
+                    "index maps id {order_id} to out-of-range slot {slot_index}"
+                ));
+            };
+            if !slot.active {
+                return Err(format!(
+                    "index maps id {order_id} to inactive slot {slot_index}"
+                ));
+            }
+            if slot.order_id != order_id {
+                return Err(format!(
+                    "index maps id {order_id} to slot {slot_index}, which holds id {}",
+                    slot.order_id
+                ));
+            }
+        }
+
+        for side in [Side::Buy, Side::Sell] {
+            let cached = self.best_index(side);
+            let derived = self.bitmap_best_index(side);
+            if cached != derived {
+                return Err(format!(
+                    "{side:?} cached best is {cached:?} but the bitmap says {derived:?}"
+                ));
+            }
+        }
+
+        match self.last_trade_side {
+            None => {
+                if !self.last_trade_qty.is_zero() {
+                    return Err(format!(
+                        "last trade has qty {} but no side",
+                        self.last_trade_qty.0
+                    ));
+                }
+            }
+            Some(_) => {
+                if self.last_trade_qty.is_zero() {
+                    return Err("last trade has a side but a zero quantity".into());
+                }
+                if self.last_trade_price.0 < self.min_ticks
+                    || self.last_trade_price.0 > self.max_ticks
+                {
+                    return Err(format!(
+                        "last trade price {} is outside the ladder [{}..={}]",
+                        self.last_trade_price.0, self.min_ticks, self.max_ticks
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Feed the deterministic state hash. Iterates levels and FIFO order, never
     /// a hash map.
     pub fn hash_into(&self, hasher: &mut blake3::Hasher) {
@@ -1434,6 +1740,124 @@ mod tests {
         assert_eq!(live.finalize(), from_snapshot.finalize());
     }
 
+    #[test]
+    fn check_invariants_accepts_live_book_states() {
+        let mut book = Book::new(&config());
+        book.check_invariants()
+            .expect("an empty book is consistent");
+
+        add(&mut book, 1, Side::Buy, 100, 10);
+        add(&mut book, 2, Side::Buy, 100, 5);
+        add(&mut book, 3, Side::Sell, 110, 7);
+        add(&mut book, 4, Side::Sell, 105, 3);
+        book.check_invariants()
+            .expect("a populated book is consistent");
+
+        let slot = book.order_index(OrderId(1)).expect("order 1 rests");
+        assert!(!book.reduce(slot, Qty(4)));
+        book.check_invariants()
+            .expect("a partial fill is consistent");
+        assert!(book.reduce(slot, Qty(6)));
+        book.cancel(OrderId(3), None).expect("cancel");
+        book.check_invariants().expect("removals are consistent");
+
+        let restored = Book::from_snapshot(&config(), book.snapshot()).expect("restore");
+        restored
+            .check_invariants()
+            .expect("a restored book is consistent");
+    }
+
+    #[test]
+    fn check_invariants_detects_a_level_aggregate_mismatch() {
+        let mut book = Book::new(&config());
+        add(&mut book, 1, Side::Buy, 100, 10);
+        book.bids[0].qty += 1;
+        assert!(book.check_invariants().is_err());
+    }
+
+    #[test]
+    fn check_invariants_detects_a_missing_bitmap_bit() {
+        let mut book = Book::new(&config());
+        add(&mut book, 1, Side::Sell, 105, 1);
+        book.ask_bitmap[0] &= !(1u64 << 5);
+        assert!(book.check_invariants().is_err());
+    }
+
+    #[test]
+    fn check_invariants_detects_a_stale_best_cache() {
+        let mut book = Book::new(&config());
+        book.best_bid_idx = Some(0);
+        assert!(book.check_invariants().is_err());
+    }
+
+    #[test]
+    fn check_invariants_detects_a_dangling_index_entry() {
+        let mut book = Book::new(&config());
+        add(&mut book, 1, Side::Buy, 100, 5);
+        let slot = book.order_index(OrderId(1)).expect("order 1 rests");
+        book.index.insert(OrderId(9), slot);
+        book.order_count += 1;
+        assert!(book.check_invariants().is_err());
+    }
+
+    #[test]
+    fn check_invariants_detects_an_active_slot_in_the_free_list() {
+        let mut book = Book::new(&config());
+        add(&mut book, 1, Side::Buy, 100, 5);
+        let slot = book.order_index(OrderId(1)).expect("order 1 rests");
+        book.free.push(slot);
+        assert!(book.check_invariants().is_err());
+    }
+
+    #[test]
+    fn check_invariants_detects_a_list_cycle() {
+        let mut book = Book::new(&config());
+        add(&mut book, 1, Side::Buy, 100, 5);
+        add(&mut book, 2, Side::Buy, 100, 5);
+        let head = book.head(Side::Buy, 0).expect("level head");
+        book.slots[head as usize].next = head;
+        assert!(book.check_invariants().is_err());
+    }
+
+    #[test]
+    fn check_invariants_detects_remaining_above_the_original_quantity() {
+        // Reachable through the public snapshot API: `from_snapshot` trusts the
+        // serialized `qty`/`remaining` pair after inserting by `remaining`.
+        let mut book = Book::new(&config());
+        add(&mut book, 1, Side::Buy, 100, 10);
+        let mut snapshot = book.snapshot();
+        snapshot.orders[0].qty = Qty(4);
+        let restored = Book::from_snapshot(&config(), snapshot).expect("insert accepts it");
+        let error = restored
+            .check_invariants()
+            .expect_err("remaining 10 > qty 4");
+        assert!(error.contains("remaining"), "{error}");
+    }
+
+    #[test]
+    fn check_invariants_detects_an_inconsistent_last_trade() {
+        let mut book = Book::new(&config());
+        add(&mut book, 1, Side::Buy, 100, 5);
+        let mut snapshot = book.snapshot();
+        assert_eq!(snapshot.last_trade_side, None);
+        snapshot.last_trade_qty = Qty(5);
+        let restored = Book::from_snapshot(&config(), snapshot).expect("insert accepts it");
+        let error = restored
+            .check_invariants()
+            .expect_err("a quantity without a side is invalid");
+        assert!(error.contains("last trade"), "{error}");
+
+        let mut snapshot = book.snapshot();
+        snapshot.last_trade_side = Some(Side::Sell);
+        snapshot.last_trade_qty = Qty::ZERO;
+        let restored = Book::from_snapshot(&config(), snapshot).expect("insert accepts it");
+        assert!(restored.check_invariants().is_err());
+
+        // A live trade is consistent.
+        book.record_trade(Price(100), Qty(5), Side::Buy);
+        book.check_invariants().expect("a recorded trade is valid");
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -1484,6 +1908,44 @@ mod tests {
                         full
                     );
                 }
+            }
+        }
+
+        /// Structural invariants hold after every insert, cancel, and reduce on
+        /// a randomly shaped book, including after the arena reuses slots.
+        #[test]
+        fn check_invariants_holds_after_random_book_operations(
+            ops in proptest::collection::vec(
+                (any::<bool>(), 100i64..=130, 1u64..=20, any::<bool>(), 0u32..=8),
+                1..200,
+            ),
+        ) {
+            let mut config = InstrumentConfig::new("BTC-USD", 100, 100, 130).unwrap();
+            config.max_orders = 64;
+            let mut book = Book::new(&config);
+            for (index, &(buy, price, qty, cancel, target)) in ops.iter().enumerate() {
+                if cancel {
+                    book.cancel(OrderId(u128::from(target) + 1), None);
+                } else {
+                    let _ = book.insert(
+                        OrderId(index as u128 + 1),
+                        ParticipantId(1),
+                        if buy { Side::Buy } else { Side::Sell },
+                        Price(price),
+                        Qty(qty),
+                        index as u64,
+                    );
+                }
+                // Reduce the head of a random level so partial fills and full
+                // removals both run through the level accounting.
+                if let Some(level_head) = book
+                    .head(if buy { Side::Buy } else { Side::Sell }, (price - 100) as usize)
+                {
+                    let slot = *book.slot(level_head);
+                    book.reduce(level_head, Qty(slot.remaining.0.min(u64::from(target))));
+                }
+                let check = book.check_invariants();
+                prop_assert!(check.is_ok(), "after op {index}: {check:?}");
             }
         }
     }

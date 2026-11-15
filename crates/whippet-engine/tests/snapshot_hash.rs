@@ -182,6 +182,9 @@ fn run(seed: u64) -> SymbolEngine {
         out.clear();
     }
     engine
+        .check_invariants()
+        .expect("the 200k-command workload leaves a consistent engine");
+    engine
 }
 
 #[test]

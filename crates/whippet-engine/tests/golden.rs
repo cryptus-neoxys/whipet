@@ -46,6 +46,12 @@ fn assert_no_cross(book: &Book) {
     }
 }
 
+fn assert_engine_invariants(engine: &SymbolEngine) {
+    engine
+        .check_invariants()
+        .unwrap_or_else(|error| panic!("engine invariants: {error}"));
+}
+
 #[test]
 fn golden_hash_is_pinned() {
     let result = GoldenLog::standard().run_symbol(scenario_config());
@@ -83,6 +89,7 @@ fn snapshot_seeded_tail_replay_equals_full_replay() {
 
     let mut full = SymbolEngine::new(config.clone());
     process_all(&mut full, &commands);
+    assert_engine_invariants(&full);
     let full_hash = full.state_hash();
 
     // Recover from several points, including the empty book and one command
@@ -176,6 +183,7 @@ fn price_time_priority_spans_multiple_levels() {
     assert_eq!(engine.book().best_ask(), None);
     assert_eq!(engine.book().depth_qty(Side::Buy), 5);
     assert_no_cross(engine.book());
+    assert_engine_invariants(&engine);
 }
 
 #[test]
@@ -186,6 +194,7 @@ fn quantity_is_conserved_and_the_book_never_crosses() {
 
     assert_no_cross(engine.book());
     assert_quantity_conservation(&executions, engine.book());
+    assert_engine_invariants(&engine);
 }
 
 #[test]
@@ -200,6 +209,7 @@ fn resting_plus_filled_equals_submitted_without_cancels() {
     ];
     let executions = process_all(&mut engine, &commands);
     assert_quantity_conservation(&executions, engine.book());
+    assert_engine_invariants(&engine);
 
     let submitted: u64 = commands.iter().map(|command| command.qty.0).sum();
     let resting = engine.book().depth_qty(Side::Buy) + engine.book().depth_qty(Side::Sell);
@@ -254,6 +264,7 @@ fn duplicate_client_order_id_has_one_effect() {
     assert_eq!(engine.book().order_count(), 1);
     assert_eq!(engine.book().depth_qty(Side::Buy), 10);
     assert_eq!(engine.dedup().len(), 1);
+    assert_engine_invariants(&engine);
 }
 
 #[test]

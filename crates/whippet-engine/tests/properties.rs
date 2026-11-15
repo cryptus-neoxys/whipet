@@ -52,6 +52,10 @@ fn arb_op() -> impl Strategy<Value = Op> {
 }
 
 fn check_invariants(engine: &SymbolEngine) {
+    engine
+        .check_invariants()
+        .unwrap_or_else(|error| panic!("engine invariants: {error}"));
+
     let book = engine.book();
     if let (Some(bid), Some(ask)) = (book.best_bid(), book.best_ask()) {
         assert!(bid.0 < ask.0, "crossed book: {bid:?} >= {ask:?}");
@@ -167,6 +171,9 @@ proptest! {
         prop_assert_eq!(first.state_hash(), second.state_hash());
         prop_assert_eq!(first.book().best_bid(), second.book().best_bid());
         prop_assert_eq!(first.book().best_ask(), second.book().best_ask());
+        if let Err(error) = first.check_invariants() {
+            prop_assert!(false, "engine invariants: {error}");
+        }
     }
 
     #[test]
@@ -211,5 +218,8 @@ proptest! {
         let snapshot = engine.snapshot_state_without_hash();
         prop_assert_eq!(snapshot.state_hash, [0; 32]);
         prop_assert_eq!(hash_symbol_snapshot(&snapshot), engine.state_hash());
+        if let Err(error) = engine.check_invariants() {
+            prop_assert!(false, "engine invariants: {error}");
+        }
     }
 }

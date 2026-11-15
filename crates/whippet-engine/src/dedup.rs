@@ -10,7 +10,7 @@
 
 use std::collections::VecDeque;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use whippet_core::ids::{OrderId, Seq};
 
@@ -22,6 +22,38 @@ pub enum DedupStatus {
     Filled = 3,
     Cancelled = 4,
     Rejected = 5,
+}
+
+impl DedupStatus {
+    /// True once the order can no longer change state: the id keeps its record
+    /// only so a retry is recognised as a duplicate, and it is eviction-
+    /// eligible.
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Filled | Self::Cancelled | Self::Rejected)
+    }
+
+    /// The dedup lifecycle transition table.
+    ///
+    /// ```text
+    /// Accepted -> Resting | Filled | Cancelled
+    /// Resting  -> Filled | Cancelled
+    /// terminal -> (nothing)
+    /// ```
+    ///
+    /// A same-status transition is invalid: `update` is a state change, and a
+    /// no-op update hides a caller bug. `DedupTable::insert` is the only
+    /// creation path and may store `Accepted` or `Rejected` directly (a
+    /// rejection at admission never rests or accepts); see
+    /// [`DedupTable::update`].
+    pub const fn can_transition(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (
+                Self::Accepted,
+                Self::Resting | Self::Filled | Self::Cancelled
+            ) | (Self::Resting, Self::Filled | Self::Cancelled)
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +100,20 @@ impl DedupTable {
         self.map.get(&order_id).copied()
     }
 
+    /// The lifecycle status of a live id, if the table still remembers it.
+    pub fn status(&self, order_id: OrderId) -> Option<DedupStatus> {
+        self.map.get(&order_id).map(|entry| entry.status)
+    }
+
+    /// Every live entry, in unspecified hash order.
+    ///
+    /// For diagnostics and invariant checks only: the eviction order and the
+    /// state hash walk [`DedupTable::insertion_order`], never this iterator, so
+    /// it must not enter a decision path.
+    pub fn iter(&self) -> impl Iterator<Item = (OrderId, DedupEntry)> + '_ {
+        self.map.iter().map(|(order_id, entry)| (*order_id, *entry))
+    }
+
     pub fn contains(&self, order_id: OrderId) -> bool {
         self.map.contains_key(&order_id)
     }
@@ -75,10 +121,12 @@ impl DedupTable {
     /// Record a first observation. Returns the previous entry if the id was
     /// already present; callers treat that as a duplicate.
     pub fn insert(&mut self, order_id: OrderId, entry: DedupEntry) -> Option<DedupEntry> {
-        let terminal = matches!(
-            entry.status,
-            DedupStatus::Filled | DedupStatus::Cancelled | DedupStatus::Rejected
+        debug_assert!(
+            matches!(entry.status, DedupStatus::Accepted | DedupStatus::Rejected),
+            "dedup insert is the creation path and must store Accepted or Rejected, got {:?} for {order_id}",
+            entry.status
         );
+        let terminal = entry.status.is_terminal();
         // One hash probe: `insert` hands back the displaced entry, which is
         // exactly the duplicate signal. The old code probed twice (`get` then
         // `insert`). A duplicate restores the displaced entry, so the second
@@ -105,12 +153,10 @@ impl DedupTable {
             if candidate == order_id {
                 continue;
             }
-            let terminal = self.map.get(&candidate).is_some_and(|entry| {
-                matches!(
-                    entry.status,
-                    DedupStatus::Filled | DedupStatus::Cancelled | DedupStatus::Rejected
-                )
-            });
+            let terminal = self
+                .map
+                .get(&candidate)
+                .is_some_and(|entry| entry.status.is_terminal());
             if terminal {
                 self.map.remove(&candidate);
             }
@@ -126,22 +172,37 @@ impl DedupTable {
         None
     }
 
+    /// Advance an id through the lifecycle.
+    ///
+    /// Only [`DedupStatus::can_transition`] transitions are legal; a caller
+    /// that skips, reverses, or repeats a status hits a debug assertion. The
+    /// engine drives an order `Accepted -> Resting -> Filled|Cancelled` (or
+    /// `Accepted -> Filled|Cancelled` when it never rests); `Rejected` is only
+    /// ever stored by [`DedupTable::insert`], because a rejected order was
+    /// never accepted.
+    ///
+    /// An unknown id is ignored in release builds. That cannot happen through
+    /// the engine (every book order has a live `Resting` entry, and eviction
+    /// only removes terminal entries), so debug builds assert it to catch a
+    /// caller that lost the creation path.
     pub fn update(&mut self, order_id: OrderId, status: DedupStatus) {
-        // One lookup: read the old status and write the new one from the same
-        // mutable borrow. This runs on every fill, rest, cancel, and reject.
         let Some(entry) = self.map.get_mut(&order_id) else {
+            debug_assert!(
+                false,
+                "dedup update for unknown id {order_id} to {status:?}; insert is the creation path"
+            );
             return;
         };
-        let was_terminal = matches!(
-            entry.status,
-            DedupStatus::Filled | DedupStatus::Cancelled | DedupStatus::Rejected
+        let previous = entry.status;
+        debug_assert!(
+            previous.can_transition(status),
+            "invalid dedup transition for {order_id}: {previous:?} -> {status:?}"
         );
+        if !previous.can_transition(status) {
+            return;
+        }
         entry.status = status;
-        let is_terminal = matches!(
-            status,
-            DedupStatus::Filled | DedupStatus::Cancelled | DedupStatus::Rejected
-        );
-        if is_terminal && !was_terminal {
+        if status.is_terminal() && !previous.is_terminal() {
             self.terminal_order.push_back(order_id);
         }
     }
@@ -233,13 +294,111 @@ impl DedupTable {
         indices
     }
 
+    /// Check the dedup table's structural invariants, returning the first
+    /// violation.
+    ///
+    /// This is a diagnostic for tests, O(live entries + queue lengths), and
+    /// never runs in a decision path.
+    ///
+    /// Invariants checked:
+    ///
+    /// - the capacity is at least one; the soft cap may only be exceeded while
+    ///   every live entry is non-terminal, because eviction never drops an
+    ///   active (`Accepted`/`Resting`) id;
+    /// - the terminal queue holds only live ids, only terminal ids, each id at
+    ///   most once, and covers every terminal id in the map exactly once;
+    /// - the insertion queue may still hold dead ids before compaction, but it
+    ///   never repeats an id consecutively and every live id appears in it at
+    ///   least once.
+    pub fn check_invariants(&self) -> Result<(), String> {
+        if self.capacity == 0 {
+            return Err("dedup capacity is zero; new() clamps it to at least one".into());
+        }
+        if self.map.len() > self.capacity {
+            // Eviction only removes terminal entries, so growing past the soft
+            // cap is legitimate only while the table is entirely active. A
+            // terminal entry above the cap means eviction was skipped.
+            if let Some((order_id, entry)) =
+                self.iter().find(|(_, entry)| entry.status.is_terminal())
+            {
+                return Err(format!(
+                    "table holds {} entries above capacity {} but terminal id {order_id} ({:?}) was not evicted",
+                    self.map.len(),
+                    self.capacity,
+                    entry.status
+                ));
+            }
+        }
+
+        let mut queued: FxHashSet<OrderId> =
+            FxHashSet::with_capacity_and_hasher(self.terminal_order.len(), Default::default());
+        for order_id in &self.terminal_order {
+            let Some(entry) = self.map.get(order_id) else {
+                return Err(format!("terminal queue holds evicted id {order_id}"));
+            };
+            if !entry.status.is_terminal() {
+                return Err(format!(
+                    "terminal queue holds non-terminal id {order_id} ({:?})",
+                    entry.status
+                ));
+            }
+            if !queued.insert(*order_id) {
+                return Err(format!("terminal queue holds id {order_id} more than once"));
+            }
+        }
+        let terminal_in_map = self
+            .map
+            .values()
+            .filter(|entry| entry.status.is_terminal())
+            .count();
+        if queued.len() != terminal_in_map {
+            return Err(format!(
+                "terminal queue covers {} ids but the map has {terminal_in_map} terminal ids",
+                queued.len()
+            ));
+        }
+
+        let mut previous: Option<OrderId> = None;
+        for order_id in &self.insertion_order {
+            if previous == Some(*order_id) {
+                return Err(format!(
+                    "insertion queue repeats id {order_id} consecutively"
+                ));
+            }
+            previous = Some(*order_id);
+        }
+        let mut seen: FxHashSet<OrderId> =
+            FxHashSet::with_capacity_and_hasher(self.map.len(), Default::default());
+        for order_id in &self.insertion_order {
+            if self.map.contains_key(order_id) {
+                seen.insert(*order_id);
+            }
+        }
+        if seen.len() != self.map.len() {
+            return Err(
+                match self.map.keys().find(|order_id| !seen.contains(order_id)) {
+                    Some(order_id) => {
+                        format!("live id {order_id} is missing from the insertion queue")
+                    }
+                    None => format!(
+                        "insertion queue covers {} live ids but the map holds {}",
+                        seen.len(),
+                        self.map.len()
+                    ),
+                },
+            );
+        }
+        Ok(())
+    }
+
     /// Rebuild a table from a snapshot walk and the terminal-queue indices
     /// produced by [`DedupTable::terminal_indices`].
     ///
-    /// Out-of-range indices and indices that point at a non-terminal entry are
-    /// skipped: a corrupt snapshot must not panic the restore path. Skipping
-    /// cannot desynchronise a valid snapshot because [`DedupTable::terminal_indices`]
-    /// only emits in-range, terminal ids.
+    /// Out-of-range indices, indices that point at a non-terminal entry, and
+    /// repeated ids are rejected with a message: a corrupt snapshot must not
+    /// panic the restore path. [`DedupTable::terminal_indices`] only emits
+    /// in-range, terminal ids at most once each, so a valid snapshot never
+    /// trips these checks.
     ///
     /// Known gap, predating the compact terminal form: `entries` is the walk
     /// filtered to the live map, so insertion-order entries for ids that were
@@ -269,26 +428,26 @@ impl DedupTable {
         // in the queue, so this cannot be reconstructed from the insertion walk
         // alone; `terminal_idx` is what carries it.
         //
-        // A repeated index is harmless: the second occurrence is stale after
-        // the first eviction and is skipped by the eviction walk, exactly as a
-        // continuous table with the same queue would behave. It is therefore
-        // allowed, while an index outside the walk or one pointing at a
-        // non-terminal entry is a corrupt snapshot and fails closed.
+        // A repeated index is a corrupt snapshot: `terminal_indices` emits at
+        // most one entry per live id (eviction pops the queue entry it removes),
+        // so a repeat would mean the restored table could evict an id twice.
+        // Fail closed rather than restore an impossible queue.
         let mut queued: std::collections::HashSet<OrderId> =
             std::collections::HashSet::with_capacity(terminal_idx.len());
         for index in terminal_idx {
             let Some((order_id, entry)) = entries.get(index as usize) else {
                 return Err(format!("terminal index {index} is out of range"));
             };
-            if !matches!(
-                entry.status,
-                DedupStatus::Filled | DedupStatus::Cancelled | DedupStatus::Rejected
-            ) {
+            if !entry.status.is_terminal() {
                 return Err(format!(
                     "terminal index {index} points at a non-terminal entry"
                 ));
             }
-            queued.insert(*order_id);
+            if !queued.insert(*order_id) {
+                return Err(format!(
+                    "terminal index {index} queues id {order_id} more than once"
+                ));
+            }
             table.terminal_order.push_back(*order_id);
         }
         // Every terminal id in the map must be in the queue, or the restored
@@ -296,12 +455,7 @@ impl DedupTable {
         let terminal_in_map = table
             .map
             .values()
-            .filter(|entry| {
-                matches!(
-                    entry.status,
-                    DedupStatus::Filled | DedupStatus::Cancelled | DedupStatus::Rejected
-                )
-            })
+            .filter(|entry| entry.status.is_terminal())
             .count();
         if queued.len() != terminal_in_map {
             return Err(format!(
@@ -730,5 +884,214 @@ mod tests {
         }
         assert!(table.entries_in_order().len() > table.len());
         assert_eq!(snapshot_hash(&table), live_hash(&table));
+    }
+
+    fn with_status(offset: u64, status: DedupStatus) -> DedupEntry {
+        DedupEntry {
+            status,
+            ..entry(offset)
+        }
+    }
+
+    #[test]
+    fn transition_table_has_exactly_the_documented_edges() {
+        use DedupStatus::{Accepted, Cancelled, Filled, Rejected, Resting};
+        let statuses = [Accepted, Resting, Filled, Cancelled, Rejected];
+        let mut allowed = Vec::new();
+        for from in statuses {
+            for to in statuses {
+                if from.can_transition(to) {
+                    allowed.push((from, to));
+                }
+            }
+        }
+        assert_eq!(
+            allowed,
+            vec![
+                (Accepted, Resting),
+                (Accepted, Filled),
+                (Accepted, Cancelled),
+                (Resting, Filled),
+                (Resting, Cancelled),
+            ],
+            "the transition table is the contract the engine's flows are checked against"
+        );
+        assert!(Filled.is_terminal());
+        assert!(Cancelled.is_terminal());
+        assert!(Rejected.is_terminal());
+        assert!(!Accepted.is_terminal());
+        assert!(!Resting.is_terminal());
+    }
+
+    #[test]
+    fn check_invariants_accepts_the_engine_lifecycle() {
+        let mut table = DedupTable::new(8);
+        table
+            .check_invariants()
+            .expect("an empty table is consistent");
+
+        table.insert(OrderId(1), entry(1));
+        table.update(OrderId(1), DedupStatus::Resting);
+        table.insert(OrderId(2), entry(2));
+        table.update(OrderId(2), DedupStatus::Cancelled);
+        table.insert(OrderId(3), entry(3));
+        table.update(OrderId(3), DedupStatus::Filled);
+        table
+            .check_invariants()
+            .expect("every legal transition is consistent");
+
+        assert_eq!(table.status(OrderId(1)), Some(DedupStatus::Resting));
+        assert_eq!(table.status(OrderId(2)), Some(DedupStatus::Cancelled));
+        assert_eq!(table.status(OrderId(3)), Some(DedupStatus::Filled));
+        assert_eq!(table.status(OrderId(9)), None);
+    }
+
+    #[test]
+    fn check_invariants_allows_growing_past_capacity_for_active_orders() {
+        let mut table = DedupTable::new(2);
+        for id in 1..=3u64 {
+            table.insert(OrderId(u128::from(id)), entry(id));
+            table.update(OrderId(u128::from(id)), DedupStatus::Resting);
+        }
+        assert!(table.len() > table.capacity(), "test precondition");
+        table
+            .check_invariants()
+            .expect("the soft cap may be exceeded while every entry is active");
+    }
+
+    #[test]
+    fn check_invariants_detects_a_consecutive_insertion_duplicate() {
+        // `from_entries` is the only public constructor from a walk, so a
+        // duplicated admission is reachable through it even though the live
+        // table never produces one.
+        let walk = vec![(OrderId(1), entry(1)), (OrderId(1), entry(1))];
+        let table = DedupTable::from_entries(4, walk, Vec::new()).expect("restore accepts");
+        let error = table.check_invariants().expect_err("consecutive duplicate");
+        assert!(error.contains("consecutively"), "{error}");
+    }
+
+    #[test]
+    fn check_invariants_detects_a_terminal_entry_above_capacity() {
+        let walk = vec![
+            (OrderId(1), with_status(1, DedupStatus::Filled)),
+            (OrderId(2), with_status(2, DedupStatus::Filled)),
+        ];
+        let table = DedupTable::from_entries(1, walk, vec![0, 1]).expect("restore accepts");
+        assert_eq!(table.len(), 2);
+        let error = table
+            .check_invariants()
+            .expect_err("terminal above the cap");
+        assert!(error.contains("capacity"), "{error}");
+    }
+
+    #[test]
+    fn check_invariants_detects_a_missing_insertion_entry() {
+        let mut table = DedupTable::new(4);
+        table.insert(OrderId(1), entry(1));
+        table.insert(OrderId(2), entry(2));
+        table.insertion_order.retain(|id| *id != OrderId(2));
+        let error = table.check_invariants().expect_err("live id missing");
+        assert!(
+            error.contains("missing from the insertion queue"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn check_invariants_detects_a_non_terminal_id_in_the_terminal_queue() {
+        let mut table = DedupTable::new(4);
+        table.insert(OrderId(1), entry(1)); // Accepted
+        table.terminal_order.push_back(OrderId(1));
+        let error = table.check_invariants().expect_err("non-terminal queued");
+        assert!(error.contains("non-terminal"), "{error}");
+    }
+
+    #[test]
+    fn check_invariants_detects_an_evicted_id_in_the_terminal_queue() {
+        let mut table = DedupTable::new(4);
+        table.insert(OrderId(1), entry(1));
+        table.update(OrderId(1), DedupStatus::Filled);
+        table.map.remove(&OrderId(1));
+        let error = table.check_invariants().expect_err("dead id queued");
+        assert!(error.contains("evicted"), "{error}");
+    }
+
+    #[test]
+    fn check_invariants_detects_a_zero_capacity() {
+        let mut table = DedupTable::new(4);
+        table.capacity = 0;
+        assert!(table.check_invariants().is_err());
+    }
+
+    #[test]
+    fn create_rejected_is_terminal_and_eviction_eligible() {
+        let mut table = DedupTable::new(2);
+        table.insert(OrderId(1), with_status(1, DedupStatus::Rejected));
+        table
+            .check_invariants()
+            .expect("rejection is terminal at creation");
+        table.insert(OrderId(2), entry(2));
+        table.insert(OrderId(3), entry(3));
+        assert!(
+            !table.contains(OrderId(1)),
+            "a create-time rejection must be eviction-eligible"
+        );
+        table.check_invariants().expect("after eviction");
+    }
+
+    #[test]
+    fn from_entries_rejects_a_repeated_terminal_index() {
+        let walk = vec![(OrderId(1), with_status(1, DedupStatus::Filled))];
+        let error = match DedupTable::from_entries(4, walk, vec![0, 0]) {
+            Ok(_) => panic!("a repeated terminal id must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.contains("more than once"), "{error}");
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "invalid dedup transition")]
+    fn update_rejects_a_backwards_transition_in_debug() {
+        let mut table = DedupTable::new(4);
+        table.insert(OrderId(1), entry(1));
+        table.update(OrderId(1), DedupStatus::Resting);
+        table.update(OrderId(1), DedupStatus::Accepted);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "invalid dedup transition")]
+    fn update_rejects_a_no_op_transition_in_debug() {
+        let mut table = DedupTable::new(4);
+        table.insert(OrderId(1), entry(1));
+        table.update(OrderId(1), DedupStatus::Accepted);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "invalid dedup transition")]
+    fn update_rejects_a_transition_out_of_a_terminal_status_in_debug() {
+        let mut table = DedupTable::new(4);
+        table.insert(OrderId(1), entry(1));
+        table.update(OrderId(1), DedupStatus::Resting);
+        table.update(OrderId(1), DedupStatus::Filled);
+        table.update(OrderId(1), DedupStatus::Cancelled);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "unknown id")]
+    fn update_rejects_an_unknown_id_in_debug() {
+        let mut table = DedupTable::new(4);
+        table.update(OrderId(7), DedupStatus::Resting);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "creation path")]
+    fn insert_rejects_a_terminal_creation_status_in_debug() {
+        let mut table = DedupTable::new(4);
+        table.insert(OrderId(1), with_status(1, DedupStatus::Filled));
     }
 }
