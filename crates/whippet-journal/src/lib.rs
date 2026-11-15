@@ -19,14 +19,14 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use iggy::prelude::{
     AutoLogin, Client, CommitPolicy, Consumer, ConsumerOffsetClient, Credentials, HeaderKey,
-    HeaderValue, Identifier, IggyByteSize, IggyClient, IggyDuration, IggyError, IggyExpiry,
-    IggyMessage, MaxTopicSize, MessageClient, PendingOperationsConfig, PollOptions, PolledMessages,
-    PollingStrategy, StreamClient, StreamCreateOptions, SystemClient, TopicClient,
+    HeaderValue as IggyHeaderValue, Identifier, IggyByteSize, IggyClient, IggyDuration, IggyError,
+    IggyExpiry, IggyMessage, MaxTopicSize, MessageClient, PendingOperationsConfig, PollOptions,
+    PolledMessages, PollingStrategy, StreamClient, StreamCreateOptions, SystemClient, TopicClient,
     TopicCreateOptions,
 };
 use serde::{Deserialize, Serialize};
 use whippet_core::config::ExchangeConfig;
-use whippet_core::headers::HeaderName;
+use whippet_core::headers::{HeaderName, HeaderValue as MetaHeaderValue};
 
 pub mod group;
 pub mod topic;
@@ -90,7 +90,7 @@ pub struct JournalMessage {
 /// keys outside the fixed routing set.
 #[derive(Debug, Clone)]
 pub enum JournalHeaders {
-    Named(Vec<(HeaderName, String)>),
+    Named(Vec<(HeaderName, MetaHeaderValue)>),
     Pairs(Vec<(String, String)>),
 }
 
@@ -108,7 +108,7 @@ impl JournalHeaders {
         match self {
             Self::Named(named) => named
                 .iter()
-                .map(|(name, value)| (name.as_str().to_string(), value.clone()))
+                .map(|(name, value)| (name.as_str().to_string(), value.as_str().to_string()))
                 .collect(),
             Self::Pairs(pairs) => pairs.clone(),
         }
@@ -119,7 +119,7 @@ impl JournalHeaders {
         match self {
             Self::Named(named) => named
                 .into_iter()
-                .map(|(name, value)| (name.as_str().to_string(), value))
+                .map(|(name, value)| (name.as_str().to_string(), value.as_str().to_string()))
                 .collect(),
             Self::Pairs(pairs) => pairs,
         }
@@ -160,7 +160,7 @@ impl JournalMessage {
     /// cached `HeaderKey`s while building the Iggy frame. Header *values*
     /// stay owned. Use [`whippet_core::headers::MessageMeta::named_pairs`] to
     /// build the argument.
-    pub fn new_named(payload: Vec<u8>, headers: Vec<(HeaderName, String)>) -> Self {
+    pub fn new_named(payload: Vec<u8>, headers: Vec<(HeaderName, MetaHeaderValue)>) -> Self {
         Self {
             payload: Bytes::from(payload),
             headers: JournalHeaders::Named(headers),
@@ -319,7 +319,7 @@ fn build_iggy_message(
 ) -> Result<IggyMessage> {
     let mut user_headers = BTreeMap::new();
     for (key, value) in headers {
-        user_headers.insert(keys.get(key)?, HeaderValue::from_str(value)?);
+        user_headers.insert(keys.get(key)?, IggyHeaderValue::from_str(value)?);
     }
     Ok(IggyMessage::builder()
         .payload(payload)
@@ -335,11 +335,14 @@ fn build_iggy_message(
 fn build_iggy_message_named(
     keys: &HeaderKeys,
     payload: Bytes,
-    headers: &[(HeaderName, String)],
+    headers: &[(HeaderName, MetaHeaderValue)],
 ) -> Result<IggyMessage> {
     let mut user_headers = BTreeMap::new();
     for (name, value) in headers {
-        user_headers.insert(keys.named(*name), HeaderValue::from_str(value)?);
+        user_headers.insert(
+            keys.named(*name),
+            IggyHeaderValue::from_str(value.as_str())?,
+        );
     }
     Ok(IggyMessage::builder()
         .payload(payload)
@@ -1610,7 +1613,7 @@ mod tests {
         for (name, value) in &headers {
             let key = keys.get(name).expect("known key");
             assert_eq!(
-                decoded.get(&key).map(HeaderValue::to_string_value),
+                decoded.get(&key).map(IggyHeaderValue::to_string_value),
                 Some(value.clone()),
                 "header {name} round-trips"
             );
@@ -1639,8 +1642,8 @@ mod tests {
         let message = JournalMessage::new_named(
             vec![9],
             vec![
-                (HeaderName::Symbol, "ETH-USD".to_string()),
-                (HeaderName::Seq, "3".to_string()),
+                (HeaderName::Symbol, "ETH-USD".into()),
+                (HeaderName::Seq, "3".into()),
             ],
         );
         assert_eq!(message.payload, Bytes::from_static(&[9u8]));
@@ -1657,7 +1660,7 @@ mod tests {
         );
         // Converting to pairs consumes and preserves values.
         assert_eq!(
-            JournalMessage::new_named(vec![], vec![(HeaderName::Codec, "x".to_string())])
+            JournalMessage::new_named(vec![], vec![(HeaderName::Codec, "x".into())])
                 .headers
                 .into_pairs(),
             vec![("codec".to_string(), "x".to_string())]
@@ -1667,21 +1670,21 @@ mod tests {
     #[test]
     fn named_headers_round_trip_like_the_pair_path() {
         let keys = HeaderKeys::new().expect("routing header keys parse");
-        let named = vec![
-            (HeaderName::Symbol, "BTC-USD".to_string()),
-            (HeaderName::Seq, "7".to_string()),
-            (HeaderName::Venue, "whippet".to_string()),
-            (HeaderName::Type, "order".to_string()),
-            (HeaderName::Schema, "1".to_string()),
+        let named: Vec<(HeaderName, MetaHeaderValue)> = vec![
+            (HeaderName::Symbol, "BTC-USD".into()),
+            (HeaderName::Seq, "7".into()),
+            (HeaderName::Venue, "whippet".into()),
+            (HeaderName::Type, "order".into()),
+            (HeaderName::Schema, "1".into()),
             (
                 HeaderName::TraceId,
-                "0000000000000000000000000000000a".to_string(),
+                "0000000000000000000000000000000a".into(),
             ),
-            (HeaderName::Codec, "fixed-le-v1".to_string()),
+            (HeaderName::Codec, "fixed-le-v1".into()),
         ];
         let pairs = named
             .iter()
-            .map(|(name, value)| (name.as_str().to_string(), value.clone()))
+            .map(|(name, value)| (name.as_str().to_string(), value.as_str().to_string()))
             .collect::<Vec<_>>();
 
         let from_named = build_iggy_message_named(&keys, Bytes::from_static(b"payload"), &named)
@@ -1703,8 +1706,8 @@ mod tests {
         for (name, value) in &named {
             let key = keys.named(*name);
             assert_eq!(
-                named_map.get(&key).map(HeaderValue::to_string_value),
-                Some(value.clone()),
+                named_map.get(&key).map(IggyHeaderValue::to_string_value),
+                Some(value.as_str().to_string()),
                 "named header {name:?} round-trips"
             );
             assert_eq!(

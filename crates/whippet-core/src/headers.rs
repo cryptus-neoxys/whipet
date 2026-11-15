@@ -37,6 +37,64 @@ pub enum HeaderMode {
     None,
 }
 
+/// An inline, fixed-capacity header value.
+///
+/// Every value Whippet writes is bounded: a symbol is 16 bytes, a sequence is
+/// at most 20 digits, a 128-bit trace id is 32 hex digits, and the static
+/// venue/type/schema/codec strings are shorter than that. Storing the bytes
+/// inline removes one heap allocation per header value while keeping the
+/// journal's named representation allocation-cheap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeaderValue {
+    bytes: [u8; 40],
+    len: u8,
+}
+
+impl HeaderValue {
+    pub const CAPACITY: usize = 40;
+
+    /// Copy `value` into the inline buffer. Panics only if a future caller
+    /// passes a value longer than [`Self::CAPACITY`]; every value built by
+    /// [`MessageMeta`] is bounded well below it.
+    pub fn new(value: &str) -> Self {
+        assert!(
+            value.len() <= Self::CAPACITY,
+            "header value exceeds {} bytes",
+            Self::CAPACITY
+        );
+        let mut bytes = [0u8; Self::CAPACITY];
+        bytes[..value.len()].copy_from_slice(value.as_bytes());
+        Self {
+            bytes,
+            len: value.len() as u8,
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        // Only `from_str` writes the bytes and it accepts `&str`, so the slice
+        // is always valid UTF-8.
+        std::str::from_utf8(&self.bytes[..usize::from(self.len)]).expect("header value is UTF-8")
+    }
+}
+
+impl From<&str> for HeaderValue {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for HeaderValue {
+    fn from(value: String) -> Self {
+        Self::new(&value)
+    }
+}
+
+impl std::fmt::Display for HeaderValue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// The fixed set of header keys Whippet writes.
 ///
 /// Iggy header keys are `String`-typed on the wire, so a producer pays one
@@ -197,30 +255,45 @@ impl MessageMeta {
     /// so building this set allocates only the values. Use it with
     /// `JournalMessage::new_named` to keep keys allocation-free through the
     /// journal.
-    pub fn named_pairs(&self, mode: HeaderMode) -> Vec<(HeaderName, String)> {
+    pub fn named_pairs(&self, mode: HeaderMode) -> Vec<(HeaderName, HeaderValue)> {
         match mode {
             HeaderMode::Full => {
                 // Sized exactly: `Full` has seven pairs, `Routing` four, so
                 // neither arm reallocates.
                 let mut pairs = Vec::with_capacity(7);
                 pairs.extend([
-                    (HeaderName::Symbol, self.symbol.to_string()),
-                    (HeaderName::Seq, seq_string(self.seq.0)),
-                    (HeaderName::Venue, self.venue.to_string()),
-                    (HeaderName::Type, self.kind.to_string()),
-                    (HeaderName::Schema, self.schema.to_string()),
-                    (HeaderName::TraceId, format!("{:032x}", self.trace_id)),
-                    (HeaderName::Codec, self.codec.to_string()),
+                    (
+                        HeaderName::Symbol,
+                        HeaderValue::new(&self.symbol.to_string()),
+                    ),
+                    (HeaderName::Seq, HeaderValue::new(&seq_string(self.seq.0))),
+                    (HeaderName::Venue, HeaderValue::new(self.venue)),
+                    (HeaderName::Type, HeaderValue::new(self.kind)),
+                    (
+                        HeaderName::Schema,
+                        HeaderValue::new(&self.schema.to_string()),
+                    ),
+                    (
+                        HeaderName::TraceId,
+                        HeaderValue::new(&format!("{:032x}", self.trace_id)),
+                    ),
+                    (HeaderName::Codec, HeaderValue::new(self.codec)),
                 ]);
                 pairs
             }
             HeaderMode::Routing => {
                 let mut pairs = Vec::with_capacity(4);
                 pairs.extend([
-                    (HeaderName::Symbol, self.symbol.to_string()),
-                    (HeaderName::Seq, seq_string(self.seq.0)),
-                    (HeaderName::Type, self.kind.to_string()),
-                    (HeaderName::Schema, self.schema.to_string()),
+                    (
+                        HeaderName::Symbol,
+                        HeaderValue::new(&self.symbol.to_string()),
+                    ),
+                    (HeaderName::Seq, HeaderValue::new(&seq_string(self.seq.0))),
+                    (HeaderName::Type, HeaderValue::new(self.kind)),
+                    (
+                        HeaderName::Schema,
+                        HeaderValue::new(&self.schema.to_string()),
+                    ),
                 ]);
                 pairs
             }
@@ -403,7 +476,11 @@ mod tests {
             );
             for ((name, value), (key, key_value)) in named.iter().zip(&string) {
                 assert_eq!(name.as_str(), key, "mode {mode:?} keeps the same names");
-                assert_eq!(value, key_value, "mode {mode:?} keeps the same values");
+                assert_eq!(
+                    value.as_str(),
+                    key_value,
+                    "mode {mode:?} keeps the same values"
+                );
             }
         }
         assert_eq!(meta.named_pairs(HeaderMode::None), Vec::new());
