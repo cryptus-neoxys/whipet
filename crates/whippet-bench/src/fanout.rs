@@ -1207,6 +1207,7 @@ mod tests {
     use whippet_core::api::{BookView, MetricsView, StateView};
     use whippet_core::config::Mode;
     use whippet_core::ids::Seq;
+    use whippet_core::protocol::SessionState;
 
     fn sample_state_view() -> StateView {
         let book = BookView {
@@ -1224,6 +1225,7 @@ mod tests {
             depth_bid_qty: 10,
             depth_ask_qty: 12,
             halted: false,
+            session: SessionState::default(),
         };
         StateView {
             mode: Mode::Durable,

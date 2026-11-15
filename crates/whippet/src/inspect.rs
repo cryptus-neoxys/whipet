@@ -26,16 +26,22 @@ pub const AUDIT_TOPIC_PARTITIONS: u32 = 4;
 
 /// The JSON object the gateway appends to the `audit` topic.
 ///
-/// The field set is exactly the gateway's: `operator`, `action`, `symbol`,
-/// `halted`, `reason`, `order_offset`, `timestamp_ns`, `service`. Unknown
-/// fields are ignored, so adding a field to the record does not break an older
-/// reader.
+/// The field set is the gateway's: `operator`, `action`, `symbol`, `halted`
+/// (halt/resume only), `session` (set_session only), `reason`, `order_offset`,
+/// `timestamp_ns`, `service`. Unknown fields are ignored, so adding a field to
+/// the record does not break an older reader.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditPayload {
     pub operator: String,
     pub action: String,
     pub symbol: String,
-    pub halted: bool,
+    /// Halt/resume records carry the state they set; session records omit it
+    /// because a session change does not claim the halt flag.
+    #[serde(default)]
+    pub halted: Option<bool>,
+    /// Session changed by a `set_session` record; absent on halt/resume.
+    #[serde(default)]
+    pub session: Option<String>,
     /// Operator-supplied free text; the gateway writes JSON `null` when absent.
     #[serde(default)]
     pub reason: Option<String>,
@@ -156,6 +162,7 @@ pub enum OrderEventKind {
     Cancel,
     Halt,
     Resume,
+    SetSession,
 }
 
 impl OrderEventKind {
@@ -165,6 +172,7 @@ impl OrderEventKind {
             Self::Cancel => "cancel",
             Self::Halt => "halt",
             Self::Resume => "resume",
+            Self::SetSession => "set_session",
         }
     }
 }
@@ -176,6 +184,7 @@ impl From<CommandKind> for OrderEventKind {
             CommandKind::Cancel => Self::Cancel,
             CommandKind::Halt => Self::Halt,
             CommandKind::Resume => Self::Resume,
+            CommandKind::SetSession => Self::SetSession,
         }
     }
 }
@@ -280,7 +289,10 @@ pub fn build_order_trace(
         let kind = OrderEventKind::from(command.kind);
         let (price_cents, qty) = match kind {
             OrderEventKind::NewOrder => (Some(command.price.0), Some(command.qty.0)),
-            OrderEventKind::Cancel | OrderEventKind::Halt | OrderEventKind::Resume => (None, None),
+            OrderEventKind::Cancel
+            | OrderEventKind::Halt
+            | OrderEventKind::Resume
+            | OrderEventKind::SetSession => (None, None),
         };
         order_events.push(OrderEvent {
             offset: *offset,
@@ -445,7 +457,8 @@ mod tests {
                 operator: operator.into(),
                 action: action.into(),
                 symbol: symbol.into(),
-                halted: action == "halt",
+                halted: Some(action == "halt"),
+                session: None,
                 reason: None,
                 order_offset: offset * 10,
                 timestamp_ns: offset,
@@ -469,7 +482,7 @@ mod tests {
         assert_eq!(record.payload.operator, "lead");
         assert_eq!(record.payload.action, "halt");
         assert_eq!(record.payload.symbol, "BTC-USD");
-        assert!(record.payload.halted);
+        assert_eq!(record.payload.halted, Some(true));
         assert_eq!(record.payload.reason.as_deref(), Some("volatility spike"));
         assert_eq!(record.payload.order_offset, 42);
         assert_eq!(record.payload.timestamp_ns, 1_700_000_000_000_000_000);
@@ -500,7 +513,7 @@ mod tests {
         }"#;
         let record = AuditRecord::decode(0, 0, null_reason.as_bytes()).expect("forward-compatible");
         assert_eq!(record.payload.reason, None);
-        assert!(!record.payload.halted);
+        assert_eq!(record.payload.halted, Some(false));
     }
 
     #[test]

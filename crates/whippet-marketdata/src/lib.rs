@@ -31,7 +31,7 @@ use whippet_core::api::{
 };
 use whippet_core::config::{ExchangeConfig, Mode};
 use whippet_core::ids::{OrderId, Price, Seq, Symbol};
-use whippet_core::protocol::{MD_FLAG_HALTED, MdEvent, MdKind, MdSnapshot, Side};
+use whippet_core::protocol::{MD_FLAG_HALTED, MdEvent, MdKind, MdSnapshot, SessionState, Side};
 
 const TRADE_TAPE_LEN: usize = 250;
 const BOOK_DEPTH: usize = 20;
@@ -92,6 +92,10 @@ struct BookState {
     /// carries no book change; this flag is the only thing a status event
     /// mutates besides `seq`.
     halted: bool,
+    /// Instrument session from the latest `MdKind::Status` event or snapshot
+    /// flags. Defaults to [`SessionState::Open`], so a hub that never sees a
+    /// session bit reports a trading instrument, exactly like the engine.
+    session: SessionState,
     /// Input offset of the event that produced `seq`, or `0` before the first
     /// applied event. It is the snapshot header's link back to the input log:
     /// a consumer can say "my image is at seq S, caused by offset O".
@@ -116,6 +120,7 @@ impl BookState {
             last_trade_side: None,
             seq: Seq(0),
             halted: false,
+            session: SessionState::default(),
             last_cause_offset: 0,
             depth_bid_qty: 0,
             depth_ask_qty: 0,
@@ -244,6 +249,13 @@ impl BookState {
             }
             MdKind::Status => {
                 self.halted = event.flags & MD_FLAG_HALTED != 0;
+                // The session bits sit above the halt bit. A status event with
+                // an out-of-range session code leaves the current session
+                // standing: the halt flag is still applied, only the unknown
+                // field is ignored.
+                if let Ok(session) = SessionState::from_md_flags(event.flags) {
+                    self.session = session;
+                }
             }
             MdKind::Bbo | MdKind::Snapshot => {}
         }
@@ -259,6 +271,12 @@ impl BookState {
         self.seq = snapshot.seq;
         self.last_cause_offset = snapshot.cause_offset;
         self.halted = snapshot.flags & MD_FLAG_HALTED != 0;
+        // Same decoding as a status event. A legacy snapshot (pre-session, all
+        // status bits zero) decodes as pre-open here, matching the wire: the
+        // session code is carried explicitly, not inferred.
+        if let Ok(session) = SessionState::from_md_flags(snapshot.flags) {
+            self.session = session;
+        }
         self.bids.clear();
         self.asks.clear();
         self.orders.clear();
@@ -364,6 +382,7 @@ impl BookState {
             depth_bid_qty: self.depth_bid_qty,
             depth_ask_qty: self.depth_ask_qty,
             halted: self.halted,
+            session: self.session,
         }
     }
 
@@ -1981,6 +2000,75 @@ mod tests {
 
         hub.apply(&status_event(0, 2));
         assert!(!btc_book(&hub.state()).halted);
+    }
+
+    /// Session bits ride above the halt bit in the status flags and land in
+    /// `BookView.session`; a stale (same- or older-seq) status event cannot
+    /// regress either.
+    #[test]
+    fn status_session_bits_set_the_book_session() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        assert_eq!(btc_book(&hub.state()).session, SessionState::Open);
+
+        hub.apply(&status_event(SessionState::PreOpen.to_md_flags(), 1));
+        assert_eq!(btc_book(&hub.state()).session, SessionState::PreOpen);
+
+        // Halt and session share one status event without colliding.
+        hub.apply(&status_event(
+            MD_FLAG_HALTED | SessionState::Closed.to_md_flags(),
+            2,
+        ));
+        let book = btc_book(&hub.state());
+        assert_eq!(book.session, SessionState::Closed);
+        assert!(book.halted);
+
+        // A stale redelivery with different bits must not regress anything.
+        hub.apply(&status_event(SessionState::Open.to_md_flags(), 2));
+        hub.apply(&status_event(SessionState::Open.to_md_flags(), 1));
+        let book = btc_book(&hub.state());
+        assert_eq!(book.session, SessionState::Closed);
+        assert!(book.halted);
+
+        hub.apply(&status_event(SessionState::Open.to_md_flags(), 3));
+        let book = btc_book(&hub.state());
+        assert_eq!(book.session, SessionState::Open);
+        assert!(!book.halted);
+    }
+
+    /// An out-of-range session code is not a session the hub can name, so the
+    /// current session stays standing while the event still applies.
+    #[test]
+    fn status_with_an_invalid_session_code_keeps_the_current_session() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        hub.apply(&status_event(SessionState::PreOpen.to_md_flags(), 1));
+        hub.apply(&status_event(0b11 << 1, 2));
+        assert_eq!(btc_book(&hub.state()).session, SessionState::PreOpen);
+    }
+
+    /// A snapshot's flags carry the session the same way a status event does,
+    /// and a stale snapshot cannot regress it.
+    #[test]
+    fn snapshot_flags_set_the_session() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        let make = |flags: u8, seq: u64| MdSnapshot {
+            symbol: Symbol::new("BTC-USD").unwrap(),
+            seq: Seq(seq),
+            cause_offset: 0,
+            timestamp_ns: 0,
+            last_trade_price: Price::ZERO,
+            last_trade_qty: Qty::ZERO,
+            bids: vec![],
+            asks: vec![],
+            orders: vec![],
+            flags,
+        };
+        assert_eq!(btc_book(&hub.state()).session, SessionState::Open);
+
+        hub.apply_snapshot(&make(SessionState::Closed.to_md_flags(), 1));
+        assert_eq!(btc_book(&hub.state()).session, SessionState::Closed);
+
+        hub.apply_snapshot(&make(SessionState::PreOpen.to_md_flags(), 1));
+        assert_eq!(btc_book(&hub.state()).session, SessionState::Closed);
     }
 
     #[test]

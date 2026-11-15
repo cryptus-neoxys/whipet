@@ -121,7 +121,7 @@ async fn audit_lists_gateway_records_and_skips_malformed_json() {
     assert_eq!(halt.payload.operator, "lead");
     assert_eq!(halt.payload.action, "halt");
     assert_eq!(halt.payload.symbol, "BTC-USD");
-    assert!(halt.payload.halted);
+    assert_eq!(halt.payload.halted, Some(true));
     assert_eq!(halt.payload.reason.as_deref(), Some("volatility spike"));
     assert_eq!(halt.payload.order_offset, 42);
     assert_eq!(halt.payload.service, "whippet");
@@ -130,7 +130,7 @@ async fn audit_lists_gateway_records_and_skips_malformed_json() {
     let resume = &report.records[1];
     assert_eq!(resume.partition, 1);
     assert_eq!(resume.payload.operator, "risk");
-    assert!(!resume.payload.halted);
+    assert_eq!(resume.payload.halted, Some(false));
     assert_eq!(resume.payload.reason, None);
 
     // Read-only: no consumer watermark was written and every record survives.

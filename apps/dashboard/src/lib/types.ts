@@ -1,6 +1,7 @@
 export type Mode = 'durable' | 'turbo';
 export type Side = 'buy' | 'sell';
 export type OrderType = 'limit' | 'market' | 'ioc' | 'fok' | 'post_only';
+export type SessionState = 'pre_open' | 'open' | 'closed';
 
 export interface LevelView {
   price_cents: number;
@@ -33,6 +34,8 @@ export interface BookView {
   depth_bid_qty: number;
   depth_ask_qty: number;
   halted: boolean;
+  /** Trading session; absent on frames from a pre-session node. */
+  session?: SessionState;
 }
 
 export interface MetricsView {

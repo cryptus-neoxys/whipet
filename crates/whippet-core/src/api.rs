@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Mode;
 use crate::ids::{OrderId, ParticipantId, Seq, Symbol};
-use crate::protocol::{MdKind, OrderType, Side};
+use crate::protocol::{MdKind, OrderType, SessionState, Side};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderRequest {
@@ -150,6 +150,16 @@ pub struct AdminRequest {
     pub reason: Option<String>,
 }
 
+/// Operator session-change request body: `{"state":"pre_open"|"open"|"closed"}`
+/// with an optional free-text `reason` recorded verbatim in the audit log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRequest {
+    /// The session the instrument moves to.
+    pub state: SessionState,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 /// Halt/resume ack.
 ///
 /// `offset` is the command's position in the Orders log (durable) or the
@@ -158,10 +168,17 @@ pub struct AdminRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminAck {
     pub symbol: Symbol,
-    /// `halt` or `resume`.
+    /// `halt`, `resume`, or `set_session`.
     pub action: String,
-    /// The instrument's state after the command.
+    /// The instrument's halt state after a `halt`/`resume` command. A
+    /// `set_session` command does not touch the halt flag, so its ack always
+    /// reports `false` here — read the live halt state from `/api/state` or
+    /// the MD feed instead of this field.
     pub halted: bool,
+    /// The instrument's session after a `set_session` command; `None` for
+    /// halt/resume, which do not change the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionState>,
     pub partition: u32,
     pub offset: u64,
     /// The operator identity the presented token acted as.
@@ -206,6 +223,11 @@ pub struct BookView {
     /// data hub copies it from the engine's halt state.
     #[serde(default)]
     pub halted: bool,
+    /// The instrument's trading session, copied by the market data hub from
+    /// the engine's status events and snapshots. `open` is the default, so a
+    /// frame from a node that predates sessions decodes as trading.
+    #[serde(default)]
+    pub session: SessionState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -435,6 +457,58 @@ mod tests {
         assert_eq!(request.reason, None);
         let request: AdminRequest = serde_json::from_str(r#"{"reason":"fat finger"}"#).unwrap();
         assert_eq!(request.reason.as_deref(), Some("fat finger"));
+    }
+
+    #[test]
+    fn session_request_parses_the_documented_states() {
+        for (json, expected) in [
+            (r#"{"state":"pre_open"}"#, SessionState::PreOpen),
+            (r#"{"state":"open"}"#, SessionState::Open),
+            (r#"{"state":"closed"}"#, SessionState::Closed),
+        ] {
+            let request: SessionRequest = serde_json::from_str(json).unwrap();
+            assert_eq!(request.state, expected);
+            assert_eq!(request.reason, None);
+        }
+        let request: SessionRequest =
+            serde_json::from_str(r#"{"state":"closed","reason":"end of day"}"#).unwrap();
+        assert_eq!(request.reason.as_deref(), Some("end of day"));
+        // Anything else is a 422 at the gateway, not a silent default.
+        assert!(serde_json::from_str::<SessionRequest>(r#"{"state":"auction"}"#).is_err());
+    }
+
+    #[test]
+    fn book_view_defaults_to_an_open_session_for_old_frames() {
+        let json = r#"{"symbol":"BTC-USD","seq":1,"bids":[],"asks":[],"best_bid_cents":null,"best_ask_cents":null,"spread_cents":null,"mid_cents":null,"last_trade_price_cents":null,"last_trade_qty":0,"last_trade_side":null,"depth_bid_qty":0,"depth_ask_qty":0,"halted":false}"#;
+        let view: BookView = serde_json::from_str(json).unwrap();
+        assert_eq!(view.session, SessionState::Open);
+    }
+
+    #[test]
+    fn admin_ack_carries_the_session_only_for_set_session() {
+        let halt = AdminAck {
+            symbol: Symbol::new("BTC-USD").unwrap(),
+            action: "halt".into(),
+            halted: true,
+            session: None,
+            partition: 3,
+            offset: 4,
+            operator: "ops-lead".into(),
+            audit_offset: 5,
+        };
+        let json = serde_json::to_value(&halt).unwrap();
+        // Halt/resume acks keep their exact old shape.
+        assert!(json.get("session").is_none());
+        assert_eq!(json["halted"], true);
+        let ack = AdminAck {
+            action: "set_session".into(),
+            halted: false,
+            session: Some(SessionState::PreOpen),
+            ..halt
+        };
+        let json = serde_json::to_value(&ack).unwrap();
+        assert_eq!(json["session"], "pre_open");
+        assert_eq!(json["halted"], false);
     }
 
     #[test]

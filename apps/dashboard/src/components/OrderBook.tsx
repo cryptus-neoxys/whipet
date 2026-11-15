@@ -1,5 +1,5 @@
 import { memo } from 'react';
-import { formatPrice, formatQty } from '../lib/format';
+import { formatPrice, formatQty, formatSession } from '../lib/format';
 import type { BookView, LevelView } from '../lib/types';
 
 /**
@@ -59,12 +59,24 @@ export function OrderBook({ book }: { book: BookView | null }) {
   for (const level of book.asks) if (level.qty > maxQty) maxQty = level.qty;
 
   const askCount = book.asks.length;
+  // The session badge sits next to the HALTED badge; both are text, so neither
+  // state is ever color-only.
+  const session = formatSession(book.session);
 
   return (
     <section className="panel book-panel" aria-label={`Order book for ${book.symbol}`}>
       <div className="panel-head">
         <span>
           {book.symbol} <span className="panel-sub">book</span>{' '}
+          {session ? (
+            <span
+              className={`session-badge session-${session.tone}`}
+              role="status"
+              aria-label={`${book.symbol} is in ${session.label}`}
+            >
+              {session.text}
+            </span>
+          ) : null}
           {book.halted ? (
             <span className="halt-badge" role="status" aria-label={`${book.symbol} is halted`}>
               halted

@@ -18,6 +18,7 @@ use axum::routing::{get, post};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::Value;
 use tokio::sync::OwnedSemaphorePermit;
 use tower_http::compression::CompressionLayer;
 use tower_http::compression::predicate::NotForContentType;
@@ -27,12 +28,12 @@ use tracing::warn;
 use whippet_core::api::{
     AdminAck, AdminRequest, ApiError, BatchOrderAck, BatchOrderRequest, BatchOrderRequestRef,
     CancelAck, CancelRequest, GUARANTEE_DURABLE, GUARANTEE_TURBO, HealthView, MAX_BATCH_ORDERS,
-    MdFeedMessage, MdFeedResync, OrderAck, OrderRequest, OrderRequestRef, StateView, TradeView,
-    WsClientMessage, WsServerMessage,
+    MdFeedMessage, MdFeedResync, OrderAck, OrderRequest, OrderRequestRef, SessionRequest,
+    StateView, TradeView, WsClientMessage, WsServerMessage,
 };
 use whippet_core::headers::{HeaderMode, MessageMeta, SCHEMA_ORDER};
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Seq, Symbol};
-use whippet_core::protocol::{Command, OrderType, Side};
+use whippet_core::protocol::{Command, OrderType, SessionState, Side};
 use whippet_journal::{JournalMessage, Topic};
 use whippet_marketdata::{LatencySummary, Metrics, RiskRejection, Stage};
 
@@ -86,6 +87,10 @@ pub fn router(ctx: Arc<NodeContext>) -> Router {
         .route(
             "/api/admin/instruments/{symbol}/resume",
             post(admin_resume),
+        )
+        .route(
+            "/api/admin/instruments/{symbol}/session",
+            post(admin_session),
         )
         .layer(middleware::from_fn_with_state(limiter, rate_limit));
 
@@ -1063,6 +1068,69 @@ async fn admin_resume(
     admin_control(&ctx, &symbol, AdminAction::Resume, headers, body).await
 }
 
+/// `POST /api/admin/instruments/{symbol}/session`: operator session change.
+///
+/// The body is `{"state":"pre_open"|"open"|"closed"}` plus an optional
+/// `reason`; anything else is a 422, never a silent default.
+async fn admin_session(
+    State(ctx): State<Arc<NodeContext>>,
+    Path(symbol): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> ApiResult<AdminAck> {
+    // 403 first, exactly like halt/resume: with no operator credentials
+    // configured the node must refuse every caller before it says anything
+    // about tokens it does not have.
+    let operator = authenticate_operator(&ctx, &headers)?;
+    let started = Instant::now();
+    let mut stage_at = Instant::now();
+    let symbol = parse_configured_symbol(&ctx, &symbol)?;
+    let bytes = read_json_body(&headers, body).await?;
+    let request: SessionRequest = serde_json::from_slice(&bytes).map_err(invalid_json)?;
+    ctx.metrics
+        .record_stage_us(Stage::GatewayParse, split_elapsed(&mut stage_at));
+    let timestamp_ns = now_ns();
+    let command = Command::set_session(
+        symbol,
+        request.state,
+        ParticipantId::derive(operator),
+        timestamp_ns,
+    );
+    admin_execute(
+        &ctx,
+        symbol,
+        OperatorAction {
+            action: "set_session",
+            command,
+            // A session change does not touch the halt flag, so there is no
+            // halted value this endpoint can state truthfully; the ack's
+            // `halted` field is documented as halt/resume-only.
+            halted: None,
+            session: Some(request.state),
+            reason: request.reason,
+        },
+        operator,
+        started,
+        stage_at,
+    )
+    .await
+}
+
+/// What one accepted operator request appends: the ordered command and the
+/// state it puts the instrument in, for the ack and the audit record.
+struct OperatorAction {
+    /// `halt`, `resume`, or `set_session`; also the journal header name.
+    action: &'static str,
+    command: Command,
+    /// Halt state after the action; `None` when the action does not touch the
+    /// halt flag (a session change).
+    halted: Option<bool>,
+    /// Session after the action; `None` for halt/resume.
+    session: Option<SessionState>,
+    /// Free-text reason, recorded verbatim in the audit record.
+    reason: Option<String>,
+}
+
 /// The operator control plane.
 ///
 /// The halt/resume command is appended to the same ordered Orders log as
@@ -1070,6 +1138,9 @@ async fn admin_resume(
 /// the same halt state by replaying the log. One JSON audit record then lands
 /// in the Audit topic on `symbol.partition(4)`. Authorization is operator-only
 /// (`WHIPPET_OPERATOR_TOKENS`); trading tokens are not operator credentials.
+///
+/// Session changes (`admin_session`) share this same append-then-audit flow
+/// through [`admin_execute`].
 async fn admin_control(
     ctx: &NodeContext,
     raw_symbol: &str,
@@ -1093,19 +1164,54 @@ async fn admin_control(
         AdminAction::Halt => Command::halt(symbol, participant, timestamp_ns),
         AdminAction::Resume => Command::resume(symbol, participant, timestamp_ns),
     };
+    admin_execute(
+        ctx,
+        symbol,
+        OperatorAction {
+            action: action.as_str(),
+            command,
+            halted: Some(action.halted()),
+            session: None,
+            reason: request.reason,
+        },
+        operator,
+        started,
+        stage_at,
+    )
+    .await
+}
+
+/// Append one operator command to the symbol's Orders-log partition, then one
+/// audit record to the Audit topic.
+///
+/// The command is the source of truth and lands first. If the audit append
+/// then fails, the endpoint returns 500 `audit_unavailable` and says the
+/// command may already be applied; the node logs the operator, action, symbol,
+/// and order offset. A missing audit record is an operational incident, not a
+/// silent success (ADR 0015).
+async fn admin_execute(
+    ctx: &NodeContext,
+    symbol: Symbol,
+    request: OperatorAction,
+    operator: &str,
+    started: Instant,
+    mut stage_at: Instant,
+) -> ApiResult<AdminAck> {
+    let timestamp_ns = request.command.timestamp_ns;
     let meta = MessageMeta::new(
         symbol,
         Seq(0),
-        action.as_str(),
+        request.action,
         SCHEMA_ORDER,
-        command.order_id.0,
+        request.command.order_id.0,
     );
-    let message = JournalMessage::new_named(command.encode(), meta.named_pairs(HeaderMode::Full));
+    let message =
+        JournalMessage::new_named(request.command.encode(), meta.named_pairs(HeaderMode::Full));
     ctx.metrics
         .record_stage_us(Stage::GatewayEncode, split_elapsed(&mut stage_at));
     let partition = symbol.partition(ctx.exchange().partitions);
     let offset = if ctx.turbo.is_some() {
-        let receiver = turbo_enqueue(ctx, partition, command, message)?;
+        let receiver = turbo_enqueue(ctx, partition, request.command, message)?;
         let ack = turbo_await(receiver).await?;
         ctx.metrics
             .record_stage_us(Stage::GatewayAppend, split_elapsed(&mut stage_at));
@@ -1123,17 +1229,23 @@ async fn admin_control(
     ctx.metrics
         .record_ingress_latency_us(elapsed.as_micros() as u64);
 
-    let halted = action.halted();
-    let audit = serde_json::json!({
+    let mut audit = serde_json::json!({
         "operator": operator,
-        "action": action.as_str(),
+        "action": request.action,
         "symbol": symbol.as_str(),
-        "halted": halted,
         "reason": request.reason,
         "order_offset": offset,
         "timestamp_ns": timestamp_ns,
         "service": "whippet",
     });
+    // Halt/resume records state the halt flag; session records state the
+    // session. An action's audit record only claims what it changed.
+    if let Some(halted) = request.halted {
+        audit["halted"] = Value::Bool(halted);
+    }
+    if let Some(session) = request.session {
+        audit["session"] = Value::String(session.as_str().into());
+    }
     // A serialized `Value` cannot fail, but the conversion stays total without
     // an `expect` on the request path.
     let payload = serde_json::to_vec(&audit).map_err(|error| {
@@ -1161,7 +1273,7 @@ async fn admin_control(
             // The command may already be applied by the engine; say so.
             warn!(
                 operator,
-                action = action.as_str(),
+                action = request.action,
                 symbol = %symbol,
                 order_offset = offset,
                 error = %error,
@@ -1174,7 +1286,7 @@ async fn admin_control(
                     format!(
                         "the {} command was appended to the order log at offset {offset} \
                          and may already be applied, but its audit record could not be written: {error}",
-                        action.as_str()
+                        request.action
                     ),
                 )),
             ));
@@ -1182,8 +1294,9 @@ async fn admin_control(
     };
     Ok(Json(AdminAck {
         symbol,
-        action: action.as_str().into(),
-        halted,
+        action: request.action.into(),
+        halted: request.halted.unwrap_or(false),
+        session: request.session,
         partition,
         offset,
         operator: operator.to_string(),
@@ -2423,6 +2536,7 @@ mod tests {
             depth_bid_qty: 0,
             depth_ask_qty: 0,
             halted: false,
+            session: SessionState::default(),
         };
         let eth = whippet_core::api::BookView {
             symbol: Symbol::new("ETH-USD").unwrap(),

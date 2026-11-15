@@ -1,3 +1,5 @@
+import type { SessionState } from './types';
+
 const decimalsBySymbol: Record<string, number> = {
   'BTC-USD': 2,
   'ETH-USD': 2,
@@ -58,4 +60,22 @@ export function formatSignedCents(cents: number | null | undefined, symbol: stri
   if (cents === null || cents === undefined) return '—';
   const sign = cents > 0 ? '+' : '';
   return `${sign}${formatPrice(cents, symbol)}`;
+}
+
+/**
+ * Badge text for an instrument's trading session. `open` renders nothing: the
+ * badge is only for the states an operator must notice. The text is lowercase
+ * but the badge CSS uppercases it, so the state is accessible without color.
+ */
+export function formatSession(
+  session: SessionState | undefined,
+): { text: string; label: string; tone: string } | null {
+  switch (session) {
+    case 'pre_open':
+      return { text: 'pre-open', label: 'pre-open', tone: 'pre-open' };
+    case 'closed':
+      return { text: 'closed', label: 'closed', tone: 'closed' };
+    default:
+      return null;
+  }
 }

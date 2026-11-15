@@ -390,8 +390,10 @@ pub async fn run_engine_shard(
 
     // Publish a snapshot immediately so a fresh dashboard has a state even
     // before the first order arrives. The snapshot carries the venue-status
-    // flags, so the hub learns a restored halt state from the same append
-    // without a separate status record or an MD-sequence bump.
+    // flags — halt bit and session code — so the hub learns a restored halt
+    // and session state from the same append without a separate status record
+    // or an MD-sequence bump. The flags are built by the engine's snapshot,
+    // so this path needs no encoding of its own.
     let mut initial_symbols: Vec<_> = engine.symbols().collect();
     initial_symbols.sort_unstable();
     let initial: Vec<MdSnapshot> = initial_symbols

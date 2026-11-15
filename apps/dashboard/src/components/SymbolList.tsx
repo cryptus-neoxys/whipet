@@ -1,4 +1,4 @@
-import { formatPrice, formatQty } from '../lib/format';
+import { formatPrice, formatQty, formatSession } from '../lib/format';
 import type { BookView } from '../lib/types';
 
 export function SymbolList({
@@ -20,6 +20,7 @@ export function SymbolList({
         {books.map((book) => {
           const active = book.symbol === selected;
           const last = book.last_trade_price_cents ?? book.mid_cents;
+          const session = formatSession(book.session);
           return (
             <button
               key={book.symbol}
@@ -30,6 +31,15 @@ export function SymbolList({
             >
               <span className="symbol-name">
                 {book.symbol}
+                {session ? (
+                  <span
+                    className={`session-tag session-${session.tone}`}
+                    role="status"
+                    aria-label={`${book.symbol} is in ${session.label}`}
+                  >
+                    {session.text}
+                  </span>
+                ) : null}
                 {book.halted ? (
                   <span className="halt-tag" role="status" aria-label={`${book.symbol} is halted`}>
                     halted

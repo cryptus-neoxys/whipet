@@ -1024,8 +1024,8 @@ pub struct AuditArgs {
     /// Only records written by this operator.
     #[arg(long)]
     pub operator: Option<String>,
-    /// Only halt or resume records.
-    #[arg(long, value_parser = ["halt", "resume"])]
+    /// Only records for this action.
+    #[arg(long, value_parser = ["halt", "resume", "set_session"])]
     pub action: Option<String>,
     /// Only records for this symbol (case-insensitive).
     #[arg(long)]
@@ -1174,7 +1174,7 @@ pub async fn audit_with_journal(args: AuditArgs, journal: &Journal) -> Result<Au
 
 fn print_audit_table(records: &[AuditRecord]) {
     println!(
-        "{:>9}  {:>10}  {:<23}  {:<12}  {:<6}  {:<8}  {:<6}  {:>12}  reason",
+        "{:>9}  {:>10}  {:<23}  {:<12}  {:<11}  {:<8}  {:<6}  {:<9}  {:>12}  reason",
         "partition",
         "offset",
         "timestamp",
@@ -1182,18 +1182,24 @@ fn print_audit_table(records: &[AuditRecord]) {
         "action",
         "symbol",
         "halted",
+        "session",
         "order_offset"
     );
     for record in records {
         println!(
-            "{:>9}  {:>10}  {:<23}  {:<12}  {:<6}  {:<8}  {:<6}  {:>12}  {}",
+            "{:>9}  {:>10}  {:<23}  {:<12}  {:<11}  {:<8}  {:<6}  {:<9}  {:>12}  {}",
             record.partition,
             record.offset,
             format_timestamp_ns(record.payload.timestamp_ns),
             record.payload.operator,
             record.payload.action,
             record.payload.symbol,
-            record.payload.halted,
+            match record.payload.halted {
+                Some(true) => "true",
+                Some(false) => "false",
+                None => "-",
+            },
+            record.payload.session.as_deref().unwrap_or("-"),
             record.payload.order_offset,
             record.payload.reason.as_deref().unwrap_or("-"),
         );
