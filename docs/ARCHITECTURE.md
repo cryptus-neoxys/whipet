@@ -405,7 +405,9 @@ admission window (Queued to Completed/Abandoned, exactly-once permit release)
 (ADR 0021). The journal enforces its offset/commit contract in the test backend
 (ADR 0023), the MD hub refuses book-state deltas until a baseline image seeds
 the symbol, and `whippet ledger` folds the logs into a double-entry projection
-whose balances reconcile with positions (ADR 0022). The full catalogue and what
+whose balances reconcile with positions, converting tick prices to quote cents
+through an explicit tick-size map (ADR 0022/0025). Wire decoders are total over
+untrusted bytes and re-encode canonically, pinned by the core proptest suite. The full catalogue and what
 remains unproven is [INVARIANTS.md](INVARIANTS.md).
 
 ## Observability

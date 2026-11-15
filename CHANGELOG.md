@@ -10,6 +10,15 @@ Whippet is pre-1.0; minor releases may change internal APIs.
 
 ### Fixed
 
+- `positions` and the ledger now convert the log's tick prices to quote cents
+  with an explicit tick size (`--tick-size-cents` or the built-in config);
+  previously they multiplied ticks by quantity and labelled the result cents,
+  understating cash/notional by the tick size. A missing tick size is an error
+  (ADR 0025).
+- TCP decoders reject trailing bytes and non-0/1 `HelloAck` booleans, the MD
+  snapshot order-count guard uses the correct 41-byte stride, level counts are
+  validated against remaining input before reserving, and string truncation is
+  UTF-8-safe. The core decoder suite covers every wire type.
 - A successful cancel report now carries the removed order's side (the fixed
   cancel layout's side is always `Buy`), and a post-acceptance BookFull /
   remainder cancel keeps the admission's role flag instead of claiming

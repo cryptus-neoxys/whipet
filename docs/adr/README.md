@@ -30,6 +30,7 @@ supersedes an earlier one.
 | [0022](0022-double-entry-ledger-projection.md) | Double-entry ledger as a deterministic log projection | Accepted (four postings per fill, all-or-nothing attribution, conservation checks) |
 | [0023](0023-resume-points-and-feed-baselines.md) | Resume points and feed baselines | Accepted (journal commit bounds, MD baseline phase, seq advances iff applied) |
 | [0024](0024-execution-output-invariants.md) | Execution output provenance invariants | Accepted (one fill ↔ one trade ↔ one maker reduce/remove; role/seq/offset checks) |
+| [0025](0025-price-units-ticks-vs-cents.md) | Price units: ticks on the wire, quote cents in projections | Accepted (`TickSizes`, `--tick-size-cents`, ledger entries carry both) |
 
 Template:
 

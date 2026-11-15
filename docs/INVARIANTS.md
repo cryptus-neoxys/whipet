@@ -195,6 +195,17 @@ failure paths that mark only the failing role.
   `storage_pressure`.
 - Config invalids fail startup: partitions outside 1–256, turbo without Iggy,
   inverted disk thresholds, malformed token pairs, unknown symbols.
+- Wire decoders are total over untrusted bytes: every input yields a typed
+  error or a canonical value, a successful decode re-encodes byte-identically
+  (the legacy snapshot form without the trailing status byte is the only
+  documented exception), and arbitrary/truncated/trailing/oversized input
+  never panics or reads out of bounds. TCP frames are exact-length (no trailing
+  bytes), booleans are 0/1, count prefixes are checked against the remaining
+  bytes before reserving, and string truncation lands on a UTF-8 boundary.
+  Proptest round-trip, mutation, and arbitrary-byte suites cover every wire
+  type (~7,400 generated cases per run plus exhaustive version/reason sweeps).
+  The price-unit rule is ADR 0025; the decoder properties live in
+  `crates/whippet-core/tests/decoders.rs`.
 
 ## 8. Market-data hub and feed
 
@@ -220,7 +231,8 @@ failure paths that mark only the failing role.
   `feed_sent == 0` when no subscriber ever attached. Every accepted event is
   one feed frame; a refused event is not a hole because seq did not advance.
 - `check_invariants` is test-only; the gate and counter are the production
-  behavior.
+  behavior. The refused-delta count is exposed as
+  `whippet_md_events_without_baseline_total` on `/metrics`.
 
 ## 9. Double-entry ledger projection
 
@@ -228,8 +240,10 @@ failure paths that mark only the failing role.
 it is a projection, not settlement. For every attributed fill report:
 
 - identity is the engine `seq`; `cause_offset` links it to the input command;
-- exactly four postings: buyer cash `-price*qty`, seller cash `+price*qty`,
-  buyer position `+qty`, seller position `-qty`;
+- exactly four postings: buyer cash `-price_cents*qty`, seller cash
+  `+price_cents*qty`, buyer position `+qty`, seller position `-qty`, where
+  `price_cents = price_ticks * tick_size_cents` (the log stores tick indices,
+  not cents; a missing tick size is an error, never a factor of one);
 - attribution is all-or-nothing: an unknown aggressor or maker (including
   `maker_order_id == 0`) posts neither leg and increments the matching
   unresolved counter;

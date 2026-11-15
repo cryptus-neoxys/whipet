@@ -246,9 +246,11 @@ test-only diagnostics; readiness is the per-shard rule above.
 
 ## Ledger projection
 
-`whippet ledger --partition N [--symbols ...] [--participant ID] [--json]`
-reads the orders and executions logs from offset 0 and prints double-entry
-cash/position accounts. It is read-only, posts four legs per attributed fill,
+`whippet ledger --partition N [--symbols ...] [--participant ID] [--json]
+[--tick-size-cents N]` reads the orders and executions logs from offset 0 and
+prints double-entry cash/position accounts. The logs store tick indices, so the
+projection converts with the tick size: without the flag it uses the built-in
+default exchange config; a custom symbol needs `--tick-size-cents`. It is read-only, posts four legs per attributed fill,
 and excludes a trade whose aggressor or maker cannot be attributed (the
 unresolved counters say how many). It is T+0 simulation, not settlement: no
 fees, funding, margin, or clearing. Its cash/position balances reconcile with
