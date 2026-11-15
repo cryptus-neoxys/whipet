@@ -1014,6 +1014,28 @@ samples; it is a 2-minute dev-loop observation, not a sustained proof. Disk
 consumption was about 14 MB/s at this offered rate, which is why the
 bounded-storage guard and the retention design are Phase A work.
 
+### Post-optimization turbo observation (dev-loop, 30 s)
+
+After the ack-before-encode and inline-header changes, a 30 s turbo run at
+5,000 requests/s showed a much lower match ack (`turbo_ack` p50 32 µs, server
+ingress window p50 31–45 µs) but **more window backpressure**: the age bound
+rejected 16,248 commands in 30 s (about 10.8%), the count bound rejected none,
+and the in-flight window peaked at 227 commands. The writer's tail on this
+Docker Desktop host (Iggy append p99 6.7 ms with occasional much longer stalls)
+holds the output ring, the matcher backs up, and the oldest admitted command
+crosses 50 ms; the guard then reject-bursts until the queue drains. The client
+p99 was 84 ms and the 150k-order run had zero transport errors, but the
+rejects are real `window_full` responses.
+
+This is the designed backpressure, not a silent drop, and it is why the turbo
+guarantee is a loss bound rather than a zero-error promise. The earlier 60 s
+turbo row above predates the faster ack path and the same writer; it is not a
+clean A/B. For a dev-loop turbo demo either lower the offered rate or raise
+`WHIPPET_TURBO_WINDOW_MS` as an explicit wider-loss decision; a native Linux
+run is required before claiming the default bound is non-binding. The soak
+manifest now records `turbo_window_max`, `turbo_drops_age_start/end`, and
+`turbo_drops_count_end` so this is visible per run.
+
 ## Phase A exit-gate attempt (dev-loop, 8 minutes)
 
 The improvement plan's Phase A exit gate asks for a 10-minute sustained run at

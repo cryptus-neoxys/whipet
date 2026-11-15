@@ -156,6 +156,16 @@ except Exception:
 def metric_gauge(text, name):
     match = re.search(r"^" + re.escape(name) + r"\s+([0-9.eE+-]+)$", text, re.MULTILINE)
     return float(match.group(1)) if match else None
+
+
+def metric_sum(text, name):
+    values = [
+        float(value)
+        for value in re.findall(
+            r"^" + re.escape(name) + r"\{[^}]*\}\s+([0-9.eE+-]+)$", text, re.MULTILINE
+        )
+    ]
+    return sum(values) if values else None
 print(json.dumps({
     "t": int(t),
     "p50_us": metrics.get("ingress_p50_us"),
@@ -172,6 +182,13 @@ print(json.dumps({
     "disk_free_iggy_bytes": metric_gauge(metrics_text, 'whippet_disk_free_bytes{volume="iggy"}'),
     "disk_free_whippet_bytes": metric_gauge(metrics_text, 'whippet_disk_free_bytes{volume="whippet"}'),
     "storage_critical": metric_gauge(metrics_text, "whippet_storage_critical"),
+    "turbo_window": metric_sum(metrics_text, "whippet_turbo_uncommitted_window"),
+    "turbo_drops_age": metric_gauge(
+        metrics_text, 'whippet_turbo_window_drops_total{reason="age"}'
+    ),
+    "turbo_drops_count": metric_gauge(
+        metrics_text, 'whippet_turbo_window_drops_total{reason="count"}'
+    ),
 }))
 PY
     count=$((count + 1))
@@ -276,6 +293,22 @@ summary = {
     "disk_free_iggy_end": next((s["disk_free_iggy_bytes"] for s in reversed(samples) if s.get("disk_free_iggy_bytes") is not None), None),
     "min_disk_free_iggy": min((s["disk_free_iggy_bytes"] for s in samples if s.get("disk_free_iggy_bytes") is not None), default=None),
     "storage_critical_seen": any(s.get("storage_critical") == 1 for s in samples),
+    "turbo_window_max": max(
+        (s["turbo_window"] for s in samples if isinstance(s.get("turbo_window"), (int, float))),
+        default=None,
+    ),
+    "turbo_drops_age_start": next(
+        (s["turbo_drops_age"] for s in samples if s.get("turbo_drops_age") is not None),
+        None,
+    ),
+    "turbo_drops_age_end": next(
+        (s["turbo_drops_age"] for s in reversed(samples) if s.get("turbo_drops_age") is not None),
+        None,
+    ),
+    "turbo_drops_count_end": next(
+        (s["turbo_drops_count"] for s in reversed(samples) if s.get("turbo_drops_count") is not None),
+        None,
+    ),
     "shards_ok": shards_ok,
     "bench_exit": bench_status,
     "verdict": "fail" if failed else ("pass" if drift is not None else "skipped"),

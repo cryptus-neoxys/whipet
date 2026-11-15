@@ -120,7 +120,6 @@ impl Drop for TurboAdmission {
 struct Clock {
     /// `(admission id, ingestion nanos)`, in admission (and seq) order.
     queued: VecDeque<(u64, u64)>,
-    inflight: usize,
 }
 
 /// The admission gate shared by ingress, the matcher, and the write-behind.
@@ -142,7 +141,6 @@ impl TurboWindow {
             window_ms: config.window_ms,
             clock: Mutex::new(Clock {
                 queued: VecDeque::with_capacity(config.window_commands.min(16_384)),
-                inflight: 0,
             }),
             next_id: AtomicU64::new(0),
             in_flight: AtomicU64::new(0),
@@ -184,7 +182,6 @@ impl TurboWindow {
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         clock.queued.push_back((id, now_ns));
-        clock.inflight += 1;
         self.in_flight.fetch_add(1, Ordering::Relaxed);
         Some(TurboAdmission {
             window: Arc::clone(self),
@@ -212,7 +209,6 @@ impl TurboWindow {
             {
                 clock.queued.remove(position);
             }
-            clock.inflight = clock.inflight.saturating_sub(1);
         }
         self.in_flight.fetch_sub(1, Ordering::Relaxed);
     }
