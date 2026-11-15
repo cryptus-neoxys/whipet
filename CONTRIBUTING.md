@@ -52,7 +52,7 @@ developing the Rust side, use the `docker run` command below.
 ## Local setup
 
 ```bash
-git clone https://github.com/cryptus-neoxys/whippet.git
+git clone https://github.com/cryptus-neoxys/whipet.git
 cd whippet
 
 # Rust workspace

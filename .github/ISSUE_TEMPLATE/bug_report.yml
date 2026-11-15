@@ -7,7 +7,7 @@ body:
     attributes:
       value: |
         Whippet is a Phase 1 single-node demo, not a production system. Read the
-        [scope and current security posture](https://github.com/cryptus-neoxys/whippet/blob/main/SECURITY.md)
+        [scope and current security posture](https://github.com/cryptus-neoxys/whipet/blob/main/SECURITY.md)
         before reporting.
 
         **Do not report security vulnerabilities here.** Use the private

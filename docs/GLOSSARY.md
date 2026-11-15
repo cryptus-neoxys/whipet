@@ -100,11 +100,14 @@ replay mean the engine reached the same state.
 
 **Dedup table.** Whippet's business-level table of order ids and their status.
 It is snapshotted with the book and the input offset. Iggy's idempotent
-producer dedup is a different mechanism and is not used here.
+producer dedup is a different mechanism and is not used here. Capacity is
+`min(2 * max_orders, 100,000)` entries per symbol with terminal-first
+eviction. The window is count-based, not a time TTL, and an id evicted from
+the window can be re-admitted.
 
 **Single writer.** Exactly one task applies commands to a partition's books.
-Whippet gets this from one Tokio task per active partition, not from thread
-pinning. There is no lock in the engine.
+Whippet gets this from one dedicated matcher OS thread per active shard, not
+from thread pinning. There is no lock in the engine.
 
 **Conflation.** Replacing intermediate states with the latest one. The MD hub
 publishes one full state frame at 20 Hz instead of every event. Trades are
@@ -141,3 +144,15 @@ machine, Docker Desktop, OrbStack, or a Linux VM. It is useful for regression
 and relative comparisons. `headline` is reserved for a native Linux host with
 the method card and manifest. The manifest's `scope_label()` makes the
 distinction; M4 and Docker Desktop are never headline.
+
+**Smoke.** A short single-repetition run that checks the harness and the
+stack work and records the rough shape of a result. Not a benchmark.
+
+**Soak.** A sustained constant-rate run (minutes or longer) that checks for
+latency drift, queue growth, RSS growth, and log growth. A soak that fails
+the drift gate is evidence of non-steady-state, not capacity.
+
+**Microbench.** A narrow criterion measurement of one component (matcher,
+hub apply, snapshot stage) with no broker, network, or async runtime on the
+measured path. It answers "did this code get faster", not "did the exchange
+get faster".

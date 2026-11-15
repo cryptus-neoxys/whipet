@@ -9,7 +9,7 @@ abstract: >-
   benchmark harness, and a live dashboard.
 authors:
   - name: "The Whippet Authors"
-repository-code: "https://github.com/cryptus-neoxys/whippet"
+repository-code: "https://github.com/cryptus-neoxys/whipet"
 license: Apache-2.0
 version: "0.1.0"
 date-released: "2026-11-14"

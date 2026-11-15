@@ -1,5 +1,10 @@
 # Benchmarks
 
+> Legend: every measurement table states its class (`microbench`, `smoke`,
+> `soak`, `dev-loop`, `headline`), repetition count, and environment.
+> Protocol matrices, flag tables, and manifest schemas are harness
+> documentation, not measurements.
+
 The benchmark method is part of the product. A latency number without a host,
 commit, configuration, sample count, and manifest is not a result.
 
@@ -45,6 +50,8 @@ warmup, one repetition, Docker Desktop on M4. All runs reported 0 errors. Each
 batch's completion is recorded once per order, so p50 includes the wait for the
 batch to fill.
 
+*Class: `dev-loop`; repetitions: 1 per row; environment: Apple M4, Docker Desktop, fresh stack, simulator stopped.*
+
 ```sh
 WHIPPET_SWEEP_RATES=1000,5000 WHIPPET_SWEEP_BATCHES=1,10,100,256 \
 WHIPPET_SWEEP_DURATION=8 WHIPPET_SWEEP_WARMUP=2 WHIPPET_SWEEP_REPETITIONS=1 \
@@ -88,6 +95,8 @@ headline results.
 Same host, simulator stopped, 8 s measured, 2 s warmup, one repetition. The
 shard thread and per-shard metrics mainly moved the
 tail; p50 is within host noise:
+
+*Class: `dev-loop`; repetitions: 1 per row; environment: same Apple M4 Docker Desktop host, simulator stopped.*
 
 | Path | Before p50 / p99 | After p50 / p99 |
 |---|---:|---:|
@@ -309,8 +318,8 @@ What it does not do:
   results-pending.
 - No CPU pinning or isolation inside the harness. The Linux runner applies
   `taskset` when asked and records governor and SMT state.
-- No server-side metrics correlation; the gateway's own histograms are
-  cumulative and separate from the harness histograms.
+- No server-side metrics correlation; the gateway's own rolling-window
+  histograms are separate from the harness histograms.
 
 ## Run matrix
 
@@ -338,6 +347,8 @@ HTTP ingress, 8 seconds measured, one repetition. **`dev-loop`, not a result.**
 The harness at that time sent passive limit orders only; there were no IOC or
 cancel events.
 
+*Class: `dev-loop`; repetitions: 1 per row; environment: Apple M4, Docker Desktop, simulator stopped.*
+
 | Rate | p50 | p99 | Errors |
 |---|---|---|---|
 | 200 /s | 2,305 µs | 6,307 µs | 0 |
@@ -360,6 +371,8 @@ exist to show the shape of the knee and to compare a local run against itself.
 Two single-order runs on the same Docker Desktop stack, fresh volumes,
 simulator stopped, 8 s measured, 2 s warmup, one repetition,
 `WHIPPET_SNAPSHOT_EVERY=1000`. These are `dev-loop` smoke data, not results.
+
+*Class: `dev-loop` (`smoke`); repetitions: 1 per row; environment: Apple M4, Docker Desktop, fresh volumes, simulator stopped.*
 
 | Run | Rate | p50 | p99 | Samples | Errors | Labels |
 |---|---|---|---|---|---|---|
@@ -484,6 +497,8 @@ an M4, 8 s measured, 2 s warmup, one repetition. The numbers exist to show the
 shape of the group-commit and binary-ingress paths and to catch regressions.
 They are not headline results and must not be quoted as transport wins.
 
+*Class: `dev-loop`; repetitions: 1 per row; environment: Apple M4, Docker Desktop, fresh stack, simulator stopped.*
+
 ### Group commit (HTTP, single order)
 
 `--batch-size 1`, so the client sends one order per request and the node's group
@@ -556,6 +571,8 @@ Same host and shape as the group-commit table: fresh stack, simulator stopped,
 Docker Desktop on an M4, 8 s measured, 2 s warmup, one repetition. **`dev-loop`,
 not a result.**
 
+*Class: `dev-loop`; repetitions: 1 per row; environment: Apple M4, Docker Desktop, fresh stack, simulator stopped.*
+
 | Batch | Rate | Connections | p50 | p99 | p99.9 | Errors | Achieved |
 |---:|---:|---:|---:|---:|---:|---:|---:|
 | 1 | 5,000/s | 4 | 1,284 ms | — | — | — | 3,160/s (connection-limited; do not feature) |
@@ -624,6 +641,8 @@ byte throughput, and inter-frame gap percentiles as the subscriber count scales.
 Docker Desktop on M4, node and simulator running, `?trades=60`, 8 s measured,
 2 s warmup, one run per subscriber count. The frame cache means the server
 serializes once per `(filter, tick)`; egress is per subscriber.
+
+*Class: `dev-loop`; repetitions: 1 per row (one run per subscriber count); environment: Apple M4, Docker Desktop, node and simulator running.*
 
 | Subscribers | Frames/s | Aggregate MB/s | Gap p50 | Gap p99 | Stalled |
 |---:|---:|---:|---:|---:|---:|
@@ -936,7 +955,8 @@ The drift arithmetic lives in `crates/whippet-bench/src/soak.rs`
 (`soak_drift_p99`, `soak_verdict`, unit-tested); the script mirrors it in
 Python for the shell-side summary.
 
-**Dev-loop result (fresh stack, 5,000/s, batch 10, 180 s).** p50 grew from
+**Dev-loop result (fresh stack, 5,000/s, batch 10, 180 s).** *(Class: `soak`
+(short); repetitions: 1; environment: Docker Desktop dev-loop host.)* p50 grew from
 1.1 ms to 5.0 ms and p99 from 7 ms to ~390 ms; node RSS grew from 119 MiB to
 282 MiB; consumer lag spiked to ~3,800 around snapshot boundaries. The run
 failed the 5% drift gate. The stage budget explains it: at the end,

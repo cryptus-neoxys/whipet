@@ -348,14 +348,23 @@ produced the event. The state view's `sequence` is the maximum `md_seq`
 observed across symbols; because each symbol has its own sequence space, it is
 a display value, not a global order.
 
+The stable output identity is in the **payload**, not the routing envelope:
+executions and MD records carry `(symbol, cause_offset, seq, kind)`. The
+envelope's routing headers carry `symbol`, `seq`, `type`, and `schema` but not
+`cause_offset`, so a consumer that must deduplicate duplicates has to decode
+the fixed payload. Keeping the full identity in one canonical place avoids
+paying for a duplicate header on every output record.
+
 ## Observability
 
 The node exposes `GET /metrics` in Prometheus text format. Counters cover
 orders, executions, trades, MD records, and engine commands. Gauges cover
 ingress and match latency quantiles, throughput, Iggy connectivity, partition
 count, mode, MD freshness, and MD sequence. Uptime is exposed as a monotonic
-counter. The values come from the same process-lifetime HDR histograms as
-`/api/state`, so the latency quantiles are cumulative, not windowed.
+counter. Latency quantiles are rolling-window views merged from the per-shard
+histograms (`whippet_stage_p50_us` / `whippet_stage_p99_us` plus the
+ingress/match/turbo summaries); they describe recent behavior, not process
+lifetime, and a spot value is not a benchmark.
 `whippet_consumer_lag` is the computed lag summed over the active shards:
 every five seconds the health monitor reads each shard's committed offset and
 head through that shard's engine-pool client and reports the total. The full
@@ -424,9 +433,11 @@ On startup, for each active shard:
 The dedup table is snapshotted with the book and the input offset. It is a
 business-level table keyed by the derived `OrderId`, not Iggy's producer
 idempotence. Capacity is `min(2 * max_orders, 100,000)` per symbol with
-terminal-first eviction (active resting orders are never evicted to make room);
-an order id older than the retained window can be accepted
-again.
+terminal-first eviction (active resting orders are never evicted to make room).
+The window is count-based, not a time TTL: its wall-clock span shrinks as
+throughput rises. An order id older than the retained window can be accepted
+again, so the table bounds duplicates but does not promise unlimited
+idempotency.
 
 The state hash covers the instrument config (tick size, ladder bounds,
 max orders, snapshot depth, market collar), the book levels and FIFO order,

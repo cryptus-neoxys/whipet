@@ -19,6 +19,7 @@ supersedes an earlier one.
 | [0011](0011-fault-injection-and-stage-budget.md) | Fault injection, stage budgets, and soak gates | Proposed — implementation in progress |
 | [0012](0012-per-role-journals-and-ingress-guards.md) | Per-role + per-shard engine journal pool, shared ingress guards, and snapshot verification | Accepted — implemented |
 | [0013](0013-turbo-mode.md) | Turbo mode: local sequencer, direct fanout, bounded uncommitted window | Accepted (implemented; startup anchor, tail replay, per-shard window gauge) |
+| [0014](0014-bounded-storage-and-replay-safe-retention.md) | Bounded storage guard and replay-safe retention rule | Proposed (guard landing in Phase A slice; deletion rule design-only — never delete without consumer + verified-baseline proof) |
 
 Template:
 

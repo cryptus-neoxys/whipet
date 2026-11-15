@@ -35,6 +35,10 @@ credentials explicitly.
 | `WHIPPET_TURBO_WINDOW_MS` | `50` | Turbo only: maximum age of the oldest unjournaled command in one shard's window, in ms (1–60,000). The binding limit is whichever of count or age is hit first. |
 | `WHIPPET_API_TOKENS` | unset | Scoped tokens as `token:participant` pairs, comma separated (for example `tok-a:alice,tok-b:bob`). Each token authorizes only its participant: the gateway derives the participant id from the name, so self-trade prevention and attribution see distinct desks. Tokens cannot contain `:`. Merged with `WHIPPET_API_TOKEN`. |
 | `WHIPPET_METRICS_TOKEN` | unset | Optional bearer token for `GET /metrics`. Health and readiness stay unauthenticated for probes. |
+| `WHIPPET_DATA_DIR` | `/data` | Directory on the node's own data volume; the storage monitor samples the filesystem that holds it. |
+| `WHIPPET_IGGY_DATA_DIR` | `/iggy-data` | Read-only mount of Iggy's data volume. Resolved once at startup; a missing path disables the Iggy sample instead of failing the node. |
+| `WHIPPET_DISK_WARN_PCT` | `70` | Volume usage percentage that raises the warning state. 1–99 and strictly below the critical value. |
+| `WHIPPET_DISK_CRIT_PCT` | `85` | Volume usage percentage that raises the critical state: readiness fails and new orders/cancels are refused with `storage_pressure`. 1–99 and strictly above the warning value. |
 | `WHIPPET_HTTP_TRACE` | unset | Set to `1` to enable per-request `tower-http` trace spans; off by default for throughput. |
 
 Concurrent single-order submissions on one partition are coalesced into one
@@ -166,6 +170,39 @@ are enforced only by the messages cleaner — and the default stack disables
 it, so nothing trims the log. See
 [Log growth and retention](#log-growth-and-retention) for the exact state.
 
+## Disk capacity and admission
+
+The node samples free space on two volumes with `statvfs` every five seconds:
+
+- `WHIPPET_DATA_DIR` (`/data`): snapshots and node-owned files, normally read-write.
+- `WHIPPET_IGGY_DATA_DIR` (`/iggy-data`): the broker's volume, mounted
+  **read-only** so the node can measure it and cannot delete from it.
+
+`used_pct = ceil((total - free) * 100 / total)`, counting reserved blocks as
+used. The worst known volume sets the state:
+
+- **ok** — below `WHIPPET_DISK_WARN_PCT`.
+- **warn** — at or above warn (alert only; ingress stays open).
+- **critical** — at or above `WHIPPET_DISK_CRIT_PCT`. `/readyz` returns 503
+  with `storage: false`; `/api/health` reports `degraded` and
+  `storage_state: "critical"`; HTTP order/cancel paths return 503
+  `storage_pressure`; TCP returns the `StoragePressure` error code. Nothing is
+  journaled and nothing is deleted.
+
+A failed `statvfs` marks that volume `available=false` and contributes **warn**
+only, so a transient mount problem cannot stop ingress. The gauges
+`whippet_disk_monitor_ok{volume}`, `whippet_disk_free_bytes{volume}`,
+`whippet_disk_used_pct{volume}`, `whippet_storage_warning`, and
+`whippet_storage_critical` expose the state; see
+[the metrics table](#prometheus-metrics).
+
+This is a guard, not retention. It refuses work before the volume fills and
+gives the operator time to act; it never trims segments. The safe response is
+to pause ingress (the critical state does it), preserve the volume, run
+`make verify-strict`, archive what must be kept, and only then delete data with
+explicit approval. The replay-safe deletion rule and the minimum log window are
+in [ADR 0014](adr/0014-bounded-storage-and-replay-safe-retention.md).
+
 ## Iggy tuning
 
 The default stack keeps the memory-pool and sharding defaults, but overrides
@@ -287,14 +324,16 @@ There are no per-order log lines on the hot path.
 
 ## Health and metrics
 
-`GET /readyz` returns 200 only when the journal is reachable and every shard
-task is alive; otherwise 503. Use it for container readiness. It reads a
-cached flag and performs no journal I/O: every five seconds the health monitor
-pings the ingress client and every engine-pool client concurrently and caches
-the single aggregate, then refreshes the consumer-lag sweep. `GET /api/health`
-returns HTTP 200 with `status: "ok"` or `"degraded"`. It is
-`ok` only when the journal is reachable (or the in-memory journal is selected)
-and every shard task is alive; `shards_ok` reports the latter. A corrupt
+`GET /readyz` returns 200 only when the journal is reachable, every shard task
+is alive, and no monitored volume is at the critical disk threshold; otherwise
+503. Use it for container readiness. It reads cached flags and performs no
+journal I/O: every five seconds the health monitor pings the ingress client and
+every engine-pool client concurrently and caches the aggregate, refreshes the
+consumer-lag sweep, and the storage monitor samples both data volumes.
+`GET /api/health` returns HTTP 200 with `status: "ok"` or `"degraded"`; it is
+`ok` only when the journal is reachable (or the in-memory journal is selected),
+every shard task is alive, and storage is below critical. `shards_ok`,
+`storage_ok`, and `storage_state` report the components. A corrupt
 snapshot or a shard task panic therefore degrades health instead of leaving a
 silent "up but not matching" node. The health monitor pings all pool entries
 because every entry is its own Iggy connection: an ingress link that is up
@@ -335,10 +374,18 @@ Series:
 | `whippet_md_events_total` | counter | MD records applied by the hub, including snapshots. |
 | `whippet_engine_commands_total` | counter | Input commands applied by the matcher. |
 | `whippet_consumer_lag` | gauge | Records waiting behind the engine consumers, summed over the active shards. Every five seconds the monitor reads each shard's committed offset and head through that shard's engine-pool client. |
-| `whippet_ingress_latency_microseconds{quantile="0.5"}` | gauge | Gateway append path p50, cumulative histogram. |
-| `whippet_ingress_latency_microseconds{quantile="0.99"}` | gauge | Gateway append path p99, cumulative histogram. |
-| `whippet_match_latency_microseconds{quantile="0.5"}` | gauge | Synchronous engine call p50, cumulative histogram. |
-| `whippet_match_latency_microseconds{quantile="0.99"}` | gauge | Synchronous engine call p99, cumulative histogram. |
+| `whippet_consumer_lag_by_shard{shard}` | gauge | Per-shard lag, so one lagging partition is visible instead of averaged away. |
+| `whippet_input_ring_occupancy{shard}` / `whippet_output_ring_occupancy{shard}` / `whippet_ring_capacity{shard}` | gauge | Bounded-ring backpressure: queued batches and capacity, reported once per second by the matcher. |
+| `whippet_ingress_latency_microseconds{quantile="0.5"}` | gauge | Gateway append path p50, process-lifetime histogram. |
+| `whippet_ingress_latency_microseconds{quantile="0.99"}` | gauge | Gateway append path p99, process-lifetime histogram. |
+| `whippet_match_latency_microseconds{quantile="0.5"}` | gauge | Matcher service-time p50, process-lifetime histogram. |
+| `whippet_match_latency_microseconds{quantile="0.99"}` | gauge | Matcher service-time p99, process-lifetime histogram. |
+| `whippet_ingress_window_p50_us` / `whippet_ingress_window_p99_us` | gauge | Rolling 10 s gateway ingress percentiles; use these to detect a recent degradation. |
+| `whippet_match_window_p50_us` / `whippet_match_window_p99_us` | gauge | Rolling 10 s matcher service-time percentiles. |
+| `whippet_latency_window_secs` | gauge | Length of the rolling latency window. |
+| `whippet_disk_free_bytes{volume="whippet"|"iggy"}` / `whippet_disk_used_pct{volume=...}` | gauge | Free bytes and used percentage of the monitored data volumes. |
+| `whippet_disk_monitor_ok{volume}` | gauge | 1 when the volume usage was read; 0 means the mount is unreadable (warn only, ingress stays open). |
+| `whippet_storage_warning` / `whippet_storage_critical` | gauge | 1 when a volume is at or above the warning/critical threshold. Critical refuses new orders and fails readiness. |
 | `whippet_throughput_orders_per_second` | gauge | Gateway acceptance rate over the last sample window. |
 | `whippet_uptime_seconds` | counter | Process uptime. Monotonic until restart. |
 | `whippet_iggy_connected` | gauge | 1 if the last Iggy ping succeeded, else 0. |
@@ -349,15 +396,17 @@ Series:
 
 Caveats:
 
-- The latency quantiles come from process-lifetime HDR histograms. They are
-  cumulative, not windowed, and they are not benchmark results.
+- The unqualified latency quantiles are process-lifetime HDR histograms. Use
+  the `*_window_*` series for current behavior; the lifetime values are for
+  long-run context, not benchmark results.
 - Counters reset when the node restarts. Prometheus handles the reset, but a
   rate over a restart boundary is meaningless.
 - `whippet_consumer_lag` is the per-shard sweep described above, not a
   placeholder. Do not alert on it across restarts: the committed offsets reset
   with the broker state.
-- `/metrics` has no authentication in Phase 1. Publish it only on the Compose
-  network, or put it behind a reverse proxy. Do not expose it to the internet.
+- `/metrics` is unauthenticated unless `WHIPPET_METRICS_TOKEN` is set. Publish
+  it only on the Compose network, or put it behind a reverse proxy and set the
+  token. Do not expose it to the internet.
 - The exposition types `whippet_uptime_seconds` as a counter. It is monotonic
   per process, which is the property that matters.
 

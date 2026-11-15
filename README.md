@@ -11,8 +11,10 @@ and market data back to it.
 - HTTP and WebSocket gateway on port 8080.
 - Orders appended to Iggy `whippet-trading/orders`, partitioned by symbol
   hash.
-- One engine task per active partition; the matching call is synchronous, with
-  an array price ladder, occupancy bitmap, and FIFO levels.
+- One dedicated matcher OS thread per active partition: async reader task →
+  bounded input ring → matcher thread (the single writer) → bounded output
+  ring → async writer task. The book is an array price ladder with an
+  occupancy bitmap and FIFO levels.
 - Execution reports and market-data deltas appended to Iggy `executions` and
   `whippet-md/md`.
 - A market-data hub that consumes the MD log and publishes a conflated state
@@ -37,7 +39,7 @@ Docker must be running. Port 8080 must be free. The first build takes
 a few minutes; after that the stack comes up in seconds.
 
 ```sh
-git clone https://github.com/cryptus-neoxys/whippet.git
+git clone https://github.com/cryptus-neoxys/whipet.git
 cd whippet
 make up
 ```
@@ -115,10 +117,16 @@ Expected shape:
   "offset": "<offset>",
   "mode": "durable",
   "status": "accepted_by_log",
+  "guarantee": "accepted_by_log",
+  "reject": null,
   "accepted_at_ns": 1760000000000000000,
   "durable_ack_ms": 1.4
 }
 ```
+
+Every ack carries `guarantee` (`accepted_by_log` in durable mode,
+`matched_unjournaled` in turbo mode) and `reject` (set only when turbo
+rejects the command, e.g. `window_full`).
 
 `accepted_by_log` means the record is in Iggy. It does not mean the order has
 been matched. Matching happens after the engine consumes the record.
@@ -252,12 +260,15 @@ manual offsets, not group members.
 │ topic orders           WHIPPET_PARTITIONS, persisted, 24 h    │
 └───────────────┬──────────────────────────────────────────────┘
                 │ named consumer whippet-engine-p<N>, manual offset
-                ▼
+                ▼ reader task (async, polls the orders log)
 ┌──────────────────────────────────────────────────────────────┐
-│ engine task for partition N (one logical writer)             │
+│ engine shard for partition N (one logical writer)            │
+│ bounded input ring: reader → matcher (capacity 2)            │
+│ whippet-shard-N: dedicated matcher OS thread, no await/I/O   │
 │ ShardEngine::process -> SymbolEngine -> Book + DedupTable    │
-│ synchronous: no await, no I/O, no clock reads                │
+│ bounded output ring: matcher → writer (capacity 2)           │
 └───────┬───────────────────────────────┬──────────────────────┘
+                ▼ writer task (async: appends outputs, commits)
         │ executions                    │ market data
         ▼                               ▼
 ┌───────────────────────┐      ┌───────────────────────────────┐
@@ -294,10 +305,29 @@ are in [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Sub-millisecond matching | Not published. It is a design target and a live in-process metric only. No benchmark result exists. |
 | Low-single-digit-millisecond durable path on Linux | Not measured. No headline numbers yet. |
 | No acknowledged loss across one node failure | Not implemented. Single node, no failover. |
-| End-to-end once-only delivery | Not claimed. The pipeline is at-least-once; the engine deduplicates order ids. |
+| End-to-end once-only delivery | Not claimed. The pipeline is at-least-once; the engine deduplicates order ids within a bounded count-based window (an evicted id can be re-admitted). |
 | Turbo mode | Implemented. Match-complete ack (`matched_unjournaled`), bounded per-shard window (10,000 commands / 50 ms defaults), write-behind orders/executions/MD, tail replay on restart. The window, not the log, is the crash-loss bound. |
 | HA / 3-node VSR | Not implemented. |
 | Surveillance, audit archive, replay scrubber, PATs, TLS, encryption | Not implemented. |
+
+## Implementation status
+
+| Capability | Status | Notes |
+|---|---|---|
+| Durable order ingress (Iggy append before ack) | Implemented | Gateway returns `accepted_by_log` after the append confirms. |
+| Batch ingress + binary TCP | Implemented | Up to 256 same-symbol orders per append; TCP on port 8081. |
+| Per-partition group commit | Implemented | Concurrent single-order appends coalesced, up to 256 per append. |
+| Dedicated matcher thread + bounded rings | Implemented | Reader → input ring → matcher OS thread → output ring → writer; see [ARCHITECTURE.md](docs/ARCHITECTURE.md). |
+| Snapshot v4 + verify | Implemented | `whippet verify` recomputes the state hash, including the terminal-eviction queue. |
+| Replay | Implemented | `whippet replay` rebuilds from the full log or from a snapshot plus tail. |
+| Turbo mode | Implemented | `WHIPPET_MODE=turbo`: match-complete ack (`matched_unjournaled`), bounded window; see [ADR 0013](docs/adr/0013-turbo-mode.md). |
+| Scoped tokens + metrics auth | Implemented | `WHIPPET_API_TOKENS` binds each token to one participant; `WHIPPET_METRICS_TOKEN` can protect `/metrics`. |
+| Consumer groups | Planned | Named consumers with manual offsets today; groups are Phase 2 work. |
+| Retention enforcement | Planned | Policies are recorded but the cleaner is off; replay-safe retention is still to design. |
+| Surveillance / audit archive | Planned | Phase 2. |
+| HA / 3-node VSR | Planned | Phase 3; single node today. |
+| TLS | Planned | Phase 2; localhost default today. |
+| FIX | Planned | After the internal order contract is stable. |
 
 ## Correctness check
 

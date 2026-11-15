@@ -11,7 +11,7 @@ export function Footer() {
         </a>
         <span>·</span>
         <a
-          href="https://github.com/cryptus-neoxys/whippet"
+          href="https://github.com/cryptus-neoxys/whipet"
           target="_blank"
           rel="noreferrer"
         >

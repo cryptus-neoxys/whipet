@@ -454,7 +454,7 @@ The Live page:
   WebSocket state frames at most twice per second. The history holds 240
   points.
 
-The metrics are live, conflated, and cumulative for the process lifetime. They
+The metrics are live and conflated. Lifetime percentiles are cumulative; use the rolling-window series (`ingress_window_p99_us`, `match_window_p99_us`) for current behavior. They
 are not benchmark results and they are not windowed percentiles. `consumer
 lag` is the computed per-shard sweep (committed offset to head, summed over
 the active shards, refreshed every five seconds).

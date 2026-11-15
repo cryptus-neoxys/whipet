@@ -225,4 +225,4 @@ not a production release.
   path.
 - Production hardening of any kind. See [SECURITY.md](SECURITY.md).
 
-[Unreleased]: https://github.com/cryptus-neoxys/whippet/commits/main
+[Unreleased]: https://github.com/cryptus-neoxys/whipet/commits/main

@@ -1,5 +1,10 @@
 # Performance
 
+> Legend: every measurement table states its class (`microbench`, `smoke`,
+> `soak`, `dev-loop`, `headline`), repetition count, and environment.
+> Structural matrices (stage budget, hot-path rules, bottleneck ranks, run
+> matrix) are plans and models, not measurements.
+
 This document is a performance model and an optimization order, not a results
 page. It answers three questions:
 
@@ -43,6 +48,8 @@ The only documented benchmark result is the smoke run in
 Docker Desktop, HTTP JSON limit orders, three symbols, 16 partitions, 200
 orders/s, 10 s measured, 2 s warmup, one repetition, 2,000 samples, 0 errors.
 
+*Class: `smoke`; repetitions: 1; environment: Apple M4, Docker Desktop.*
+
 | Metric | Value |
 |---|---:|
 | p50 | 1,948 µs |
@@ -63,6 +70,8 @@ single-order HTTP (`POST /api/orders`), 8 s measured, 2 s warmup, one
 repetition, `batch_size = 1`, `subscribers = 0`, scope `dev-loop`. The
 manifests are under `artifacts/bench/` (gitignored); `git_sha` is `unknown` in
 all four. Treat them as a regression baseline, not a published result.
+
+*Class: `dev-loop` (regression baseline); repetitions: 1 per rate; environment: Docker Desktop, simulator stopped.*
 
 | Rate (orders/s) | Samples | p50 (µs) | p99 (µs) | p99.9 (µs) | Max (µs) | Errors | Slip p50 (µs) | Slip p99 (µs) | Local manifest |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
@@ -126,6 +135,8 @@ Fresh stack, simulator stopped, mixed limit/IOC/cancel, 10 s measured, 3 s
 warmup, one repetition, default snapshots. The first table is the pre-batch
 single-order baseline; the second is the post-tranche batch sweep.
 
+*Class: `dev-loop`; repetitions: 1 per row; environment: dev-loop host, simulator stopped, fresh stack.*
+
 | Rate | Batch | p50 | p99 | Errors |
 |---:|---:|---:|---:|---:|
 | 1,000/s | 1 | 543 µs | 1,027 µs | 0 |
@@ -158,6 +169,8 @@ The next tranche attacks the remaining per-order wait and the warm paths:
 Final sweep on the new tree (dev-loop, Docker Desktop, simulator stopped, one
 repetition, 8 s measured, 2 s warmup). Every row has 0 errors.
 
+*Class: `dev-loop`; repetitions: 1 per row; environment: Docker Desktop, simulator stopped.*
+
 | Rate | Batch | p50 | p99 | p99.9 | Before (p50) |
 |---:|---:|---:|---:|---:|---:|
 | 1,000/s | 1 | 538 µs | 9,567 µs | 20,335 µs | 543 µs |
@@ -173,6 +186,8 @@ The `5,000/s batch 100` p99 is a one-repetition outlier, not a trend. The
 harness now also records scheduler slip, so `service = latency - slip` is
 available per sample. On the final sweep:
 
+*Same runs as the sweep table above: class `dev-loop`; repetitions: 1; environment: Docker Desktop.*
+
 | Rate | Batch | service p50 | service p99 | slip p50 |
 |---:|---:|---:|---:|---:|
 | 1,000/s | 1 | 444 µs | 9,416 µs | 94 µs |
@@ -186,6 +201,8 @@ Desktop. The 1,000/s run is labeled `generator-bound`; treat its p50 as an
 upper bound on the server.
 
 TCP (same host, `--transport tcp`):
+
+*Class: `dev-loop`; repetitions: 1 per row; environment: Docker Desktop, same host as the sweep above.*
 
 | Path | p50 | p99 | Errors |
 |---|---:|---:|---:|
@@ -226,6 +243,8 @@ p50 is within host noise while the tail moved.
 Measured with this tranche (criterion, loaded host — directionally useful, not
 headline numbers):
 
+*Class: `microbench`; repetitions: criterion defaults (unspecified — not reproducible as published); environment: loaded shared host.*
+
 - **Off-loop hash cost.** `hash_symbol_snapshot` measures ~2.51 ms on a book
   of 20,000 orders plus a 20,000-entry dedup table. That is the work the match
   path used to pay on the snapshot interval and now pays on the blocking
@@ -237,6 +256,8 @@ headline numbers):
 Dev-loop after the shard thread (Docker Desktop, simulator stopped, 8 s
 measured, 2 s warmup, one repetition). Before is the final Sprint A sweep on
 the same host:
+
+*Class: `dev-loop`; repetitions: 1 per row; environment: Docker Desktop, same host.*
 
 | Path | Before p50 / p99 | After p50 / p99 |
 |---|---:|---:|
@@ -261,6 +282,8 @@ thread.
 Snapshot stage split at 170k commands / 68k dedup entries (targeted release
 bench, shared host, v3 format):
 
+*Class: `microbench` (targeted stage timing); repetitions: unspecified — not reproducible as published; environment: shared host.*
+
 | Stage | Thread | Time |
 |---|---|---:|
 | `matcher_clone_with_hash` (old path) | shard | 5.55 ms |
@@ -280,8 +303,9 @@ file size only, not timing). Serialize/fsync remains
 the dominant snapshot cost.
 
 Dev-loop soak after the split (fresh stack, 5,000/s, batch 10, 90 s): p50
-**2.22 ms**, p99 **76.5 ms**, 0 errors over 450,000 orders. The p99 is the
-periodic snapshot path (clone/serialize/fsync), not matching; the off-loop
+**2.22 ms**, p99 **76.5 ms**, 0 errors over 450,000 orders. *(Class: `soak`
+(short); repetitions: 1; environment: dev-loop host, fresh stack.)* The p99 is
+the periodic snapshot path (clone/serialize/fsync), not matching; the off-loop
 hash is restored and the cadence is 30 s. `engine_process` stays at 4 µs and
 `md_apply` at 3 µs. A full-vs-seeded replay with a 33.9k-record tail matches
 after the dedup terminal-queue fix. A 10-minute soak still fails the 5% drift
@@ -479,8 +503,9 @@ tail sample:
   the hashes left zeroed; the blocking snapshot writer then fills the hashes
   off the match path and writes the file. The snapshot is
   gated by `appended_offset`, so it is only taken once every output up to the
-  matcher's offset is in the journal. At the default dedup cap (100,000
-  entries per symbol), the clone is large; the hash that used to accompany it
+  matcher's offset is in the journal. At the default dedup cap
+  (`min(2 * max_orders, 100,000)` = 100,000 entries per symbol with the default
+  `max_orders`), the clone is large; the hash that used to accompany it
   on the match path is ~2.51 ms on a 20k/20k book (measured above). It is a
   periodic tail-latency source, not a per-order cost.
 - **Initial MD snapshot.** At startup, each shard publishes a full MD snapshot
@@ -598,6 +623,8 @@ The working tree now has a cached best bid/ask index with a bitmap fallback,
 `FxHashMap` in the book and dedup table, and a criterion bench at
 `crates/whippet-engine/benches/engine.rs`. A same-period A/B on a loaded host
 (old sources stashed vs. new) measured:
+
+*Class: `microbench`; repetitions: criterion defaults (unspecified — not reproducible as published); environment: loaded host (load average 4–9).*
 
 | Bench | Before | After | Change |
 |---|---:|---:|---:|
@@ -763,7 +790,9 @@ noise.
 The default Compose stack keeps Iggy's default tuning; the optional profile is
 documented in [deploy/iggy/iggy.toml](../deploy/iggy/iggy.toml) and is not the
 default. No committed manifest accompanies this note; it is an operator
-observation, not a publishable run. Do not present these numbers as a headline
+observation, not a publishable run. *(Class: operator observation, not a
+result; repetitions: 1; environment: 16 GB Docker Desktop VM with a large
+log.)* Do not present these numbers as a headline
 result. Do not tune the broker before batch ingress and the journal fast paths;
 revisit it with a clean log and a controlled A/B.
 
@@ -885,7 +914,7 @@ distribution, add an export and put it under `raw/`, with the histogram bounds
 and significant digits in the method card. Do not average percentiles across
 runs; the manifest keeps every repetition for a reason.
 
-`/metrics` exposes cumulative process-lifetime percentiles. They are useful for
+`/metrics` exposes rolling-window latency percentiles. They are useful for
 a live view and for a restart-relative comparison, not for a benchmark. The
 harness histograms and the server histograms are separate; do not mix them.
 
@@ -934,6 +963,8 @@ the same 60 s soak shape on the same Docker Desktop host (3 active shards,
 5,000 orders/s offered, 300,000 orders), one repetition each. They are
 `dev-loop` smoke output, not a headline result.
 
+*Class: `dev-loop` (`smoke`); repetitions: 1 per mode; environment: Docker Desktop, same host.*
+
 | Mode | p50 | p99 | p99.9 | Offered | Errored | Ack point |
 |---|---|---|---|---|---|---|
 | durable | 1,173 µs | 30,991 µs | 184,831 µs | 300,000 | 0 | after the Iggy append |
@@ -960,6 +991,28 @@ A single-order turbo smoke ack measured 88 µs. These are one-run observations;
 no claim is made about a Linux headline or sub-millisecond end-to-end durable
 latency. The differential test, not this table, is what proves turbo and
 durable match identically.
+
+## Rolling-window soak view (dev-loop)
+
+The `/api/state` percentiles now include a rolling 10 s window, and the soak
+summary records `window_p50_us`/`window_p99_us` per sample plus the disk-free
+gauges. A 120 s durable run at 5,000 orders/s (batch 10, 12 samples) shows the
+log-growth degradation without a restart:
+
+| Metric | Value |
+|---|---|
+| Client-side request p99 | 667,135 µs |
+| Server window p99, median across samples | 168,127 µs |
+| Server window p99, max | 816,639 µs |
+| Server window p50, median | 1,042 µs |
+| Iggy volume free, start → end | 18.19 GB → 16.49 GB |
+
+The window median is far above the 1–4 ms seen in the first minute of a fresh
+run on the same host, so this is real drift, not a lifetime-histogram artifact.
+The soak verdict is `skipped` because the drift gate requires at least 20
+samples; it is a 2-minute dev-loop observation, not a sustained proof. Disk
+consumption was about 14 MB/s at this offered rate, which is why the
+bounded-storage guard and the retention design are Phase A work.
 
 ## Guardrails
 
