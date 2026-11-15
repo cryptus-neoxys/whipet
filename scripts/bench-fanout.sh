@@ -5,6 +5,11 @@
 #   WHIPPET_FANOUT_SUBSCRIBERS=1,10,100,1000 WHIPPET_FANOUT_DURATION=30 \
 #     scripts/bench-fanout.sh
 #
+# NOTE: the 1,000-subscriber row requires a direct network. Docker Desktop's
+# host port proxy fails around 1,000 concurrent WebSockets (socket reset before
+# the node's 2,048 cap), so treat 1,000 as a native-Linux / direct-network
+# target, not a Docker Desktop result.
+#
 # Starts the Compose stack (iggy + node) if the gateway is not already healthy,
 # stops the simulator for the duration of the sweep, runs 1 / 10 / 100 / 1,000
 # subscribers for 30 s each with label dev-loop-fanout and 10k orders/s batched
@@ -28,6 +33,10 @@
 #   WHIPPET_FANOUT_OUTPUT_DIR   output directory (default ./artifacts/bench)
 
 set -euo pipefail
+
+# Every fanout subscriber comes from one host, so disable the per-IP WebSocket
+# sub-limit; the global cap still applies.
+export WHIPPET_WS_PER_IP=0
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE=(docker compose -f "${ROOT}/deploy/compose.yaml")
@@ -121,6 +130,9 @@ cargo build --release -p whippet-bench --example fanout
 
 IFS=',' read -r -a subscriber_list <<<"${SUBSCRIBERS}"
 for subs in "${subscriber_list[@]}"; do
+    if [ "${subs}" = "1000" ]; then
+        echo "bench-fanout: NOTE: 1,000 subscribers requires a direct network; Docker Desktop's host proxy fails around 1,000 (socket reset before the node cap)."
+    fi
     echo "bench-fanout: label=${LABEL} subscribers=${subs} duration=${DURATION}s warmup=${WARMUP}s trades=${TRADES} symbols=${SYMBOLS:-all} parse=${PARSE} ingress_rate=${INGRESS_RATE}/s ingress_batch=${INGRESS_BATCH} baseline=${BASELINE_METRICS:-none}"
     args=(
         --gateway "${GATEWAY}"
