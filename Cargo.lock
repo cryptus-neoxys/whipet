@@ -3938,7 +3938,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "hdrhistogram",
- "rand 0.8.8",
+ "rand 0.10.3",
  "rand_chacha 0.3.1",
  "reqwest 0.12.28",
  "serde",
@@ -4010,7 +4010,7 @@ dependencies = [
 name = "whippet-sim"
 version = "0.1.0"
 dependencies = [
- "rand 0.8.8",
+ "rand 0.10.3",
  "rand_chacha 0.3.1",
  "serde",
  "whippet-core",
