@@ -589,28 +589,28 @@ impl Metrics {
     /// [`Histogram::add`] cannot fail; the value-by-value replay is a
     /// lossless fallback for a config mismatch that cannot happen today.
     pub(crate) fn merge_match_latency(&self, source: &mut Histogram<u64>) {
-        if source.is_empty() {
-            return;
-        }
-        // A poisoned lock leaves `source` unmerged and uncleaned, so the next
-        // merge retries instead of dropping the samples.
-        let Ok(mut histogram) = self.match_latency.lock() else {
-            return;
-        };
-        if histogram.add(&*source).is_err() {
-            for sample in source.iter_recorded() {
-                let value = sample.value_iterated_to();
-                for _ in 0..sample.count_at_value() {
-                    let _ = histogram.record(value);
-                }
-            }
-        }
-        source.clear();
+        merge_histogram(&self.match_latency, source);
+    }
+
+    /// Drain a shard's per-stage histogram into the global one for `stage`
+    /// and clear the source. Same drain-and-clear contract as
+    /// [`Metrics::merge_match_latency`]: a merge without new samples is a
+    /// no-op, and a poisoned lock leaves the source intact for a retry.
+    pub(crate) fn merge_stage(&self, stage: Stage, source: &mut Histogram<u64>) {
+        merge_histogram(&self.stages[stage.index()], source);
     }
 
     #[cfg(test)]
     fn match_latency_sample_count(&self) -> u64 {
         self.match_latency
+            .lock()
+            .map(|histogram| histogram.len())
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn stage_sample_count(&self, stage: Stage) -> u64 {
+        self.stages[stage.index()]
             .lock()
             .map(|histogram| histogram.len())
             .unwrap_or(0)
@@ -656,9 +656,13 @@ fn new_histogram() -> Histogram<u64> {
     Histogram::new_with_max(60_000_000, 3).expect("valid histogram bounds")
 }
 
+/// Clamp shared by every stage recorder so a locally recorded sample and a
+/// directly recorded sample land in identical HDR buckets and merge cleanly.
+const STAGE_US_MAX: u64 = 59_999_999;
+
 fn record(histogram: &Mutex<Histogram<u64>>, value: u64) {
     if let Ok(mut histogram) = histogram.lock() {
-        let _ = histogram.record(value.min(59_999_999));
+        let _ = histogram.record(value.min(STAGE_US_MAX));
     }
 }
 
@@ -673,6 +677,32 @@ fn percentile(histogram: &Mutex<Histogram<u64>>, quantile: f64) -> f64 {
             }
         })
         .unwrap_or(0.0)
+}
+
+/// Drain `source` into `target` under `target`'s mutex and clear the source.
+///
+/// An empty source is a no-op, so a merge without new records adds nothing.
+/// Both histograms are built by [`new_histogram`], so [`Histogram::add`]
+/// cannot fail; the value-by-value replay is a lossless fallback for a config
+/// mismatch that cannot happen today.
+fn merge_histogram(target: &Mutex<Histogram<u64>>, source: &mut Histogram<u64>) {
+    if source.is_empty() {
+        return;
+    }
+    // A poisoned lock leaves `source` unmerged and uncleaned, so the next
+    // merge retries instead of dropping the samples.
+    let Ok(mut histogram) = target.lock() else {
+        return;
+    };
+    if histogram.add(&*source).is_err() {
+        for sample in source.iter_recorded() {
+            let value = sample.value_iterated_to();
+            for _ in 0..sample.count_at_value() {
+                let _ = histogram.record(value);
+            }
+        }
+    }
+    source.clear();
 }
 
 /// One lock acquisition for all three stage percentiles and the sample count.
@@ -701,15 +731,18 @@ fn micros_since(start: Instant) -> u64 {
 /// Per-shard metrics recorder, owned by one match-loop task.
 ///
 /// The shard thread owns this value, so recording never takes a lock: the
-/// counters are plain [`Cell`]s and latency samples go into a shard-local HDR
-/// histogram behind a [`RefCell`], both uncontended single-thread writes on
-/// the same stack the engine already touches.
+/// counters are plain [`Cell`]s and latency samples go into shard-local HDR
+/// histograms behind a [`RefCell`], both uncontended single-thread writes on
+/// the same stack the engine already touches. Stage samples are kept in one
+/// local histogram per [`Stage`], allocated lazily on the stage's first
+/// sample, so a shard that only records `EngineProcess` pays for one
+/// histogram instead of nine.
 ///
 /// `merge_into` is the only cross-thread step, and the shard loop calls it
-/// periodically (e.g. once per batch or on the 20 Hz cadence): counters are
-/// swapped to zero and fetched onto the global atomics, and the local
+/// periodically (e.g. once per second or on exit): counters are swapped to
+/// zero and fetched onto the global atomics, and each non-empty local
 /// histogram is drained into the global one under the existing histogram
-/// mutex. Because counters swap to zero and the histogram clears on drain, a
+/// mutex. Because counters swap to zero and a drained histogram clears, a
 /// second merge without new records adds nothing, and no recorded sample is
 /// ever added twice or lost.
 ///
@@ -721,6 +754,9 @@ pub struct ShardMetrics {
     orders_matched: Cell<u64>,
     orders_rejected: Cell<u64>,
     match_latency: RefCell<Histogram<u64>>,
+    /// One local histogram per [`Stage`], indexed by `Stage::index`. `None`
+    /// until the stage records its first sample.
+    stages: [RefCell<Option<Histogram<u64>>>; STAGE_COUNT],
 }
 
 impl Default for ShardMetrics {
@@ -737,6 +773,7 @@ impl ShardMetrics {
             orders_matched: Cell::new(0),
             orders_rejected: Cell::new(0),
             match_latency: RefCell::new(new_histogram()),
+            stages: std::array::from_fn(|_| RefCell::new(None)),
         }
     }
 
@@ -744,7 +781,21 @@ impl ShardMetrics {
     /// sample and a directly recorded sample land in identical buckets.
     pub fn record_match_latency_us(&self, micros: u64) {
         let mut histogram = self.match_latency.borrow_mut();
-        let _ = histogram.record(micros.min(59_999_999));
+        let _ = histogram.record(micros.min(STAGE_US_MAX));
+    }
+
+    /// Record one stage sample in microseconds without any global lock.
+    ///
+    /// Single-thread counterpart to [`Metrics::record_stage_us`]: the sample
+    /// lands in this shard's local histogram for `stage` and reaches the
+    /// global one at the next `merge_into`. The clamping matches
+    /// [`Metrics::record_stage_us`] exactly, so a merged sample and a
+    /// directly recorded sample are bucket-identical and their percentiles
+    /// agree within HDR resolution.
+    pub fn record_stage_us(&self, stage: Stage, micros: u64) {
+        let mut slot = self.stages[stage.index()].borrow_mut();
+        let histogram = slot.get_or_insert_with(new_histogram);
+        let _ = histogram.record(micros.min(STAGE_US_MAX));
     }
 
     pub fn record_engine_command(&self) {
@@ -766,9 +817,10 @@ impl ShardMetrics {
     /// Hand this shard's records to the global [`Metrics`].
     ///
     /// Counters are read with a swap-to-zero, so they are added exactly once;
-    /// the latency histogram is drained and cleared, so a merge without new
-    /// records is a no-op. Call this only from the thread that records: the
-    /// counters are not atomic.
+    /// each non-empty local histogram (match latency and per-stage) is
+    /// drained into its global counterpart and cleared, so a merge without
+    /// new records is a no-op. Call this only from the thread that records:
+    /// the counters are not atomic.
     pub fn merge_into(&self, global: &Metrics) {
         global.add_match_counters(
             self.engine_commands.replace(0),
@@ -777,6 +829,12 @@ impl ShardMetrics {
             self.orders_rejected.replace(0),
         );
         global.merge_match_latency(&mut self.match_latency.borrow_mut());
+        for stage in Stage::ALL {
+            let mut slot = self.stages[stage.index()].borrow_mut();
+            if let Some(histogram) = slot.as_mut() {
+                global.merge_stage(stage, histogram);
+            }
+        }
     }
 }
 
@@ -2044,5 +2102,171 @@ mod shard_metrics_tests {
         let view = global.snapshot();
         assert_eq!(view.engine_commands, 15);
         assert_eq!(global.match_latency_sample_count(), 15);
+    }
+
+    fn stage_summary(metrics: &Metrics, stage: Stage) -> LatencySummary {
+        metrics
+            .stage_snapshot()
+            .into_iter()
+            .find(|(recorded, _)| *recorded == stage)
+            .map(|(_, summary)| summary)
+            .expect("every stage is in the snapshot")
+    }
+
+    #[test]
+    fn merged_stage_percentiles_match_direct_recording() {
+        // A spread wide enough to cross several HDR buckets at 3 significant
+        // digits, with a heavy tail so p99 is not the max.
+        let samples: Vec<u64> = (0..2_000)
+            .map(|index| match index % 10 {
+                0..=4 => 150 + index as u64,
+                5..=8 => 1_500 + index as u64,
+                _ => 40_000 + index as u64,
+            })
+            .collect();
+
+        let direct = global();
+        for sample in &samples {
+            direct.record_stage_us(Stage::EngineProcess, *sample);
+        }
+
+        let merged = global();
+        let shard = ShardMetrics::new();
+        for sample in &samples {
+            shard.record_stage_us(Stage::EngineProcess, *sample);
+        }
+        shard.merge_into(&merged);
+
+        let direct_summary = stage_summary(&direct, Stage::EngineProcess);
+        let merged_summary = stage_summary(&merged, Stage::EngineProcess);
+        assert_eq!(merged_summary.samples, direct_summary.samples);
+        assert_eq!(merged_summary.p50_us, direct_summary.p50_us);
+        assert_eq!(merged_summary.p99_us, direct_summary.p99_us);
+        assert_eq!(merged_summary.p999_us, direct_summary.p999_us);
+        assert!(merged_summary.p50_us > 0.0);
+        assert!(merged_summary.p50_us <= merged_summary.p99_us);
+        assert!(merged_summary.p99_us >= 40_000.0);
+        assert!(merged_summary.p99_us <= 42_000.0);
+    }
+
+    #[test]
+    fn stage_merge_adds_exactly_once() {
+        let global = global();
+        let shard = ShardMetrics::new();
+
+        for sample in 1..=50u64 {
+            shard.record_stage_us(Stage::EngineProcess, 100 + sample);
+        }
+        shard.merge_into(&global);
+        let after_first = stage_summary(&global, Stage::EngineProcess);
+        assert_eq!(after_first.samples, 50);
+
+        // A second merge without new samples must add nothing: the first
+        // merge drained the shard-local histogram.
+        shard.merge_into(&global);
+        let after_second = stage_summary(&global, Stage::EngineProcess);
+        assert_eq!(after_second.samples, 50);
+        assert_eq!(after_second.p50_us, after_first.p50_us);
+        assert_eq!(after_second.p99_us, after_first.p99_us);
+
+        // Samples that land after a merge still reach the globals on the
+        // next one.
+        for sample in 1..=10u64 {
+            shard.record_stage_us(Stage::EngineProcess, 200 + sample);
+        }
+        shard.merge_into(&global);
+        assert_eq!(stage_summary(&global, Stage::EngineProcess).samples, 60);
+        assert_eq!(global.stage_sample_count(Stage::EngineProcess), 60);
+    }
+
+    #[test]
+    fn stage_samples_are_isolated_per_stage() {
+        let global = global();
+        let shard = ShardMetrics::new();
+
+        shard.record_stage_us(Stage::EngineProcess, 333);
+        shard.merge_into(&global);
+
+        let process = stage_summary(&global, Stage::EngineProcess);
+        assert_eq!(process.samples, 1);
+        assert_eq!(process.p50_us, 333.0);
+        assert_eq!(process.p99_us, 333.0);
+
+        // The sample went only to the stage it named. Every other stage,
+        // including the other engine stages the writer records, stays empty.
+        for stage in Stage::ALL {
+            if stage == Stage::EngineProcess {
+                continue;
+            }
+            let summary = stage_summary(&global, stage);
+            assert_eq!(summary.samples, 0, "{:?} received foreign samples", stage);
+            assert_eq!(summary.p50_us, 0.0, "{:?}", stage);
+        }
+    }
+
+    #[test]
+    fn empty_shard_stage_merge_is_a_no_op() {
+        let global = global();
+        let before = global.stage_snapshot();
+
+        let shard = ShardMetrics::new();
+        shard.merge_into(&global);
+        shard.merge_into(&global);
+
+        let after = global.stage_snapshot();
+        for ((before_stage, before_summary), (after_stage, after_summary)) in
+            before.iter().zip(&after)
+        {
+            assert_eq!(before_stage, after_stage);
+            assert_eq!(before_summary.samples, after_summary.samples);
+            assert_eq!(before_summary.p50_us, after_summary.p50_us);
+            assert_eq!(before_summary.p99_us, after_summary.p99_us);
+        }
+    }
+
+    #[test]
+    fn every_stage_survives_the_round_trip() {
+        let global = global();
+        let shard = ShardMetrics::new();
+
+        for stage in Stage::ALL {
+            let base = 1_000 + stage.index() as u64;
+            let tail = 2_000 + stage.index() as u64;
+            shard.record_stage_us(stage, base);
+            shard.record_stage_us(stage, tail);
+        }
+        shard.merge_into(&global);
+
+        for stage in Stage::ALL {
+            let base = 1_000 + stage.index() as u64;
+            let tail = 2_000 + stage.index() as u64;
+            let summary = stage_summary(&global, stage);
+            assert_eq!(summary.samples, 2, "{:?} lost samples on merge", stage);
+            assert_eq!(summary.p50_us, base as f64, "{:?}", stage);
+            assert_eq!(summary.p99_us, tail as f64, "{:?}", stage);
+        }
+    }
+
+    #[test]
+    fn stage_records_clamp_like_the_global_path() {
+        let global = global();
+        let shard = ShardMetrics::new();
+
+        shard.record_stage_us(Stage::EngineProcess, u64::MAX);
+        shard.record_stage_us(Stage::EngineProcess, 0);
+        shard.merge_into(&global);
+
+        let direct_metrics = Metrics::new(
+            ExchangeConfig::default().mode,
+            ExchangeConfig::default().partitions,
+        );
+        direct_metrics.record_stage_us(Stage::EngineProcess, u64::MAX);
+        direct_metrics.record_stage_us(Stage::EngineProcess, 0);
+
+        let merged = stage_summary(&global, Stage::EngineProcess);
+        let direct_summary = stage_summary(&direct_metrics, Stage::EngineProcess);
+        assert_eq!(merged.samples, 2);
+        assert_eq!(merged.p50_us, direct_summary.p50_us);
+        assert_eq!(merged.p99_us, direct_summary.p99_us);
     }
 }
