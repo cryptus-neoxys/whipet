@@ -956,3 +956,50 @@ async fn borrowed_ingress_matches_owned_validation_results() {
         "rejected requests must not reach the journal"
     );
 }
+
+#[tokio::test]
+async fn ingress_fails_closed_when_the_shard_is_down() {
+    let node = common::TestNode::new();
+    let symbol = whippet_core::ids::Symbol::new("BTC-USD").unwrap();
+    let before = node.orders(symbol).len();
+    node.ctx
+        .shards_ok
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let app = gateway::router(Arc::clone(&node.ctx));
+
+    let (status, body) = post(
+        &app,
+        "/api/orders",
+        json!({"symbol":"BTC-USD","side":"buy","price_cents":6500000,"qty":1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["code"], "shard_unavailable");
+    assert_eq!(
+        node.orders(symbol).len(),
+        before,
+        "a rejected order must not be appended"
+    );
+}
+
+#[tokio::test]
+async fn escaped_json_strings_still_validate() {
+    let node = common::TestNode::new();
+    let app = gateway::router(Arc::clone(&node.ctx));
+    // `\u0063` is `c`; the borrowed fast path cannot represent it, so the
+    // gateway must fall back to the owned DTO instead of rejecting the body.
+    let raw = r#"{"symbol":"BTC-USD","side":"buy","price_cents":6500000,"qty":1,"participant":"ali\u0063e"}"#;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/orders")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(raw))
+                .expect("request"),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::OK);
+}
