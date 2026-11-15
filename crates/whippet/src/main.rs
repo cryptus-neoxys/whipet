@@ -38,6 +38,10 @@ enum Commands {
     Doctor(whippet::cli::DoctorArgs),
     /// Plan the oldest order-log offset that is safe to delete per partition. Read-only.
     RetentionPlan(whippet::cli::RetentionPlanArgs),
+    /// List the control-plane audit records written by halt/resume. Read-only.
+    Audit(whippet::cli::AuditArgs),
+    /// Reconstruct one order's timeline from the orders and executions logs. Read-only.
+    OrderTrace(whippet::cli::OrderTraceArgs),
 }
 
 #[tokio::main]
@@ -63,5 +67,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Replay(args) => whippet::cli::run_replay(args).await,
         Commands::Doctor(args) => whippet::cli::run_doctor(args).await,
         Commands::RetentionPlan(args) => whippet::cli::run_retention_plan(args).await,
+        Commands::Audit(args) => whippet::cli::run_audit(args).await,
+        Commands::OrderTrace(args) => whippet::cli::run_order_trace(args).await,
     }
 }

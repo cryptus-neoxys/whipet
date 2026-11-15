@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use clap::Args;
 use iggy::prelude::{
     AutoLogin, Client as IggyClientTrait, Credentials, Identifier, IggyClient, TopicClient,
@@ -11,12 +12,17 @@ use iggy::prelude::{
 use reqwest::Client;
 use whippet_bench::BenchConfig;
 use whippet_core::config::{ExchangeConfig, Mode};
-use whippet_core::protocol::Command;
+use whippet_core::ids::{OrderId, Symbol};
+use whippet_core::protocol::{Command, ExecutionReport};
 use whippet_engine::ShardEngine;
-use whippet_journal::{IggyJournal, Journal, Topic};
+use whippet_journal::{IggyJournal, Journal, PayloadRecord, Topic};
 
 use crate::config::{exchange_config, read_password};
 use crate::engine_runner::resume_offset;
+use crate::inspect::{
+    AUDIT_TOPIC_PARTITIONS, AuditFilter, AuditRecord, ExecRole, OrderTrace, build_order_trace,
+    filter_audit, parse_order_id,
+};
 use crate::retention::{RetentionDecision, RetentionInput, evaluate, explain};
 use crate::snapshot::SnapshotStore;
 
@@ -975,4 +981,510 @@ pub async fn retention_plan_with_journal(
 /// Render an optional offset for the table; a missing value is `-`, never 0.
 fn offset_cell(offset: Option<u64>) -> String {
     offset.map_or_else(|| "-".to_string(), |offset| offset.to_string())
+}
+
+fn optional_cell<T: std::fmt::Display>(value: Option<T>) -> String {
+    value.map_or_else(|| "-".to_string(), |value| value.to_string())
+}
+
+fn format_timestamp_ns(timestamp_ns: u64) -> String {
+    let seconds = (timestamp_ns / 1_000_000_000) as i64;
+    let nanos = (timestamp_ns % 1_000_000_000) as u32;
+    match DateTime::<Utc>::from_timestamp(seconds, nanos) {
+        Some(timestamp) => timestamp.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+        None => timestamp_ns.to_string(),
+    }
+}
+
+fn offset_list(offsets: &[u64]) -> String {
+    offsets
+        .iter()
+        .map(|offset| offset.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct AuditArgs {
+    #[arg(long, env = "WHIPPET_IGGY_ADDR", default_value = "127.0.0.1:8090")]
+    pub iggy_addr: String,
+    #[arg(long, env = "WHIPPET_IGGY_USER", default_value = "iggy")]
+    pub iggy_user: String,
+    #[arg(long, env = "WHIPPET_IGGY_PASSWORD", default_value = "iggy")]
+    pub iggy_password: String,
+    /// Read the Iggy password from a file, as the node does.
+    #[arg(long, env = "WHIPPET_IGGY_PASSWORD_FILE")]
+    pub iggy_password_file: Option<PathBuf>,
+    /// Number of audit-topic partitions to scan from offset 0. The topic is
+    /// pinned at 4 partitions (ADR 0015); a lower value reads a prefix.
+    #[arg(long, default_value_t = AUDIT_TOPIC_PARTITIONS)]
+    pub partitions: u32,
+    /// Only records written by this operator.
+    #[arg(long)]
+    pub operator: Option<String>,
+    /// Only halt or resume records.
+    #[arg(long, value_parser = ["halt", "resume"])]
+    pub action: Option<String>,
+    /// Only records for this symbol (case-insensitive).
+    #[arg(long)]
+    pub symbol: Option<String>,
+    /// Only records at or after this audit-topic offset (inclusive). This is the
+    /// audit topic's offset, not the order_offset the record carries.
+    #[arg(long)]
+    pub min_offset: Option<u64>,
+    /// Stop after this many matching records.
+    #[arg(long)]
+    pub limit: Option<usize>,
+    /// Exit non-zero when any record on the scanned partitions is not valid
+    /// audit JSON. Without it, malformed records are counted and skipped.
+    #[arg(long)]
+    pub strict: bool,
+    /// Print one JSON object per matching record instead of a table.
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl AuditArgs {
+    fn validate(&self) -> Result<()> {
+        if self.partitions == 0 || self.partitions > AUDIT_TOPIC_PARTITIONS {
+            bail!(
+                "--partitions must be between 1 and {AUDIT_TOPIC_PARTITIONS}; the audit topic is \
+                 pinned at {AUDIT_TOPIC_PARTITIONS} partitions (ADR 0015)"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// What `whippet audit` read and printed.
+///
+/// `records` is the filtered set, in read order (partition-major, then offset).
+/// `scanned` counts every record read, `decoded` the valid audit JSON, and
+/// `malformed` the rest.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditReport {
+    pub partitions: u32,
+    pub scanned: u64,
+    pub decoded: u64,
+    pub malformed: u64,
+    pub records: Vec<AuditRecord>,
+}
+
+/// List control-plane audit records. Read-only: it reads the audit topic and
+/// never appends, commits, or creates anything.
+pub async fn run_audit(args: AuditArgs) -> Result<()> {
+    // Validate before connecting so a bad partition count is a usage error, not
+    // a connection attempt followed by an error.
+    args.validate()?;
+    let password = read_password(&args.iggy_password, args.iggy_password_file.as_deref())?;
+    let journal = Journal::Iggy(
+        IggyJournal::connect(&args.iggy_addr, &args.iggy_user, &password)
+            .await
+            .with_context(|| format!("connecting to Iggy at {}", args.iggy_addr))?,
+    );
+    audit_with_journal(args, &journal).await.map(|_| ())
+}
+
+/// The audit core, with the journal injected so the read path and the
+/// malformed-record policy can be tested on the memory journal.
+///
+/// Reads every requested audit partition from offset 0, decodes the gateway
+/// JSON, then applies [`AuditFilter`]. It never commits: an audit listing must
+/// not move any consumer's watermark.
+///
+/// Returns the report that was printed. With `--strict` and at least one
+/// malformed record the records are still printed, then the call fails, so the
+/// operator sees the damage and the shell still gets a non-zero exit.
+#[doc(hidden)]
+pub async fn audit_with_journal(args: AuditArgs, journal: &Journal) -> Result<AuditReport> {
+    args.validate()?;
+    let filter = AuditFilter {
+        operator: args.operator.clone(),
+        action: args.action.clone(),
+        symbol: args.symbol.clone(),
+        min_offset: args.min_offset,
+        limit: args.limit,
+    };
+
+    let mut records = Vec::new();
+    let mut scanned = 0u64;
+    let mut malformed = 0u64;
+    for partition in 0..args.partitions {
+        let consumer = format!("whippet-audit-p{partition}");
+        let payloads = read_topic_from_start(journal, Topic::Audit, partition, &consumer).await?;
+        for payload in payloads {
+            scanned += 1;
+            match AuditRecord::decode(partition, payload.offset, &payload.payload) {
+                Ok(decoded) => records.push(decoded),
+                Err(error) => {
+                    malformed += 1;
+                    eprintln!(
+                        "skip audit partition {partition} offset {}: {error}",
+                        payload.offset
+                    );
+                }
+            }
+        }
+    }
+    let decoded = records.len() as u64;
+    let matched = filter_audit(&records, &filter);
+    let description = filter.describe();
+
+    if args.json {
+        for record in &matched {
+            println!("{}", serde_json::to_string(record)?);
+        }
+        if matched.is_empty() {
+            eprintln!("no audit records matched ({description})");
+        }
+        eprintln!(
+            "audit: scanned {scanned} record(s) on {} partition(s), {decoded} decoded, \
+             {malformed} malformed, {} matched ({description}); read-only, nothing committed",
+            args.partitions,
+            matched.len()
+        );
+    } else {
+        if matched.is_empty() {
+            println!("no audit records matched ({description})");
+        } else {
+            print_audit_table(&matched);
+        }
+        println!(
+            "audit: scanned {scanned} record(s) on {} partition(s), {decoded} decoded, \
+             {malformed} malformed, {} matched ({description}); read-only, nothing committed",
+            args.partitions,
+            matched.len()
+        );
+    }
+
+    if args.strict && malformed > 0 {
+        bail!("--strict: {malformed} audit record(s) were not valid JSON");
+    }
+    Ok(AuditReport {
+        partitions: args.partitions,
+        scanned,
+        decoded,
+        malformed,
+        records: matched,
+    })
+}
+
+fn print_audit_table(records: &[AuditRecord]) {
+    println!(
+        "{:>9}  {:>10}  {:<23}  {:<12}  {:<6}  {:<8}  {:<6}  {:>12}  reason",
+        "partition",
+        "offset",
+        "timestamp",
+        "operator",
+        "action",
+        "symbol",
+        "halted",
+        "order_offset"
+    );
+    for record in records {
+        println!(
+            "{:>9}  {:>10}  {:<23}  {:<12}  {:<6}  {:<8}  {:<6}  {:>12}  {}",
+            record.partition,
+            record.offset,
+            format_timestamp_ns(record.payload.timestamp_ns),
+            record.payload.operator,
+            record.payload.action,
+            record.payload.symbol,
+            record.payload.halted,
+            record.payload.order_offset,
+            record.payload.reason.as_deref().unwrap_or("-"),
+        );
+    }
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct OrderTraceArgs {
+    #[arg(long, env = "WHIPPET_IGGY_ADDR", default_value = "127.0.0.1:8090")]
+    pub iggy_addr: String,
+    #[arg(long, env = "WHIPPET_IGGY_USER", default_value = "iggy")]
+    pub iggy_user: String,
+    #[arg(long, env = "WHIPPET_IGGY_PASSWORD", default_value = "iggy")]
+    pub iggy_password: String,
+    /// Read the Iggy password from a file, as the node does.
+    #[arg(long, env = "WHIPPET_IGGY_PASSWORD_FILE")]
+    pub iggy_password_file: Option<PathBuf>,
+    /// Partition that owns the symbol. BTC-USD is partition 1 with 16 partitions.
+    #[arg(long, default_value_t = 1)]
+    pub partition: u32,
+    /// Order id as a u128 decimal or 0x-prefixed hex. A bare 32-digit hex value
+    /// (as `OrderId` prints it) is accepted when it contains a hex letter.
+    #[arg(long, value_parser = parse_order_id)]
+    pub order_id: OrderId,
+    /// Restrict the scan to these symbols. Omit to scan every symbol on the
+    /// partition.
+    #[arg(long, value_delimiter = ',')]
+    pub symbols: Vec<Symbol>,
+    /// Print the trace as one JSON document instead of a timeline table.
+    #[arg(long)]
+    pub json: bool,
+    /// Exit non-zero when an execution's cause offset does not resolve to a
+    /// decoded order or cancel record for the same symbol.
+    #[arg(long)]
+    pub verify: bool,
+}
+
+/// Reconstruct one order's timeline across the orders and executions topics.
+/// Read-only: it reads both topics from offset 0 and never appends or commits.
+pub async fn run_order_trace(args: OrderTraceArgs) -> Result<()> {
+    let password = read_password(&args.iggy_password, args.iggy_password_file.as_deref())?;
+    let journal = Journal::Iggy(
+        IggyJournal::connect(&args.iggy_addr, &args.iggy_user, &password)
+            .await
+            .with_context(|| format!("connecting to Iggy at {}", args.iggy_addr))?,
+    );
+    order_trace_with_journal(args, &journal).await.map(|_| ())
+}
+
+/// The order-trace core, with the journal injected so the reconstruction can be
+/// tested on the memory journal.
+///
+/// Both topics are read from offset 0 on one partition. The orders log is the
+/// authority for which commands exist; the executions log is matched by
+/// `order_id` (own events) and `maker_order_id` (maker-side legs). The table is
+/// printed, then `--verify` turns an unresolved cause offset into a non-zero
+/// exit. "No matching records" is a valid empty trace and exits zero.
+#[doc(hidden)]
+pub async fn order_trace_with_journal(
+    args: OrderTraceArgs,
+    journal: &Journal,
+) -> Result<OrderTrace> {
+    let orders_consumer = format!("whippet-order-trace-orders-p{}", args.partition);
+    let order_payloads =
+        read_topic_from_start(journal, Topic::Orders, args.partition, &orders_consumer).await?;
+    let mut orders = Vec::with_capacity(order_payloads.len());
+    let mut skipped_orders = 0u64;
+    for payload in order_payloads {
+        match Command::decode(&payload.payload) {
+            Ok(command) => orders.push((payload.offset, command)),
+            Err(error) => {
+                skipped_orders += 1;
+                eprintln!("skip orders offset {}: {error}", payload.offset);
+            }
+        }
+    }
+
+    let executions_consumer = format!("whippet-order-trace-executions-p{}", args.partition);
+    let execution_payloads = read_topic_from_start(
+        journal,
+        Topic::Executions,
+        args.partition,
+        &executions_consumer,
+    )
+    .await?;
+    let mut executions = Vec::with_capacity(execution_payloads.len());
+    let mut skipped_executions = 0u64;
+    for payload in execution_payloads {
+        match ExecutionReport::decode(&payload.payload) {
+            Ok(report) => executions.push(report),
+            Err(error) => {
+                skipped_executions += 1;
+                eprintln!("skip executions offset {}: {error}", payload.offset);
+            }
+        }
+    }
+
+    let symbols = (!args.symbols.is_empty()).then_some(args.symbols.as_slice());
+    let trace = build_order_trace(args.order_id, args.partition, symbols, &orders, &executions);
+
+    if args.json {
+        if trace.orders.is_empty() && trace.executions.is_empty() {
+            eprintln!(
+                "no orders or executions reference order id {} on partition {}",
+                trace.order_id.to_hex(),
+                trace.partition
+            );
+        }
+        if !trace.unresolved_cause_offsets.is_empty() {
+            eprintln!(
+                "unresolved cause offset(s): {}",
+                offset_list(&trace.unresolved_cause_offsets)
+            );
+        }
+        println!("{}", serde_json::to_string_pretty(&trace)?);
+    } else {
+        print_order_trace(&trace);
+        println!(
+            "skipped: {skipped_orders} order record(s), {skipped_executions} execution record(s) \
+             did not decode; read-only, nothing committed"
+        );
+    }
+
+    if args.verify && !trace.unresolved_cause_offsets.is_empty() {
+        bail!(
+            "--verify: cause offset(s) {} do not resolve to a decoded order or cancel record on \
+             partition {}",
+            offset_list(&trace.unresolved_cause_offsets),
+            trace.partition
+        );
+    }
+    Ok(trace)
+}
+
+fn print_order_trace(trace: &OrderTrace) {
+    println!(
+        "order-trace  order_id={}  partition={}",
+        trace.order_id.to_hex(),
+        trace.partition
+    );
+
+    // One merged timeline: an order event sorts at its own offset and an
+    // execution sorts at the offset that caused it, so a fill appears
+    // immediately after the command that produced it.
+    let mut rows: Vec<(u64, u8, u64, String)> = Vec::new();
+    for event in &trace.orders {
+        rows.push((
+            event.offset,
+            0,
+            0,
+            format!(
+                "{:>10}  {:>8}  {:>6}  {:<26}  {:<6}  {:>10}  {:>10}  {:>10}  {:<23}  participant={}",
+                "orders",
+                event.offset,
+                "-",
+                "-",
+                "-",
+                optional_cell(event.price_cents),
+                optional_cell(event.qty),
+                "-",
+                format_timestamp_ns(event.timestamp_ns),
+                event.participant.0,
+            ),
+        ));
+    }
+    for event in &trace.executions {
+        let (symbol, cause_offset, seq, kind) = event.identity();
+        let role = match event.role {
+            ExecRole::Order => "order",
+            ExecRole::Maker => "maker",
+        };
+        let maker = if event.maker_order_id == OrderId(0) {
+            "-".to_string()
+        } else {
+            event.maker_order_id.to_hex()
+        };
+        rows.push((
+            event.cause_offset,
+            1,
+            event.seq,
+            format!(
+                "{:>10}  {:>8}  {:>6}  {:<26}  {:<6}  {:>10}  {:>10}  {:>10}  {:<23}  seq={seq} maker={maker} reason={}",
+                "executions",
+                "-",
+                cause_offset,
+                format!("{symbol}/{cause_offset}/{seq}/{}", kind.as_str()),
+                role,
+                event.price,
+                event.qty,
+                event.remaining,
+                format_timestamp_ns(event.timestamp_ns),
+                event.reason.as_str(),
+            ),
+        ));
+    }
+    rows.sort_unstable_by_key(|(cause_offset, log, seq, _)| (*cause_offset, *log, *seq));
+
+    if rows.is_empty() {
+        println!(
+            "no orders or executions reference order id {} on partition {}",
+            trace.order_id.to_hex(),
+            trace.partition
+        );
+    } else {
+        println!(
+            "{:>10}  {:>8}  {:>6}  {:<26}  {:<6}  {:>10}  {:>10}  {:>10}  {:<23}  detail",
+            "log", "offset", "cause", "identity", "role", "price", "qty", "remaining", "timestamp"
+        );
+        for (_, _, _, line) in rows {
+            println!("{line}");
+        }
+    }
+
+    let own = trace
+        .executions
+        .iter()
+        .filter(|event| event.role == ExecRole::Order)
+        .count();
+    let maker = trace.executions.len() - own;
+    println!(
+        "summary: orders={} executions={} (own={own}, maker={maker}) complete={}",
+        trace.orders.len(),
+        trace.executions.len(),
+        if trace.complete { "yes" } else { "no" }
+    );
+    if !trace.complete {
+        println!(
+            "note: no terminal execution report (filled/rejected/cancelled) names this order id; \
+             a maker-side fill does not carry the maker's remaining quantity"
+        );
+    }
+    if trace.unresolved_cause_offsets.is_empty() {
+        println!(
+            "causes: every execution cause offset resolves to a decoded order or cancel record"
+        );
+    } else {
+        println!(
+            "causes: unresolved cause offset(s): {}",
+            offset_list(&trace.unresolved_cause_offsets)
+        );
+    }
+}
+
+/// Read every record in one topic partition from offset zero.
+///
+/// Read-only: this polls with `read_payloads_into` and never commits, appends,
+/// creates topics, or trims. Iggy can return a transient empty poll while a
+/// partition is being materialised, so an empty batch is retried a bounded
+/// number of times; the memory journal is synchronous, so an empty batch there
+/// is the true end of the log.
+async fn read_topic_from_start(
+    journal: &Journal,
+    topic: Topic,
+    partition: u32,
+    consumer: &str,
+) -> Result<Vec<PayloadRecord>> {
+    const BATCH: u32 = 1_000;
+    const MAX_WAIT_MS: u64 = 100;
+    const EMPTY_POLL_LIMIT: u32 = 5;
+
+    let mut records = Vec::new();
+    let mut batch = Vec::new();
+    let mut offset = 0u64;
+    let mut empty_polls = 0u32;
+    loop {
+        let count = journal
+            .read_payloads_into(
+                topic,
+                partition,
+                consumer,
+                offset,
+                BATCH,
+                MAX_WAIT_MS,
+                &mut batch,
+            )
+            .await
+            .with_context(|| {
+                format!("reading {topic} partition {partition} from offset {offset}")
+            })?;
+        if count == 0 {
+            if !journal.is_iggy() || empty_polls + 1 >= EMPTY_POLL_LIMIT {
+                break;
+            }
+            empty_polls += 1;
+            tokio::time::sleep(Duration::from_millis(MAX_WAIT_MS)).await;
+            continue;
+        }
+        empty_polls = 0;
+        for record in &batch {
+            // Never move backwards if the broker echoes an older record.
+            offset = offset.max(record.offset.saturating_add(1));
+            records.push(record.clone());
+        }
+    }
+    Ok(records)
 }

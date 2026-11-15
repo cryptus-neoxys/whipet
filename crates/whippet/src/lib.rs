@@ -8,6 +8,7 @@ pub mod config;
 pub mod context;
 pub mod engine_runner;
 pub mod gateway;
+pub mod inspect;
 pub mod node;
 pub mod ratelimit;
 pub mod retention;

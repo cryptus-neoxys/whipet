@@ -4,6 +4,9 @@ Single-node, single-broker operations for the Phase 1 durable slice. There is
 no HA story in this build; the single-node caveats are part of the contract,
 not a footnote.
 
+Operator sequence (boot, disk pressure, verify, replay, restore, crash
+recovery, incidents): [RUNBOOK.md](RUNBOOK.md).
+
 ## Configuration
 
 The node reads these from flags or environment variables. Every value has a

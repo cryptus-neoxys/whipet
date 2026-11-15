@@ -433,6 +433,8 @@ artifact.
   troubleshooting.
 - [OPERATIONS.md](docs/OPERATIONS.md): configuration, retention, disk, reset,
   backup, upgrade pins.
+- [RUNBOOK.md](docs/RUNBOOK.md): operator sequence — boot, disk pressure,
+  verify, replay, restore, crash recovery, control plane, feed, incidents.
 - [FAILURE-MODES.md](docs/FAILURE-MODES.md): what happens today when a
   component fails, and what is only planned.
 - [BENCHMARKS.md](docs/BENCHMARKS.md): method, run matrix, scope labels, the
