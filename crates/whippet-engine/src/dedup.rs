@@ -75,6 +75,10 @@ impl DedupTable {
     /// Record a first observation. Returns the previous entry if the id was
     /// already present; callers treat that as a duplicate.
     pub fn insert(&mut self, order_id: OrderId, entry: DedupEntry) -> Option<DedupEntry> {
+        let terminal = matches!(
+            entry.status,
+            DedupStatus::Filled | DedupStatus::Cancelled | DedupStatus::Rejected
+        );
         // One hash probe: `insert` hands back the displaced entry, which is
         // exactly the duplicate signal. The old code probed twice (`get` then
         // `insert`). A duplicate restores the displaced entry, so the second
@@ -112,6 +116,12 @@ impl DedupTable {
             }
         }
         self.insertion_order.push_back(order_id);
+        if terminal {
+            // A rejected entry is inserted terminal without an `update`
+            // transition; it must still be eviction-eligible and present in
+            // the snapshot's terminal queue.
+            self.terminal_order.push_back(order_id);
+        }
         self.compact_if_needed();
         None
     }
@@ -242,7 +252,7 @@ impl DedupTable {
         capacity: usize,
         entries: Vec<(OrderId, DedupEntry)>,
         terminal_idx: Vec<u32>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         // Use the configured capacity, not the insertion-walk length: an id
         // that was evicted and re-admitted appears more than once in `entries`,
         // so `entries.len()` can exceed the live map size. Inflating the
@@ -257,23 +267,45 @@ impl DedupTable {
         // that was evicted and re-admitted appears once per terminal transition
         // in the queue, so this cannot be reconstructed from the insertion walk
         // alone; `terminal_idx` is what carries it.
-        let mut terminal_order = VecDeque::with_capacity(terminal_idx.len());
+        let mut seen = std::collections::HashSet::with_capacity(terminal_idx.len());
         for index in terminal_idx {
-            let Some((order_id, _)) = entries.get(index as usize) else {
-                continue;
+            let Some((order_id, entry)) = entries.get(index as usize) else {
+                return Err(format!("terminal index {index} is out of range"));
             };
-            let terminal = table.map.get(order_id).is_some_and(|entry| {
+            if !matches!(
+                entry.status,
+                DedupStatus::Filled | DedupStatus::Cancelled | DedupStatus::Rejected
+            ) {
+                return Err(format!(
+                    "terminal index {index} points at a non-terminal entry"
+                ));
+            }
+            if !seen.insert(*order_id) {
+                return Err(format!(
+                    "terminal index {index} repeats order id {order_id:?}"
+                ));
+            }
+            table.terminal_order.push_back(*order_id);
+        }
+        // Every terminal id in the map must be in the queue, or the restored
+        // table would evict a different set than a continuous replay.
+        let terminal_in_map = table
+            .map
+            .values()
+            .filter(|entry| {
                 matches!(
                     entry.status,
                     DedupStatus::Filled | DedupStatus::Cancelled | DedupStatus::Rejected
                 )
-            });
-            if terminal {
-                terminal_order.push_back(*order_id);
-            }
+            })
+            .count();
+        if table.terminal_order.len() != terminal_in_map {
+            return Err(format!(
+                "terminal queue has {} entries but the map has {terminal_in_map} terminal ids",
+                table.terminal_order.len()
+            ));
         }
-        table.terminal_order = terminal_order;
-        table
+        Ok(table)
     }
 
     pub fn hash_into(&self, hasher: &mut blake3::Hasher) {
@@ -467,7 +499,8 @@ mod tests {
         assert!(walk.len() > table.len(), "test precondition: re-admission");
 
         let terminal_idx = table.terminal_indices(&walk);
-        let mut restored = DedupTable::from_entries(4, walk, terminal_idx);
+        let mut restored =
+            DedupTable::from_entries(4, walk, terminal_idx).expect("valid terminal indices");
         assert_eq!(restored.capacity(), 4, "restored capacity must not inflate");
         assert_eq!(restored.len(), table.len());
 
@@ -492,7 +525,8 @@ mod tests {
         table.update(OrderId(1), DedupStatus::Filled);
         let walk = table.entries_in_order();
         let terminal_idx = table.terminal_indices(&walk);
-        let mut restored = DedupTable::from_entries(2, walk, terminal_idx);
+        let mut restored =
+            DedupTable::from_entries(2, walk, terminal_idx).expect("valid terminal indices");
         table.insert(OrderId(9), entry(9));
         restored.insert(OrderId(9), entry(9));
         assert_eq!(table.contains(OrderId(5)), restored.contains(OrderId(5)));
@@ -533,7 +567,8 @@ mod tests {
             .collect();
         assert_eq!(resolved, live_queue);
 
-        let mut restored = DedupTable::from_entries(4, walk, terminal_idx);
+        let mut restored =
+            DedupTable::from_entries(4, walk, terminal_idx).expect("valid terminal indices");
         assert_eq!(
             restored.terminal_order(),
             live_queue,
@@ -555,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_terminal_indices_are_skipped_without_panicking() {
+    fn malformed_terminal_indices_are_rejected() {
         let mut table = DedupTable::new(4);
         table.insert(OrderId(1), entry(1));
         table.update(OrderId(1), DedupStatus::Filled);
@@ -563,11 +598,13 @@ mod tests {
         let walk = table.entries_in_order();
 
         // 0 is a terminal entry, 1 is a non-terminal entry, 9 and u32::MAX are
-        // out of range. A corrupt snapshot must degrade, not abort the restore.
+        // out of range. A corrupt terminal queue must fail closed, not restore
+        // a table that evicts differently from a continuous replay.
         let restored = DedupTable::from_entries(4, walk, vec![0, 1, 9, u32::MAX]);
-        assert_eq!(restored.terminal_order(), vec![OrderId(1)]);
-        assert_eq!(restored.len(), 2);
-        assert!(restored.contains(OrderId(2)));
+        assert!(
+            restored.is_err(),
+            "a corrupt terminal queue must be rejected"
+        );
     }
 
     #[test]

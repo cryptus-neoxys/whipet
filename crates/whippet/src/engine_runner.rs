@@ -265,6 +265,17 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
     // No snapshot means the engine state is empty, so the only correct resume
     // point is the start of the log. Starting at the committed offset would
     // skip every order before it and diverge from a clean replay.
+    // A snapshot ahead of the log head cannot be a resume point: the records
+    // it claims are not in this partition. Fail before the reader waits on a
+    // tail that will never arrive.
+    if let Some(snapshot_offset) = snapshot_last_offset {
+        let head = journal.lag(Topic::Orders, shard_id, 0).await.unwrap_or(0);
+        if snapshot_offset > head {
+            anyhow::bail!(
+                "snapshot at offset {snapshot_offset} is ahead of the order log head {head} for shard {shard_id}; reset or resnapshot"
+            );
+        }
+    }
     let next_offset = match snapshot_last_offset {
         Some(offset) => offset.saturating_add(1),
         None => 0,
@@ -1328,6 +1339,13 @@ fn spawn_snapshot_writer(
                 .map(|symbol| hex(&symbol.state_hash))
                 .collect();
             let write_started = Instant::now();
+            // One snapshot write at a time: three shards fsyncing at once
+            // contend with Iggy's WAL on the same volume and produced a
+            // multi-hundred-millisecond gateway tail.
+            let _guard = ctx
+                .snapshot_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let result = if verify {
                 writer.write(request)
             } else {

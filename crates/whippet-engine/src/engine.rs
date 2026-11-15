@@ -817,7 +817,8 @@ impl SymbolEngine {
                 dedup_capacity,
                 snapshot.dedup,
                 snapshot.dedup_terminal_idx,
-            ),
+            )
+            .map_err(EngineError::Snapshot)?,
             exec_seq: snapshot.exec_seq,
             md_seq: snapshot.md_seq,
             last_offset: snapshot.last_offset,
@@ -1344,9 +1345,10 @@ mod tests {
     }
 
     #[test]
-    fn malformed_terminal_indices_do_not_break_a_restore() {
-        // Terminal indices are not hashed, so a corrupt list must be skipped
-        // rather than panic or fail a snapshot that is otherwise intact.
+    fn malformed_terminal_indices_are_rejected() {
+        // Terminal indices are not hashed, so a corrupt list must fail closed
+        // here; otherwise a restored table could evict differently from a
+        // continuous replay while every hash still matches.
         let mut engine = SymbolEngine::new(config());
         process(&mut engine, &limit(Side::Buy, 100, 10, 1, 1), 0);
         process(&mut engine, &limit(Side::Sell, 105, 4, 2, 2), 1);
@@ -1354,9 +1356,11 @@ mod tests {
         // Out of range, and an index that points at a non-terminal entry.
         snapshot.dedup_terminal_idx = vec![u32::MAX, 0];
         snapshot.state_hash = hash_symbol_snapshot(&snapshot);
-        let restored = SymbolEngine::from_snapshot(config(), snapshot).expect("restores");
-        assert_eq!(restored.state_hash(), engine.state_hash());
-        assert!(restored.dedup().terminal_order().is_empty());
+        let err = match SymbolEngine::from_snapshot(config(), snapshot) {
+            Ok(_) => panic!("a corrupt terminal queue must be rejected"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, EngineError::Snapshot(_)), "{err:?}");
     }
 
     #[test]

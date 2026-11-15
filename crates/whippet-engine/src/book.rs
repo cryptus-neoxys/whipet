@@ -735,7 +735,7 @@ impl Book {
         book.last_trade_qty = snapshot.last_trade_qty;
         book.last_trade_side = snapshot.last_trade_side;
         for order in snapshot.orders {
-            book.insert(
+            let slot = book.insert(
                 order.order_id,
                 order.participant,
                 order.side,
@@ -743,6 +743,10 @@ impl Book {
                 order.remaining,
                 order.seq,
             )?;
+            // `insert` treats its quantity as both original and remaining. A
+            // partially filled resting order has `qty > remaining`; restore the
+            // original so a snapshot round-trip is byte-identical.
+            book.slots[slot as usize].qty = order.qty;
         }
         Ok(book)
     }
@@ -843,6 +847,36 @@ mod tests {
         let mut config = InstrumentConfig::new("BTC-USD", 100, 100, 200).unwrap();
         config.max_orders = 1024;
         config
+    }
+
+    #[test]
+    fn from_snapshot_restores_qty_and_remaining() {
+        let mut book = Book::new(&config());
+        let index = book
+            .insert(
+                OrderId(7),
+                ParticipantId(1),
+                Side::Buy,
+                Price(100),
+                Qty(10),
+                1,
+            )
+            .expect("insert");
+        book.reduce(index, Qty(4));
+        let snapshot = book.snapshot();
+        assert_eq!(snapshot.orders[0].qty, Qty(10));
+        assert_eq!(snapshot.orders[0].remaining, Qty(6));
+
+        let restored = Book::from_snapshot(&config(), snapshot.clone()).expect("restore");
+        assert_eq!(
+            restored.snapshot().orders[0].qty,
+            snapshot.orders[0].qty,
+            "the original quantity must survive a snapshot round trip"
+        );
+        assert_eq!(
+            restored.snapshot().orders[0].remaining,
+            snapshot.orders[0].remaining
+        );
     }
 
     #[test]
