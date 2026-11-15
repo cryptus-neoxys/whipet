@@ -31,6 +31,7 @@
 #![forbid(unsafe_code)]
 
 pub mod fanout;
+pub mod soak;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};

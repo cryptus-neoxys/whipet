@@ -42,6 +42,16 @@ pub struct FanoutConfig {
     pub symbols: Vec<String>,
     pub output_dir: PathBuf,
     pub label: String,
+    /// Real ingress load posted at `POST /api/orders` while subscribers run.
+    /// `0` (default) disables the driver and preserves the old quiet-book
+    /// measurement.
+    #[serde(default)]
+    pub ingress_rate: u64,
+    /// No-subscriber baseline for the comparison mode. Loaded by the example
+    /// from `--baseline-metrics PATH`; echoed in the manifest with a note that
+    /// compares the `/metrics` deltas with and without subscribers.
+    #[serde(default)]
+    pub baseline: Option<BaselineSnapshot>,
 }
 
 impl Default for FanoutConfig {
@@ -55,6 +65,8 @@ impl Default for FanoutConfig {
             symbols: Vec::new(),
             output_dir: PathBuf::from("artifacts/bench"),
             label: "fanout".into(),
+            ingress_rate: 0,
+            baseline: None,
         }
     }
 }
@@ -209,6 +221,27 @@ pub struct FanoutMetricsScrape {
     pub process_cpu_seconds_delta: Option<f64>,
 }
 
+/// Achieved load of the optional ingress driver (`--ingress-rate R`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct IngressSummary {
+    pub target_rate_per_sec: u64,
+    pub sent: u64,
+    pub ok: u64,
+    pub errors: u64,
+    pub elapsed_secs: f64,
+    pub achieved_per_sec: f64,
+}
+
+/// No-subscriber baseline for the comparison mode. The example loads the
+/// `/metrics` deltas from a `--ingress-rate 0`-style run's manifest so the
+/// report can show whether subscribers slowed the engine.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BaselineSnapshot {
+    pub source: String,
+    pub orders_ingressed_delta: Option<u64>,
+    pub md_sequence_delta: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientSummary {
     pub client_id: usize,
@@ -253,6 +286,8 @@ pub struct FanoutManifest {
     pub gap_us: LatencySummary,
     pub clients: Vec<ClientSummary>,
     pub metrics: FanoutMetricsScrape,
+    pub ingress: IngressSummary,
+    pub baseline: Option<BaselineSnapshot>,
     pub notes: Vec<String>,
     pub labels: Vec<String>,
 }
@@ -354,6 +389,146 @@ pub fn metrics_url(gateway: &str) -> Result<String> {
         )));
     };
     Ok(format!("{base}/metrics"))
+}
+
+/// Absolute-deadline pacing plan for the ingress driver. Pure so the pacing
+/// math is unit-testable: `total_orders` POSTs spaced `period_ns` apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngressPlan {
+    pub total_orders: u64,
+    pub period_ns: u64,
+}
+
+pub fn plan_ingress(rate_per_sec: u64, total_secs: u64) -> IngressPlan {
+    if rate_per_sec == 0 || total_secs == 0 {
+        return IngressPlan {
+            total_orders: 0,
+            period_ns: 0,
+        };
+    }
+    IngressPlan {
+        total_orders: rate_per_sec.saturating_mul(total_secs),
+        period_ns: (1_000_000_000u64 / rate_per_sec).max(1),
+    }
+}
+
+/// One minimal same-symbol ladder order. Unique client id and participant per
+/// sequence number so repeated runs never collide and the engine's self-trade
+/// prevention never fires between driver orders. Prices walk a ±20-tick
+/// ladder around a fixed reference; sides alternate.
+pub fn ingress_order_body(seq: u64, symbol: &str) -> serde_json::Value {
+    let side = if seq.is_multiple_of(2) { "buy" } else { "sell" };
+    let ladder = (seq % 40) as i64 - 20;
+    serde_json::json!({
+        "symbol": symbol,
+        "side": side,
+        "order_type": "limit",
+        "price_cents": 6_500_000 + ladder * 100,
+        "qty": 1 + (seq % 50),
+        "client_order_id": format!("fanout-ingress-{seq}"),
+        "participant": format!("fanout-ingress-p-{seq}"),
+    })
+}
+
+/// Compare a no-subscriber baseline run with this run's `/metrics` deltas.
+/// Pure so the comparison wording is unit-testable.
+pub fn baseline_note(
+    baseline: &BaselineSnapshot,
+    current_orders_delta: Option<u64>,
+    current_md_delta: Option<u64>,
+    subscribers: usize,
+) -> String {
+    match (baseline.orders_ingressed_delta, current_orders_delta) {
+        (Some(base), Some(current)) => {
+            let pct = if base == 0 {
+                0.0
+            } else {
+                (current as f64 - base as f64) / base as f64 * 100.0
+            };
+            format!(
+                "Baseline comparison ({}): no-subscriber orders_ingressed_delta={} vs \
+                 {} subscriber(s) orders_ingressed_delta={} ({:+.1}%). A negative drift means \
+                 subscribers slowed the engine's ingress; md_sequence_delta baseline={:?} vs current={:?}.",
+                baseline.source,
+                base,
+                subscribers,
+                current,
+                pct,
+                baseline.md_sequence_delta,
+                current_md_delta,
+            )
+        }
+        _ => format!(
+            "Baseline comparison ({}): /metrics deltas unavailable on one or both sides; \
+             no subscriber-overhead conclusion can be drawn.",
+            baseline.source,
+        ),
+    }
+}
+
+/// POST `POST /api/orders` at `rate_per_sec` for `total_secs` seconds on an
+/// absolute-deadline schedule. A `rate_per_sec` of 0 disables the driver and
+/// returns a zero summary. Requests run with bounded concurrency; every
+/// issued request is counted as `ok` (2xx) or `errors`.
+async fn run_ingress_driver(
+    client: &Client,
+    gateway: &str,
+    rate_per_sec: u64,
+    total_secs: u64,
+    symbol: &str,
+) -> IngressSummary {
+    let plan = plan_ingress(rate_per_sec, total_secs);
+    if plan.total_orders == 0 {
+        return IngressSummary::default();
+    }
+    let url = format!("{}/api/orders", gateway.trim_end_matches('/'));
+    let started = Instant::now();
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(512));
+    let mut tasks = tokio::task::JoinSet::new();
+    for seq in 0..plan.total_orders {
+        let deadline = started + Duration::from_nanos(plan.period_ns.saturating_mul(seq));
+        let now = Instant::now();
+        if deadline > now {
+            tokio::time::sleep_until(deadline.into()).await;
+        }
+        let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+            // Saturated driver: count the unsent slot as an error rather than
+            // silently lowering the offered rate.
+            tasks.spawn(async move { false });
+            continue;
+        };
+        let body = ingress_order_body(seq, symbol);
+        let request = client.post(&url).json(&body).build();
+        let Ok(request) = request else {
+            drop(permit);
+            tasks.spawn(async move { false });
+            continue;
+        };
+        let owned = client.clone();
+        tasks.spawn(async move {
+            let _permit = permit;
+            let response = owned.execute(request).await;
+            matches!(response, Ok(response) if response.status().is_success())
+        });
+    }
+    let mut ok = 0u64;
+    let mut errors = 0u64;
+    while let Some(outcome) = tasks.join_next().await {
+        match outcome {
+            Ok(true) => ok += 1,
+            _ => errors += 1,
+        }
+    }
+    let elapsed_secs = started.elapsed().as_secs_f64();
+    let sent = ok + errors;
+    IngressSummary {
+        target_rate_per_sec: rate_per_sec,
+        sent,
+        ok,
+        errors,
+        elapsed_secs,
+        achieved_per_sec: sent as f64 / elapsed_secs.max(f64::EPSILON),
+    }
 }
 
 fn validate_config(config: &FanoutConfig) -> Result<Vec<Symbol>> {
@@ -556,6 +731,28 @@ pub async fn run_fanout(config: FanoutConfig) -> Result<FanoutManifest> {
     let measure_start = start + Duration::from_secs(config.warmup_secs);
     let measure_end = measure_start + Duration::from_secs(config.duration_secs);
 
+    // The ingress driver covers warmup plus the measured window so the
+    // subscribers observe the engine under load for the whole run.
+    let ingress_symbol = config
+        .symbols
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "BTC-USD".into());
+    let ingress_client = http_client.clone();
+    let ingress_gateway = config.gateway.clone();
+    let ingress_rate = config.ingress_rate;
+    let ingress_secs = config.warmup_secs + config.duration_secs;
+    let ingress_task = tokio::spawn(async move {
+        run_ingress_driver(
+            &ingress_client,
+            &ingress_gateway,
+            ingress_rate,
+            ingress_secs,
+            &ingress_symbol,
+        )
+        .await
+    });
+
     let mut tasks = Vec::with_capacity(sockets.len());
     for (client_id, socket) in sockets.into_iter().enumerate() {
         tasks.push(tokio::spawn(run_subscriber(
@@ -573,6 +770,9 @@ pub async fn run_fanout(config: FanoutConfig) -> Result<FanoutManifest> {
             .map_err(|error| BenchError::Config(format!("subscriber task failed: {error}")))?;
         runs.push(run);
     }
+    let ingress = ingress_task
+        .await
+        .map_err(|error| BenchError::Config(format!("ingress driver task failed: {error}")))?;
     let after_metrics = scrape_metrics(&http_client, &config.gateway).await;
 
     let measured_secs = config.duration_secs as f64;
@@ -634,6 +834,25 @@ pub async fn run_fanout(config: FanoutConfig) -> Result<FanoutManifest> {
         "A client with no frame for >1 s (1,000,000 µs) during the measured window is flagged as stalled."
             .into(),
     ];
+    if ingress.sent > 0 {
+        notes.push(format!(
+            "Ingress driver: target {} orders/s for {} s (warmup + measured), sent {} (ok {}, errors {}), \
+             achieved {:.0} orders/s over {:.1} s via POST /api/orders.",
+            ingress.target_rate_per_sec,
+            ingress_secs,
+            ingress.sent,
+            ingress.ok,
+            ingress.errors,
+            ingress.achieved_per_sec,
+            ingress.elapsed_secs,
+        ));
+    } else {
+        notes.push(
+            "Ingress driver off (--ingress-rate 0): the book carries background traffic only; \
+             use this shape as the no-subscriber baseline for the comparison mode."
+                .into(),
+        );
+    }
     if metrics.before.is_some() && metrics.after.is_some() {
         if metrics
             .after
@@ -651,6 +870,14 @@ pub async fn run_fanout(config: FanoutConfig) -> Result<FanoutManifest> {
         notes.push(format!(
             "WARNING: {stalled_clients} of {} subscriber(s) stalled (>1 s without a frame).",
             config.subscribers
+        ));
+    }
+    if let Some(baseline) = config.baseline.clone() {
+        notes.push(baseline_note(
+            &baseline,
+            metrics.orders_ingressed_delta,
+            metrics.md_sequence_delta,
+            config.subscribers,
         ));
     }
 
@@ -683,6 +910,8 @@ pub async fn run_fanout(config: FanoutConfig) -> Result<FanoutManifest> {
         gap_us: summarize(&pooled_gaps),
         clients,
         metrics,
+        ingress,
+        baseline: config.baseline.clone(),
         notes,
         labels,
     };
@@ -849,6 +1078,19 @@ mod tests {
                     process_cpu_seconds_total: None,
                 }),
             ),
+            ingress: IngressSummary {
+                target_rate_per_sec: 10_000,
+                sent: 300_000,
+                ok: 299_900,
+                errors: 100,
+                elapsed_secs: 30.0,
+                achieved_per_sec: 10_000.0,
+            },
+            baseline: Some(BaselineSnapshot {
+                source: "baseline.json".into(),
+                orders_ingressed_delta: Some(300_000),
+                md_sequence_delta: Some(600),
+            }),
             notes: vec!["dev-loop fanout test".into()],
             labels: vec![scope, "fanout".into()],
         };
@@ -876,10 +1118,71 @@ mod tests {
         assert_eq!(value["metrics"]["orders_ingressed_delta"], 600);
         assert_eq!(value["metrics"]["md_sequence_delta"], 600);
         assert!(value["metrics"]["process_cpu_seconds_delta"].is_null());
+        assert_eq!(value["ingress"]["target_rate_per_sec"], 10_000);
+        assert_eq!(value["ingress"]["sent"], 300_000);
+        assert_eq!(value["ingress"]["errors"], 100);
+        assert_eq!(value["baseline"]["orders_ingressed_delta"], 300_000);
 
         let decoded: FanoutManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.run_id, "fanout-test-run");
         assert_eq!(decoded.subscribers, 10);
+    }
+
+    #[test]
+    fn ingress_pacing_matches_the_offered_rate() {
+        let off = plan_ingress(0, 35);
+        assert_eq!(
+            off,
+            IngressPlan {
+                total_orders: 0,
+                period_ns: 0,
+            }
+        );
+
+        let plan = plan_ingress(10_000, 35);
+        assert_eq!(plan.total_orders, 350_000);
+        assert_eq!(plan.period_ns, 100_000);
+
+        let single = plan_ingress(1_000, 30);
+        assert_eq!(single.total_orders, 30_000);
+        assert_eq!(single.period_ns, 1_000_000);
+    }
+
+    #[test]
+    fn ingress_order_bodies_form_a_unique_ladder() {
+        let first = ingress_order_body(0, "BTC-USD");
+        let second = ingress_order_body(1, "BTC-USD");
+        assert_eq!(first["symbol"], "BTC-USD");
+        assert_eq!(first["side"], "buy");
+        assert_eq!(second["side"], "sell");
+        assert_ne!(
+            first["client_order_id"], second["client_order_id"],
+            "client ids must be unique per order"
+        );
+        assert_ne!(
+            first["participant"], second["participant"],
+            "participants must be unique per order"
+        );
+        // The ladder walks ±20 ticks around the reference price.
+        let price = first["price_cents"].as_i64().unwrap();
+        assert!((6_498_000..=6_502_000).contains(&price));
+    }
+
+    #[test]
+    fn baseline_note_compares_deltas_with_and_without_subscribers() {
+        let baseline = BaselineSnapshot {
+            source: "baseline.json".into(),
+            orders_ingressed_delta: Some(300_000),
+            md_sequence_delta: Some(600),
+        };
+        let note = baseline_note(&baseline, Some(294_000), Some(590), 10);
+        assert!(note.contains("baseline.json"));
+        assert!(note.contains("300000"));
+        assert!(note.contains("294000"));
+        assert!(note.contains("-2.0%"));
+
+        let missing = baseline_note(&baseline, None, None, 10);
+        assert!(missing.contains("unavailable"));
     }
 
     #[test]
@@ -1014,6 +1317,8 @@ whippet_md_sequence 6789
             symbols: Vec::new(),
             output_dir: output_dir.clone(),
             label: "dev-loop-fanout".into(),
+            ingress_rate: 0,
+            baseline: None,
         };
         let manifest = run_fanout(config).await.unwrap();
         server.abort();

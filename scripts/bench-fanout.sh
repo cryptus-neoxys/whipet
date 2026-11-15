@@ -8,7 +8,9 @@
 # Starts the Compose stack (iggy + node) if the gateway is not already healthy,
 # stops the simulator for the duration of the sweep, runs 1 / 10 / 100
 # subscribers for 30 s each with label dev-loop-fanout, and writes fanout
-# manifests to artifacts/bench.
+# manifests to artifacts/bench. With WHIPPET_FANOUT_INGRESS_RATE=R the harness
+# also posts R orders/s at POST /api/orders for the whole run and records the
+# achieved rate, error count, and /metrics deltas in the manifest.
 #
 # Environment overrides:
 #   WHIPPET_GATEWAY             gateway base URL (default http://127.0.0.1:8080)
@@ -17,6 +19,8 @@
 #   WHIPPET_FANOUT_WARMUP       warmup seconds per run (default 5)
 #   WHIPPET_FANOUT_TRADES       trade tape cap on /ws?trades=N (default 0 = full tape)
 #   WHIPPET_FANOUT_SYMBOLS      optional comma-separated Subscribe filter (default all)
+#   WHIPPET_FANOUT_INGRESS_RATE real ingress load in orders/s via POST /api/orders (default 0 = off)
+#   WHIPPET_FANOUT_BASELINE_METRICS path to a no-subscriber baseline manifest for the comparison note (default empty)
 #   WHIPPET_FANOUT_LABEL        manifest label (default dev-loop-fanout)
 #   WHIPPET_FANOUT_OUTPUT_DIR   output directory (default ./artifacts/bench)
 
@@ -30,6 +34,8 @@ DURATION="${WHIPPET_FANOUT_DURATION:-30}"
 WARMUP="${WHIPPET_FANOUT_WARMUP:-5}"
 TRADES="${WHIPPET_FANOUT_TRADES:-0}"
 SYMBOLS="${WHIPPET_FANOUT_SYMBOLS:-}"
+INGRESS_RATE="${WHIPPET_FANOUT_INGRESS_RATE:-0}"
+BASELINE_METRICS="${WHIPPET_FANOUT_BASELINE_METRICS:-}"
 LABEL="${WHIPPET_FANOUT_LABEL:-dev-loop-fanout}"
 OUTPUT_DIR="${WHIPPET_FANOUT_OUTPUT_DIR:-${ROOT}/artifacts/bench}"
 RESTART_SIM=0
@@ -42,9 +48,15 @@ Runs the 20 Hz WebSocket fanout harness for 1 / 10 / 100 subscribers (30 s
 measured, 5 s warmup each) with label dev-loop-fanout, writing JSON manifests
 to artifacts/bench.
 
+Comparison mode: run once with WHIPPET_FANOUT_INGRESS_RATE=0 (quiet book) and
+once with WHIPPET_FANOUT_INGRESS_RATE=10000, passing the first manifest with
+WHIPPET_FANOUT_BASELINE_METRICS so the second manifest records whether
+subscribers slowed the engine.
+
 Environment: WHIPPET_GATEWAY, WHIPPET_FANOUT_SUBSCRIBERS,
 WHIPPET_FANOUT_DURATION, WHIPPET_FANOUT_WARMUP, WHIPPET_FANOUT_TRADES,
-WHIPPET_FANOUT_SYMBOLS, WHIPPET_FANOUT_LABEL, WHIPPET_FANOUT_OUTPUT_DIR.
+WHIPPET_FANOUT_SYMBOLS, WHIPPET_FANOUT_INGRESS_RATE,
+WHIPPET_FANOUT_BASELINE_METRICS, WHIPPET_FANOUT_LABEL, WHIPPET_FANOUT_OUTPUT_DIR.
 EOF
 }
 
@@ -101,18 +113,22 @@ cargo build --release -p whippet-bench --example fanout
 
 IFS=',' read -r -a subscriber_list <<<"${SUBSCRIBERS}"
 for subs in "${subscriber_list[@]}"; do
-    echo "bench-fanout: label=${LABEL} subscribers=${subs} duration=${DURATION}s warmup=${WARMUP}s trades=${TRADES} symbols=${SYMBOLS:-all}"
+    echo "bench-fanout: label=${LABEL} subscribers=${subs} duration=${DURATION}s warmup=${WARMUP}s trades=${TRADES} symbols=${SYMBOLS:-all} ingress_rate=${INGRESS_RATE}/s baseline=${BASELINE_METRICS:-none}"
     args=(
         --gateway "${GATEWAY}"
         --subscribers "${subs}"
         --duration "${DURATION}"
         --warmup "${WARMUP}"
         --trades "${TRADES}"
+        --ingress-rate "${INGRESS_RATE}"
         --output-dir "${OUTPUT_DIR}"
         --label "${LABEL}"
     )
     if [ -n "${SYMBOLS}" ]; then
         args+=(--symbols "${SYMBOLS}")
+    fi
+    if [ -n "${BASELINE_METRICS}" ]; then
+        args+=(--baseline-metrics "${BASELINE_METRICS}")
     fi
     cargo run --quiet --release -p whippet-bench --example fanout -- "${args[@]}"
 done

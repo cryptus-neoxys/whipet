@@ -11,13 +11,18 @@
 //!   --gateway http://127.0.0.1:8080 --subscribers 10 --duration 30 \
 //!   --warmup 5 --trades 0 --label dev-loop-fanout --output-dir artifacts/bench
 //! ```
+//!
+//! Comparison mode: run once with `--ingress-rate 0` (no-subscriber baseline)
+//! and once with `--ingress-rate 10000`, passing the first manifest with
+//! `--baseline-metrics` so the second manifest records whether subscribers
+//! slowed the engine.
 
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
 
 use whippet_bench::BenchError;
-use whippet_bench::fanout::{FanoutConfig, run_fanout};
+use whippet_bench::fanout::{BaselineSnapshot, FanoutConfig, run_fanout};
 
 fn take(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, BenchError> {
     args.next()
@@ -38,6 +43,10 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<FanoutCon
             "--duration" => config.duration_secs = parse(&flag, &take(&mut args, &flag)?)?,
             "--warmup" => config.warmup_secs = parse(&flag, &take(&mut args, &flag)?)?,
             "--trades" => config.trades = parse(&flag, &take(&mut args, &flag)?)?,
+            "--ingress-rate" => config.ingress_rate = parse(&flag, &take(&mut args, &flag)?)?,
+            "--baseline-metrics" => {
+                config.baseline = Some(load_baseline(&take(&mut args, &flag)?)?);
+            }
             "--symbols" => {
                 config.symbols = take(&mut args, &flag)?
                     .split(',')
@@ -51,7 +60,8 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<FanoutCon
             "-h" | "--help" => {
                 println!(
                     "usage: fanout [--gateway URL] [--subscribers N] [--duration S] [--warmup S]\n\
-                     \x20      [--trades N] [--symbols A,B] [--output-dir DIR] [--label NAME]"
+                     \x20      [--trades N] [--ingress-rate R] [--baseline-metrics PATH]\n\
+                     \x20      [--symbols A,B] [--output-dir DIR] [--label NAME]"
                 );
                 return Ok(None);
             }
@@ -61,6 +71,25 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<FanoutCon
         }
     }
     Ok(Some(config))
+}
+
+/// Load the `/metrics` deltas from a no-subscriber baseline manifest so this
+/// run's manifest can record whether subscribers slowed the engine.
+fn load_baseline(path: &str) -> Result<BaselineSnapshot, BenchError> {
+    let raw = std::fs::read_to_string(path).map_err(|error| {
+        BenchError::Config(format!("--baseline-metrics: cannot read {path:?}: {error}"))
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
+        BenchError::Config(format!(
+            "--baseline-metrics: invalid JSON in {path:?}: {error}"
+        ))
+    })?;
+    let at = |pointer: &str| value.pointer(pointer).and_then(serde_json::Value::as_u64);
+    Ok(BaselineSnapshot {
+        source: path.to_string(),
+        orders_ingressed_delta: at("/metrics/orders_ingressed_delta"),
+        md_sequence_delta: at("/metrics/md_sequence_delta"),
+    })
 }
 
 fn main() -> Result<(), BenchError> {
@@ -102,6 +131,16 @@ fn main() -> Result<(), BenchError> {
             manifest.stalled_clients
         );
     }
+    if manifest.ingress.sent > 0 {
+        println!(
+            "ingress: target={}/s  sent={}  ok={}  errors={}  achieved={:.0}/s",
+            manifest.ingress.target_rate_per_sec,
+            manifest.ingress.sent,
+            manifest.ingress.ok,
+            manifest.ingress.errors,
+            manifest.ingress.achieved_per_sec,
+        );
+    }
     println!(
         "manifest: {}/{}.json",
         output_dir.display(),
@@ -122,6 +161,8 @@ mod tests {
         assert_eq!(defaults.duration_secs, 30);
         assert_eq!(defaults.warmup_secs, 5);
         assert_eq!(defaults.trades, 0);
+        assert_eq!(defaults.ingress_rate, 0);
+        assert!(defaults.baseline.is_none());
         assert!(defaults.symbols.is_empty());
         assert_eq!(defaults.output_dir, PathBuf::from("artifacts/bench"));
         assert_eq!(defaults.label, "fanout");
@@ -137,6 +178,8 @@ mod tests {
             "3",
             "--trades",
             "25",
+            "--ingress-rate",
+            "10000",
             "--symbols",
             "BTC-USD,ETH-USD",
             "--output-dir",
@@ -152,8 +195,30 @@ mod tests {
         assert_eq!(custom.duration_secs, 15);
         assert_eq!(custom.warmup_secs, 3);
         assert_eq!(custom.trades, 25);
+        assert_eq!(custom.ingress_rate, 10_000);
         assert_eq!(custom.symbols, vec!["BTC-USD", "ETH-USD"]);
         assert_eq!(custom.output_dir, PathBuf::from("/tmp/out"));
         assert_eq!(custom.label, "dev-loop-fanout");
+    }
+
+    #[test]
+    fn baseline_metrics_flag_loads_deltas_from_a_manifest() {
+        let dir = std::env::temp_dir().join(format!("whippet-baseline-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("baseline.json");
+        std::fs::write(
+            &path,
+            r#"{"metrics": {"orders_ingressed_delta": 300000, "md_sequence_delta": 600}}"#,
+        )
+        .unwrap();
+        let args = ["--baseline-metrics", path.to_str().unwrap()]
+            .into_iter()
+            .map(String::from);
+        let config = parse_args(args).unwrap().unwrap();
+        let baseline = config.baseline.unwrap();
+        assert_eq!(baseline.source, path.to_str().unwrap());
+        assert_eq!(baseline.orders_ingressed_delta, Some(300_000));
+        assert_eq!(baseline.md_sequence_delta, Some(600));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -31,9 +31,11 @@ length-prefixed ingress instead, with per-frame stage timestamps. A final
 dev-loop batch-size sweep, a group-commit measurement, and a TCP measurement
 are recorded below; there are still no headline numbers. A 20 Hz WebSocket
 fanout harness (`examples/fanout.rs`, `scripts/bench-fanout.sh`) measures `/ws`
-egress across `N` concurrent subscribers (results pending); replay, failover,
-and soak workloads are in the matrix but not implemented. The run-matrix table
-says which rows the harness can execute today.
+egress across `N` concurrent subscribers, with an optional real-ingress driver
+(`--ingress-rate`) and a no-subscriber baseline comparison; replay, failover,
+and soak workloads are in the matrix with repeatable scripts
+(`scripts/soak.sh`, `scripts/crash-test.sh`); the soak has dev-loop results below. The
+run-matrix table says which rows the harness can execute today.
 
 ## Dev-loop result: final batch-size sweep (after)
 
@@ -300,8 +302,11 @@ What it does not do:
 - No raw `.hdr` files. The manifest's summaries are the raw artifact.
 - No fill notifications. A cancel can race a fill and be rejected; those
   rejections appear in `error_count`.
-- No replay, failover, or soak workloads; the fanout runner measures the 20 Hz
+- No replay, or failover workloads; the fanout runner measures the 20 Hz
   `/ws` feed rather than the dossier's 100k/s raw-tick F2 workload.
+  `scripts/crash-test.sh` (kill-and-replay on one node) and `scripts/soak.sh`
+  (10-minute constant-rate proof) exist as repeatable proofs; both are
+  results-pending.
 - No CPU pinning or isolation inside the harness. The Linux runner applies
   `taskset` when asked and records governor and SMT state.
 - No server-side metrics correlation; the gateway's own histograms are
@@ -316,12 +321,12 @@ is the honest status of this harness.
 |---|---|---|---|---|
 | L1 | 64 B orders, 1 symbol | 1k / 5k / 10k / 25k / 50k / 100k orders/s | 5 min x 5 | Partial. HTTP JSON by default, binary TCP with `--transport tcp`, mixed limit/IOC/cancel flow, optional batching, TCP stage timestamps. Payload size is not 64 B on the wire. |
 | L2 | 256 B, 10 symbols | 10k / 50k orders/s | 5 min x 5 | Partial. Only three instruments exist; the runner labels the row `L2-3sym`. |
-| F1 | 10k orders/s | 1 / 10 / 100 / 1000 subscribers | 5 min x 5 | Partial. `examples/fanout.rs` (`scripts/bench-fanout.sh`) measures `/ws` fanout across `N` subscribers (20 Hz conflated state frames); not yet coupled with a 10k/s ingress driver in one run. |
+| F1 | 10k orders/s | 1 / 10 / 100 / 1000 subscribers | 5 min x 5 | Partial. `examples/fanout.rs` (`scripts/bench-fanout.sh`) measures `/ws` fanout across `N` subscribers and can add real ingress with `--ingress-rate` (`WHIPPET_FANOUT_INGRESS_RATE`); a 10k/s comparison pair has not been recorded yet. |
 | F2 | Fixed 100k egress/s | 10 / 100 subscribers | 5 min x 5 | No. |
 | R1 | 10M replay | 0 / mid / tail; 1 / 10 / 100 consumers | drain x 5 | No. `whippet replay` exists for correctness, not replay throughput. |
 | R2 | Replay + live 10k/s | 1 config | 5 min x 5 | No. |
-| C1 | 10k/s, 3-node | 20 random kill phases | 30 s each | No. Single node. |
-| S1 | 80% SLO knee soak | 1 config | 30 min x 3 | No. No knee-finding or soak mode. |
+| C1 | 10k/s, 3-node | 20 random kill phases | 30 s each | No. Single node only; `scripts/crash-test.sh` proves kill-and-replay on one node, results pending. |
+| S1 | 80% SLO knee soak | 1 config | 30 min x 3 | Partial. `scripts/soak.sh` runs a constant-rate proof with a 5% drift gate; the dev-loop 180 s run fails the gate (broker append growth), Linux pending. |
 
 Running L1 with the current harness produces a valid HTTP-ingress measurement,
 not the binary-ingress L1 in the dossier. Label it accordingly.
@@ -650,11 +655,24 @@ results.
   measured window exceeds **1 second (1,000,000 µs)**, that subscriber is
   flagged as `stalled = true`, `stalled_clients` is incremented, and the
   manifest adds the `stalled-subscriber` label.
+- **Ingress driver.** With `--ingress-rate R` (`WHIPPET_FANOUT_INGRESS_RATE`
+  in `scripts/bench-fanout.sh`) the harness also posts `R` same-symbol ladder
+  limit orders/s at `POST /api/orders` for the whole run (warmup + measured)
+  while the subscribers listen. Every order carries a unique client id and
+  participant, so repeated runs never collide. The manifest records the target
+  rate, achieved rate, sent/ok/error counts, and the `/metrics` deltas across
+  the run in a new `ingress` field. With `R = 0` (default) the driver is off
+  and the manifest says so; use that shape as the no-subscriber baseline.
 - **Server `/metrics` scrape.** Immediately before warmup and after the
   measured window, the harness scrapes `GET /metrics` on the gateway and
   records `whippet_orders_ingressed_total`, `whippet_md_sequence`, and
   `process_cpu_seconds_total` (if the endpoint exposes it; skipped cleanly when
   absent or unreachable), along with their deltas across the run.
+- **Baseline comparison.** Pass a quiet-book manifest with
+  `--baseline-metrics PATH` (`WHIPPET_FANOUT_BASELINE_METRICS` in the script).
+  The manifest echoes the baseline's `/metrics` deltas in a `baseline` field
+  and adds a note comparing them with this run's deltas, so the report shows
+  whether subscribers slowed the engine.
 
 ### Flags and commands
 
@@ -665,6 +683,8 @@ results.
 | `--duration` | `30` | Measured window in seconds |
 | `--warmup` | `5` | Warmup window in seconds (excluded from counts/histograms) |
 | `--trades` | `0` | Trade tape limit passed as `/ws?trades=N` (`0` = full tape) |
+| `--ingress-rate` | `0` | Real ingress load in orders/s via `POST /api/orders` for warmup + measured (`0` = off) |
+| `--baseline-metrics` | *(none)* | Path to a no-subscriber baseline manifest; the manifest echoes its `/metrics` deltas with a comparison note |
 | `--symbols` | *(all)* | Optional comma-separated symbol filter sent as `Subscribe` |
 | `--output-dir` | `artifacts/bench` | Directory for `<run-id>.json` |
 | `--label` | `fanout` | Workload label recorded in the manifest |
@@ -697,6 +717,34 @@ cargo run --release -p whippet-bench --example fanout -- \
   --trades 25 \
   --symbols BTC-USD \
   --label dev-loop-fanout \
+  --output-dir artifacts/bench
+```
+
+Comparison mode (quiet book vs 10k/s ingress, same subscriber count):
+
+```sh
+# 1. Quiet-book baseline: driver off. This manifest is the baseline.
+WHIPPET_FANOUT_SUBSCRIBERS=1 WHIPPET_FANOUT_INGRESS_RATE=0 \
+  scripts/bench-fanout.sh
+# 2. Loaded run: same subscribers, driver on, baseline attached.
+WHIPPET_FANOUT_SUBSCRIBERS=1 WHIPPET_FANOUT_INGRESS_RATE=10000 \
+  WHIPPET_FANOUT_BASELINE_METRICS=artifacts/bench/<baseline-run-id>.json \
+  scripts/bench-fanout.sh
+```
+
+The second manifest's `baseline` field echoes the first run's
+`orders_ingressed_delta` / `md_sequence_delta` and its notes say whether the
+subscriber path slowed the engine. Single-run equivalent:
+
+```sh
+cargo run --release -p whippet-bench --example fanout -- \
+  --gateway http://127.0.0.1:8080 \
+  --subscribers 1 \
+  --duration 30 \
+  --warmup 5 \
+  --ingress-rate 10000 \
+  --baseline-metrics artifacts/bench/<baseline-run-id>.json \
+  --label dev-loop-fanout-ingress \
   --output-dir artifacts/bench
 ```
 
@@ -775,17 +823,90 @@ ingress `BenchManifest` schema:
     "md_sequence_delta": 0,
     "process_cpu_seconds_delta": null
   },
+  "ingress": {
+    "target_rate_per_sec": 0,
+    "sent": 0,
+    "ok": 0,
+    "errors": 0,
+    "elapsed_secs": 0.0,
+    "achieved_per_sec": 0.0
+  },
+  "baseline": null,
   "notes": [],
   "labels": ["dev-loop", "fanout"]
 }
 ```
 
+With `--baseline-metrics`, `baseline` is
+`{"source": "<path>", "orders_ingressed_delta": <n>, "md_sequence_delta": <n>}`
+and the notes carry the subscriber-overhead comparison.
+
 ### Results
 
 **Status: pending.** Neither the `dev-loop-fanout` sweep (1 / 10 / 100
-subscribers) nor a native Linux fanout run has been recorded yet. Run
-`scripts/bench-fanout.sh` and link the resulting manifests from
+subscribers), the `--ingress-rate 10000` comparison pair, nor a native Linux
+fanout run has been recorded yet. Run `scripts/bench-fanout.sh` and link the
+resulting manifests from
 `artifacts/bench/` before quoting any fanout numbers.
+
+## Soak (constant-rate proof — dev-loop measured)
+
+`scripts/soak.sh` starts the stack, stops the simulator, runs the HTTP
+batch-10 workload at 5,000 orders/s for 10 minutes, samples `/api/state`
+every 10 s (server ingress p50/p99, consumer lag, node RSS when Docker
+exposes it), and writes a JSON summary to `artifacts/bench/soak-<ts>.json`.
+The bench container's own manifest lands next to it. The script fails when
+the mean p99 of the last 10% of samples drifts more than 5% from the first
+10%, or when a shard reports failure (`shards_ok: false` on `/api/health`).
+
+```sh
+scripts/soak.sh
+```
+
+Knobs (`WHIPPET_SOAK_RATE`, `WHIPPET_SOAK_BATCH`, `WHIPPET_SOAK_DURATION`,
+`WHIPPET_SOAK_WARMUP`, `WHIPPET_SOAK_INTERVAL`, `WHIPPET_SOAK_OUTPUT_DIR`)
+keep the same defaults (5,000/s, batch 10, 600 s, 5 s warmup, 10 s polls).
+The drift arithmetic lives in `crates/whippet-bench/src/soak.rs`
+(`soak_drift_p99`, `soak_verdict`, unit-tested); the script mirrors it in
+Python for the shell-side summary.
+
+**Dev-loop result (fresh stack, 5,000/s, batch 10, 180 s).** p50 grew from
+1.1 ms to 5.0 ms and p99 from 7 ms to ~390 ms; node RSS grew from 119 MiB to
+282 MiB; consumer lag spiked to ~3,800 around snapshot boundaries. The run
+failed the 5% drift gate. The stage budget explains it: at the end,
+`gateway_append` was p50 5.0 ms / p99 448 ms, `engine_append` p50 1.9 ms, while
+`engine_process` stayed at 4 µs and `md_apply` at 3 µs. The growth is the Iggy
+append round trip as the log grows, not matcher CPU.
+
+Two Iggy changes were measured on the same host. Disabling the one-minute
+message cleaner removed the early periodic spikes but not the monotonic growth.
+A 1 GiB WAL plus a 200 µs WAL group-commit delay reduced the 120 s run to
+p50 1.2 → 3.0 ms and p99 4.7 → 227 ms. The default stack keeps the cleaner
+off and the larger WAL because both were measured better here; re-measure on
+native Linux before treating them as tuned.
+
+The honest reading: the durable path is **not steady-state at 5,000/s for
+minutes on Docker Desktop**. The next work is per-role Iggy clients (ingress vs
+engine output), log-size/retention, and the Linux run with a fresh log. Do not
+quote these as headline results.
+
+## Crash recovery (kill -9 proof — method recorded, results pending)
+
+`scripts/crash-test.sh` runs a short workload (1,000 orders/s, batch 10,
+20 s), kills the node with `docker compose kill node` (SIGKILL, the Compose
+equivalent of `kill -9`), restarts it, waits for `/api/health` readiness,
+then runs `make replay` and asserts both replay hashes match. Raw replay
+output goes to `artifacts/bench/crash-<ts>.log` with a JSON summary
+(`crash-<ts>.json`) next to it holding both hashes and the verdict.
+
+```sh
+scripts/crash-test.sh
+```
+
+Knobs: `WHIPPET_CRASH_RATE`, `WHIPPET_CRASH_BATCH`,
+`WHIPPET_CRASH_DURATION`, `WHIPPET_CRASH_OUTPUT_DIR`.
+
+**Status: pending.** No crash-test summary has been recorded yet.
 
 ## Running a benchmark
 
@@ -897,8 +1018,9 @@ Never hand-edit a manifest. If a field is wrong, fix the harness and rerun.
 - Run the TCP sweep on native Linux and publish it. The TCP path and its stage
   timestamps exist, and there is a dev-loop measurement above, but no headline
   TCP row yet.
-- Run `scripts/bench-fanout.sh` (and the native Linux fanout sweep) and record
-  the manifests; add replay, failover, and soak workloads.
+- Run `scripts/bench-fanout.sh` (and the native Linux fanout sweep, the
+  `--ingress-rate 10000` comparison pair, the soak, and the crash test) and
+  record the manifests; add replay throughput and failover workloads.
 - Export raw histogram data alongside the manifest if a consumer needs it.
 - The open-order working set bounds the harness's tracked ids; aggressive
   limit remainders are not tracked and can still rest. The steady-state check
