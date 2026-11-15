@@ -23,18 +23,29 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing::warn;
 use whippet_core::api::{
-    ApiError, BatchOrderAck, BatchOrderRequestRef, CancelAck, CancelRequest, HealthView,
-    MAX_BATCH_ORDERS, OrderAck, OrderRequestRef, StateView, TradeView, WsClientMessage,
-    WsServerMessage,
+    ApiError, BatchOrderAck, BatchOrderRequest, BatchOrderRequestRef, CancelAck, CancelRequest,
+    HealthView, MAX_BATCH_ORDERS, OrderAck, OrderRequest, OrderRequestRef, StateView, TradeView,
+    WsClientMessage, WsServerMessage,
 };
-use whippet_core::headers::{MessageMeta, SCHEMA_ORDER};
+use whippet_core::headers::{HeaderMode, MessageMeta, SCHEMA_ORDER};
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Seq, Symbol};
 use whippet_core::protocol::{Command, OrderType, Side};
 use whippet_journal::{JournalMessage, Topic};
+use whippet_marketdata::{LatencySummary, Metrics, Stage};
 
 use crate::context::NodeContext;
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
+
+/// Split one request/batch clock: return the microseconds since `cursor` and
+/// move the cursor to now. Stages are consecutive slices of the same clock, so
+/// a batch records one sample per stage, never one per order.
+fn split_elapsed(cursor: &mut Instant) -> u64 {
+    let now = Instant::now();
+    let micros = now.saturating_duration_since(*cursor).as_micros() as u64;
+    *cursor = now;
+    micros
+}
 
 /// Upper bound on tracked source addresses. The limiter fails closed (429)
 /// when the table is full of live entries, so a spoofed-IP flood cannot grow
@@ -46,7 +57,7 @@ const BUCKET_IDLE: Duration = Duration::from_secs(60);
 
 pub fn router(ctx: Arc<NodeContext>) -> Router {
     let limiter = Arc::new(RateLimiter::new(ctx.config.rate_limit_per_sec));
-    let frames = Arc::new(FrameCache::default());
+    let frames = Arc::new(FrameCache::new(Arc::clone(&ctx.metrics)));
     let participants = Arc::new(ParticipantCache::default());
     let ingress = Router::new()
         .route("/api/orders", post(submit_order))
@@ -260,25 +271,71 @@ fn invalid_json(error: serde_json::Error) -> (StatusCode, Json<ApiError>) {
     )
 }
 
+/// Refuse new orders when no matcher is running. Without this the gateway
+/// acknowledges orders that will never be matched.
+fn ensure_shards_ready(ctx: &NodeContext) -> Result<(), (StatusCode, Json<ApiError>)> {
+    if ctx.shards_ok() {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::new(
+                "shard_unavailable",
+                "the matching shard is not running; orders are not being accepted",
+            )),
+        ))
+    }
+}
+
 async fn submit_order(
     State(ctx): State<Arc<NodeContext>>,
     Extension(participants): Extension<Arc<ParticipantCache>>,
     headers: HeaderMap,
     body: Body,
 ) -> ApiResult<OrderAck> {
+    ensure_shards_ready(&ctx)?;
     let started = Instant::now();
     let caller = authenticate(&ctx, &headers)?;
+    // The stage budget starts after auth, which is not a stage: this keeps
+    // `GatewayParse` to the body read and the JSON parse.
+    let mut stage_at = Instant::now();
     let bytes = read_json_body(&headers, body).await?;
-    let request: OrderRequestRef<'_> = serde_json::from_slice(&bytes).map_err(invalid_json)?;
-    let validated = validate_order_ref(&ctx, &request, caller, &participants)?;
+    // Fast path: borrow the strings from the body. A body with a JSON escape
+    // cannot be borrowed, so fall back to the owned DTO rather than rejecting
+    // a request the old API accepted.
+    let validated = match serde_json::from_slice::<OrderRequestRef<'_>>(&bytes) {
+        Ok(request) => validate_order_ref(&ctx, &request, caller, &participants),
+        Err(borrow_error) => match serde_json::from_slice::<OrderRequest>(&bytes) {
+            Ok(owned) => {
+                let request = OrderRequestRef {
+                    symbol: owned.symbol.as_str(),
+                    side: owned.side,
+                    order_type: owned.order_type,
+                    price_cents: owned.price_cents,
+                    qty: owned.qty,
+                    client_order_id: owned.client_order_id.as_deref(),
+                    participant: owned.participant.as_deref(),
+                };
+                validate_order_ref(&ctx, &request, caller, &participants)
+            }
+            Err(_) => Err(invalid_json(borrow_error)),
+        },
+    };
+    ctx.metrics
+        .record_stage_us(Stage::GatewayParse, split_elapsed(&mut stage_at));
+    let validated = validated?;
     let timestamp_ns = now_ns();
     let (order_id, message) = build_order(&validated, timestamp_ns);
     let partition = validated.symbol.partition(ctx.exchange().partitions);
+    ctx.metrics
+        .record_stage_us(Stage::GatewayEncode, split_elapsed(&mut stage_at));
     let append = ctx
         .group_commit
         .append(Topic::Orders, partition, vec![message])
-        .await
-        .map_err(journal_unavailable)?;
+        .await;
+    ctx.metrics
+        .record_stage_us(Stage::GatewayAppend, split_elapsed(&mut stage_at));
+    let append = append.map_err(journal_unavailable)?;
     let elapsed = started.elapsed();
     ctx.metrics.record_ingress();
     ctx.metrics
@@ -311,56 +368,42 @@ async fn submit_orders(
     Query(query): Query<BatchQuery>,
     body: Body,
 ) -> ApiResult<BatchOrderAck> {
+    ensure_shards_ready(&ctx)?;
     let include_acks = query.acks.as_deref().is_none_or(|value| {
         !(value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("false"))
     });
     let started = Instant::now();
     let caller = authenticate(&ctx, &headers)?;
+    // See `submit_order`: the stage budget starts after auth, and every stage
+    // below is a slice of this one clock, shared by the whole batch.
+    let mut stage_at = Instant::now();
     let bytes = read_json_body(&headers, body).await?;
-    let request: BatchOrderRequestRef<'_> = serde_json::from_slice(&bytes).map_err(invalid_json)?;
-    if request.orders.is_empty() {
-        return Err(bad_request(
-            "empty_batch",
-            "orders must contain at least one order",
-        ));
-    }
-    if request.orders.len() > MAX_BATCH_ORDERS {
-        return Err(bad_request(
-            "batch_too_large",
-            format!("at most {MAX_BATCH_ORDERS} orders per batch"),
-        ));
-    }
-    let symbol = Symbol::new(request.orders[0].symbol).map_err(|_| {
-        bad_request(
-            "unknown_symbol",
-            format!("unknown symbol {}", request.orders[0].symbol),
-        )
-    })?;
-    let partition = symbol.partition(ctx.exchange().partitions);
-
-    // Pass 1: reject mixed symbols, authenticate every participant, and
-    // validate every order. Nothing is appended unless the whole batch is
-    // acceptable.
-    let mut validated = Vec::with_capacity(request.orders.len());
-    for (index, order) in request.orders.iter().enumerate() {
-        let order_symbol = Symbol::new(order.symbol).map_err(|_| {
-            with_index(
-                index,
-                bad_request("unknown_symbol", format!("unknown symbol {}", order.symbol)),
-            )
-        })?;
-        if order_symbol != symbol {
-            return Err(bad_request(
-                "mixed_symbols",
-                format!(
-                    "order {index} uses {order_symbol} but the batch started with {symbol}; split the batch by symbol",
-                ),
-            ));
-        }
-        let order = validate_order_ref(&ctx, order, caller, &participants)
-            .map_err(|error| with_index(index, error))?;
-        validated.push(order);
-    }
+    let validated = match serde_json::from_slice::<BatchOrderRequestRef<'_>>(&bytes) {
+        Ok(request) => validate_batch(&ctx, &request, caller, &participants),
+        Err(borrow_error) => match serde_json::from_slice::<BatchOrderRequest>(&bytes) {
+            Ok(owned) => {
+                let orders: Vec<OrderRequestRef<'_>> = owned
+                    .orders
+                    .iter()
+                    .map(|order| OrderRequestRef {
+                        symbol: order.symbol.as_str(),
+                        side: order.side,
+                        order_type: order.order_type,
+                        price_cents: order.price_cents,
+                        qty: order.qty,
+                        client_order_id: order.client_order_id.as_deref(),
+                        participant: order.participant.as_deref(),
+                    })
+                    .collect();
+                let request = BatchOrderRequestRef { orders };
+                validate_batch(&ctx, &request, caller, &participants)
+            }
+            Err(_) => Err(invalid_json(borrow_error)),
+        },
+    };
+    ctx.metrics
+        .record_stage_us(Stage::GatewayParse, split_elapsed(&mut stage_at));
+    let (partition, validated) = validated?;
 
     // Pass 2: encode one command and header set per order.
     let timestamp_ns = now_ns();
@@ -373,14 +416,18 @@ async fn submit_orders(
     }
 
     let count = messages.len() as u32;
+    ctx.metrics
+        .record_stage_us(Stage::GatewayEncode, split_elapsed(&mut stage_at));
     // Route batches through the same per-partition writer as single orders, so
     // one partition has exactly one append path and log order matches arrival
     // order across transports.
     let append = ctx
         .group_commit
         .append(Topic::Orders, partition, messages)
-        .await
-        .map_err(journal_unavailable)?;
+        .await;
+    ctx.metrics
+        .record_stage_us(Stage::GatewayAppend, split_elapsed(&mut stage_at));
+    let append = append.map_err(journal_unavailable)?;
     let elapsed = started.elapsed();
     let durable_ack_ms = elapsed.as_secs_f64() * 1_000.0;
     // Throughput is per order, but latency is sampled once per batch: every
@@ -419,6 +466,57 @@ async fn submit_orders(
         durable_ack_ms,
         orders,
     }))
+}
+
+/// Pass 1 of batch ingress: reject mixed symbols, authenticate every
+/// participant, and validate every order. Nothing is appended unless the whole
+/// batch is acceptable. Returns the target partition and the settled orders.
+fn validate_batch<'a>(
+    ctx: &NodeContext,
+    request: &BatchOrderRequestRef<'a>,
+    caller: Option<&str>,
+    participants: &ParticipantCache,
+) -> Result<(u32, Vec<ValidatedOrder>), (StatusCode, Json<ApiError>)> {
+    if request.orders.is_empty() {
+        return Err(bad_request(
+            "empty_batch",
+            "orders must contain at least one order",
+        ));
+    }
+    if request.orders.len() > MAX_BATCH_ORDERS {
+        return Err(bad_request(
+            "batch_too_large",
+            format!("at most {MAX_BATCH_ORDERS} orders per batch"),
+        ));
+    }
+    let symbol = Symbol::new(request.orders[0].symbol).map_err(|_| {
+        bad_request(
+            "unknown_symbol",
+            format!("unknown symbol {}", request.orders[0].symbol),
+        )
+    })?;
+    let partition = symbol.partition(ctx.exchange().partitions);
+    let mut validated = Vec::with_capacity(request.orders.len());
+    for (index, order) in request.orders.iter().enumerate() {
+        let order_symbol = Symbol::new(order.symbol).map_err(|_| {
+            with_index(
+                index,
+                bad_request("unknown_symbol", format!("unknown symbol {}", order.symbol)),
+            )
+        })?;
+        if order_symbol != symbol {
+            return Err(bad_request(
+                "mixed_symbols",
+                format!(
+                    "order {index} uses {order_symbol} but the batch started with {symbol}; split the batch by symbol",
+                ),
+            ));
+        }
+        let order = validate_order_ref(ctx, order, caller, participants)
+            .map_err(|error| with_index(index, error))?;
+        validated.push(order);
+    }
+    Ok((partition, validated))
 }
 
 /// The parts of an order that validation has already settled. Building the
@@ -544,7 +642,7 @@ fn build_order(order: &ValidatedOrder, timestamp_ns: u64) -> (OrderId, JournalMe
     );
     (
         order.order_id,
-        JournalMessage::new(command.encode(), meta.pairs()),
+        JournalMessage::new_named(command.encode(), meta.named_pairs(HeaderMode::Full)),
     )
 }
 
@@ -559,7 +657,7 @@ pub(crate) fn journal_message_for_command(command: &Command) -> JournalMessage {
         SCHEMA_ORDER,
         command.order_id.0,
     );
-    JournalMessage::new(command.encode(), meta.pairs())
+    JournalMessage::new_named(command.encode(), meta.named_pairs(HeaderMode::Full))
 }
 
 /// Constant-time bearer comparison shared by the HTTP and TCP ingress paths.
@@ -573,6 +671,7 @@ async fn cancel_order(
     headers: HeaderMap,
     Json(request): Json<CancelRequest>,
 ) -> ApiResult<CancelAck> {
+    ensure_shards_ready(&ctx)?;
     let caller = authenticate(&ctx, &headers)?;
     ctx.exchange().instrument(request.symbol).ok_or_else(|| {
         bad_request(
@@ -592,7 +691,7 @@ async fn cancel_order(
         SCHEMA_ORDER,
         request.order_id.0,
     );
-    let message = JournalMessage::new(command.encode(), meta.pairs());
+    let message = JournalMessage::new_named(command.encode(), meta.named_pairs(HeaderMode::Full));
     let append = ctx
         .group_commit
         .append(Topic::Orders, partition, vec![message])
@@ -787,7 +886,8 @@ async fn instruments(
 async fn prometheus(State(ctx): State<Arc<NodeContext>>) -> impl IntoResponse {
     let state = ctx.hub.latest();
     let stats = ctx.group_commit.stats();
-    let mut body = prometheus_text(&state.metrics, state.freshness_ms, state.sequence);
+    let stages = ctx.metrics.stage_snapshot();
+    let mut body = prometheus_text(&state.metrics, state.freshness_ms, state.sequence, &stages);
     body.push_str("# HELP whippet_group_commit_batches_total Group-commit appends completed.\n");
     body.push_str("# TYPE whippet_group_commit_batches_total counter\n");
     body.push_str(&format!(
@@ -823,12 +923,16 @@ async fn prometheus(State(ctx): State<Arc<NodeContext>>) -> impl IntoResponse {
 
 /// Prometheus exposition. Counters are monotonic; percentiles are gauges
 /// because they describe the recent process window, not a cumulative sum.
+///
+/// `stages` is [`whippet_marketdata::Metrics::stage_snapshot`]: one p50 and one
+/// p99 series per stage, with the stage name as the `stage` label.
 pub(crate) fn prometheus_text(
     metrics: &whippet_core::api::MetricsView,
     freshness_ms: u64,
     sequence: u64,
+    stages: &[(Stage, LatencySummary)],
 ) -> String {
-    let mut out = String::with_capacity(2_048);
+    let mut out = String::with_capacity(3_072);
     out.push_str(
         "# HELP whippet_orders_ingressed_total Orders accepted by the gateway and appended to Iggy.\n",
     );
@@ -924,6 +1028,31 @@ pub(crate) fn prometheus_text(
     out.push_str("# HELP whippet_md_sequence Newest per-symbol MD sequence observed.\n");
     out.push_str("# TYPE whippet_md_sequence gauge\n");
     out.push_str(&format!("whippet_md_sequence {sequence}\n"));
+    // The stage budget: where a request spends its time between the socket and
+    // the published frame. One series per stage even before it has samples, so
+    // a graph never interpolates across a missing label.
+    out.push_str(
+        "# HELP whippet_stage_p50_us Stage latency p50, request intake to visible state.\n",
+    );
+    out.push_str("# TYPE whippet_stage_p50_us gauge\n");
+    for (stage, summary) in stages {
+        out.push_str(&format!(
+            "whippet_stage_p50_us{{stage=\"{}\"}} {}\n",
+            stage.as_str(),
+            summary.p50_us
+        ));
+    }
+    out.push_str(
+        "# HELP whippet_stage_p99_us Stage latency p99, request intake to visible state.\n",
+    );
+    out.push_str("# TYPE whippet_stage_p99_us gauge\n");
+    for (stage, summary) in stages {
+        out.push_str(&format!(
+            "whippet_stage_p99_us{{stage=\"{}\"}} {}\n",
+            stage.as_str(),
+            summary.p99_us
+        ));
+    }
     out
 }
 
@@ -965,15 +1094,30 @@ struct WsQuery {
 /// whole `StateView` and ran `serde_json::to_string` independently, so N clients
 /// cost N serializations of the same bytes. Now the first subscriber builds the
 /// frame and the rest clone a refcounted buffer.
-#[derive(Default)]
+///
+/// A serialization miss is recorded as the `WsFrame` stage; cache hits are not,
+/// so the stage measures frame building and nothing else.
 struct FrameCache {
     inner: Mutex<FrameCacheInner>,
+    metrics: Arc<Metrics>,
+}
+
+impl FrameCache {
+    fn new(metrics: Arc<Metrics>) -> Self {
+        Self {
+            inner: Mutex::new(FrameCacheInner::default()),
+            metrics,
+        }
+    }
 }
 
 #[derive(Default)]
 struct FrameCacheInner {
-    sequence: u64,
-    freshness_ms: u64,
+    /// The exact published frame these entries were built from. Pointer
+    /// identity is the only correct invalidation key: `sequence` and
+    /// `freshness_ms` both stay 0 on a node that has applied no MD event, so
+    /// keying on them would serve the first frame forever.
+    last_state: Option<Arc<StateView>>,
     frames: HashMap<(Vec<Symbol>, usize), axum::extract::ws::Utf8Bytes>,
 }
 
@@ -985,7 +1129,7 @@ const MAX_CACHED_FRAMES: usize = 16;
 impl FrameCache {
     fn frame(
         &self,
-        state: &StateView,
+        state: &Arc<StateView>,
         symbols: &[Symbol],
         trade_limit: usize,
     ) -> axum::extract::ws::Utf8Bytes {
@@ -993,9 +1137,12 @@ impl FrameCache {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if inner.sequence != state.sequence || inner.freshness_ms != state.freshness_ms {
-            inner.sequence = state.sequence;
-            inner.freshness_ms = state.freshness_ms;
+        if inner
+            .last_state
+            .as_ref()
+            .is_none_or(|last| !Arc::ptr_eq(last, state))
+        {
+            inner.last_state = Some(Arc::clone(state));
             inner.frames.clear();
         }
         let key = (symbols.to_vec(), trade_limit);
@@ -1004,22 +1151,28 @@ impl FrameCache {
         }
         // The unfiltered, untruncated frame is the common case. Serialize the
         // published view directly instead of cloning it first.
+        let mut encode_at = Instant::now();
         let text = if symbols.is_empty() && trade_limit == 0 {
             serde_json::to_string(&WsServerMessage::State {
-                state: state.clone(),
+                state: state.as_ref().clone(),
             })
         } else {
-            let view = filtered_state(state, symbols, trade_limit);
+            let view = filtered_state(state.as_ref(), symbols, trade_limit);
             serde_json::to_string(&WsServerMessage::State { state: view })
         }
         .unwrap_or_else(|_| {
             "{\"type\":\"notice\",\"level\":\"error\",\"message\":\"encode failed\"}".into()
         });
+        self.metrics
+            .record_stage_us(Stage::WsFrame, split_elapsed(&mut encode_at));
         let frame = axum::extract::ws::Utf8Bytes::from(text);
-        if inner.frames.len() >= MAX_CACHED_FRAMES {
-            // Bounded: a burst of distinct subscriptions evicts the cache for
-            // this tick instead of growing it without limit.
-            inner.frames.clear();
+        if inner.frames.len() >= MAX_CACHED_FRAMES
+            && let Some(evict) = inner.frames.keys().next().cloned()
+        {
+            // Evict one entry, not the whole cache: a single client with many
+            // distinct subscriptions must not force every other subscriber to
+            // re-serialize this tick.
+            inner.frames.remove(&evict);
         }
         inner.frames.insert(key, frame.clone());
         frame
@@ -1234,17 +1387,63 @@ mod tests {
     }
 
     #[test]
+    fn frame_cache_invalidates_without_md_events() {
+        // `sequence` and `freshness_ms` both stay 0 on a node that has applied
+        // no MD event. Two different published frames must still produce
+        // different bytes; keying on those fields alone would freeze the feed.
+        let cache = FrameCache::new(Arc::new(Metrics::new(
+            Mode::Durable,
+            whippet_core::config::ExchangeConfig::default().partitions,
+        )));
+        let mut first = sample_state();
+        first.sequence = 0;
+        first.freshness_ms = 0;
+        first.metrics.orders_ingressed = 1;
+        let mut second = first.clone();
+        second.metrics.orders_ingressed = 2;
+
+        let a = cache.frame(&Arc::new(first), &[], 60);
+        let b = cache.frame(&Arc::new(second), &[], 60);
+        assert_ne!(a, b, "a new published frame must not reuse stale bytes");
+    }
+
+    #[test]
     fn frame_cache_reuses_bytes_for_the_same_tick() {
-        let cache = FrameCache::default();
-        let state = sample_state();
+        let cache = FrameCache::new(Arc::new(Metrics::new(Mode::Durable, 1)));
+        let state = Arc::new(sample_state());
         let first = cache.frame(&state, &[], 60);
         let second = cache.frame(&state, &[], 60);
         assert_eq!(first, second);
-        // A new sequence invalidates the cache.
-        let mut next = state.clone();
+        // A new published Arc invalidates the cache.
+        let mut next = (*state).clone();
         next.sequence += 1;
-        let third = cache.frame(&next, &[], 60);
+        let third = cache.frame(&Arc::new(next), &[], 60);
         assert_ne!(first, third);
+    }
+
+    #[test]
+    fn frame_cache_records_ws_frame_only_on_a_serialization_miss() {
+        let metrics = Arc::new(Metrics::new(Mode::Durable, 1));
+        let cache = FrameCache::new(Arc::clone(&metrics));
+        let state = Arc::new(sample_state());
+        let ws_frame_samples = || {
+            metrics
+                .stage_snapshot()
+                .into_iter()
+                .find(|(stage, _)| *stage == Stage::WsFrame)
+                .map(|(_, summary)| summary.samples)
+                .expect("ws_frame is always in the snapshot")
+        };
+
+        cache.frame(&state, &[], 60);
+        assert_eq!(ws_frame_samples(), 1);
+        // Same tick, same filter: a cache hit does no serialization, so it must
+        // not add a sample.
+        cache.frame(&state, &[], 60);
+        assert_eq!(ws_frame_samples(), 1);
+        // A different filter is a miss and is measured.
+        cache.frame(&state, &[Symbol::new("BTC-USD").unwrap()], 60);
+        assert_eq!(ws_frame_samples(), 2);
     }
 
     #[test]
@@ -1276,11 +1475,74 @@ mod tests {
     #[test]
     fn prometheus_text_contains_core_series() {
         let metrics = MetricsView::empty(Mode::Durable, 16);
-        let text = prometheus_text(&metrics, 42, 7);
+        let text = prometheus_text(&metrics, 42, 7, &[]);
         assert!(text.contains("whippet_orders_ingressed_total 0"));
         assert!(text.contains("whippet_mode{mode=\"durable\"} 1"));
         assert!(text.contains("whippet_md_freshness_milliseconds 42"));
         assert!(text.contains("whippet_md_sequence 7"));
         assert!(text.contains("# TYPE whippet_ingress_latency_microseconds gauge"));
+    }
+
+    #[test]
+    fn prometheus_text_exposes_one_series_per_stage() {
+        let metrics = Metrics::new(Mode::Durable, 16);
+        for stage in Stage::ALL {
+            metrics.record_stage_us(stage, 7);
+        }
+        let stages = metrics.stage_snapshot();
+        let text = prometheus_text(&MetricsView::empty(Mode::Durable, 16), 0, 0, &stages);
+
+        assert!(text.contains("# HELP whippet_stage_p50_us"));
+        assert!(text.contains("# TYPE whippet_stage_p50_us gauge"));
+        assert!(text.contains("# HELP whippet_stage_p99_us"));
+        assert!(text.contains("# TYPE whippet_stage_p99_us gauge"));
+        for stage in Stage::ALL {
+            let name = stage.as_str();
+            assert!(
+                text.contains(&format!("whippet_stage_p50_us{{stage=\"{name}\"}} 7")),
+                "missing p50 series for {name}"
+            );
+            assert!(
+                text.contains(&format!("whippet_stage_p99_us{{stage=\"{name}\"}} 7")),
+                "missing p99 series for {name}"
+            );
+        }
+        // Exactly one series per stage per quantile, no duplicates.
+        assert_eq!(
+            text.matches("whippet_stage_p50_us{").count(),
+            Stage::ALL.len()
+        );
+        assert_eq!(
+            text.matches("whippet_stage_p99_us{").count(),
+            Stage::ALL.len()
+        );
+        // Every exposed stage value is a non-negative number.
+        for line in text
+            .lines()
+            .filter(|line| line.starts_with("whippet_stage_"))
+        {
+            let value = line.rsplit(' ').next().expect("value column");
+            let value: f64 = value.parse().expect("numeric stage value");
+            assert!(value >= 0.0, "negative stage value in {line}");
+        }
+    }
+
+    #[test]
+    fn prometheus_text_reports_unrecorded_stages_as_zero() {
+        let metrics = Metrics::new(Mode::Durable, 16);
+        let text = prometheus_text(
+            &MetricsView::empty(Mode::Durable, 16),
+            0,
+            0,
+            &metrics.stage_snapshot(),
+        );
+        for stage in Stage::ALL {
+            let name = stage.as_str();
+            assert!(
+                text.contains(&format!("whippet_stage_p50_us{{stage=\"{name}\"}} 0")),
+                "an unrecorded stage still needs a p50 series: {name}"
+            );
+            assert!(text.contains(&format!("whippet_stage_p99_us{{stage=\"{name}\"}} 0")));
+        }
     }
 }

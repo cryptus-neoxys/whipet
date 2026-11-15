@@ -349,6 +349,85 @@ struct StateParts {
     sequence: u64,
 }
 
+/// Number of distinct [`Stage`] values. Kept in sync with the enum by
+/// `Stage::ALL`; `Stage::index` relies on the declaration order.
+const STAGE_COUNT: usize = 9;
+
+/// A slice of the request-to-visible-state time budget.
+///
+/// The harness measures client-side send and wire time; these stages explain
+/// where a request spends its time inside the node. Each stage is recorded by
+/// the component that owns it, from one clock per request or batch: a stage is
+/// the elapsed slice since the previous boundary, never a per-order stamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// Request intake: body read and `serde_json` parse (auth precedes the
+    /// stage clock).
+    GatewayParse,
+    /// Field and participant validation, before any encoding.
+    GatewayValidate,
+    /// Command and journal-header encoding.
+    GatewayEncode,
+    /// The group-commit append round trip.
+    GatewayAppend,
+    /// Applying a batch of MD deltas to the hub's books.
+    MdApply,
+    /// Serializing a state frame for a WebSocket subscriber (cache miss only).
+    WsFrame,
+    /// Matching one command on the shard thread.
+    EngineProcess,
+    /// Publishing the executions and MD outputs of one batch.
+    EngineAppend,
+    /// The offset commit (only when the watermark is due).
+    EngineCommit,
+}
+
+impl Stage {
+    /// Every stage, in declaration and exposition order.
+    pub const ALL: [Stage; STAGE_COUNT] = [
+        Stage::GatewayParse,
+        Stage::GatewayValidate,
+        Stage::GatewayEncode,
+        Stage::GatewayAppend,
+        Stage::MdApply,
+        Stage::WsFrame,
+        Stage::EngineProcess,
+        Stage::EngineAppend,
+        Stage::EngineCommit,
+    ];
+
+    /// Stable snake_case name, used as the Prometheus `stage` label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Stage::GatewayParse => "gateway_parse",
+            Stage::GatewayValidate => "gateway_validate",
+            Stage::GatewayEncode => "gateway_encode",
+            Stage::GatewayAppend => "gateway_append",
+            Stage::MdApply => "md_apply",
+            Stage::WsFrame => "ws_frame",
+            Stage::EngineProcess => "engine_process",
+            Stage::EngineAppend => "engine_append",
+            Stage::EngineCommit => "engine_commit",
+        }
+    }
+
+    /// Index into [`Metrics`]' per-stage histogram array.
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Latency percentiles for one [`Stage`], in microseconds.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LatencySummary {
+    pub p50_us: f64,
+    pub p99_us: f64,
+    pub p999_us: f64,
+    /// Samples behind the percentiles. Zero means the stage has not recorded
+    /// yet, which is different from a stage whose samples were all sub-microsecond.
+    pub samples: u64,
+}
+
 /// Shared metrics. Counters are atomics; percentiles come from HDR histograms
 /// at the edge, never from the match loop.
 pub struct Metrics {
@@ -364,6 +443,8 @@ pub struct Metrics {
     partition_count: AtomicU64,
     ingress: Mutex<Histogram<u64>>,
     match_latency: Mutex<Histogram<u64>>,
+    /// One histogram per [`Stage`]. Indexed by `Stage::index`.
+    stages: [Mutex<Histogram<u64>>; STAGE_COUNT],
     rate: Mutex<RateState>,
     started: Instant,
     mode: Mode,
@@ -390,6 +471,7 @@ impl Metrics {
             partition_count: AtomicU64::new(u64::from(partitions)),
             ingress: Mutex::new(new_histogram()),
             match_latency: Mutex::new(new_histogram()),
+            stages: std::array::from_fn(|_| Mutex::new(new_histogram())),
             rate: Mutex::new(RateState {
                 at: Instant::now(),
                 orders: 0,
@@ -418,6 +500,26 @@ impl Metrics {
 
     pub fn record_match_latency_us(&self, micros: u64) {
         record(&self.match_latency, micros);
+    }
+
+    /// Record one stage sample in microseconds.
+    ///
+    /// Callers split a single request/batch clock, so a batch records one
+    /// `GatewayAppend` sample, not one per order.
+    pub fn record_stage_us(&self, stage: Stage, micros: u64) {
+        record(&self.stages[stage.index()], micros);
+    }
+
+    /// p50/p99/p999 per stage, in microseconds, in [`Stage::ALL`] order.
+    ///
+    /// A stage with no samples reports zeroes, so the Prometheus exposition
+    /// always has exactly one series per stage instead of a gap that a graph
+    /// would interpolate.
+    pub fn stage_snapshot(&self) -> Vec<(Stage, LatencySummary)> {
+        Stage::ALL
+            .into_iter()
+            .map(|stage| (stage, latency_summary(&self.stages[stage.index()])))
+            .collect()
     }
 
     pub fn record_execution(&self) {
@@ -571,6 +673,29 @@ fn percentile(histogram: &Mutex<Histogram<u64>>, quantile: f64) -> f64 {
             }
         })
         .unwrap_or(0.0)
+}
+
+/// One lock acquisition for all three stage percentiles and the sample count.
+fn latency_summary(histogram: &Mutex<Histogram<u64>>) -> LatencySummary {
+    histogram
+        .lock()
+        .map(|histogram| {
+            if histogram.is_empty() {
+                LatencySummary::default()
+            } else {
+                LatencySummary {
+                    p50_us: histogram.value_at_quantile(0.50) as f64,
+                    p99_us: histogram.value_at_quantile(0.99) as f64,
+                    p999_us: histogram.value_at_quantile(0.999) as f64,
+                    samples: histogram.len(),
+                }
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn micros_since(start: Instant) -> u64 {
+    start.elapsed().as_micros() as u64
 }
 
 /// Per-shard metrics recorder, owned by one match-loop task.
@@ -748,6 +873,9 @@ impl MdHub {
         if events.is_empty() {
             return;
         }
+        // One clock for the whole batch. The stage records the slice the hub
+        // spends under its own lock, including duplicate/stale rejection.
+        let started = Instant::now();
         let mut state = self.state.lock().expect("md state poisoned");
         let mut applied = 0u64;
         let mut trades_applied = 0u64;
@@ -787,6 +915,10 @@ impl MdHub {
             }
         }
         if applied == 0 {
+            // A batch of duplicates still did work; record it before returning.
+            drop(state);
+            self.metrics
+                .record_stage_us(Stage::MdApply, micros_since(started));
             return;
         }
         self.metrics.record_md_events(applied);
@@ -796,6 +928,10 @@ impl MdHub {
         state.md_events = state.md_events.saturating_add(applied);
         state.trades_count = state.trades_count.saturating_add(trades_applied);
         state.dirty = true;
+        // Drop the hub lock before touching the histogram mutex.
+        drop(state);
+        self.metrics
+            .record_stage_us(Stage::MdApply, micros_since(started));
     }
 
     pub fn apply_snapshot(&self, snapshot: &MdSnapshot) {
@@ -1269,6 +1405,98 @@ mod tests {
         assert_eq!(metrics.trades, 1);
         // The read path did not build or publish a new state frame.
         assert!(Arc::ptr_eq(&before, &hub.latest()));
+    }
+
+    #[test]
+    fn stage_indexes_and_names_are_stable() {
+        for (index, stage) in Stage::ALL.iter().enumerate() {
+            assert_eq!(stage.index(), index, "ALL must follow declaration order");
+            assert!(!stage.as_str().is_empty());
+        }
+        // The exposition labels are unique and snake_case.
+        let mut names: Vec<&str> = Stage::ALL.iter().map(|stage| stage.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), Stage::ALL.len());
+    }
+
+    #[test]
+    fn stage_snapshot_reports_percentiles_per_stage() {
+        let metrics = Metrics::new(config().mode, config().partitions);
+        for sample in 1..=1_000u64 {
+            metrics.record_stage_us(Stage::GatewayParse, sample);
+        }
+        metrics.record_stage_us(Stage::GatewayAppend, 42);
+
+        let snapshot = metrics.stage_snapshot();
+        assert_eq!(snapshot.len(), Stage::ALL.len());
+        let summary = |stage: Stage| {
+            snapshot
+                .iter()
+                .find(|(recorded, _)| *recorded == stage)
+                .map(|(_, summary)| *summary)
+                .expect("every stage is in the snapshot")
+        };
+
+        let parse = summary(Stage::GatewayParse);
+        assert_eq!(parse.samples, 1_000);
+        // HDR buckets at 3 significant digits: assert a tight band, not the
+        // exact sample.
+        assert!(
+            (495.0..=505.0).contains(&parse.p50_us),
+            "p50 = {}",
+            parse.p50_us
+        );
+        assert!(
+            (985.0..=995.0).contains(&parse.p99_us),
+            "p99 = {}",
+            parse.p99_us
+        );
+        assert!(
+            (995.0..=1_000.0).contains(&parse.p999_us),
+            "p999 = {}",
+            parse.p999_us
+        );
+        assert!(parse.p50_us <= parse.p99_us && parse.p99_us <= parse.p999_us);
+
+        // Stages are independent histograms, not one shared window.
+        let append = summary(Stage::GatewayAppend);
+        assert_eq!(append.samples, 1);
+        assert_eq!(append.p50_us, 42.0);
+        assert_eq!(append.p99_us, 42.0);
+
+        // A stage with no samples reports zeroes and says so.
+        let ws = summary(Stage::WsFrame);
+        assert_eq!(ws.samples, 0);
+        assert_eq!(ws.p50_us, 0.0);
+        assert_eq!(ws.p99_us, 0.0);
+        assert_eq!(ws.p999_us, 0.0);
+    }
+
+    #[test]
+    fn apply_batch_records_one_md_apply_sample_per_batch() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        let metrics = hub.metrics();
+        let md_apply = |metrics: &Metrics| {
+            metrics
+                .stage_snapshot()
+                .into_iter()
+                .find(|(stage, _)| *stage == Stage::MdApply)
+                .map(|(_, summary)| summary)
+                .expect("md_apply is always in the snapshot")
+        };
+
+        hub.apply_batch(&mixed_stream());
+        assert_eq!(md_apply(&metrics).samples, 1);
+
+        // A replay of the same stream is all duplicates: the batch still did
+        // work, so it still records exactly one sample.
+        hub.apply_batch(&mixed_stream());
+        assert_eq!(md_apply(&metrics).samples, 2);
+
+        // An empty batch is not a request: nothing is recorded.
+        hub.apply_batch(&[]);
+        assert_eq!(md_apply(&metrics).samples, 2);
     }
 
     #[test]

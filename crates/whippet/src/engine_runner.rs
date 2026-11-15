@@ -1,5 +1,6 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -8,11 +9,13 @@ use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
-use whippet_core::headers::{MessageMeta, SCHEMA_EXECUTION, SCHEMA_MD_EVENT, SCHEMA_MD_SNAPSHOT};
+use whippet_core::headers::{
+    HeaderMode, MessageMeta, SCHEMA_EXECUTION, SCHEMA_MD_EVENT, SCHEMA_MD_SNAPSHOT,
+};
 use whippet_core::protocol::{Command, ExecKind, ExecutionReport, MdEvent, MdKind, MdSnapshot};
 use whippet_engine::{EngineOutput, ShardEngine};
-use whippet_journal::{JournalMessage, Topic};
-use whippet_marketdata::ShardMetrics;
+use whippet_journal::{AppendResult, Journal, JournalMessage, PayloadRecord, Topic};
+use whippet_marketdata::{ShardMetrics, Stage};
 
 use crate::context::NodeContext;
 use crate::snapshot::{SequencedSnapshot, SnapshotWriter};
@@ -29,7 +32,8 @@ const COMMIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// An output append is retried this many times before the shard fails. Without
 /// a bound, a wedged output topic stalls matching while the gateway keeps
 /// acknowledging new orders.
-const APPEND_MAX_ATTEMPTS: u32 = 30;
+#[doc(hidden)]
+pub const APPEND_MAX_ATTEMPTS: u32 = 30;
 
 /// Backoff for a commit that failed; the loop keeps applying records meanwhile.
 const COMMIT_RETRY_INITIAL: Duration = Duration::from_millis(100);
@@ -47,15 +51,131 @@ const SNAPSHOT_QUEUE_CAPACITY: usize = 2;
 
 /// Batches buffered between the reader and the matcher, and between the matcher
 /// and the writer. Small on purpose: this is the backpressure boundary.
-const SHARD_RING_CAPACITY: usize = 2;
+#[doc(hidden)]
+pub const SHARD_RING_CAPACITY: usize = 2;
 
-/// Minimum spacing between engine-state snapshots.
-const SNAPSHOT_MIN_INTERVAL: Duration = Duration::from_secs(5);
+/// Minimum spacing between engine-state snapshots. The snapshot is bounded by
+/// the dedup window, but it still costs hash + serialize + fsync, so 15 s keeps
+/// the tail spikes rare without making the replay window large.
+const SNAPSHOT_MIN_INTERVAL: Duration = Duration::from_secs(15);
 
 /// The node gives each shard task five seconds to stop; the final snapshot flush
 /// has to fit inside that budget.
 const FINAL_SNAPSHOT_SEND_TIMEOUT: Duration = Duration::from_millis(1_000);
 const FINAL_SNAPSHOT_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The journal operations a shard performs.
+///
+/// The shard loop is written against this trait so the failure paths — an
+/// append that fails once, an append that never succeeds, a reader that returns
+/// a non-contiguous batch — can be exercised without a broker. [`Journal`]
+/// implements it by forwarding to its inherent methods, so production behaviour
+/// is unchanged.
+///
+/// The methods return `impl Future + Send` rather than being `async fn` so the
+/// trait's futures are known to be `Send` and the shard can be spawned.
+#[doc(hidden)]
+pub trait JournalOps {
+    fn append(
+        &self,
+        topic: Topic,
+        partition: u32,
+        messages: &[JournalMessage],
+    ) -> impl Future<Output = whippet_journal::Result<AppendResult>> + Send;
+
+    fn commit(
+        &self,
+        topic: Topic,
+        partition: u32,
+        consumer: &str,
+        offset: u64,
+    ) -> impl Future<Output = whippet_journal::Result<()>> + Send;
+
+    fn committed(
+        &self,
+        topic: Topic,
+        partition: u32,
+        consumer: &str,
+    ) -> impl Future<Output = whippet_journal::Result<Option<u64>>> + Send;
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_payloads_into<'a>(
+        &'a self,
+        topic: Topic,
+        partition: u32,
+        consumer: &'a str,
+        offset: u64,
+        count: u32,
+        max_wait_ms: u64,
+        out: &'a mut Vec<PayloadRecord>,
+    ) -> impl Future<Output = whippet_journal::Result<usize>> + Send + 'a;
+
+    fn is_iggy(&self) -> bool;
+
+    fn ping(&self) -> impl Future<Output = bool> + Send;
+}
+
+#[doc(hidden)]
+impl JournalOps for Journal {
+    fn append(
+        &self,
+        topic: Topic,
+        partition: u32,
+        messages: &[JournalMessage],
+    ) -> impl Future<Output = whippet_journal::Result<AppendResult>> + Send {
+        Journal::append(self, topic, partition, messages)
+    }
+
+    fn commit(
+        &self,
+        topic: Topic,
+        partition: u32,
+        consumer: &str,
+        offset: u64,
+    ) -> impl Future<Output = whippet_journal::Result<()>> + Send {
+        Journal::commit(self, topic, partition, consumer, offset)
+    }
+
+    fn committed(
+        &self,
+        topic: Topic,
+        partition: u32,
+        consumer: &str,
+    ) -> impl Future<Output = whippet_journal::Result<Option<u64>>> + Send {
+        Journal::committed(self, topic, partition, consumer)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_payloads_into<'a>(
+        &'a self,
+        topic: Topic,
+        partition: u32,
+        consumer: &'a str,
+        offset: u64,
+        count: u32,
+        max_wait_ms: u64,
+        out: &'a mut Vec<PayloadRecord>,
+    ) -> impl Future<Output = whippet_journal::Result<usize>> + Send + 'a {
+        Journal::read_payloads_into(
+            self,
+            topic,
+            partition,
+            consumer,
+            offset,
+            count,
+            max_wait_ms,
+            out,
+        )
+    }
+
+    fn is_iggy(&self) -> bool {
+        Journal::is_iggy(self)
+    }
+
+    fn ping(&self) -> impl Future<Output = bool> + Send {
+        Journal::ping(self)
+    }
+}
 
 /// Owns one partition's books. The single writer is this task; the engine is a
 /// pure state machine and never awaits.
@@ -97,16 +217,15 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
     };
 
     let consumer = format!("whippet-engine-p{shard_id}");
+    // A shard's journal handle is cloned once and threaded through the reader
+    // and writer explicitly, so the journal edge can be substituted in tests.
+    let journal = Arc::clone(&ctx.journal);
     // The snapshot is authoritative for the resume point, so its offset is
     // treated as already acknowledged: the watermark must not fire a redundant
     // commit on the first batch after a restore.
     let committed_offset = match snapshot_last_offset {
         Some(offset) => Some(offset),
-        None => match ctx
-            .journal
-            .committed(Topic::Orders, shard_id, &consumer)
-            .await
-        {
+        None => match journal.committed(Topic::Orders, shard_id, &consumer).await {
             Ok(offset) => offset,
             Err(error) => {
                 anyhow::bail!(
@@ -131,8 +250,14 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
     if !initial.is_empty() {
         let messages: Vec<JournalMessage> = initial.iter().map(snapshot_message).collect();
         let mut startup_shutdown = ctx.shutdown.subscribe();
-        if let Err(error) =
-            append_with_retry(&ctx, Topic::Md, shard_id, &messages, &mut startup_shutdown).await
+        if let Err(error) = append_with_retry(
+            journal.as_ref(),
+            Topic::Md,
+            shard_id,
+            &messages,
+            &mut startup_shutdown,
+        )
+        .await
         {
             warn!(shard = shard_id, error = %error, "initial MD snapshot was not published");
         }
@@ -165,6 +290,7 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
 
     let reader = tokio::spawn(read_orders(
         Arc::clone(&ctx),
+        Arc::clone(&journal),
         shard_id,
         consumer.clone(),
         next_offset,
@@ -193,6 +319,7 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
 
     let result = run_writer(
         Arc::clone(&ctx),
+        journal.as_ref(),
         shard_id,
         consumer,
         committed_offset,
@@ -207,32 +334,51 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
     // closes the matcher input; the matcher sends its final snapshot and exits.
     // Abort is a safety net for a writer that stopped first.
     reader.abort();
+    join_matcher(&ctx, shard_id, matcher)?;
+    result
+}
+
+/// Join the matcher thread and fail the shard if it panicked.
+///
+/// Split out of [`run_engine_shard`] so the orchestration's panic path can be
+/// tested without a broker: the caller gets an error instead of a silent exit.
+#[doc(hidden)]
+pub fn join_matcher(
+    ctx: &NodeContext,
+    shard_id: u32,
+    matcher: std::thread::JoinHandle<()>,
+) -> Result<()> {
     if matcher.join().is_err() {
         ctx.mark_shard_failed();
         anyhow::bail!("matcher thread for shard {shard_id} panicked");
     }
-    result
+    Ok(())
 }
 
 /// One poll's worth of orders, handed to the matcher thread.
-struct InputBatch {
-    records: Vec<whippet_journal::PayloadRecord>,
+#[doc(hidden)]
+pub struct InputBatch {
+    pub records: Vec<whippet_journal::PayloadRecord>,
 }
 
 /// One batch of matcher output, handed to the async writer.
-struct OutputBatch {
-    executions: Vec<JournalMessage>,
-    md: Vec<JournalMessage>,
-    last_offset: u64,
-    snapshot: Option<SequencedSnapshot>,
+#[doc(hidden)]
+pub struct OutputBatch {
+    pub executions: Vec<JournalMessage>,
+    pub md: Vec<JournalMessage>,
+    pub last_offset: u64,
+    pub snapshot: Option<SequencedSnapshot>,
     /// The matcher is exiting: flush the final snapshot and commit.
-    final_batch: bool,
+    pub final_batch: bool,
 }
 
 /// Poll the orders log and feed the matcher. This is the only task that reads
 /// the orders topic, so the consumer offset advances in one place.
-async fn read_orders(
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn read_orders<J: JournalOps + 'static>(
     ctx: Arc<NodeContext>,
+    journal: Arc<J>,
     shard_id: u32,
     consumer: String,
     start_offset: u64,
@@ -246,7 +392,7 @@ async fn read_orders(
         let mut records = recycle.try_recv().unwrap_or_default();
         let result = tokio::select! {
             _ = shutdown.changed() => break,
-            result = ctx.journal.read_payloads_into(
+            result = journal.read_payloads_into(
                 Topic::Orders,
                 shard_id,
                 &consumer,
@@ -265,7 +411,7 @@ async fn read_orders(
             }
         };
         if count == 0 {
-            if !ctx.journal.is_iggy() {
+            if !journal.is_iggy() {
                 sleep(Duration::from_millis(1)).await;
             }
             continue;
@@ -301,8 +447,9 @@ async fn read_orders(
 /// The matcher: a pure, blocking loop that owns the engine. No await, no I/O,
 /// no lock. It records match latency and builds output messages, then hands
 /// the batch to the writer.
+#[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
-fn run_matcher(
+pub fn run_matcher(
     ctx: Arc<NodeContext>,
     shard_id: u32,
     mut engine: ShardEngine,
@@ -328,6 +475,7 @@ fn run_matcher(
         let mut executions: Vec<JournalMessage> = Vec::with_capacity(BATCH_CAPACITY);
         let mut md_messages: Vec<JournalMessage> = Vec::with_capacity(BATCH_CAPACITY);
         let mut snapshot_due = false;
+        let mut process_us: u64 = 0;
         // If a snapshot was deferred, this boundary is a candidate: the state
         // is still at `last_offset`, which the writer may now have caught up to.
         let mut snapshot = if snapshot_pending
@@ -357,7 +505,9 @@ fn run_matcher(
                             "engine rejected an input for this shard"
                         );
                     } else {
-                        shard_metrics.record_match_latency_us(started.elapsed().as_micros() as u64);
+                        let elapsed = started.elapsed().as_micros() as u64;
+                        process_us = process_us.saturating_add(elapsed);
+                        shard_metrics.record_match_latency_us(elapsed);
                         shard_metrics.record_engine_command();
                         for execution in &out.executions {
                             shard_metrics.record_execution();
@@ -403,6 +553,10 @@ fn run_matcher(
             }
         }
 
+        // One stage sample per batch, not per command: the global stage
+        // histogram is not on the per-command path.
+        ctx.metrics
+            .record_stage_us(Stage::EngineProcess, process_us);
         // Hand the polled buffer back for reuse.
         let _ = recycle.try_send(batch.records);
         // One global merge per second, not one lock per command.
@@ -445,9 +599,11 @@ fn run_matcher(
 
 /// Drain matcher output, publish executions and MD, commit the watermark, and
 /// forward snapshots. This is the async journal edge for the shard.
+#[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
-async fn run_writer(
+pub async fn run_writer<J: JournalOps + ?Sized>(
     ctx: Arc<NodeContext>,
+    journal: &J,
     shard_id: u32,
     consumer: String,
     committed_offset: Option<u64>,
@@ -462,19 +618,44 @@ async fn run_writer(
 
     let mut shutdown_exec = ctx.shutdown.subscribe();
     let mut shutdown_md = ctx.shutdown.subscribe();
+    // Flush the commit watermark while idle. Without this tick the committed
+    // offset sits behind the applied offset until the next order arrives,
+    // because the reader discards empty polls and never wakes the writer.
+    let mut commit_tick = tokio::time::interval(COMMIT_MAX_DELAY);
+    commit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    commit_tick.tick().await;
 
-    while let Some(batch) = output.recv().await {
+    loop {
+        let batch = tokio::select! {
+            batch = output.recv() => match batch {
+                Some(batch) => batch,
+                None => break,
+            },
+            _ = commit_tick.tick() => {
+                maybe_commit(
+                    journal,
+                    Topic::Orders,
+                    shard_id,
+                    &consumer,
+                    &mut watermark,
+                    &mut commit_retry,
+                )
+                .await;
+                continue;
+            }
+        };
         // Executions and MD are independent topics: join them so the shard
         // pays one overlapped round trip per batch, not two sequential ones.
+        let append_started = Instant::now();
         let (execution_result, md_result) = tokio::join!(
             append_with_retry(
-                &ctx,
+                journal,
                 Topic::Executions,
                 shard_id,
                 &batch.executions,
                 &mut shutdown_exec,
             ),
-            append_with_retry(&ctx, Topic::Md, shard_id, &batch.md, &mut shutdown_md),
+            append_with_retry(journal, Topic::Md, shard_id, &batch.md, &mut shutdown_md),
         );
         // Do not advance the applied offset or commit unless both outputs are
         // durable. Advancing here would let a restart skip orders whose
@@ -492,10 +673,15 @@ async fn run_writer(
             );
         }
 
+        ctx.metrics.record_stage_us(
+            Stage::EngineAppend,
+            append_started.elapsed().as_micros() as u64,
+        );
         appended_offset.store(batch.last_offset, Ordering::Release);
         watermark.note_applied(batch.last_offset);
+        let commit_started = Instant::now();
         maybe_commit(
-            &ctx,
+            journal,
             Topic::Orders,
             shard_id,
             &consumer,
@@ -503,6 +689,10 @@ async fn run_writer(
             &mut commit_retry,
         )
         .await;
+        ctx.metrics.record_stage_us(
+            Stage::EngineCommit,
+            commit_started.elapsed().as_micros() as u64,
+        );
 
         if batch.final_batch {
             final_snapshot = batch.snapshot;
@@ -540,7 +730,7 @@ async fn run_writer(
     }
 
     if let Some(offset) = watermark.pending() {
-        match commit_once(&ctx, Topic::Orders, shard_id, &consumer, offset).await {
+        match commit_once(journal, Topic::Orders, shard_id, &consumer, offset).await {
             Ok(()) => {
                 watermark.mark_committed(offset, Instant::now());
                 info!(shard = shard_id, offset, "committed final applied offset");
@@ -598,7 +788,7 @@ pub async fn run_md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
         let records = tokio::select! {
             _ = shutdown.changed() => {
                 if let Some(offset) = watermark.pending() {
-                    match commit_once(&ctx, Topic::Md, shard_id, &consumer, offset).await {
+                    match commit_once(ctx.journal.as_ref(), Topic::Md, shard_id, &consumer, offset).await {
                         Ok(()) => watermark.mark_committed(offset, Instant::now()),
                         Err(error) => warn!(shard = shard_id, offset, error = %error, "final MD offset commit failed"),
                     }
@@ -617,7 +807,7 @@ pub async fn run_md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
         };
         if records.is_empty() {
             maybe_commit(
-                &ctx,
+                ctx.journal.as_ref(),
                 Topic::Md,
                 shard_id,
                 &consumer,
@@ -677,7 +867,7 @@ pub async fn run_md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
         watermark.note_applied(last_offset);
         next_offset = last_offset.saturating_add(1);
         maybe_commit(
-            &ctx,
+            ctx.journal.as_ref(),
             Topic::Md,
             shard_id,
             &consumer,
@@ -837,8 +1027,9 @@ impl CommitRetry {
 ///
 /// A failure never propagates: the shard keeps applying records and retries the
 /// commit later. Only the commit lags, never the applied state.
-async fn maybe_commit(
-    ctx: &NodeContext,
+#[allow(clippy::too_many_arguments)]
+async fn maybe_commit<J: JournalOps + ?Sized>(
+    journal: &J,
     topic: Topic,
     shard_id: u32,
     consumer: &str,
@@ -852,7 +1043,7 @@ async fn maybe_commit(
     let Some(offset) = watermark.pending() else {
         return;
     };
-    match commit_once(ctx, topic, shard_id, consumer, offset).await {
+    match commit_once(journal, topic, shard_id, consumer, offset).await {
         Ok(()) => {
             watermark.mark_committed(offset, Instant::now());
             retry.succeeded();
@@ -872,8 +1063,8 @@ async fn maybe_commit(
 }
 
 /// One bounded commit attempt.
-async fn commit_once(
-    ctx: &NodeContext,
+async fn commit_once<J: JournalOps + ?Sized>(
+    journal: &J,
     topic: Topic,
     partition: u32,
     consumer: &str,
@@ -881,7 +1072,7 @@ async fn commit_once(
 ) -> Result<()> {
     match tokio::time::timeout(
         COMMIT_TIMEOUT,
-        ctx.journal.commit(topic, partition, consumer, offset),
+        journal.commit(topic, partition, consumer, offset),
     )
     .await
     {
@@ -946,8 +1137,9 @@ fn spawn_snapshot_writer(
     })
 }
 
-async fn append_with_retry(
-    ctx: &NodeContext,
+#[doc(hidden)]
+pub async fn append_with_retry<J: JournalOps + ?Sized>(
+    journal: &J,
     topic: Topic,
     partition: u32,
     messages: &[JournalMessage],
@@ -958,18 +1150,31 @@ async fn append_with_retry(
     }
     let mut delay = Duration::from_millis(100);
     let mut attempts: u32 = 0;
+    let mut last_warn: Option<Instant> = None;
     loop {
-        match ctx.journal.append(topic, partition, messages).await {
+        match journal.append(topic, partition, messages).await {
             Ok(_) => return Ok(()),
             Err(error) => {
                 attempts += 1;
-                warn!(
-                    topic = %topic,
-                    partition,
-                    attempt = attempts,
-                    error = %error,
-                    "append failed; retrying"
-                );
+                let warn_now = last_warn.is_none_or(|at| at.elapsed() >= Duration::from_secs(1));
+                if warn_now {
+                    last_warn = Some(Instant::now());
+                    warn!(
+                        topic = %topic,
+                        partition,
+                        attempt = attempts,
+                        error = %error,
+                        "append failed; retrying"
+                    );
+                } else {
+                    tracing::debug!(
+                        topic = %topic,
+                        partition,
+                        attempt = attempts,
+                        error = %error,
+                        "append failed; retrying"
+                    );
+                }
                 if attempts >= APPEND_MAX_ATTEMPTS {
                     anyhow::bail!(
                         "{topic} append failed {attempts} times on partition {partition}: {error}"
@@ -998,7 +1203,7 @@ fn execution_message(execution: &ExecutionReport) -> JournalMessage {
         SCHEMA_EXECUTION,
         u128::from(execution.cause_offset),
     );
-    JournalMessage::new(execution.encode(), meta.routing_pairs())
+    JournalMessage::new_named(execution.encode(), meta.named_pairs(HeaderMode::Routing))
 }
 
 fn md_message(event: &MdEvent) -> JournalMessage {
@@ -1009,7 +1214,7 @@ fn md_message(event: &MdEvent) -> JournalMessage {
         SCHEMA_MD_EVENT,
         u128::from(event.cause_offset),
     );
-    JournalMessage::new(event.encode(), meta.routing_pairs())
+    JournalMessage::new_named(event.encode(), meta.named_pairs(HeaderMode::Routing))
 }
 
 fn snapshot_message(snapshot: &MdSnapshot) -> JournalMessage {
@@ -1020,7 +1225,7 @@ fn snapshot_message(snapshot: &MdSnapshot) -> JournalMessage {
         SCHEMA_MD_SNAPSHOT,
         u128::from(snapshot.cause_offset),
     );
-    JournalMessage::new(snapshot.encode(), meta.pairs())
+    JournalMessage::new_named(snapshot.encode(), meta.named_pairs(HeaderMode::Full))
 }
 
 fn hex(bytes: &[u8; 32]) -> String {
