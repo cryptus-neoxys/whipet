@@ -6,6 +6,14 @@
 //! into net quantity, buy/sell quantity, fill count, cash flow and traded
 //! notional per participant and symbol.
 //!
+//! The logs store each fill price as an integer **ladder tick index**, not
+//! quote cents, so every value here is converted with the instrument's
+//! configured tick size: `price_ticks * tick_size_cents * qty`. A symbol with
+//! no tick size, or a non-positive one, is an error — never a silent factor of
+//! one, because that would misprice every report by the venue's tick and still
+//! look plausible. [`TickSizes`] carries the per-symbol sizes; the CLI resolves
+//! them from the built-in default config or `--tick-size-cents`.
+//!
 //! This is a **reconstruction, not a settlement ledger**: it reads only the
 //! decoded logs, has no account balances, deposits, fees, or margin, and
 //! never writes. Participant attribution depends on the orders log — an
@@ -22,6 +30,7 @@
 //! [`Journal`]: whippet_journal::Journal
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 use serde::Serialize;
 use whippet_core::ids::{OrderId, ParticipantId, Symbol};
@@ -30,14 +39,118 @@ use whippet_core::protocol::{Command, CommandKind, ExecKind, ExecutionReport, Si
 /// Printed on every positions run, to stderr so `--json` output stays
 /// machine-readable.
 pub const POSITIONS_NOTICE: &str = "reconstruction from the orders and executions logs, not a settlement ledger; \
-     maker attribution depends on the orders log; read-only";
+     prices are log ticks converted to quote cents with the configured tick size \
+     (--tick-size-cents overrides the built-in config); maker attribution depends on the orders log; read-only";
+
+/// Per-symbol tick size, used to turn the log's integer tick prices into quote
+/// cents.
+///
+/// The engine's [`Price`] is a ladder index, so `price.0 * qty` is
+/// tick×quantity. A field named `..._cents` must multiply by the instrument's
+/// tick size exactly once. There is deliberately no default: [`TickSizes::require`]
+/// rejects a missing or non-positive entry, so a caller cannot silently report
+/// tick units as cents.
+///
+/// [`Price`]: whippet_core::ids::Price
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TickSizes {
+    cents: BTreeMap<Symbol, i64>,
+}
+
+/// Why a projection could not price a symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickSizeError {
+    /// The symbol has no tick size in the supplied map.
+    Missing { symbol: Symbol },
+    /// The supplied tick size is zero or negative.
+    NonPositive {
+        symbol: Symbol,
+        tick_size_cents: i64,
+    },
+}
+
+impl fmt::Display for TickSizeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing { symbol } => write!(
+                f,
+                "no tick size for symbol {symbol}: pass --tick-size-cents, or use a symbol in the \
+                 built-in default config"
+            ),
+            Self::NonPositive {
+                symbol,
+                tick_size_cents,
+            } => write!(
+                f,
+                "tick size for symbol {symbol} must be at least 1 cent; got {tick_size_cents}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TickSizeError {}
+
+impl TickSizes {
+    pub fn new(entries: impl IntoIterator<Item = (Symbol, i64)>) -> Self {
+        Self {
+            cents: entries.into_iter().collect(),
+        }
+    }
+
+    pub fn insert(&mut self, symbol: Symbol, tick_size_cents: i64) {
+        self.cents.insert(symbol, tick_size_cents);
+    }
+
+    pub fn get(&self, symbol: Symbol) -> Option<i64> {
+        self.cents.get(&symbol).copied()
+    }
+
+    /// The symbol's tick size, or the reason it cannot be priced.
+    pub fn require(&self, symbol: Symbol) -> Result<i64, TickSizeError> {
+        match self.get(symbol) {
+            None => Err(TickSizeError::Missing { symbol }),
+            Some(tick_size_cents) if tick_size_cents <= 0 => Err(TickSizeError::NonPositive {
+                symbol,
+                tick_size_cents,
+            }),
+            Some(tick_size_cents) => Ok(tick_size_cents),
+        }
+    }
+
+    /// Convert a price in integer ticks into quote cents.
+    ///
+    /// Saturating because a corrupt log could carry `i64::MAX` ticks against a
+    /// huge tick size; one absurd record must not wrap into a plausible value.
+    pub fn price_cents(&self, symbol: Symbol, price_ticks: i64) -> Result<i128, TickSizeError> {
+        let tick_size_cents = self.require(symbol)?;
+        Ok(i128::from(price_ticks).saturating_mul(i128::from(tick_size_cents)))
+    }
+
+    /// Trade value in quote cents: `price_ticks * tick_size_cents * qty`.
+    pub fn quote_cents(
+        &self,
+        symbol: Symbol,
+        price_ticks: i64,
+        qty: u64,
+    ) -> Result<i128, TickSizeError> {
+        Ok(self
+            .price_cents(symbol, price_ticks)?
+            .saturating_mul(i128::from(qty)))
+    }
+}
+
+impl FromIterator<(Symbol, i64)> for TickSizes {
+    fn from_iter<T: IntoIterator<Item = (Symbol, i64)>>(iter: T) -> Self {
+        Self::new(iter)
+    }
+}
 
 /// One participant's reconstructed position in one symbol.
 ///
-/// `cash_cents` is the signed traded cash flow of the attributed legs: a buy
-/// pays `price * qty`, a sell receives it, and no fee or funding is modelled.
-/// `notional_cents` is the unsigned traded value (`price * qty`) summed over
-/// both sides, so it measures turnover rather than exposure.
+/// `cash_cents` is the signed traded cash flow of the attributed legs in quote
+/// cents: a buy pays `price_ticks * tick_size_cents * qty`, a sell receives it,
+/// and no fee or funding is modelled. `notional_cents` is the unsigned traded
+/// value summed over both sides, so it measures turnover rather than exposure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SymbolPosition {
     pub symbol: Symbol,
@@ -162,26 +275,23 @@ struct Accum {
     unresolved_maker_fills: u64,
 }
 
-/// Trade value in cents. Saturating because a corrupt log could carry
-/// `i64::MAX` price against a `u64::MAX` quantity, which does not fit in
-/// `i128` after multiplication (the product exceeds `i128::MAX` by a hair).
-///
-/// The ledger uses the same function so its cash postings and the positions
-/// cash flow agree exactly, including on saturated values.
-pub(crate) fn trade_cents(price: i64, qty: u64) -> i128 {
-    i128::from(price).saturating_mul(i128::from(qty))
-}
-
 /// Fold one fill leg into its participant/symbol row.
+///
+/// The value is quote cents: the engine's price is a ladder tick index, so the
+/// instrument's tick size is applied exactly once. The multiplication saturates
+/// inside [`TickSizes::quote_cents`], so a corrupt extreme saturates instead of
+/// wrapping; both legs of a trade share the same value, so conservation holds
+/// even then.
 fn apply_leg(
     rows: &mut BTreeMap<(ParticipantId, Symbol), Accum>,
+    tick_sizes: &TickSizes,
     participant: ParticipantId,
     symbol: Symbol,
     side: Side,
-    price: i64,
+    price_ticks: i64,
     qty: u64,
-) {
-    let value = trade_cents(price, qty);
+) -> Result<(), TickSizeError> {
+    let value = tick_sizes.quote_cents(symbol, price_ticks, qty)?;
     let acc = rows.entry((participant, symbol)).or_default();
     match side {
         Side::Buy => {
@@ -195,13 +305,16 @@ fn apply_leg(
     }
     acc.notional_cents = acc.notional_cents.saturating_add(value);
     acc.fills = acc.fills.saturating_add(1);
+    Ok(())
 }
 
 /// Build one partition's position report from already-decoded logs.
 ///
 /// `orders` is every decoded command on the partition with its orders-topic
 /// offset; `executions` is every decoded execution report. Both are filtered
-/// by `symbols` when it is `Some`.
+/// by `symbols` when it is `Some`. `tick_sizes` converts the logs' integer tick
+/// prices into quote cents; a symbol with no tick size, or a non-positive one,
+/// is an error rather than a silent factor of one.
 ///
 /// Attribution rules:
 ///
@@ -214,8 +327,9 @@ fn apply_leg(
 ///   `report.order_id`, `report.side` and `report.qty`; the maker leg uses
 ///   `report.maker_order_id`, the opposite side, and the same `qty`, because
 ///   the engine emits one report per trade and never a separate maker fill.
-/// - Quantities add on a buy and subtract on a sell. Cash pays `price * qty`
-///   on a buy and receives it on a sell; fees and funding are not modelled.
+/// - Quantities add on a buy and subtract on a sell. Cash pays
+///   `price_ticks * tick_size_cents * qty` on a buy and receives it on a sell;
+///   fees and funding are not modelled.
 /// - A maker id absent from the order map leaves the aggressor leg counted and
 ///   increments `unresolved_maker_fills`. An aggressor id absent from the map
 ///   cannot be attributed to anyone and increments
@@ -225,7 +339,8 @@ pub fn build_positions(
     orders: &[(u64, Command)],
     executions: &[ExecutionReport],
     symbols: Option<&[Symbol]>,
-) -> PositionReport {
+    tick_sizes: &TickSizes,
+) -> Result<PositionReport, TickSizeError> {
     let allowed = |symbol: Symbol| symbols.is_none_or(|symbols| symbols.contains(&symbol));
     let order_info = order_index(orders, allowed);
 
@@ -247,12 +362,13 @@ pub fn build_positions(
         if let Some(info) = aggressor {
             apply_leg(
                 &mut rows,
+                tick_sizes,
                 info.participant,
                 info.symbol,
                 report.side,
                 report.price.0,
                 report.qty.0,
-            );
+            )?;
         } else {
             unresolved_aggressor_fills = unresolved_aggressor_fills.saturating_add(1);
         }
@@ -263,12 +379,13 @@ pub fn build_positions(
         match order_info.get(&report.maker_order_id).copied() {
             Some(maker) => apply_leg(
                 &mut rows,
+                tick_sizes,
                 maker.participant,
                 maker.symbol,
                 report.side.opposite(),
                 report.price.0,
                 report.qty.0,
-            ),
+            )?,
             None => {
                 unresolved_maker_fills = unresolved_maker_fills.saturating_add(1);
                 // The gap belongs to the trade the aggressor caused, so record
@@ -316,13 +433,13 @@ pub fn build_positions(
         })
         .collect();
 
-    PositionReport {
+    Ok(PositionReport {
         partition,
         symbols: report_symbols.into_iter().collect(),
         participants,
         unresolved_maker_fills,
         unresolved_aggressor_fills,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -337,6 +454,10 @@ mod tests {
 
     fn eth() -> Symbol {
         Symbol::new("ETH-USD").expect("static symbol")
+    }
+
+    fn tick_sizes() -> TickSizes {
+        TickSizes::from_iter([(symbol(), 1), (eth(), 1)])
     }
 
     fn new_order(
@@ -405,7 +526,8 @@ mod tests {
             new_order(1, 2, 8, Side::Sell, 100, 3),
         ];
         let executions = vec![fill(0, 2, 1, Side::Sell, 100, 3, ExecKind::Filled)];
-        let report = build_positions(1, &orders, &executions, None);
+        let report = build_positions(1, &orders, &executions, None, &tick_sizes())
+            .expect("the fixture symbols have tick sizes");
 
         let maker = row(&report, 7);
         assert_eq!(maker.net_qty, 3);
@@ -442,7 +564,8 @@ mod tests {
             fill(0, 3, 1, Side::Sell, 100, 3, ExecKind::PartiallyFilled),
             fill(1, 3, 2, Side::Sell, 100, 5, ExecKind::Filled),
         ];
-        let report = build_positions(1, &orders, &executions, None);
+        let report = build_positions(1, &orders, &executions, None, &tick_sizes())
+            .expect("the fixture symbols have tick sizes");
 
         let maker = row(&report, 7);
         assert_eq!(maker.buy_qty, 8);
@@ -469,7 +592,8 @@ mod tests {
     fn unknown_maker_keeps_the_aggressor_leg_and_counts_the_gap() {
         let orders = vec![new_order(0, 2, 8, Side::Sell, 100, 3)];
         let executions = vec![fill(0, 2, 99, Side::Sell, 100, 3, ExecKind::Filled)];
-        let report = build_positions(1, &orders, &executions, None);
+        let report = build_positions(1, &orders, &executions, None, &tick_sizes())
+            .expect("the fixture symbols have tick sizes");
 
         let aggressor = row(&report, 8);
         assert_eq!(aggressor.net_qty, -3);
@@ -484,7 +608,8 @@ mod tests {
     fn unknown_aggressor_is_counted_and_never_attributed_to_a_guess() {
         let orders = vec![new_order(0, 1, 7, Side::Buy, 100, 3)];
         let executions = vec![fill(0, 99, 1, Side::Sell, 100, 3, ExecKind::Filled)];
-        let report = build_positions(1, &orders, &executions, None);
+        let report = build_positions(1, &orders, &executions, None, &tick_sizes())
+            .expect("the fixture symbols have tick sizes");
 
         // Only the maker leg is attributable.
         assert_eq!(report.participants.len(), 1);
@@ -505,7 +630,8 @@ mod tests {
             fill(1, 2, 0, Side::Sell, 100, 0, ExecKind::Cancelled),
             fill(2, 1, 0, Side::Buy, 100, 0, ExecKind::Accepted),
         ];
-        let report = build_positions(1, &orders, &executions, None);
+        let report = build_positions(1, &orders, &executions, None, &tick_sizes())
+            .expect("the fixture symbols have tick sizes");
         assert!(report.participants.is_empty());
         assert!(report.symbols.is_empty());
     }
@@ -531,9 +657,11 @@ mod tests {
         eth_fill.symbol = eth();
         let executions = vec![fill(0, 1, 0, Side::Buy, 100, 3, ExecKind::Filled), eth_fill];
 
-        let all = build_positions(1, &orders, &executions, None);
+        let all = build_positions(1, &orders, &executions, None, &tick_sizes())
+            .expect("the fixture symbols have tick sizes");
         assert_eq!(all.symbols, vec![symbol(), eth()]);
-        let filtered = build_positions(1, &orders, &executions, Some(&[eth()]));
+        let filtered = build_positions(1, &orders, &executions, Some(&[eth()]), &tick_sizes())
+            .expect("the fixture symbols have tick sizes");
         assert_eq!(filtered.symbols, vec![eth()]);
         assert_eq!(filtered.participants.len(), 1);
         assert_eq!(filtered.participants[0].symbols[0].symbol, eth());
@@ -567,7 +695,8 @@ mod tests {
             fill(3, 4, 0, Side::Buy, 100, 1, ExecKind::Filled),
         ];
 
-        let report = build_positions(1, &orders, &executions, None);
+        let report = build_positions(1, &orders, &executions, None, &tick_sizes())
+            .expect("the fixture symbols have tick sizes");
         assert_eq!(
             report
                 .participants
@@ -604,7 +733,8 @@ mod tests {
             new_order(1, 1, 9, Side::Sell, 100, 5),
         ];
         let executions = vec![fill(0, 1, 0, Side::Buy, 100, 2, ExecKind::Filled)];
-        let report = build_positions(1, &orders, &executions, None);
+        let report = build_positions(1, &orders, &executions, None, &tick_sizes())
+            .expect("the fixture symbols have tick sizes");
 
         assert_eq!(report.participants.len(), 1);
         assert_eq!(row(&report, 7).buy_qty, 2);
@@ -621,10 +751,55 @@ mod tests {
             fill(0, 1, 0, Side::Buy, 100, 1, ExecKind::Filled),
             fill(1, 2, 0, Side::Buy, 100, 1, ExecKind::Filled),
         ];
-        let mut report = build_positions(1, &orders, &executions, None);
+        let mut report = build_positions(1, &orders, &executions, None, &tick_sizes())
+            .expect("the fixture symbols have tick sizes");
         report.retain_participant(ParticipantId(8));
         assert_eq!(report.participants.len(), 1);
         assert_eq!(report.participants[0].participant, ParticipantId(8));
         assert_eq!(report.symbols, vec![symbol()]);
+    }
+
+    #[test]
+    fn a_hundred_cent_tick_scales_value_once() {
+        // 3 ticks at 100 cents per tick, qty 2: 600 cents, not 6 or 60,000.
+        let tick_sizes = TickSizes::from_iter([(symbol(), 100)]);
+        let orders = vec![
+            new_order(0, 1, 7, Side::Buy, 3, 2),
+            new_order(1, 2, 8, Side::Sell, 3, 2),
+        ];
+        let executions = vec![fill(0, 2, 1, Side::Sell, 3, 2, ExecKind::Filled)];
+        let report = build_positions(1, &orders, &executions, None, &tick_sizes)
+            .expect("the fixture symbol has a tick size");
+
+        let maker = row(&report, 7);
+        assert_eq!(maker.notional_cents, 600);
+        assert_eq!(maker.cash_cents, -600);
+        let taker = row(&report, 8);
+        assert_eq!(taker.notional_cents, 600);
+        assert_eq!(taker.cash_cents, 600);
+    }
+
+    #[test]
+    fn a_missing_or_non_positive_tick_size_is_an_error() {
+        let orders = vec![
+            new_order(0, 1, 7, Side::Buy, 100, 5),
+            new_order(1, 2, 8, Side::Sell, 100, 3),
+        ];
+        let executions = vec![fill(0, 2, 1, Side::Sell, 100, 3, ExecKind::Filled)];
+
+        let error = build_positions(1, &orders, &executions, None, &TickSizes::default())
+            .expect_err("a missing tick size must not default to 1");
+        assert_eq!(error, TickSizeError::Missing { symbol: symbol() });
+
+        let zero = TickSizes::from_iter([(symbol(), 0)]);
+        let error = build_positions(1, &orders, &executions, None, &zero)
+            .expect_err("a zero tick size is not a factor");
+        assert_eq!(
+            error,
+            TickSizeError::NonPositive {
+                symbol: symbol(),
+                tick_size_cents: 0,
+            }
+        );
     }
 }

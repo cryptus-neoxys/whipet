@@ -8,11 +8,18 @@
 //! position — so cash and that symbol's position each sum to zero within the
 //! entry. Account balances are the fold of those postings.
 //!
+//! The logs store each fill price as an integer **ladder tick index**, not
+//! quote cents, so [`build_ledger`] converts with the instrument's tick size:
+//! `price_ticks * tick_size_cents * qty`. The entry keeps both the raw
+//! `price_ticks` and the `tick_size_cents` used, so a posted value can be
+//! audited without the config. A symbol with no tick size, or a non-positive
+//! one, is an error — never a silent factor of one.
+//!
 //! This is a **simulation ledger, not clearing or settlement**: posting is T+0,
 //! there are no fees, funding, deposits, withdrawals, margin calls, or
 //! settlement dates, and an account may run a negative cash balance (the
-//! simulation does not model credit). It reads only the decoded logs and never
-//! writes.
+//! simulation does not model credit). Cash balances are quote cents; position
+//! balances are share counts. It reads only the decoded logs and never writes.
 //!
 //! Participant attribution is the same as [`crate::positions`]: an execution
 //! report carries no participant, so a leg is attributed through the
@@ -25,10 +32,12 @@
 //!
 //! The module is the pure half: it reads only its arguments — no wall clock,
 //! no network, no journal, no logging — so the same decoded logs always
-//! produce the same report. `seq` is the canonical order: entries are sorted
-//! by `ExecutionReport.seq`, so the report does not depend on the order in
-//! which the decoded executions are handed in. The journal reads live in
-//! [`crate::cli`] behind the [`Journal`] seam.
+//! produce the same report. The engine stamps `ExecutionReport.seq` per
+//! symbol, not per partition, so an entry is identified by `(symbol, seq)` and
+//! ordered by `(cause_offset, seq)` — the output order of the logs. The report
+//! therefore does not depend on the order in which the decoded executions are
+//! handed in. The journal reads live in [`crate::cli`] behind the [`Journal`]
+//! seam.
 //!
 //! [`Journal`]: whippet_journal::Journal
 
@@ -39,12 +48,14 @@ use serde::Serialize;
 use whippet_core::ids::{OrderId, ParticipantId, Symbol};
 use whippet_core::protocol::{Command, ExecKind, ExecutionReport, Side};
 
-use crate::positions::{order_index, trade_cents};
+use crate::positions::{TickSizeError, TickSizes, order_index};
 
 /// Printed on every ledger run, to stderr so `--json` output stays
 /// machine-readable.
 pub const LEDGER_NOTICE: &str = "simulation ledger reconstructed from the orders and executions logs: \
-     T+0 posting, no fees, funding, deposits, withdrawals or settlement dates; read-only";
+     log tick prices converted to quote cents with the configured tick size \
+     (--tick-size-cents overrides the built-in config); T+0 posting, no fees, funding, \
+     deposits, withdrawals or settlement dates; read-only";
 
 /// What a posting moves: cash, or one symbol's position.
 ///
@@ -71,6 +82,7 @@ impl fmt::Display for Asset {
 ///
 /// Postings are the atomic unit of the ledger: no entry changes an account
 /// except through a posting, and every entry's postings balance per asset.
+/// A cash delta is in quote cents; a position delta is a share count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct Posting {
     pub participant: ParticipantId,
@@ -80,20 +92,32 @@ pub struct Posting {
 
 /// One attributed trade, balanced across its four legs.
 ///
-/// `seq` is the `ExecutionReport.seq` of the fill and is the entry identity.
+/// `seq` is the `ExecutionReport.seq` of the fill. The engine stamps it per
+/// symbol, so the entry identity is `(symbol, seq)`, not `seq` alone.
 /// `cause_offset` is the orders-log offset that produced the report, so an
 /// entry can be traced back to its input command.
+///
+/// `price_ticks` is the fill price exactly as the engine emitted it, a ladder
+/// tick index. `tick_size_cents` is the instrument's tick size used for the
+/// conversion, and `price_cents` is `price_ticks * tick_size_cents`. Keeping
+/// all three makes the entry auditable from the report alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LedgerEntry {
     pub seq: u64,
     pub cause_offset: u64,
     pub symbol: Symbol,
-    pub price_cents: i64,
+    /// The fill price as an integer ladder tick index (`ExecutionReport.price`).
+    pub price_ticks: i64,
+    /// The instrument's tick size in quote cents, applied exactly once.
+    pub tick_size_cents: i64,
+    /// The fill price in quote cents: `price_ticks * tick_size_cents`.
+    pub price_cents: i128,
     pub qty: u64,
     pub buyer: ParticipantId,
     pub seller: ParticipantId,
-    /// Exactly four: buyer cash `-price*qty`, seller cash `+price*qty`,
-    /// buyer position `+qty`, seller position `-qty`.
+    /// Exactly four, in quote cents / shares: buyer cash
+    /// `-price_ticks*tick_size_cents*qty`, seller cash `+...`, buyer position
+    /// `+qty`, seller position `-qty`.
     pub postings: Vec<Posting>,
 }
 
@@ -111,9 +135,10 @@ pub struct AccountBalance {
 
 /// The ledger projection for one partition.
 ///
-/// `entries` is sorted by `seq`, the canonical order. `accounts` is sorted by
-/// participant and then asset. Both unresolved counters are scan-wide: they
-/// describe gaps in the log, not one participant's accounts.
+/// `entries` is sorted by `(cause_offset, seq)`, the logs' output order, and
+/// `accounts` is sorted by participant and then asset. Both unresolved
+/// counters are scan-wide: they describe gaps in the log, not one
+/// participant's accounts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LedgerReport {
     pub partition: u32,
@@ -144,8 +169,14 @@ impl LedgerReport {
     ///
     /// Checks, in order:
     ///
-    /// - every entry has a non-zero `seq`, positive `qty` and positive price;
-    /// - entries are strictly increasing in `seq`, so no `seq` repeats;
+    /// - every entry has a non-zero `seq`, positive `qty`, positive
+    ///   `price_ticks` and positive `tick_size_cents`, and its quoted
+    ///   `price_cents` equals `price_ticks * tick_size_cents`;
+    /// - entries are strictly ordered by `(cause_offset, seq)`, so no fill
+    ///   repeats and the list follows the logs' output order;
+    /// - each symbol's `seq` increases along that order. `seq` is stamped per
+    ///   symbol by the engine, so two symbols may legitimately carry the same
+    ///   `seq`; the entry identity is `(symbol, seq)`;
     /// - every entry has exactly four postings, every posting has a non-zero
     ///   delta, the postings match the trade's four documented legs, and the
     ///   postings sum to zero **per asset** (cash and that symbol's position);
@@ -159,10 +190,15 @@ impl LedgerReport {
     /// [`LedgerReport::retain_participant`] the account list is a subset while
     /// the entries stay whole. The checks above still hold for that subset.
     ///
-    /// All value arithmetic is checked: an overflow is reported as a broken
-    /// invariant rather than wrapping into a plausible balance.
+    /// Account and report-total accumulation uses checked `i128` arithmetic, so
+    /// an overflow is a broken invariant rather than a wrapped balance. The
+    /// price and trade-value products saturate at the `i128` limits, matching
+    /// the projection: one absurd record saturates instead of wrapping into a
+    /// plausible number.
     pub fn check_invariants(&self) -> Result<(), String> {
-        let mut previous_seq: Option<u64> = None;
+        let mut previous: Option<(u64, Symbol, u64)> = None;
+        // Per-symbol sequence walk: `seq` restarts at 1 for each instrument.
+        let mut seq_by_symbol: BTreeMap<Symbol, u64> = BTreeMap::new();
         let mut cash_total: i128 = 0;
         let mut position_totals: BTreeMap<Symbol, i128> = BTreeMap::new();
         // Every posting folded by account, used to prove the account rows.
@@ -175,19 +211,25 @@ impl LedgerReport {
                         .to_string(),
                 );
             }
-            match previous_seq {
-                Some(previous) if entry.seq == previous => {
-                    return Err(format!("duplicate entry seq {previous}"));
-                }
-                Some(previous) if entry.seq < previous => {
-                    return Err(format!(
-                        "entry seq {} follows {previous}: entries are not sorted by seq",
-                        entry.seq
-                    ));
-                }
-                _ => {}
+            let key = (entry.cause_offset, entry.symbol, entry.seq);
+            if let Some(previous) = previous
+                && key <= previous
+            {
+                return Err(format!(
+                    "duplicate or out-of-order entry (offset {}, {}, seq {}): it is not after the previous entry (offset {}, {}, seq {})",
+                    key.0, key.1, key.2, previous.0, previous.1, previous.2
+                ));
             }
-            previous_seq = Some(entry.seq);
+            previous = Some(key);
+            if let Some(previous_seq) = seq_by_symbol.get(&entry.symbol)
+                && entry.seq <= *previous_seq
+            {
+                return Err(format!(
+                    "duplicate or out-of-order fill seq {} for {}: the previous {} entry used seq {previous_seq}",
+                    entry.seq, entry.symbol, entry.symbol
+                ));
+            }
+            seq_by_symbol.insert(entry.symbol, entry.seq);
 
             if entry.qty == 0 {
                 return Err(format!(
@@ -195,10 +237,24 @@ impl LedgerReport {
                     entry.seq
                 ));
             }
-            if entry.price_cents <= 0 {
+            if entry.price_ticks <= 0 {
                 return Err(format!(
-                    "entry {} has non-positive price {}",
-                    entry.seq, entry.price_cents
+                    "entry {} has non-positive tick price {}",
+                    entry.seq, entry.price_ticks
+                ));
+            }
+            if entry.tick_size_cents <= 0 {
+                return Err(format!(
+                    "entry {} has non-positive tick size {}",
+                    entry.seq, entry.tick_size_cents
+                ));
+            }
+            let price_cents =
+                i128::from(entry.price_ticks).saturating_mul(i128::from(entry.tick_size_cents));
+            if entry.price_cents != price_cents {
+                return Err(format!(
+                    "entry {} price {} cents is not {} ticks at {} cents per tick",
+                    entry.seq, entry.price_cents, entry.price_ticks, entry.tick_size_cents
                 ));
             }
             if entry.postings.len() != 4 {
@@ -209,7 +265,7 @@ impl LedgerReport {
                 ));
             }
 
-            let value = trade_cents(entry.price_cents, entry.qty);
+            let value = entry.price_cents.saturating_mul(i128::from(entry.qty));
             let qty = i128::from(entry.qty);
             let position = Asset::Position(entry.symbol);
             let expected = [
@@ -355,14 +411,16 @@ impl LedgerReport {
 ///
 /// `orders` is every decoded command on the partition with its orders-topic
 /// offset; `executions` is every decoded execution report. Both are filtered
-/// by `symbols` when it is `Some`.
+/// by `symbols` when it is `Some`. `tick_sizes` converts each fill's integer
+/// tick price into quote cents; a posted trade whose symbol has no tick size,
+/// or a non-positive one, is an error rather than a silent factor of one.
 ///
 /// Attribution and selection rules:
 ///
 /// - Only `filled` and `partially_filled` reports with a positive quantity,
-///   a positive price and a non-zero `seq` are posted. The remaining kinds do
-///   not move balances, and a zero or negative value would create a zero-delta
-///   or nonsensical posting that the invariants reject.
+///   a positive tick price and a non-zero `seq` are posted. The remaining kinds
+///   do not move balances, and a zero or negative value would create a
+///   zero-delta or nonsensical posting that the invariants reject.
 /// - The aggressor leg is `report.order_id` with `report.side`; the maker leg
 ///   is `report.maker_order_id` with the opposite side, at the same price and
 ///   quantity, because the engine emits one report per trade and never a
@@ -372,15 +430,18 @@ impl LedgerReport {
 /// - **All or nothing**: if either order id is absent from the order map (or
 ///   the maker id is zero) the trade is not posted at all and the missing
 ///   side(s) are counted. A one-sided posting would break conservation.
-/// - An execution `seq` is the entry identity. A malformed log that repeats
-///   one keeps the first entry in the canonical sort order, so the result is
-///   deterministic and `check_invariants` holds.
+/// - A fill is identified by `(symbol, seq)`: the engine stamps `seq` per
+///   symbol, so two instruments may legitimately carry the same number. A
+///   malformed log that repeats a pair keeps the first entry in the canonical
+///   `(cause_offset, seq)` order, so the result is deterministic and
+///   `check_invariants` holds.
 pub fn build_ledger(
     partition: u32,
     orders: &[(u64, Command)],
     executions: &[ExecutionReport],
     symbols: Option<&[Symbol]>,
-) -> LedgerReport {
+    tick_sizes: &TickSizes,
+) -> Result<LedgerReport, TickSizeError> {
     let allowed = |symbol: Symbol| symbols.is_none_or(|symbols| symbols.contains(&symbol));
     let order_info = order_index(orders, allowed);
 
@@ -421,14 +482,22 @@ pub fn build_ledger(
             Side::Buy => (aggressor.participant, maker.participant),
             Side::Sell => (maker.participant, aggressor.participant),
         };
-        let value = trade_cents(report.price.0, report.qty.0);
+        // Price the trade only once both legs are known: an unresolved trade
+        // moves no balances, so it does not need a tick size. The factor is
+        // applied once, to the price; the value is that quoted price times the
+        // quantity.
+        let tick_size_cents = tick_sizes.require(report.symbol)?;
+        let price_cents = tick_sizes.price_cents(report.symbol, report.price.0)?;
+        let value = price_cents.saturating_mul(i128::from(report.qty.0));
         let qty = i128::from(report.qty.0);
         let position = Asset::Position(report.symbol);
         candidates.push(LedgerEntry {
             seq: report.seq.0,
             cause_offset: report.cause_offset,
             symbol: report.symbol,
-            price_cents: report.price.0,
+            price_ticks: report.price.0,
+            tick_size_cents,
+            price_cents,
             qty: report.qty.0,
             buyer,
             seller,
@@ -457,13 +526,16 @@ pub fn build_ledger(
         });
     }
 
-    // Sort before de-duplicating so the surviving entry for a repeated `seq`
-    // does not depend on the input order either.
+    // Sort before de-duplicating so the surviving entry for a repeated
+    // `(symbol, seq)` also does not depend on the input order. `cause_offset`
+    // is partition-global, so `(cause_offset, seq)` reproduces the order in
+    // which the engine appended the reports; sorting by `seq` alone would
+    // interleave two symbols whose per-symbol counters happen to line up.
     candidates.sort_by_key(|entry| {
         (
-            entry.seq,
             entry.cause_offset,
             entry.symbol,
+            entry.seq,
             entry.price_cents,
             entry.qty,
             entry.buyer.0,
@@ -471,13 +543,15 @@ pub fn build_ledger(
         )
     });
     let mut entries: Vec<LedgerEntry> = Vec::with_capacity(candidates.len());
+    let mut seen: BTreeMap<Symbol, u64> = BTreeMap::new();
     for entry in candidates {
-        if entries
-            .last()
-            .is_some_and(|previous| previous.seq == entry.seq)
-        {
-            continue;
+        // Strictly increasing per symbol: the first fill for a `(symbol, seq)`
+        // wins, and the map also drops any out-of-order duplicate.
+        match seen.get(&entry.symbol) {
+            Some(previous) if entry.seq <= *previous => continue,
+            _ => {}
         }
+        seen.insert(entry.symbol, entry.seq);
         entries.push(entry);
     }
 
@@ -505,13 +579,13 @@ pub fn build_ledger(
         )
         .collect();
 
-    LedgerReport {
+    Ok(LedgerReport {
         partition,
         entries,
         accounts,
         unresolved_maker_fills,
         unresolved_aggressor_fills,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -522,6 +596,10 @@ mod tests {
 
     fn symbol() -> Symbol {
         Symbol::new("BTC-USD").expect("static symbol")
+    }
+
+    fn eth() -> Symbol {
+        Symbol::new("ETH-USD").expect("static symbol")
     }
 
     fn new_order(
@@ -555,9 +633,32 @@ mod tests {
         price: i64,
         qty: u64,
     ) -> ExecutionReport {
+        fill_on(
+            symbol(),
+            seq,
+            seq,
+            order_id,
+            maker_order_id,
+            side,
+            price,
+            qty,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fill_on(
+        symbol: Symbol,
+        seq: u64,
+        cause_offset: u64,
+        order_id: u128,
+        maker_order_id: u128,
+        side: Side,
+        price: i64,
+        qty: u64,
+    ) -> ExecutionReport {
         ExecutionReport {
             kind: ExecKind::Filled,
-            symbol: symbol(),
+            symbol,
             side,
             order_type: OrderType::Limit,
             price: Price(price),
@@ -566,7 +667,7 @@ mod tests {
             order_id: OrderId(order_id),
             maker_order_id: OrderId(maker_order_id),
             seq: Seq(seq),
-            cause_offset: seq,
+            cause_offset,
             timestamp_ns: seq,
             reason: RejectReason::None,
             flags: 0,
@@ -580,7 +681,73 @@ mod tests {
             new_order(1, 2, 8, Side::Sell, 100, 3),
         ];
         let executions = vec![fill(10, 2, 1, Side::Sell, 100, 3)];
-        build_ledger(1, &orders, &executions, None)
+        build_ledger(1, &orders, &executions, None, &tick_sizes())
+            .expect("the fixture symbols have tick sizes")
+    }
+
+    fn tick_sizes() -> TickSizes {
+        TickSizes::from_iter([(symbol(), 1), (eth(), 1)])
+    }
+
+    #[test]
+    fn the_tick_size_is_applied_once_to_the_postings() {
+        // 3 ticks at 100 cents, qty 2: 600 cents. Applying the factor twice
+        // would give 60,000 and not applying it gives 6.
+        let tick_sizes = TickSizes::from_iter([(symbol(), 100)]);
+        let orders = vec![
+            new_order(0, 1, 7, Side::Buy, 3, 2),
+            new_order(1, 2, 8, Side::Sell, 3, 2),
+        ];
+        let executions = vec![fill(10, 2, 1, Side::Sell, 3, 2)];
+        let report = build_ledger(1, &orders, &executions, None, &tick_sizes)
+            .expect("the fixture symbol has a tick size");
+        report
+            .check_invariants()
+            .expect("the converted entry balances");
+
+        let entry = &report.entries[0];
+        assert_eq!(entry.price_ticks, 3);
+        assert_eq!(entry.tick_size_cents, 100);
+        assert_eq!(entry.price_cents, 300);
+        assert_eq!(entry.postings[0].delta, -600);
+        assert_eq!(entry.postings[1].delta, 600);
+        assert_eq!(account_cash(&report, 7), -600);
+        assert_eq!(account_cash(&report, 8), 600);
+    }
+
+    #[test]
+    fn a_missing_or_non_positive_tick_size_is_an_error() {
+        let orders = vec![
+            new_order(0, 1, 7, Side::Buy, 100, 5),
+            new_order(1, 2, 8, Side::Sell, 100, 3),
+        ];
+        let executions = vec![fill(10, 2, 1, Side::Sell, 100, 3)];
+
+        let error = build_ledger(1, &orders, &executions, None, &TickSizes::default())
+            .expect_err("a missing tick size must not default to 1");
+        assert_eq!(error, TickSizeError::Missing { symbol: symbol() });
+
+        let zero = TickSizes::from_iter([(symbol(), 0)]);
+        let error = build_ledger(1, &orders, &executions, None, &zero)
+            .expect_err("a zero tick size is not a factor");
+        assert_eq!(
+            error,
+            TickSizeError::NonPositive {
+                symbol: symbol(),
+                tick_size_cents: 0,
+            }
+        );
+    }
+
+    fn account_cash(report: &LedgerReport, participant: u64) -> i128 {
+        report
+            .accounts
+            .iter()
+            .find(|account| {
+                account.participant == ParticipantId(participant) && account.asset == Asset::Cash
+            })
+            .expect("the participant has a cash account")
+            .balance
     }
 
     #[test]
@@ -634,8 +801,10 @@ mod tests {
         let mut backward = forward.clone();
         backward.reverse();
 
-        let a = build_ledger(1, &orders, &forward, None);
-        let b = build_ledger(1, &orders, &backward, None);
+        let a = build_ledger(1, &orders, &forward, None, &tick_sizes())
+            .expect("the fixture symbols have tick sizes");
+        let b = build_ledger(1, &orders, &backward, None, &tick_sizes())
+            .expect("the fixture symbols have tick sizes");
         assert_eq!(a, b, "seq, not input order, is the canonical order");
     }
 
@@ -647,7 +816,9 @@ mod tests {
             &maker_unknown,
             &[fill(10, 2, 99, Side::Sell, 100, 3)],
             None,
-        );
+            &tick_sizes(),
+        )
+        .expect("the fixture symbols have tick sizes");
         assert!(report.entries.is_empty());
         assert!(report.accounts.is_empty());
         assert_eq!(report.unresolved_maker_fills, 1);
@@ -660,7 +831,9 @@ mod tests {
             &aggressor_unknown,
             &[fill(10, 99, 1, Side::Sell, 100, 3)],
             None,
-        );
+            &tick_sizes(),
+        )
+        .expect("the fixture symbols have tick sizes");
         assert!(report.entries.is_empty());
         assert_eq!(report.unresolved_maker_fills, 0);
         assert_eq!(report.unresolved_aggressor_fills, 1);
@@ -708,6 +881,15 @@ mod tests {
                 .contains("does not equal")
         );
 
+        let mut wrong_price = report.clone();
+        wrong_price.entries[0].price_cents = 1;
+        assert!(
+            wrong_price
+                .check_invariants()
+                .expect_err("a mis-quoted price is rejected")
+                .contains("cents is not")
+        );
+
         let mut zero_seq = report;
         zero_seq.entries[0].seq = 0;
         assert!(
@@ -729,7 +911,8 @@ mod tests {
             fill(10, 2, 1, Side::Sell, 100, 3),
             fill(10, 3, 1, Side::Sell, 100, 3),
         ];
-        let report = build_ledger(1, &orders, &executions, None);
+        let report = build_ledger(1, &orders, &executions, None, &tick_sizes())
+            .expect("the fixture symbols have tick sizes");
         assert_eq!(report.entries.len(), 1, "one seq, one entry");
         report.check_invariants().expect("the survivor balances");
 
@@ -737,9 +920,63 @@ mod tests {
         reversed.reverse();
         assert_eq!(
             report,
-            build_ledger(1, &orders, &reversed, None),
+            build_ledger(1, &orders, &reversed, None, &tick_sizes())
+                .expect("the fixture symbols have tick sizes"),
             "the surviving entry for a repeated seq is input-order independent"
         );
+    }
+
+    #[test]
+    fn seq_is_per_symbol_so_two_symbols_may_reuse_it() {
+        let orders = vec![
+            new_order(0, 1, 7, Side::Buy, 100, 5),
+            new_order(1, 2, 8, Side::Sell, 100, 3),
+            (
+                2,
+                Command::new_order(
+                    eth(),
+                    Side::Buy,
+                    OrderType::Limit,
+                    Price(50),
+                    Qty(4),
+                    OrderId(3),
+                    ParticipantId(9),
+                    2,
+                ),
+            ),
+            (
+                3,
+                Command::new_order(
+                    eth(),
+                    Side::Sell,
+                    OrderType::Limit,
+                    Price(50),
+                    Qty(4),
+                    OrderId(4),
+                    ParticipantId(10),
+                    3,
+                ),
+            ),
+        ];
+        // The engine restarts `seq` per symbol, so both fills carry seq 1.
+        let executions = vec![
+            fill_on(symbol(), 1, 2, 2, 1, Side::Sell, 100, 3),
+            fill_on(eth(), 1, 3, 4, 3, Side::Sell, 50, 4),
+        ];
+        let report = build_ledger(1, &orders, &executions, None, &tick_sizes())
+            .expect("the fixture symbols have tick sizes");
+        assert_eq!(
+            report
+                .entries
+                .iter()
+                .map(|entry| (entry.symbol, entry.seq, entry.cause_offset))
+                .collect::<Vec<_>>(),
+            vec![(symbol(), 1, 2), (eth(), 1, 3)],
+            "cause_offset, not seq, is the partition-global order"
+        );
+        report
+            .check_invariants()
+            .expect("a per-symbol seq collision is legal");
     }
 
     #[test]

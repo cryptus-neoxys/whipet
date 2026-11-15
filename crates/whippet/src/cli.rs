@@ -1,5 +1,6 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -13,7 +14,7 @@ use reqwest::Client;
 use whippet_bench::BenchConfig;
 use whippet_core::config::{ExchangeConfig, Mode};
 use whippet_core::ids::{OrderId, ParticipantId, Symbol};
-use whippet_core::protocol::{Command, ExecutionReport};
+use whippet_core::protocol::{Command, ExecKind, ExecutionReport};
 use whippet_engine::ShardEngine;
 use whippet_journal::{IggyJournal, Journal, PayloadRecord, Topic};
 
@@ -24,7 +25,7 @@ use crate::inspect::{
     filter_audit, parse_order_id,
 };
 use crate::ledger::{LEDGER_NOTICE, LedgerReport, build_ledger};
-use crate::positions::{POSITIONS_NOTICE, PositionReport, build_positions};
+use crate::positions::{POSITIONS_NOTICE, PositionReport, TickSizes, build_positions};
 use crate::retention::{RetentionDecision, RetentionInput, evaluate, explain};
 use crate::snapshot::SnapshotStore;
 use crate::surveillance::{SurveillanceConfig, SurveillanceReport, analyze};
@@ -1727,6 +1728,61 @@ fn indicators_cell(indicators: &[crate::surveillance::Indicator]) -> String {
         .join(",")
 }
 
+/// Symbols a projection must price: the explicit `--symbols` request when
+/// there is one, otherwise every symbol with a fill in the decoded log.
+///
+/// A filter is the caller's statement of what it wants priced, so every
+/// requested symbol must resolve even when the log has no fill for it. Without
+/// a filter only a fill can move a balance, so only fill symbols need a size.
+fn priced_symbols(requested: &[Symbol], executions: &[ExecutionReport]) -> Vec<Symbol> {
+    let mut symbols: BTreeSet<Symbol> = requested.iter().copied().collect();
+    if requested.is_empty() {
+        symbols.extend(
+            executions
+                .iter()
+                .filter(|report| {
+                    matches!(report.kind, ExecKind::Filled | ExecKind::PartiallyFilled)
+                        && report.qty.0 > 0
+                })
+                .map(|report| report.symbol),
+        );
+    }
+    symbols.into_iter().collect()
+}
+
+/// Resolve the tick size for every symbol a projection will price.
+///
+/// The logs store `Price` as an integer ladder tick, so a value cannot be
+/// labelled "cents" without the instrument's tick size. `--tick-size-cents` is
+/// the explicit authority and applies to every symbol in the scan. Without it
+/// the built-in [`ExchangeConfig::default`] is the fallback; a symbol it does
+/// not know is an error, never a silent factor of one, because a node's real
+/// universe and tick sizes can differ from the default.
+fn resolve_tick_sizes(override_cents: Option<i64>, symbols: &[Symbol]) -> Result<TickSizes> {
+    if let Some(cents) = override_cents {
+        if cents <= 0 {
+            bail!("--tick-size-cents must be at least 1; got {cents}");
+        }
+        return Ok(symbols.iter().map(|symbol| (*symbol, cents)).collect());
+    }
+    let default = ExchangeConfig::default();
+    let mut tick_sizes = TickSizes::default();
+    for symbol in symbols {
+        let Some(instrument) = default
+            .instruments
+            .iter()
+            .find(|instrument| instrument.symbol == *symbol)
+        else {
+            bail!(
+                "no tick size for symbol {symbol}: it is not in the built-in default config; \
+                 pass --tick-size-cents to project a deployment with a custom universe or tick size"
+            );
+        };
+        tick_sizes.insert(*symbol, instrument.tick_size_cents);
+    }
+    Ok(tick_sizes)
+}
+
 #[derive(Args, Debug, Clone)]
 pub struct PositionsArgs {
     #[arg(long, env = "WHIPPET_IGGY_ADDR", default_value = "127.0.0.1:8090")]
@@ -1750,6 +1806,12 @@ pub struct PositionsArgs {
     /// name cannot be resolved offline; pass the numeric id the engine saw.
     #[arg(long)]
     pub participant: Option<u64>,
+    /// Tick size in cents for the requested symbols. The logs store prices as
+    /// integer ladder ticks, so the projection needs this to report quote
+    /// cents. Omit to use the built-in default config; pass it for a custom
+    /// deployment, whose universe and tick sizes may differ.
+    #[arg(long)]
+    pub tick_size_cents: Option<i64>,
     /// Print the report as one JSON document instead of a table.
     #[arg(long)]
     pub json: bool,
@@ -1778,7 +1840,9 @@ pub async fn run_positions(args: PositionsArgs) -> Result<()> {
 ///
 /// Both topics are read from offset 0 on one partition with
 /// [`read_topic_from_start`], decoded, and folded by
-/// [`build_positions`]. The report is a reconstruction, not a settlement
+/// [`build_positions`]. The log's tick prices are converted to quote cents with
+/// the tick size from `--tick-size-cents`, or from the built-in default config
+/// when the flag is absent. The report is a reconstruction, not a settlement
 /// ledger: no balances, deposits, fees, or margin, and participant attribution
 /// depends on the orders log. Malformed records are counted in one summary
 /// line, never logged per record. No fills is a valid empty report and exits
@@ -1827,7 +1891,11 @@ pub async fn positions_with_journal(
     }
 
     let symbols = (!args.symbols.is_empty()).then_some(args.symbols.as_slice());
-    let mut report = build_positions(args.partition, &orders, &executions, symbols);
+    let tick_sizes = resolve_tick_sizes(
+        args.tick_size_cents,
+        &priced_symbols(&args.symbols, &executions),
+    )?;
+    let mut report = build_positions(args.partition, &orders, &executions, symbols, &tick_sizes)?;
     if let Some(participant) = args.participant {
         report.retain_participant(ParticipantId(participant));
     }
@@ -1938,6 +2006,12 @@ pub struct LedgerArgs {
     /// name cannot be resolved offline; pass the numeric id the engine saw.
     #[arg(long)]
     pub participant: Option<u64>,
+    /// Tick size in cents for the requested symbols. The logs store prices as
+    /// integer ladder ticks, so the projection needs this to report quote
+    /// cents. Omit to use the built-in default config; pass it for a custom
+    /// deployment, whose universe and tick sizes may differ.
+    #[arg(long)]
+    pub tick_size_cents: Option<i64>,
     /// Print the report as one JSON document instead of a table.
     #[arg(long)]
     pub json: bool,
@@ -1966,9 +2040,11 @@ pub async fn run_ledger(args: LedgerArgs) -> Result<()> {
 ///
 /// Both topics are read from offset 0 on one partition with
 /// [`read_topic_from_start`], decoded, and folded by [`build_ledger`]. The
-/// report must pass [`LedgerReport::check_invariants`] before it is printed:
-/// a projection that does not conserve cash and shares is a bug, not a
-/// report. This is a simulation ledger — T+0 posting, no fees, funding,
+/// log's tick prices are converted to quote cents with the tick size from
+/// `--tick-size-cents`, or from the built-in default config when the flag is
+/// absent. The report must pass [`LedgerReport::check_invariants`] before it is
+/// printed: a projection that does not conserve cash and shares is a bug, not
+/// a report. This is a simulation ledger — T+0 posting, no fees, funding,
 /// deposits, withdrawals, or settlement dates — and participant attribution
 /// depends on the orders log. Malformed records are counted in one summary
 /// line, never logged per record. No fills is a valid empty report and exits
@@ -2014,7 +2090,11 @@ pub async fn ledger_with_journal(args: LedgerArgs, journal: &Journal) -> Result<
     }
 
     let symbols = (!args.symbols.is_empty()).then_some(args.symbols.as_slice());
-    let mut report = build_ledger(args.partition, &orders, &executions, symbols);
+    let tick_sizes = resolve_tick_sizes(
+        args.tick_size_cents,
+        &priced_symbols(&args.symbols, &executions),
+    )?;
+    let mut report = build_ledger(args.partition, &orders, &executions, symbols, &tick_sizes)?;
     if let Some(participant) = args.participant {
         report.retain_participant(ParticipantId(participant));
     }

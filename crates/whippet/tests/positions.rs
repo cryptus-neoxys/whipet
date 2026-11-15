@@ -5,13 +5,14 @@
 //! The positions command reconstructs per-participant, per-symbol positions and
 //! cash flow from the orders and executions topics through the `Journal` seam.
 //! These tests pin the two-leg attribution (aggressor and resting maker), the
-//! cash signs, the unresolved-maker accounting, the symbol and participant
-//! filters, the JSON shape, the CLI defaults, and — most importantly — that the
-//! command is read-only: no consumer offset moves and no record is appended.
+//! cash signs, the tick-to-cents conversion, the unresolved-maker accounting,
+//! the symbol and participant filters, the JSON shape, the CLI defaults, and —
+//! most importantly — that the command is read-only: no consumer offset moves
+//! and no record is appended.
 
 use clap::Parser;
 use whippet::cli::{PositionsArgs, positions_with_journal};
-use whippet::positions::{PositionReport, build_positions};
+use whippet::positions::{PositionReport, TickSizes, build_positions};
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Seq, Symbol};
 use whippet_core::protocol::{Command, ExecKind, ExecutionReport, OrderType, RejectReason, Side};
 use whippet_journal::{Journal, JournalMessage, Topic};
@@ -26,6 +27,11 @@ fn eth() -> Symbol {
     Symbol::new("ETH-USD").expect("static symbol")
 }
 
+/// One-cent ticks keep every pre-conversion fixture value unchanged.
+fn tick_sizes() -> TickSizes {
+    TickSizes::from_iter([(symbol(), 1), (eth(), 1)])
+}
+
 fn positions_args(partition: u32) -> PositionsArgs {
     PositionsArgs {
         iggy_addr: "127.0.0.1:8090".into(),
@@ -35,6 +41,7 @@ fn positions_args(partition: u32) -> PositionsArgs {
         partition,
         symbols: Vec::new(),
         participant: None,
+        tick_size_cents: Some(1),
         json: false,
     }
 }
@@ -287,7 +294,8 @@ fn positions_json_shape_is_stable() {
         .enumerate()
         .map(|(offset, command)| (offset as u64, command))
         .collect();
-    let report = build_positions(PARTITION, &indexed, &executions, None);
+    let report = build_positions(PARTITION, &indexed, &executions, None, &tick_sizes())
+        .expect("the fixture symbols have tick sizes");
     let json = serde_json::to_value(&report).expect("the report serializes");
 
     assert_eq!(json["partition"], 1);
@@ -334,6 +342,85 @@ async fn positions_rejects_partition_zero_before_reading() {
     assert!(error.to_string().contains("--partition"));
 }
 
+#[tokio::test]
+async fn positions_use_the_builtin_tick_size_without_the_flag() {
+    // Price 100 ticks on BTC-USD, whose built-in tick is 100 cents: a 2-lot
+    // trade is 20,000 cents, not 200.
+    let journal = Journal::memory();
+    let orders = [
+        new_order(symbol(), 1, 7, Side::Buy, 100, 2),
+        new_order(symbol(), 2, 8, Side::Sell, 100, 2),
+    ];
+    let executions = [fill(
+        0,
+        symbol(),
+        2,
+        1,
+        Side::Sell,
+        100,
+        2,
+        ExecKind::Filled,
+    )];
+    let order_payloads: Vec<Vec<u8>> = orders.iter().map(Command::encode).collect();
+    let execution_payloads: Vec<Vec<u8>> = executions.iter().map(ExecutionReport::encode).collect();
+    append(&journal, Topic::Orders, &order_payloads).await;
+    append(&journal, Topic::Executions, &execution_payloads).await;
+
+    let mut args = positions_args(PARTITION);
+    args.tick_size_cents = None;
+    let report = positions_with_journal(args, &journal)
+        .await
+        .expect("the built-in config prices BTC-USD");
+    let maker = &report.participants[0];
+    assert_eq!(maker.participant, ParticipantId(7));
+    assert_eq!(maker.cash_cents, -20_000);
+    assert_eq!(maker.notional_cents, 20_000);
+    assert_eq!(report.participants[1].cash_cents, 20_000);
+}
+
+#[tokio::test]
+async fn positions_name_a_symbol_with_no_tick_size() {
+    let doge = Symbol::new("DOGE-USD").expect("static symbol");
+    let journal = Journal::memory();
+    let orders = [
+        new_order(doge, 1, 7, Side::Buy, 100, 2),
+        new_order(doge, 2, 8, Side::Sell, 100, 2),
+    ];
+    let executions = [fill(0, doge, 2, 1, Side::Sell, 100, 2, ExecKind::Filled)];
+    let order_payloads: Vec<Vec<u8>> = orders.iter().map(Command::encode).collect();
+    let execution_payloads: Vec<Vec<u8>> = executions.iter().map(ExecutionReport::encode).collect();
+    append(&journal, Topic::Orders, &order_payloads).await;
+    append(&journal, Topic::Executions, &execution_payloads).await;
+
+    let mut args = positions_args(PARTITION);
+    args.tick_size_cents = None;
+    let error = positions_with_journal(args, &journal)
+        .await
+        .expect_err("DOGE-USD is outside the built-in default config");
+    let message = error.to_string();
+    assert!(message.contains("DOGE-USD"), "{message}");
+    assert!(message.contains("--tick-size-cents"), "{message}");
+
+    // The explicit flag makes the same log priceable.
+    let mut args = positions_args(PARTITION);
+    args.tick_size_cents = Some(50);
+    let report = positions_with_journal(args, &journal)
+        .await
+        .expect("the flag resolves the custom symbol");
+    assert_eq!(report.participants[0].cash_cents, -10_000);
+}
+
+#[tokio::test]
+async fn positions_reject_a_non_positive_tick_size_flag() {
+    let journal = Journal::memory();
+    let mut args = positions_args(PARTITION);
+    args.tick_size_cents = Some(0);
+    let error = positions_with_journal(args, &journal)
+        .await
+        .expect_err("a zero tick size is a usage error");
+    assert!(error.to_string().contains("--tick-size-cents"));
+}
+
 #[test]
 fn positions_args_defaults_and_overrides_parse() {
     #[derive(Parser)]
@@ -350,6 +437,7 @@ fn positions_args_defaults_and_overrides_parse() {
     assert_eq!(cli.positions.partition, 1);
     assert!(cli.positions.symbols.is_empty());
     assert!(cli.positions.participant.is_none());
+    assert!(cli.positions.tick_size_cents.is_none());
     assert!(!cli.positions.json);
 
     let cli = Cli::parse_from([
@@ -362,6 +450,8 @@ fn positions_args_defaults_and_overrides_parse() {
         "BTC-USD,ETH-USD",
         "--participant",
         "7",
+        "--tick-size-cents",
+        "100",
         "--json",
         "--iggy-password-file",
         "/tmp/iggy-password",
@@ -374,6 +464,7 @@ fn positions_args_defaults_and_overrides_parse() {
         "symbols parse as a comma-separated list"
     );
     assert_eq!(cli.positions.participant, Some(7));
+    assert_eq!(cli.positions.tick_size_cents, Some(100));
     assert!(cli.positions.json);
     assert_eq!(
         cli.positions.iggy_password_file,
