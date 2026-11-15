@@ -251,7 +251,22 @@ artifact. Per [ADR 0009](adr/0009-performance-budget-and-optimization-order.md),
 a change without a manifest is not a performance result; the manifests are in
 `artifacts/bench` and are local.
 
-### Phase 1.5d (in progress)
+### Phase 1.5e (implemented; dev-loop measured)
+
+Phase 1.5e separates the ingress and engine Iggy clients, shares one sharded
+rate limiter across HTTP and TCP, caps WebSocket connections, verifies the
+final snapshot at write time, and moves the last stage sample off the matcher
+thread.
+
+Dev-loop soak after the split (fresh stack, 5,000/s, batch 10, 120 s): p50
+**0.51–0.89 ms** (previously 1.2–3.0 ms), p99 **0.2–0.34 s**, RSS 120 → 276 MiB.
+The p50 improvement is the per-role clients and the smaller snapshot; the p99
+is the periodic snapshot path (clone on the matcher, hash/serialize/fsync on
+the writer), not matching. `engine_process` stayed at 4 µs and `md_apply` at
+3 µs. A 10-minute soak still fails the 5% drift gate on Docker Desktop; the
+next step is a copy-on-write snapshot or a longer cadence, then the Linux run.
+
+### Phase 1.5d (implemented)
 
 Phase 1.5d is specified in
 [ADR 0011](adr/0011-fault-injection-and-stage-budget.md). It does not chase a

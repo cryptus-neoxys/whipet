@@ -83,7 +83,7 @@ private network with synthetic data only.
 | Client mTLS | Not implemented and not claimed. Apache Iggy does not currently support client mTLS. |
 | Audit | No hash chain, no signed checkpoints, no audit verifier. |
 | Surveillance | Not implemented. |
-| Rate limiting | No gateway rate limiter or per-client quota. |
+| Rate limiting | Optional per-IP token bucket (`WHIPPET_RATE_LIMIT_PER_SEC`, default off), shared by HTTP and TCP and charged per order; plus global TCP (1,024) and WebSocket (2,048) connection caps. There is no per-participant quota. |
 | Cluster | Single node. No RF3, no failover, no zero-loss-across-a-node-failure claim. |
 
 ### Known gaps
@@ -96,14 +96,15 @@ private network with synthetic data only.
    Whippet stream and manage consumer groups.
 4. **Unauthenticated dashboard and API.** Anyone who can reach port 8080 can
    read state and submit orders or cancels.
-5. **Permissive CORS.** `CorsLayer::permissive()` allows any origin. This is
-   convenient for local development and wrong for a public deployment.
+5. **No permissive CORS.** The dashboard is served same-origin and there is no
+   wildcard CORS layer; a separate frontend needs its own proxy.
 6. **No encryption at rest.** Iggy segments and snapshots are readable by anyone
    with filesystem or volume access.
 7. **No client mTLS.** Do not describe the deployment as mutually authenticated.
-8. **No rate limiting or body-size policy beyond framework defaults.** The
-   gateway validates symbol, quantity, and price, but it is not a security
-   boundary against a determined client.
+8. **Rate limiting is optional and per-IP.** With `WHIPPET_RATE_LIMIT_PER_SEC`
+   unset there is no limit; when set, a client is charged per order and the
+   budget is shared across transports. The 2 MiB body cap returns 413. The
+   gateway is still not a security boundary against a determined client.
 9. **No audit integrity.** There is no hash chain or external checkpoint, so a
    log tamper is not detectable by Whippet itself.
 10. **No HA.** A single node loss can lose data that was not durably written or

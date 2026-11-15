@@ -61,15 +61,53 @@ services:
       # the node dials `iggy:8090`.
       IGGY_NODE_ADVERTISED_ADDRESS: iggy
       IGGY_LOGGING_LEVEL: ${IGGY_LOGGING_LEVEL:-info}
-      # The message cleaner runs a full maintenance pass every minute; on this
-      # Docker Desktop volume it produced a periodic append-latency spike.
-      # Whippet topics do not use message expiry, so the pass has nothing to
-      # reclaim. Re-enable it if retention is configured.
+      # Retention in Iggy 0.10: topics created with a finite message expiry
+      # or max_topic_size are trimmed only by the messages cleaner (the
+      # segment cleaner), which deletes the oldest sealed segments per
+      # partition, best-effort, once per interval (default 1 m). The active
+      # segment is never touched. Whippet topics are created with finite
+      # expiry (1 h MD, 24 h orders, 7 d executions) and an 8 GiB max size
+      # on the trading/MD topics, so with the cleaner disabled below those
+      # policies are recorded at creation but never enforced: nothing trims
+      # the log, and it grows until the volume is full.
+      #
+      # Why disabled: on this Docker Desktop volume the once-per-minute
+      # cleaner pass produced a periodic append-latency spike. In the
+      # measured dev-loop soak, disabling it removed the early periodic
+      # spikes but not the monotonic growth with log size
+      # (docs/BENCHMARKS.md). The demo discipline is `make reset` before a
+      # measured run, not a background cleanup. See docs/OPERATIONS.md,
+      # "Log growth and retention".
+      #
+      # Do not re-enable this for retention without a retention/replay
+      # design: the engine and MD consumers keep their committed offsets in
+      # Iggy, and a retention shorter than a consumer's downtime deletes
+      # the log window it needs to replay.
       IGGY_DATA_MAINTENANCE_MESSAGES_CLEANER_ENABLED: "false"
-      # Larger WAL and a short WAL group-commit window: fewer rotations and
-      # amortised WAL writes as the log grows. Re-measure on the target host.
+      # Per-partition WAL budget; the Iggy 0.10 default is 256 MiB. A larger
+      # WAL means fewer checkpoints and rotations and amortised WAL writes
+      # as the log grows. Measured with the group-commit delay below: a
+      # 120 s soak run grew p50 1.2 -> 3.0 ms and p99 4.7 -> 227 ms. The
+      # default stack keeps both values; re-measure on native Linux before
+      # treating them as tuned.
       IGGY_PARTITION_WAL_BYTES_MAX: 1GiB
+      # Bounded wait (microseconds; the Iggy 0.10 default is 0) for more
+      # prepares before the WAL writer starts its durability barrier, so one
+      # barrier covers a group of prepares instead of one per prepare. It
+      # spends up to this much acknowledgment latency to cut device writes.
+      # Measured effect is in the same soak run as the WAL size above.
       IGGY_PARTITION_WAL_GROUP_COMMIT_DELAY_MICROS: "200"
+      # Example larger-retention / larger-WAL profile. Commented out, NOT
+      # measured here, and not the tuned default: re-measure on the target
+      # host before using any of it. The cleaner on restores the
+      # once-per-minute pass (and its measured append-latency spike) and
+      # makes the per-topic expiry and max size above actually delete
+      # sealed segments. 4 GiB is the documented maximum for
+      # IGGY_PARTITION_WAL_BYTES_MAX in Iggy 0.10; the delay is documented
+      # up to 10000.
+      # IGGY_PARTITION_WAL_BYTES_MAX: 4GiB
+      # IGGY_PARTITION_WAL_GROUP_COMMIT_DELAY_MICROS: "1000"
+      # IGGY_DATA_MAINTENANCE_MESSAGES_CLEANER_ENABLED: "true"
     # Read the root password from a Compose secret instead of an environment
     # variable, then exec the stock server binary. The image entrypoint is
     # `iggy-server`; the wrapper only adds the secret and keeps PID 1 correct.

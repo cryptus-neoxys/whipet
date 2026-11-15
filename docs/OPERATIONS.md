@@ -20,7 +20,8 @@ credentials explicitly.
 | `WHIPPET_IGGY_PASSWORD_FILE` | unset | Read the Iggy password from a file instead of the environment. Compose points this at `/run/secrets/iggy_root_password`; the container entrypoint also exports the value. |
 | `WHIPPET_API_TOKEN` | unset | Optional bearer token for `/api/orders`, `/api/orders/batch`, and `/api/cancel`. |
 | `WHIPPET_API_PARTICIPANT` | `api` | Participant identity used when a bearer token is configured. |
-| `WHIPPET_RATE_LIMIT_PER_SEC` | `0` | Optional per-IP request limit; `0` disables. |
+| `WHIPPET_RATE_LIMIT_PER_SEC` | `0` | Optional per-IP ingress limit; `0` disables. Shared by HTTP and TCP, charged per order (a 256-order batch costs 256 tokens). |
+| `WHIPPET_MAX_WS_CONNECTIONS` | `2048` | Concurrent WebSocket subscriber cap. |
 | `WHIPPET_JOURNAL` | `iggy` | `iggy` for the demo, `memory` for tests and brokerless development. |
 | `WHIPPET_MODE` | `durable` | Only `durable` is enabled. `turbo` is rejected at startup with a Phase 2 message. |
 | `WHIPPET_SYMBOLS` | `BTC-USD,ETH-USD,SOL-USD` | Comma-separated subset of the built-in instruments. Unknown symbols are rejected. |
@@ -111,16 +112,78 @@ Rough sizing, not a measurement:
 On macOS, keep Iggy data in a named Docker volume, not a bind mount to the host
 filesystem. Bind-mounted I/O is slow and changes the failure behavior.
 
+These retention values are recorded at topic creation, but in Iggy 0.10 they
+are enforced only by the messages cleaner — and the default stack disables
+it, so nothing trims the log. See
+[Log growth and retention](#log-growth-and-retention) for the exact state.
+
 ## Iggy tuning
 
-The default stack keeps Iggy's 0.10 defaults. We tested a smaller profile
-(`IGGY_MEMORY_POOL_SIZE=1GiB`, four shards, no core pinning,
-`partition_io_capacity=32`, 136 MiB WAL) and it regressed durable-ingress
-latency on a 16 GB Docker Desktop VM, especially after a broker restart. The
-defaults are the measured-better configuration here. `deploy/iggy/iggy.toml`
-contains the alternative as a documented example for a memory-constrained
-3-node VM; do not treat it as a benchmark-tuned profile without measuring it on
-the target host.
+The default stack keeps the memory-pool and sharding defaults, but overrides
+three values (see [Log growth and retention](#log-growth-and-retention)): the
+messages cleaner off, a 1 GiB partition WAL, and a 200 µs WAL group-commit
+delay. We tested a smaller profile (`IGGY_MEMORY_POOL_SIZE=1GiB`, four
+shards, no core pinning, `partition_io_capacity=32`, 136 MiB WAL) and it
+regressed durable-ingress latency on a 16 GB Docker Desktop VM, especially
+after a broker restart. `deploy/iggy/iggy.toml` contains the alternative as a
+documented example for a memory-constrained 3-node VM; do not treat it as a
+benchmark-tuned profile without measuring it on the target host.
+
+## Log growth and retention
+
+The log grows with every accepted order and every execution and MD record
+Whippet appends. The growth is measurable: in the dev-loop soak
+(`scripts/soak.sh`, fresh stack, 5,000 orders/s, batch 10), HTTP ingress p50
+grew from 1.1 ms to 5.0 ms and p99 from 7 ms to ~390 ms over 180 s while the
+log grew, with node RSS up from 119 MiB to 282 MiB. The stage budget shows
+the cost is the Iggy append round trip (`gateway_append` p99 448 ms) with
+matcher CPU unchanged (`engine_process` 4 µs), and a run with the larger WAL
+measured below grew less (p50 1.2 → 3.0 ms, p99 4.7 → 227 ms over 120 s).
+Full numbers and caveats are in [the soak section of
+BENCHMARKS.md](BENCHMARKS.md#soak-constant-rate-proof--dev-loop-measured).
+The durable path is not steady-state at 5,000 orders/s for minutes on Docker
+Desktop; do not quote these as headline results.
+
+Retention state in the default stack:
+
+- Topic creation records a finite per-topic policy (24 h orders, 7 d
+  executions, 1 h MD, 30 d/90 d ops) and a max topic size (8 GiB, 2 GiB ops),
+  with 64 MiB segments (see [Topic creation](#topic-creation)).
+- In Iggy 0.10, that policy is enforced only by the messages cleaner, which
+  deletes the oldest sealed segments per partition, best-effort, once per
+  interval (default 1 m). The active segment is never touched.
+- The default stack disables that cleaner
+  (`IGGY_DATA_MAINTENANCE_MESSAGES_CLEANER_ENABLED=false`), so the policies
+  are recorded but never enforced: nothing trims the log, and it grows until
+  the volume is full. Disabling was measured to remove the cleaner's
+  once-per-minute append-latency spikes; it did not remove the growth with
+  log size.
+
+The demo discipline is `make reset` before a measured run, not a background
+cleanup. A fresh log also removes the cold-start effect: the first run after
+`make reset` measured 6.2 ms p50 / 810 ms p99 against 1.3 ms / 7.3 ms for the
+same workload immediately after (cold 1 GiB WAL allocation and page cache).
+Warm the stack before measuring.
+
+Knobs that matter, and what the default stack does:
+
+| Knob | Active value | Iggy 0.10 default | Why |
+|---|---|---|---|
+| `IGGY_DATA_MAINTENANCE_MESSAGES_CLEANER_ENABLED` | `false` | `true`, interval 1 m | Disabling removed the cleaner's periodic append-latency spikes in the soak. With it off, no retention policy is enforced. |
+| `IGGY_PARTITION_WAL_BYTES_MAX` | `1GiB` | `256 MiB` | Fewer checkpoints and rotations as the log grows; measured with the knob below to grow latency less over a 120 s soak run. |
+| `IGGY_PARTITION_WAL_GROUP_COMMIT_DELAY_MICROS` | `200` | `0` | Amortises WAL device writes: one durability barrier covers a group of prepares instead of one per prepare, for up to this much ack latency. |
+| `IGGY_PARTITION_IO_CAPACITY` | not set | `16` | Active partition file jobs per shard. The alternative profile in `deploy/iggy/iggy.toml` uses 32. |
+| Segment size | 64 MiB per topic, set at creation | 1 GiB | Retention deletes only sealed segments, so segment size bounds the granularity of any future cleanup. |
+
+Risk of enabling expiry enforcement: do not turn the cleaner on, or shorten
+the per-topic expiry, without a retention/replay design. The engine and MD
+consumers keep their committed offsets in Iggy. If retention deletes a
+segment range before a consumer's committed offset, that consumer has a gap
+it cannot reconstruct from the log alone, and `whippet replay --expect-hash`
+no longer sees the full log. This is the same boundary as under
+[Single-node caveats](#single-node-caveats): retention bounds recovery. A
+retention shorter than a consumer's downtime is a data-loss design decision,
+not a tuning tweak.
 
 ## Reset
 
@@ -314,11 +377,11 @@ Restore:
    mismatch aborts that shard with an error; the node does not silently use a
    corrupt file.
 
-To rebuild a shard from scratch, you must remove both the snapshot and the
-stale committed offset, or recreate the topic. Deleting only the snapshot
-while the engine consumer has a later committed offset starts the engine after
-that offset, with no state before it. That is a partial rebuild, not a full
-one. The safe reset is `make reset`.
+To rebuild a shard from scratch, delete the snapshot; the engine starts at
+offset zero and replays the whole log (the committed offset only seeds the
+commit watermark). That is a full replay. If the log has been truncated by
+retention, replay from zero hits a gap and the shard fails closed; the safe
+reset for the demo is `make reset`.
 
 If you want to cold-copy the Iggy volume, stop the whole stack first. Do not
 copy a live volume.

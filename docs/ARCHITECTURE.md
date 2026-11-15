@@ -347,8 +347,10 @@ On startup, for each active shard:
    snapshot.
 3. Set the next input offset to the maximum symbol `last_offset` in the
    snapshot plus one.
-4. If there is no snapshot, read the engine consumer's committed offset and
-   start after it. If there is no committed offset, start at zero.
+4. If there is no snapshot (or the snapshot has no applied commands), start at
+   offset zero and replay the whole log. The broker's committed offset seeds
+   the commit watermark, not the resume point: starting after it with an empty
+   engine would skip every earlier order.
 5. Replay from that offset. The engine applies commands in log order.
 
 The dedup table is snapshotted with the book and the input offset. It is a
@@ -396,8 +398,8 @@ duplicate. See [FAILURE-MODES.md](FAILURE-MODES.md).
 
 - **One process, one broker.** Gateway, engine, MD hub, and API share a
   process. Process isolation is logical, not a network boundary.
-- **HTTP JSON ingress.** No binary TCP, QUIC, or FIX session layer. JSON is a
-  convenience path for the demo and the bench harness.
+- **Two ingress transports.** HTTP/JSON for the dashboard, simulator, and
+  curl; binary TCP for the throughput path. No QUIC or FIX session layer yet.
 - **No pinned cores.** The matcher has a dedicated OS thread, but no core
   pinning, no `SYS_NICE`, no busy-poll, no hugepages, no NUMA work.
 - **`BTreeMap` in the MD cache.** The price ladder lives only in the engine.

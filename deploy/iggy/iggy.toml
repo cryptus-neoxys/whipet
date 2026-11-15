@@ -14,6 +14,22 @@
 #
 # Tested with apache/iggy:0.10.0. The root username and password are supplied
 # by IGGY_ROOT_USERNAME / IGGY_ROOT_PASSWORD at first boot, not stored here.
+#
+# The active default stack (deploy/compose.yaml) currently sets, via
+# environment variables:
+#
+#   IGGY_DATA_MAINTENANCE_MESSAGES_CLEANER_ENABLED=false   (0.10 default: true)
+#   IGGY_PARTITION_WAL_BYTES_MAX=1GiB                      (0.10 default: 256 MiB)
+#   IGGY_PARTITION_WAL_GROUP_COMMIT_DELAY_MICROS=200       (0.10 default: 0)
+#
+# This file is NOT mounted by that stack. If you mount it via
+# IGGY_CONFIG_PATH, reproduce those values (commented blocks below show
+# them) or the node silently runs the 0.10 defaults instead. The values in
+# [sharding] and [partition] here are the alternative, memory-constrained
+# profile from the research dossier -- an example, not the active compose
+# profile and not benchmark-tuned; measure on the target host before use.
+# See docs/OPERATIONS.md, "Log growth and retention", for the measured
+# effects and the retention caveat.
 
 path = "local_data"
 
@@ -55,14 +71,33 @@ size = "1 GiB"
 [sharding]
 # Four shards is the single-node M4 profile from the research dossier. Docker
 # shares cores, so do not pin.
+#
+# The active default stack leaves partition_io_capacity unset (0.10 default:
+# 16 active partition file jobs per shard). The 32 below is part of the
+# alternative example profile only.
 cpu_allocation = 4
 pin_cores = false
 partition_io_capacity = 32
 
+# Matches the active compose stack: the messages cleaner (segment cleaner)
+# is off, so no per-topic retention (message expiry or max_topic_size) is
+# enforced and the log grows until the volume is full. The demo discipline
+# is `make reset` before a measured run. Do not enable this without a
+# retention/replay design; see docs/OPERATIONS.md.
+# [data_maintenance.messages]
+# cleaner_enabled = false
+# interval = "1 m"
+
 [partition]
-# Smaller WAL than the 256 MiB default; use this only after measuring it on the
-# target host. The single-node default stack keeps 256 MiB.
+# The active default stack sets wal_bytes_max = 1 GiB
+# (IGGY_PARTITION_WAL_BYTES_MAX) with a 200 µs WAL group-commit delay;
+# both measured better on the 16 GB Docker Desktop VM (docs/BENCHMARKS.md).
+# The smaller WAL below is the memory-constrained example profile; do not
+# treat it as benchmark-tuned without measuring it on the target host.
 wal_bytes_max = "136 MiB"
+# Group-commit window matching the active compose stack (0.10 default 0,
+# documented maximum 10000).
+# wal_group_commit_delay_micros = 200
 
 [logging]
 file_enabled = false

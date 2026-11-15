@@ -10,6 +10,20 @@ Whippet is pre-1.0; minor releases may change internal APIs.
 
 ### Added
 
+- Separate Iggy connections for ingress and the engine, so a slow output
+  append cannot head-of-line block the gateway.
+- Shared sharded per-IP rate limiter for HTTP and TCP, charged per order;
+  TCP `Hello` is rate limited; WebSocket connection cap
+  (`WHIPPET_MAX_WS_CONNECTIONS`, default 2,048).
+- Snapshot write-time verification for the final snapshot; periodic snapshots
+  fill hashes and are verified on restore.
+- Per-shard stage histograms merged once per second; `EngineProcess` no longer
+  takes a global lock per batch.
+- Fanout harness `--parse envelope|full`, `--ingress-batch`, and a
+  1,000-subscriber sweep.
+- `make soak`, `make crash-test`, and a log-growth/retention operations
+  section.
+
 - Binary TCP ingress on `WHIPPET_TCP_ADDR` (default `0.0.0.0:8081`) with a
   length-prefixed fixed-layout frame, optional token handshake, and the same
   one-append-per-batch semantics as HTTP.
@@ -30,6 +44,8 @@ Whippet is pre-1.0; minor releases may change internal APIs.
 
 ### Changed
 
+- The engine starts at offset zero when there is no snapshot (or the snapshot
+  has no applied commands), instead of after the committed offset.
 - The shard loop joins the executions and MD appends with the next orders poll,
   so matching and the broker round trip overlap instead of running in series.
 - Hot path: cached best bid/ask indices, `FxHashMap` order/dedup maps,
