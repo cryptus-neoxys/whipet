@@ -64,7 +64,12 @@ export function OrderBook({ book }: { book: BookView | null }) {
     <section className="panel book-panel" aria-label={`Order book for ${book.symbol}`}>
       <div className="panel-head">
         <span>
-          {book.symbol} <span className="panel-sub">book</span>
+          {book.symbol} <span className="panel-sub">book</span>{' '}
+          {book.halted ? (
+            <span className="halt-badge" role="status" aria-label={`${book.symbol} is halted`}>
+              halted
+            </span>
+          ) : null}
         </span>
         <span className="panel-meta">
           seq {book.seq} · {book.bids.length + askCount} levels

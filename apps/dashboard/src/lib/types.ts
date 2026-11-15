@@ -32,6 +32,7 @@ export interface BookView {
   last_trade_side: Side | null;
   depth_bid_qty: number;
   depth_ask_qty: number;
+  halted: boolean;
 }
 
 export interface MetricsView {

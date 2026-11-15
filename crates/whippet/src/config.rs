@@ -147,6 +147,12 @@ pub struct NodeArgs {
     /// attribution see distinct identities. Merged with `WHIPPET_API_TOKEN`.
     #[arg(long, env = "WHIPPET_API_TOKENS")]
     pub api_tokens: Option<String>,
+    /// Scoped operator tokens as `token:operator-name` pairs, comma separated.
+    /// Each token authorizes the halt/resume admin endpoints as its own
+    /// operator identity. Separate from `WHIPPET_API_TOKENS`: a trading token
+    /// is never an operator credential.
+    #[arg(long, env = "WHIPPET_OPERATOR_TOKENS")]
+    pub operator_tokens: Option<String>,
     /// Optional bearer token for `GET /metrics`. When set, the endpoint
     /// requires it; health and readiness stay unauthenticated for probes.
     #[arg(long, env = "WHIPPET_METRICS_TOKEN")]
@@ -197,6 +203,9 @@ pub struct NodeConfig {
     pub api_participant: String,
     /// Scoped tokens. Never logged or serialized.
     pub api_tokens: Vec<ApiToken>,
+    /// Scoped operator tokens for the admin endpoints. Never logged or
+    /// serialized.
+    pub operator_tokens: Vec<ApiToken>,
     /// Optional bearer token for `/metrics`.
     pub metrics_token: Option<String>,
     /// 0 disables per-IP ingress limiting.
@@ -234,6 +243,29 @@ impl NodeConfig {
             && matched.is_none()
         {
             matched = Some(self.api_participant.as_str());
+        }
+        matched
+    }
+
+    /// True when any operator token is configured. False means the admin
+    /// endpoints refuse every caller with `operator_not_configured`.
+    pub fn operators_configured(&self) -> bool {
+        !self.operator_tokens.is_empty()
+    }
+
+    /// Map a presented bearer token to its operator name, or `None`.
+    ///
+    /// Same timing contract as [`Self::participant_for`]: a full constant-time
+    /// scan that does not stop at the first match, so response timing does not
+    /// reveal whether a token exists or which entry matched.
+    pub fn operator_for(&self, presented: &str) -> Option<&str> {
+        let presented = presented.as_bytes();
+        let mut matched: Option<&str> = None;
+        for entry in &self.operator_tokens {
+            if crate::auth::constant_time_eq(entry.token.as_bytes(), presented) && matched.is_none()
+            {
+                matched = Some(entry.participant.as_str());
+            }
         }
         matched
     }
@@ -295,20 +327,17 @@ impl NodeConfig {
             .map(parse_api_tokens)
             .transpose()?
             .unwrap_or_default();
+        let operator_tokens = args
+            .operator_tokens
+            .as_deref()
+            .map(parse_operator_tokens)
+            .transpose()?
+            .unwrap_or_default();
         let metrics_token = args.metrics_token.filter(|value| !value.trim().is_empty());
         // A duplicate token would make `participant_for` order-dependent; a
         // duplicate participant is allowed (rotation, two tokens one desk).
-        for (index, entry) in api_tokens.iter().enumerate() {
-            if api_tokens[..index]
-                .iter()
-                .any(|other| other.token == entry.token)
-            {
-                return Err(ConfigError::Invalid(format!(
-                    "duplicate token for participant {} in WHIPPET_API_TOKENS",
-                    entry.participant
-                )));
-            }
-        }
+        reject_duplicate_tokens(&api_tokens, "WHIPPET_API_TOKENS", "participant")?;
+        reject_duplicate_tokens(&operator_tokens, "WHIPPET_OPERATOR_TOKENS", "operator")?;
 
         let exchange = exchange_config(&args.venue, args.partitions, mode, &args.symbols)?;
 
@@ -328,6 +357,7 @@ impl NodeConfig {
             api_token,
             api_participant,
             api_tokens,
+            operator_tokens,
             metrics_token,
             rate_limit_per_sec: args.rate_limit_per_sec,
             ws_per_ip: args.ws_per_ip,
@@ -337,46 +367,75 @@ impl NodeConfig {
     }
 }
 
-/// Parse `token:participant` pairs from `WHIPPET_API_TOKENS`.
+/// Parse `token:name` pairs from one of the scoped-token variables.
 ///
 /// Tokens cannot contain `:`; the first colon separates the pair. Empty pairs
 /// are ignored so a trailing comma is harmless. Both fields are trimmed and
-/// bounded like the legacy token/participant.
-fn parse_api_tokens(raw: &str) -> Result<Vec<ApiToken>, ConfigError> {
+/// bounded like the legacy token/participant. `env` names the variable for the
+/// error text; `role` names the identity the token binds (`participant` for
+/// trading, `operator` for the admin endpoints).
+fn parse_token_pairs(raw: &str, env: &str, role: &str) -> Result<Vec<ApiToken>, ConfigError> {
     let mut tokens = Vec::new();
     for pair in raw.split(',') {
         let pair = pair.trim();
         if pair.is_empty() {
             continue;
         }
-        let Some((token, participant)) = pair.split_once(':') else {
-            return Err(ConfigError::Invalid(
-                "WHIPPET_API_TOKENS entries must be token:participant".into(),
-            ));
+        let Some((token, name)) = pair.split_once(':') else {
+            return Err(ConfigError::Invalid(format!(
+                "{env} entries must be token:{role}"
+            )));
         };
         let token = token.trim();
-        let participant = participant.trim();
+        let name = name.trim();
         if token.is_empty() || token.len() > 256 {
             return Err(ConfigError::Invalid(
                 "an API token must be between 1 and 256 bytes".into(),
             ));
         }
         if token.contains(':') {
-            return Err(ConfigError::Invalid(
-                "API tokens cannot contain ':' (use token:participant)".into(),
-            ));
+            return Err(ConfigError::Invalid(format!(
+                "API tokens cannot contain ':' (use token:{role})"
+            )));
         }
-        if participant.is_empty() || participant.len() > 64 {
-            return Err(ConfigError::Invalid(
-                "a token participant must be between 1 and 64 bytes".into(),
-            ));
+        if name.is_empty() || name.len() > 64 {
+            return Err(ConfigError::Invalid(format!(
+                "a token {role} must be between 1 and 64 bytes"
+            )));
         }
         tokens.push(ApiToken {
             token: token.to_string(),
-            participant: participant.to_string(),
+            participant: name.to_string(),
         });
     }
     Ok(tokens)
+}
+
+fn parse_api_tokens(raw: &str) -> Result<Vec<ApiToken>, ConfigError> {
+    parse_token_pairs(raw, "WHIPPET_API_TOKENS", "participant")
+}
+
+fn parse_operator_tokens(raw: &str) -> Result<Vec<ApiToken>, ConfigError> {
+    parse_token_pairs(raw, "WHIPPET_OPERATOR_TOKENS", "operator")
+}
+
+/// Reject a duplicate token in a scoped-token list.
+///
+/// A duplicate token would make the lookup order-dependent; a duplicate name
+/// is allowed (rotation, two tokens one identity).
+fn reject_duplicate_tokens(tokens: &[ApiToken], env: &str, role: &str) -> Result<(), ConfigError> {
+    for (index, entry) in tokens.iter().enumerate() {
+        if tokens[..index]
+            .iter()
+            .any(|other| other.token == entry.token)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "duplicate token for {role} {} in {env}",
+                entry.participant
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Parse the optional binary TCP listen address. `off`, `none`, and an empty
@@ -549,6 +608,55 @@ mod tests {
     fn malformed_and_duplicate_scoped_tokens_are_rejected() {
         for raw in ["no-colon", "tok:", ":alice", "tok-a:alice,tok-a:bob"] {
             let cli = Cli::parse_from(["test", "--api-tokens", raw]);
+            assert!(
+                NodeConfig::from_args(cli.node).is_err(),
+                "{raw} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn operator_tokens_bind_distinct_operators() {
+        let cli = Cli::parse_from(["test", "--operator-tokens", "op-a:lead, op-b:risk"]);
+        let config = NodeConfig::from_args(cli.node).unwrap();
+        assert!(config.operators_configured());
+        assert_eq!(config.operator_for("op-a"), Some("lead"));
+        assert_eq!(config.operator_for("op-b"), Some("risk"));
+        assert_eq!(config.operator_for("op-c"), None);
+    }
+
+    #[test]
+    fn a_trading_token_is_never_an_operator_token() {
+        let cli = Cli::parse_from([
+            "test",
+            "--api-tokens",
+            "tok-a:alice",
+            "--operator-tokens",
+            "op-a:lead",
+        ]);
+        let config = NodeConfig::from_args(cli.node).unwrap();
+        assert_eq!(config.operator_for("tok-a"), None);
+        assert_eq!(config.participant_for("op-a"), None);
+    }
+
+    #[test]
+    fn without_operator_tokens_the_admin_lookup_is_closed() {
+        let cli = Cli::parse_from(["test", "--api-token", "trader-s3cret"]);
+        let config = NodeConfig::from_args(cli.node).unwrap();
+        assert!(!config.operators_configured());
+        assert_eq!(config.operator_for("trader-s3cret"), None);
+    }
+
+    #[test]
+    fn malformed_and_duplicate_operator_tokens_are_rejected() {
+        for raw in [
+            "no-colon",
+            "op:",
+            ":lead",
+            "op-a:lead,op-a:risk",
+            "op-a:lead,op-b:",
+        ] {
+            let cli = Cli::parse_from(["test", "--operator-tokens", raw]);
             assert!(
                 NodeConfig::from_args(cli.node).is_err(),
                 "{raw} must be rejected"

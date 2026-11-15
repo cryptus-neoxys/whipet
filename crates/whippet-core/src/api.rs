@@ -142,6 +142,33 @@ pub struct CancelAck {
     pub guarantee: String,
 }
 
+/// Operator halt/resume request body. The reason is free text recorded
+/// verbatim in the audit log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminRequest {
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Halt/resume ack.
+///
+/// `offset` is the command's position in the Orders log (durable) or the
+/// matcher's local seq (turbo) — the same offset domain the order acks use.
+/// `audit_offset` is the audit record's offset in the Audit topic.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminAck {
+    pub symbol: Symbol,
+    /// `halt` or `resume`.
+    pub action: String,
+    /// The instrument's state after the command.
+    pub halted: bool,
+    pub partition: u32,
+    pub offset: u64,
+    /// The operator identity the presented token acted as.
+    pub operator: String,
+    pub audit_offset: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LevelView {
     pub price_cents: i64,
@@ -175,6 +202,10 @@ pub struct BookView {
     pub last_trade_side: Option<Side>,
     pub depth_bid_qty: u64,
     pub depth_ask_qty: u64,
+    /// True while the instrument is halted by an operator command. The market
+    /// data hub copies it from the engine's halt state.
+    #[serde(default)]
+    pub halted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,6 +352,14 @@ mod tests {
         let request: BatchOrderRequest = serde_json::from_str(json).unwrap();
         assert_eq!(request.orders.len(), 2);
         assert_eq!(request.orders[0].symbol.as_str(), "BTC-USD");
+    }
+
+    #[test]
+    fn admin_request_defaults_to_no_reason() {
+        let request: AdminRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(request.reason, None);
+        let request: AdminRequest = serde_json::from_str(r#"{"reason":"fat finger"}"#).unwrap();
+        assert_eq!(request.reason.as_deref(), Some("fat finger"));
     }
 
     #[test]

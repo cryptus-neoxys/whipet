@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use whippet_core::config::{ExchangeConfig, InstrumentConfig};
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Seq, Symbol};
 use whippet_core::protocol::{
-    Command, CommandKind, ExecKind, ExecutionReport, FLAG_MAKER, FLAG_RESTED, FLAG_TAKER, MdEvent,
-    MdKind, MdOrder, MdSnapshot, OrderType, RejectReason, Side,
+    Command, CommandKind, ExecKind, ExecutionReport, FLAG_MAKER, FLAG_RESTED, FLAG_TAKER,
+    MD_FLAG_HALTED, MdEvent, MdKind, MdOrder, MdSnapshot, OrderType, RejectReason, Side,
 };
 
 use crate::book::{Book, BookError, BookSnapshot, RestingOrder, hash_book_snapshot};
@@ -252,6 +252,10 @@ impl SymbolEngine {
         self.halted
     }
 
+    /// Set the halt flag without an input command. This bypasses the log, so
+    /// replay and snapshots only stay consistent when it is used before any
+    /// command is logged (bootstrap/admin paths should prefer
+    /// [`Command::halt`]/[`Command::resume`], which are ordered).
     pub fn set_halted(&mut self, halted: bool) {
         self.halted = halted;
     }
@@ -263,6 +267,8 @@ impl SymbolEngine {
         self.commands = self.commands.saturating_add(1);
 
         match command.kind {
+            CommandKind::Halt => self.process_halt(command, out),
+            CommandKind::Resume => self.process_resume(command, out),
             CommandKind::Cancel => self.process_cancel(command, out),
             CommandKind::NewOrder => self.process_new_order(command, out),
         }
@@ -282,6 +288,43 @@ impl SymbolEngine {
                 self.until_md_snapshot = self.md_snapshot_every;
             }
         }
+    }
+
+    /// Halt the instrument.
+    ///
+    /// Halt and resume are log-ordered operator commands, so they take part in
+    /// the same offset/sequence bookkeeping as client traffic: `process` has
+    /// already set `last_offset` and advanced the command clock before this
+    /// runs, which makes the emitted status event point at the halt command's
+    /// own offset. The audit trail is the gateway's record for the command
+    /// itself; the engine emits market data only, no execution report.
+    ///
+    /// Repeating a halt is idempotent on the book and re-emits the status
+    /// event: an operator may need confirmation of the current state, and the
+    /// event is harmless to consumers that already know.
+    fn process_halt(&mut self, command: &Command, out: &mut EngineOutput) {
+        self.halted = true;
+        self.push_status(out, command, MD_FLAG_HALTED);
+    }
+
+    /// Resume a halted instrument. A resume on a running instrument is a no-op
+    /// on the book (it still re-emits the clear status).
+    fn process_resume(&mut self, command: &Command, out: &mut EngineOutput) {
+        self.halted = false;
+        self.push_status(out, command, 0);
+    }
+
+    fn push_status(&mut self, out: &mut EngineOutput, command: &Command, flags: u8) {
+        self.push_md(
+            out,
+            MdKind::Status,
+            Side::Buy,
+            Price::ZERO,
+            Qty::ZERO,
+            OrderId(0),
+            command.participant,
+            flags,
+        );
     }
 
     fn process_cancel(&mut self, command: &Command, out: &mut EngineOutput) {
@@ -332,6 +375,9 @@ impl SymbolEngine {
             self.reject(out, command, RejectReason::UnknownSymbol);
             return;
         }
+        // A halt blocks new risk but not risk withdrawal: cancels are
+        // dispatched above this check so participants can pull resting orders
+        // while the instrument is halted, and resume itself is never blocked.
         if self.halted {
             self.reject(out, command, RejectReason::Halted);
             return;
@@ -737,6 +783,7 @@ impl SymbolEngine {
             bids,
             asks,
             orders,
+            flags: if self.halted { MD_FLAG_HALTED } else { 0 },
         }
     }
 
@@ -1347,6 +1394,180 @@ mod tests {
         let out = process(&mut engine, &cancel, 1);
         assert_eq!(out.executions[0].kind, ExecKind::Cancelled);
         assert_eq!(engine.book().best_bid(), None);
+    }
+
+    #[test]
+    fn halt_rejects_new_orders_and_keeps_the_book() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Buy, 100, 10, 1, 1), 0);
+
+        let halt = Command::halt(symbol(), ParticipantId(9), 5);
+        let out = process(&mut engine, &halt, 1);
+
+        assert!(engine.is_halted());
+        assert!(
+            out.executions.is_empty(),
+            "operator commands emit no execution report"
+        );
+        assert_eq!(out.md.len(), 1);
+        let status = &out.md[0];
+        assert_eq!(status.kind, MdKind::Status);
+        assert_eq!(status.symbol, symbol());
+        assert_eq!(status.flags, MD_FLAG_HALTED);
+        assert_eq!(status.participant, ParticipantId(9));
+        assert_eq!(status.order_id, OrderId(0));
+        assert_eq!(status.side, Side::Buy);
+        assert_eq!(status.price, Price::ZERO);
+        assert_eq!(status.qty, Qty::ZERO);
+        assert_eq!(status.cause_offset, 1, "status points at the halt command");
+        assert_eq!(status.timestamp_ns, 5);
+
+        // The book is untouched by the halt itself.
+        assert_eq!(engine.book().best_bid(), Some(Price(100)));
+        assert_eq!(engine.book().level_qty(Side::Buy, 0), Qty(10));
+
+        let out = process(&mut engine, &limit(Side::Buy, 99, 5, 2, 2), 2);
+        assert_eq!(out.executions.len(), 1);
+        assert_eq!(out.executions[0].kind, ExecKind::Rejected);
+        assert_eq!(out.executions[0].reason, RejectReason::Halted);
+        assert!(out.md.is_empty(), "a rejection emits no market data");
+        assert_eq!(engine.book().level_qty(Side::Buy, 0), Qty(10));
+        assert_eq!(engine.book().best_bid(), Some(Price(100)));
+    }
+
+    #[test]
+    fn repeated_halt_is_idempotent_and_reemits_status() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Sell, 105, 10, 1, 1), 0);
+        process(
+            &mut engine,
+            &Command::halt(symbol(), ParticipantId(9), 2),
+            1,
+        );
+        let bids_before = engine.book().best_bid();
+        let asks_before = engine.book().best_ask();
+        let resting_before = engine.book().level_qty(Side::Sell, 0);
+
+        let out = process(
+            &mut engine,
+            &Command::halt(symbol(), ParticipantId(9), 3),
+            2,
+        );
+        assert!(engine.is_halted());
+        assert!(out.executions.is_empty());
+        assert_eq!(
+            out.md.len(),
+            1,
+            "an operator may need the status confirmed again"
+        );
+        assert_eq!(out.md[0].kind, MdKind::Status);
+        assert_eq!(out.md[0].flags, MD_FLAG_HALTED);
+        assert_eq!(out.md[0].cause_offset, 2);
+
+        assert_eq!(engine.book().best_bid(), bids_before);
+        assert_eq!(engine.book().best_ask(), asks_before);
+        assert_eq!(
+            engine.book().level_qty(Side::Sell, 0),
+            resting_before,
+            "a repeated halt must not change the book"
+        );
+    }
+
+    #[test]
+    fn cancel_is_allowed_while_halted_and_resume_accepts_orders() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Buy, 100, 10, 1, 1), 0);
+        process(
+            &mut engine,
+            &Command::halt(symbol(), ParticipantId(9), 2),
+            1,
+        );
+
+        // Risk withdrawal stays open: participants can pull resting orders.
+        let cancel = Command::cancel(symbol(), OrderId(1), ParticipantId(1), 3);
+        let out = process(&mut engine, &cancel, 2);
+        assert_eq!(out.executions[0].kind, ExecKind::Cancelled);
+        assert_eq!(out.md[0].kind, MdKind::Remove);
+        assert_eq!(engine.book().best_bid(), None);
+        assert!(
+            engine.is_halted(),
+            "a cancel does not resume the instrument"
+        );
+
+        let out = process(
+            &mut engine,
+            &Command::resume(symbol(), ParticipantId(9), 4),
+            3,
+        );
+        assert!(!engine.is_halted());
+        assert!(out.executions.is_empty());
+        assert_eq!(out.md.len(), 1);
+        assert_eq!(out.md[0].kind, MdKind::Status);
+        assert_eq!(out.md[0].flags, 0);
+        assert_eq!(out.md[0].participant, ParticipantId(9));
+        assert_eq!(out.md[0].cause_offset, 3);
+
+        let out = process(&mut engine, &limit(Side::Buy, 100, 4, 2, 2), 4);
+        assert_eq!(out.executions[0].kind, ExecKind::Accepted);
+        assert_eq!(engine.book().best_bid(), Some(Price(100)));
+    }
+
+    #[test]
+    fn halt_survives_snapshot_and_restore() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Sell, 105, 10, 1, 1), 0);
+        process(
+            &mut engine,
+            &Command::halt(symbol(), ParticipantId(9), 2),
+            1,
+        );
+        let hash = engine.state_hash();
+
+        let restored =
+            SymbolEngine::from_snapshot(config(), engine.snapshot_state()).expect("restore");
+        assert!(restored.is_halted(), "the halt flag is part of the state");
+        assert_eq!(restored.state_hash(), hash);
+
+        let mut restored_engine = restored;
+        let out = process(&mut restored_engine, &limit(Side::Buy, 105, 1, 2, 2), 2);
+        assert_eq!(out.executions[0].reason, RejectReason::Halted);
+
+        let out = process(
+            &mut restored_engine,
+            &Command::resume(symbol(), ParticipantId(9), 3),
+            3,
+        );
+        assert!(!restored_engine.is_halted());
+        assert_eq!(out.md.len(), 1);
+        assert_eq!(out.md[0].flags, 0);
+
+        // A rejected id stays in the dedup window, so use a fresh one.
+        let out = process(&mut restored_engine, &limit(Side::Buy, 100, 1, 3, 2), 4);
+        assert_eq!(out.executions[0].kind, ExecKind::Accepted);
+    }
+
+    #[test]
+    fn halt_and_resume_replay_deterministically() {
+        let commands = [
+            (0, limit(Side::Sell, 105, 10, 1, 1)),
+            (1, Command::halt(symbol(), ParticipantId(9), 2)),
+            (2, limit(Side::Buy, 100, 4, 2, 2)),
+            (3, Command::resume(symbol(), ParticipantId(9), 4)),
+            (4, limit(Side::Buy, 104, 8, 3, 3)),
+        ];
+        let mut a = SymbolEngine::new(config());
+        let mut b = SymbolEngine::new(config());
+        for (offset, command) in &commands {
+            let out_a = process(&mut a, command, *offset);
+            let out_b = process(&mut b, command, *offset);
+            assert_eq!(
+                out_a.md.iter().map(|e| e.encode()).collect::<Vec<_>>(),
+                out_b.md.iter().map(|e| e.encode()).collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(a.state_hash(), b.state_hash());
+        assert!(!a.is_halted());
+        assert_eq!(a.book().best_bid(), Some(Price(104)));
     }
 
     #[test]

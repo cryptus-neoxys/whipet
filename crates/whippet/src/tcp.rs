@@ -496,6 +496,16 @@ fn validate_batch(ctx: &NodeContext, commands: &[Command]) -> Result<Symbol, Tcp
                 ));
             }
             CommandKind::NewOrder | CommandKind::Cancel => {}
+            // Operator commands are HTTP-only and require operator
+            // credentials; a TCP Submit must never be able to halt a market.
+            CommandKind::Halt | CommandKind::Resume => {
+                return Err(error_response(
+                    TcpErrorCode::InvalidCommand,
+                    format!(
+                        "command {index}: operator commands are not accepted on the order channel"
+                    ),
+                ));
+            }
         }
     }
     Ok(symbol)
@@ -597,6 +607,7 @@ mod tests {
             api_token: api_token.map(str::to_string),
             api_participant: "api".into(),
             api_tokens: Vec::new(),
+            operator_tokens: Vec::new(),
             metrics_token: None,
             rate_limit_per_sec: per_sec,
             ws_per_ip: 0,

@@ -10,7 +10,7 @@ use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, Extension, Query, Request, State};
+use axum::extract::{ConnectInfo, Extension, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
@@ -25,9 +25,10 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing::warn;
 use whippet_core::api::{
-    ApiError, BatchOrderAck, BatchOrderRequest, BatchOrderRequestRef, CancelAck, CancelRequest,
-    GUARANTEE_DURABLE, GUARANTEE_TURBO, HealthView, MAX_BATCH_ORDERS, OrderAck, OrderRequest,
-    OrderRequestRef, StateView, TradeView, WsClientMessage, WsServerMessage,
+    AdminAck, AdminRequest, ApiError, BatchOrderAck, BatchOrderRequest, BatchOrderRequestRef,
+    CancelAck, CancelRequest, GUARANTEE_DURABLE, GUARANTEE_TURBO, HealthView, MAX_BATCH_ORDERS,
+    OrderAck, OrderRequest, OrderRequestRef, StateView, TradeView, WsClientMessage,
+    WsServerMessage,
 };
 use whippet_core::headers::{HeaderMode, MessageMeta, SCHEMA_ORDER};
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Seq, Symbol};
@@ -76,6 +77,16 @@ pub fn router(ctx: Arc<NodeContext>) -> Router {
         .route("/api/orders", post(submit_order))
         .route("/api/orders/batch", post(submit_orders))
         .route("/api/cancel", post(cancel_order))
+        // Operator endpoints sit inside the ingress router so they inherit the
+        // same per-IP rate-limit middleware as order ingress; no special case.
+        .route(
+            "/api/admin/instruments/{symbol}/halt",
+            post(admin_halt),
+        )
+        .route(
+            "/api/admin/instruments/{symbol}/resume",
+            post(admin_resume),
+        )
         .layer(middleware::from_fn_with_state(limiter, rate_limit));
 
     let api = Router::new()
@@ -967,6 +978,175 @@ async fn cancel_order(
     }))
 }
 
+/// The two operator actions the admin endpoints expose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdminAction {
+    Halt,
+    Resume,
+}
+
+impl AdminAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Halt => "halt",
+            Self::Resume => "resume",
+        }
+    }
+
+    /// The instrument's state after the action.
+    fn halted(self) -> bool {
+        matches!(self, Self::Halt)
+    }
+}
+
+/// `POST /api/admin/instruments/{symbol}/halt`: operator halt.
+async fn admin_halt(
+    State(ctx): State<Arc<NodeContext>>,
+    Path(symbol): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> ApiResult<AdminAck> {
+    admin_control(&ctx, &symbol, AdminAction::Halt, headers, body).await
+}
+
+/// `POST /api/admin/instruments/{symbol}/resume`: operator resume.
+async fn admin_resume(
+    State(ctx): State<Arc<NodeContext>>,
+    Path(symbol): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> ApiResult<AdminAck> {
+    admin_control(&ctx, &symbol, AdminAction::Resume, headers, body).await
+}
+
+/// The operator control plane.
+///
+/// The halt/resume command is appended to the same ordered Orders log as
+/// client traffic — never applied out of band — so a restored engine reaches
+/// the same halt state by replaying the log. One JSON audit record then lands
+/// in the Audit topic on `symbol.partition(4)`. Authorization is operator-only
+/// (`WHIPPET_OPERATOR_TOKENS`); trading tokens are not operator credentials.
+async fn admin_control(
+    ctx: &NodeContext,
+    raw_symbol: &str,
+    action: AdminAction,
+    headers: HeaderMap,
+    body: Body,
+) -> ApiResult<AdminAck> {
+    // 403 first: with no operator credentials configured the node must refuse
+    // every caller before it says anything about tokens it does not have.
+    let operator = authenticate_operator(ctx, &headers)?;
+    let started = Instant::now();
+    let mut stage_at = Instant::now();
+    let symbol = parse_configured_symbol(ctx, raw_symbol)?;
+    let bytes = read_json_body(&headers, body).await?;
+    let request: AdminRequest = serde_json::from_slice(&bytes).map_err(invalid_json)?;
+    ctx.metrics
+        .record_stage_us(Stage::GatewayParse, split_elapsed(&mut stage_at));
+    let timestamp_ns = now_ns();
+    let participant = ParticipantId::derive(operator);
+    let command = match action {
+        AdminAction::Halt => Command::halt(symbol, participant, timestamp_ns),
+        AdminAction::Resume => Command::resume(symbol, participant, timestamp_ns),
+    };
+    let meta = MessageMeta::new(
+        symbol,
+        Seq(0),
+        action.as_str(),
+        SCHEMA_ORDER,
+        command.order_id.0,
+    );
+    let message = JournalMessage::new_named(command.encode(), meta.named_pairs(HeaderMode::Full));
+    ctx.metrics
+        .record_stage_us(Stage::GatewayEncode, split_elapsed(&mut stage_at));
+    let partition = symbol.partition(ctx.exchange().partitions);
+    let offset = if ctx.turbo.is_some() {
+        let receiver = turbo_enqueue(ctx, partition, command, message)?;
+        let ack = turbo_await(receiver).await?;
+        ctx.metrics
+            .record_stage_us(Stage::GatewayAppend, split_elapsed(&mut stage_at));
+        ack.seq
+    } else {
+        let append = ctx
+            .group_commit
+            .append(Topic::Orders, partition, vec![message])
+            .await;
+        ctx.metrics
+            .record_stage_us(Stage::GatewayAppend, split_elapsed(&mut stage_at));
+        append.map_err(journal_unavailable)?.base_offset
+    };
+    let elapsed = started.elapsed();
+    ctx.metrics
+        .record_ingress_latency_us(elapsed.as_micros() as u64);
+
+    let halted = action.halted();
+    let audit = serde_json::json!({
+        "operator": operator,
+        "action": action.as_str(),
+        "symbol": symbol.as_str(),
+        "halted": halted,
+        "reason": request.reason,
+        "order_offset": offset,
+        "timestamp_ns": timestamp_ns,
+        "service": "whippet",
+    });
+    // A serialized `Value` cannot fail, but the conversion stays total without
+    // an `expect` on the request path.
+    let payload = serde_json::to_vec(&audit).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError::new(
+                "audit_unavailable",
+                format!("the command is in the order log but its audit record could not be built: {error}"),
+            )),
+        )
+    })?;
+    // The Audit topic is pinned at four partitions; route by the same symbol
+    // hash so one operator's activity for one symbol is a single ordered log.
+    let audit_partition = symbol.partition(Topic::Audit.partition_count(ctx.exchange()));
+    let audit_meta = MessageMeta::new(symbol, Seq(0), "audit", SCHEMA_ORDER, u128::from(offset));
+    let audit_message =
+        JournalMessage::new_named(payload, audit_meta.named_pairs(HeaderMode::Full));
+    let audit_offset = match ctx
+        .group_commit
+        .append(Topic::Audit, audit_partition, vec![audit_message])
+        .await
+    {
+        Ok(append) => append.base_offset,
+        Err(error) => {
+            // The command may already be applied by the engine; say so.
+            warn!(
+                operator,
+                action = action.as_str(),
+                symbol = %symbol,
+                order_offset = offset,
+                error = %error,
+                "the operator command was appended to the order log but its audit record was not"
+            );
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(
+                    "audit_unavailable",
+                    format!(
+                        "the {} command was appended to the order log at offset {offset} \
+                         and may already be applied, but its audit record could not be written: {error}",
+                        action.as_str()
+                    ),
+                )),
+            ));
+        }
+    };
+    Ok(Json(AdminAck {
+        symbol,
+        action: action.as_str().into(),
+        halted,
+        partition,
+        offset,
+        operator: operator.to_string(),
+        audit_offset,
+    }))
+}
+
 /// `Some(participant)` when the request presented a valid token. `None` means
 /// anonymous ingress, which is only possible when no token is configured.
 fn authenticate<'a>(
@@ -999,6 +1179,59 @@ fn bearer_token(value: &str) -> Option<&str> {
     }
     let token = token.trim();
     (!token.is_empty()).then_some(token)
+}
+
+/// Operator credentials are separate from trading tokens: only a token in
+/// `WHIPPET_OPERATOR_TOKENS` reaches the admin endpoints, and it acts as its
+/// own operator identity, never as a trading participant.
+///
+/// With no operator tokens configured the node refuses every caller with 403
+/// before it looks at the presented credential; otherwise a missing or
+/// invalid token is 401.
+fn authenticate_operator<'a>(
+    ctx: &'a NodeContext,
+    headers: &HeaderMap,
+) -> Result<&'a str, (StatusCode, Json<ApiError>)> {
+    if !ctx.config.operators_configured() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError::new(
+                "operator_not_configured",
+                "no operator tokens are configured; halt/resume is refused",
+            )),
+        ));
+    }
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(bearer_token);
+    match presented.and_then(|token| ctx.config.operator_for(token)) {
+        Some(operator) => Ok(operator),
+        None => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ApiError::new(
+                "unauthorized",
+                "a valid operator Authorization: Bearer token is required",
+            )),
+        )),
+    }
+}
+
+/// Parse a path symbol and confirm it belongs to the configured exchange.
+/// Anything else — malformed or merely unknown — is one `unknown_symbol` 400.
+fn parse_configured_symbol(
+    ctx: &NodeContext,
+    raw: &str,
+) -> Result<Symbol, (StatusCode, Json<ApiError>)> {
+    let symbol = Symbol::new(raw)
+        .map_err(|_| bad_request("unknown_symbol", format!("unknown symbol {raw}")))?;
+    if ctx.exchange().instrument(symbol).is_none() {
+        return Err(bad_request(
+            "unknown_symbol",
+            format!("unknown symbol {raw}"),
+        ));
+    }
+    Ok(symbol)
 }
 
 /// Shared participant check for the HTTP ingress paths. Returns the name
@@ -1944,6 +2177,7 @@ mod tests {
             last_trade_side: None,
             depth_bid_qty: 0,
             depth_ask_qty: 0,
+            halted: false,
         };
         let eth = whippet_core::api::BookView {
             symbol: Symbol::new("ETH-USD").unwrap(),

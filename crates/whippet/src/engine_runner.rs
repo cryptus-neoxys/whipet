@@ -389,7 +389,9 @@ pub async fn run_engine_shard(
     };
 
     // Publish a snapshot immediately so a fresh dashboard has a state even
-    // before the first order arrives.
+    // before the first order arrives. The snapshot carries the venue-status
+    // flags, so the hub learns a restored halt state from the same append
+    // without a separate status record or an MD-sequence bump.
     let mut initial_symbols: Vec<_> = engine.symbols().collect();
     initial_symbols.sort_unstable();
     let initial: Vec<MdSnapshot> = initial_symbols

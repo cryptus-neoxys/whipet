@@ -1223,6 +1223,7 @@ mod tests {
             last_trade_side: None,
             depth_bid_qty: 10,
             depth_ask_qty: 12,
+            halted: false,
         };
         StateView {
             mode: Mode::Durable,

@@ -132,12 +132,19 @@ impl FromStr for OrderType {
     }
 }
 
-/// Input command kinds. Cancel reuses the fixed `Command` layout so the
-/// journal, gateway, and replay tooling have one decoder.
+/// Input command kinds. Cancel, halt and resume reuse the fixed `Command`
+/// layout so the journal, gateway, and replay tooling have one decoder.
+///
+/// `Halt` and `Resume` are operator commands on the same input log as client
+/// traffic. Being ordered commands is what makes them replayable: a restored
+/// engine reaches the same halt state by replaying the log, and the audit
+/// trail is just the record that carried the command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandKind {
     NewOrder = 1,
     Cancel = 2,
+    Halt = 3,
+    Resume = 4,
 }
 
 impl CommandKind {
@@ -145,6 +152,8 @@ impl CommandKind {
         match code {
             1 => Ok(Self::NewOrder),
             2 => Ok(Self::Cancel),
+            3 => Ok(Self::Halt),
+            4 => Ok(Self::Resume),
             other => Err(CoreError::UnknownDiscriminant {
                 kind: "CommandKind",
                 value: other,
@@ -212,6 +221,40 @@ impl Command {
             price: Price::ZERO,
             qty: Qty::ZERO,
             order_id,
+            participant,
+            timestamp_ns,
+            nonce: 0,
+            flags: 0,
+        }
+    }
+
+    /// Operator command: halt the instrument until the next resume.
+    ///
+    /// The unused order fields stay zero (side is `Buy` only because the field
+    /// is fixed-width) so the decoder has one shape for every command kind.
+    pub fn halt(symbol: Symbol, participant: ParticipantId, timestamp_ns: u64) -> Self {
+        Self::control(CommandKind::Halt, symbol, participant, timestamp_ns)
+    }
+
+    /// Operator command: resume a halted instrument.
+    pub fn resume(symbol: Symbol, participant: ParticipantId, timestamp_ns: u64) -> Self {
+        Self::control(CommandKind::Resume, symbol, participant, timestamp_ns)
+    }
+
+    fn control(
+        kind: CommandKind,
+        symbol: Symbol,
+        participant: ParticipantId,
+        timestamp_ns: u64,
+    ) -> Self {
+        Self {
+            kind,
+            symbol,
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            price: Price::ZERO,
+            qty: Qty::ZERO,
+            order_id: OrderId(0),
             participant,
             timestamp_ns,
             nonce: 0,
@@ -507,6 +550,11 @@ impl MdKind {
     }
 }
 
+/// Status-event flag: the instrument is halted. A resume status event carries
+/// `0`. Consumers should treat `MdKind::Status` with this flag set as "reject
+/// new orders until a status event without it".
+pub const MD_FLAG_HALTED: u8 = 1 << 0;
+
 pub const MD_EVENT_ENCODED_LEN: usize = 1 + 1 + 16 + 8 + 8 + 8 + 1 + 1 + 8 + 8 + 16 + 8;
 
 /// A market-data delta. `cause_offset` is the input offset that produced it.
@@ -651,6 +699,9 @@ pub struct MdSnapshot {
     pub bids: Vec<MdLevel>,
     pub asks: Vec<MdLevel>,
     pub orders: Vec<MdOrder>,
+    /// Venue-status bits carried by the snapshot, e.g. [`MD_FLAG_HALTED`].
+    /// Encoded as an optional trailing byte so older snapshots decode as 0.
+    pub flags: u8,
 }
 
 impl MdSnapshot {
@@ -658,7 +709,8 @@ impl MdSnapshot {
         let mut writer = Writer::with_capacity(
             MD_SNAPSHOT_HEADER_LEN
                 + (self.bids.len() + self.asks.len()) * 20
-                + self.orders.len() * 37,
+                + self.orders.len() * 37
+                + 1,
         );
         writer
             .u8(WIRE_VERSION)
@@ -681,6 +733,7 @@ impl MdSnapshot {
         for order in &self.orders {
             order.encode(&mut writer);
         }
+        writer.u8(self.flags);
         writer.finish()
     }
 
@@ -726,6 +779,14 @@ impl MdSnapshot {
         for _ in 0..order_count {
             orders.push(MdOrder::decode(&mut reader)?);
         }
+        // The status byte is optional: snapshots written before the control
+        // plane decode as running (0), and the decoder still rejects any
+        // other trailing bytes.
+        let flags = if reader.remaining() >= 1 {
+            reader.u8()?
+        } else {
+            0
+        };
         reader.finish()?;
         Ok(Self {
             symbol,
@@ -737,6 +798,7 @@ impl MdSnapshot {
             bids,
             asks,
             orders,
+            flags,
         })
     }
 }
@@ -771,6 +833,46 @@ mod tests {
         let command = Command::cancel(symbol(), OrderId(9), ParticipantId(1), 5);
         let bytes = command.encode();
         assert_eq!(Command::decode(&bytes).unwrap(), command);
+    }
+
+    #[test]
+    fn halt_and_resume_round_trip() {
+        let halt = Command::halt(symbol(), ParticipantId(7), 1_700_000_000_000_000_001);
+        assert_eq!(halt.kind, CommandKind::Halt);
+        assert_eq!(halt.side, Side::Buy);
+        assert_eq!(halt.order_type, OrderType::Limit);
+        assert_eq!(halt.price, Price::ZERO);
+        assert_eq!(halt.qty, Qty::ZERO);
+        assert_eq!(halt.order_id, OrderId(0));
+        assert_eq!(halt.participant, ParticipantId(7));
+        assert_eq!(halt.nonce, 0);
+        assert_eq!(halt.flags, 0);
+        let bytes = halt.encode();
+        assert_eq!(bytes.len(), COMMAND_ENCODED_LEN);
+        assert_eq!(Command::decode(&bytes).unwrap(), halt);
+
+        let resume = Command::resume(symbol(), ParticipantId(7), 1_700_000_000_000_000_002);
+        assert_eq!(resume.kind, CommandKind::Resume);
+        assert_eq!(resume.price, Price::ZERO);
+        assert_eq!(resume.qty, Qty::ZERO);
+        assert_eq!(resume.order_id, OrderId(0));
+        let bytes = resume.encode();
+        assert_eq!(bytes.len(), COMMAND_ENCODED_LEN);
+        assert_eq!(Command::decode(&bytes).unwrap(), resume);
+    }
+
+    #[test]
+    fn command_kind_from_code_covers_every_kind() {
+        for kind in [
+            CommandKind::NewOrder,
+            CommandKind::Cancel,
+            CommandKind::Halt,
+            CommandKind::Resume,
+        ] {
+            assert_eq!(CommandKind::from_code(kind as u8).unwrap(), kind);
+        }
+        assert!(CommandKind::from_code(0).is_err());
+        assert!(CommandKind::from_code(5).is_err());
     }
 
     #[test]
@@ -817,6 +919,26 @@ mod tests {
     }
 
     #[test]
+    fn halted_status_event_round_trip() {
+        let event = MdEvent {
+            kind: MdKind::Status,
+            symbol: symbol(),
+            seq: Seq(1),
+            cause_offset: 2,
+            timestamp_ns: 3,
+            side: Side::Buy,
+            flags: MD_FLAG_HALTED,
+            price: Price::ZERO,
+            qty: Qty::ZERO,
+            order_id: OrderId(0),
+            participant: ParticipantId(4),
+        };
+        let bytes = event.encode();
+        assert_eq!(bytes.len(), MD_EVENT_ENCODED_LEN);
+        assert_eq!(MdEvent::decode(&bytes).unwrap(), event);
+    }
+
+    #[test]
     fn snapshot_round_trip() {
         let snapshot = MdSnapshot {
             symbol: symbol(),
@@ -849,9 +971,14 @@ mod tests {
                 qty: Qty(10),
                 participant: ParticipantId(2),
             }],
+            flags: MD_FLAG_HALTED,
         };
         let bytes = snapshot.encode();
         assert_eq!(MdSnapshot::decode(&bytes).unwrap(), snapshot);
+
+        // A snapshot written before the status byte decodes as running.
+        let legacy = &bytes[..bytes.len() - 1];
+        assert_eq!(MdSnapshot::decode(legacy).unwrap().flags, 0);
     }
 
     #[test]

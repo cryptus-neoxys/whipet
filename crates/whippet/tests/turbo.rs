@@ -70,6 +70,7 @@ fn test_node_with(
         api_token: None,
         api_participant: "api".into(),
         api_tokens: Vec::new(),
+        operator_tokens: Vec::new(),
         metrics_token: None,
         rate_limit_per_sec: 0,
         ws_per_ip: 0,

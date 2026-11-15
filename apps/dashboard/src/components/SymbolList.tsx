@@ -28,7 +28,14 @@ export function SymbolList({
               aria-pressed={active}
               onClick={() => onSelect(book.symbol)}
             >
-              <span className="symbol-name">{book.symbol}</span>
+              <span className="symbol-name">
+                {book.symbol}
+                {book.halted ? (
+                  <span className="halt-tag" role="status" aria-label={`${book.symbol} is halted`}>
+                    halted
+                  </span>
+                ) : null}
+              </span>
               <span className="symbol-price">{formatPrice(last, book.symbol)}</span>
               <span className="symbol-meta">
                 <span className={book.last_trade_side === 'sell' ? 'sell' : 'buy'}>

@@ -21,7 +21,7 @@ use tokio::sync::watch;
 use whippet_core::api::{BookView, LevelView, MetricsView, StateView, TradeView};
 use whippet_core::config::{ExchangeConfig, Mode};
 use whippet_core::ids::{OrderId, Price, Seq, Symbol};
-use whippet_core::protocol::{MdEvent, MdKind, MdSnapshot, Side};
+use whippet_core::protocol::{MD_FLAG_HALTED, MdEvent, MdKind, MdSnapshot, Side};
 
 const TRADE_TAPE_LEN: usize = 250;
 const BOOK_DEPTH: usize = 20;
@@ -70,6 +70,10 @@ struct BookState {
     last_trade_qty: u64,
     last_trade_side: Option<Side>,
     seq: Seq,
+    /// Instrument halt state from the latest `MdKind::Status` event. A halt
+    /// carries no book change; this flag is the only thing a status event
+    /// mutates besides `seq`.
+    halted: bool,
     /// Running sum of every bid level, including levels below the visible
     /// depth. Kept in step with the level maps so `view()` never folds them.
     depth_bid_qty: u64,
@@ -89,6 +93,7 @@ impl BookState {
             last_trade_qty: 0,
             last_trade_side: None,
             seq: Seq(0),
+            halted: false,
             depth_bid_qty: 0,
             depth_ask_qty: 0,
         }
@@ -213,7 +218,10 @@ impl BookState {
                 self.last_trade_qty = event.qty.0;
                 self.last_trade_side = Some(event.side);
             }
-            MdKind::Bbo | MdKind::Status | MdKind::Snapshot => {}
+            MdKind::Status => {
+                self.halted = event.flags & MD_FLAG_HALTED != 0;
+            }
+            MdKind::Bbo | MdKind::Snapshot => {}
         }
         true
     }
@@ -225,6 +233,7 @@ impl BookState {
             return false;
         }
         self.seq = snapshot.seq;
+        self.halted = snapshot.flags & MD_FLAG_HALTED != 0;
         self.bids.clear();
         self.asks.clear();
         self.orders.clear();
@@ -329,6 +338,7 @@ impl BookState {
             last_trade_side: self.last_trade_side,
             depth_bid_qty: self.depth_bid_qty,
             depth_ask_qty: self.depth_ask_qty,
+            halted: self.halted,
         }
     }
 }
@@ -1612,6 +1622,7 @@ mod tests {
                 qty: Qty(7),
                 participant: ParticipantId(1),
             }],
+            flags: 0,
         };
         hub.apply_snapshot(&snapshot);
         let mut reduce = event(MdKind::Reduce, Side::Buy, 65_001, 3, 77);
@@ -1634,6 +1645,96 @@ mod tests {
             .find(|book| book.symbol.as_str() == "BTC-USD")
             .unwrap();
         assert!(btc.bids.is_empty());
+    }
+
+    fn status_event(flags: u8, seq: u64) -> MdEvent {
+        MdEvent {
+            kind: MdKind::Status,
+            symbol: Symbol::new("BTC-USD").unwrap(),
+            seq: Seq(seq),
+            cause_offset: 0,
+            timestamp_ns: 1,
+            side: Side::Buy,
+            flags,
+            price: Price::ZERO,
+            qty: Qty::ZERO,
+            order_id: OrderId(0),
+            participant: ParticipantId(1),
+        }
+    }
+
+    fn btc_book(state: &StateView) -> BookView {
+        state
+            .symbols
+            .iter()
+            .find(|book| book.symbol.as_str() == "BTC-USD")
+            .cloned()
+            .expect("BTC-USD book")
+    }
+
+    #[test]
+    fn status_sets_and_clears_the_halt_flag() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        assert!(!btc_book(&hub.state()).halted);
+
+        hub.apply(&status_event(MD_FLAG_HALTED, 1));
+        assert!(btc_book(&hub.state()).halted);
+
+        hub.apply(&status_event(0, 2));
+        assert!(!btc_book(&hub.state()).halted);
+    }
+
+    #[test]
+    fn stale_status_is_ignored() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        hub.apply(&status_event(MD_FLAG_HALTED, 2));
+        assert!(btc_book(&hub.state()).halted);
+
+        // Same seq (a redelivery) and an older seq must not clear the halt.
+        hub.apply(&status_event(0, 2));
+        assert!(btc_book(&hub.state()).halted);
+        hub.apply(&status_event(0, 1));
+        assert!(btc_book(&hub.state()).halted);
+    }
+
+    #[test]
+    fn status_leaves_the_book_and_tape_untouched() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        let mut add = event(MdKind::Add, Side::Sell, 65_100, 10, 1);
+        add.seq = Seq(1);
+        hub.apply(&add);
+        let mut trade = event(MdKind::Trade, Side::Buy, 65_100, 4, 2);
+        trade.seq = Seq(2);
+        hub.apply(&trade);
+        let before = btc_book(&hub.state());
+
+        hub.apply(&status_event(MD_FLAG_HALTED, 3));
+        let after = btc_book(&hub.state());
+
+        assert!(after.halted);
+        let levels = |levels: &[LevelView]| {
+            levels
+                .iter()
+                .map(|level| (level.price_cents, level.qty, level.orders))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(levels(&after.bids), levels(&before.bids));
+        assert_eq!(levels(&after.asks), levels(&before.asks));
+        assert_eq!(after.best_bid_cents, before.best_bid_cents);
+        assert_eq!(after.best_ask_cents, before.best_ask_cents);
+        assert_eq!(after.last_trade_price_cents, before.last_trade_price_cents);
+        assert_eq!(after.last_trade_qty, before.last_trade_qty);
+        assert_eq!(after.last_trade_side, before.last_trade_side);
+        assert_eq!(after.depth_bid_qty, before.depth_bid_qty);
+        assert_eq!(after.depth_ask_qty, before.depth_ask_qty);
+        // The status is a real applied event: it advances the per-symbol seq
+        // and the hub sequence, but it is not a trade.
+        assert_eq!(after.seq, Seq(3));
+        let state = hub.state();
+        assert_eq!(state.sequence, 3);
+        assert_eq!(state.trades.len(), 1);
+        assert_eq!(state.metrics.md_events, 3);
+        assert_eq!(state.metrics.trades, 1);
     }
 
     #[test]
@@ -1675,6 +1776,7 @@ mod tests {
                 qty: Qty(1),
                 participant: ParticipantId(1),
             }],
+            flags: 0,
         };
         hub.apply_snapshot(&make(5, 65_005));
         hub.apply_snapshot(&make(3, 65_003));
@@ -1712,6 +1814,7 @@ mod tests {
                 qty: Qty(7),
                 participant: ParticipantId(1),
             }],
+            flags: 0,
         };
         hub.apply_snapshot(&snapshot);
         let state = hub.state();
@@ -1928,6 +2031,7 @@ mod tests {
             bids: vec![],
             asks: vec![],
             orders,
+            flags: 0,
         };
         hub.apply_snapshot(&snapshot);
         hub.publish();
@@ -2191,6 +2295,7 @@ mod tests {
             bids: vec![],
             asks: vec![],
             orders,
+            flags: 0,
         });
         assert_eq!(book.depth_bid_qty, total_depth(&book.bids));
         assert_eq!(book.depth_ask_qty, total_depth(&book.asks));
