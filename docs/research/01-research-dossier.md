@@ -2,7 +2,7 @@
 
 Date: 2026-11-14
 Status: research complete; architecture proposed; three decisions pending (UI stack, default mode, cluster-in-v1)
-Repo: `~/Documents/repos/github.com/cryptus-neoxys/whippet`
+Repo: `~/Documents/repos/github.com/cryptus-neoxys/whipet`
 
 ---
 

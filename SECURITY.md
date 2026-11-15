@@ -21,7 +21,7 @@ release. The Iggy server and SDK are pinned separately; see
 
 Use GitHub's private vulnerability reporting for this repository:
 
-<https://github.com/cryptus-neoxys/whippet/security/advisories/new>
+<https://github.com/cryptus-neoxys/whipet/security/advisories/new>
 
 If private reporting is unavailable, open a minimal public issue asking for a
 private channel. Do not include exploit details, credentials, customer data, or
