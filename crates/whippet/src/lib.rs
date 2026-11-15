@@ -12,5 +12,6 @@ pub mod node;
 pub mod ratelimit;
 pub mod sim_runner;
 pub mod snapshot;
+pub mod storage;
 pub mod tcp;
 pub mod turbo;

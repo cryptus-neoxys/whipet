@@ -62,6 +62,11 @@ impl TestNode {
             rate_limit_per_sec: 0,
             ws_per_ip: 0,
             turbo: whippet::turbo::TurboConfig::default(),
+            storage: whippet::storage::StorageConfig {
+                whippet_dir: tempdir.path().join("data"),
+                iggy_dir: None,
+                ..whippet::storage::StorageConfig::default()
+            },
         };
         let journal = Arc::new(Journal::memory());
         // The test pool is one shared memory journal: every entry is the same
@@ -85,6 +90,7 @@ impl TestNode {
         let (shutdown, _) = watch::channel(false);
         let rate_limiter = Arc::new(whippet::ratelimit::RateLimiter::new(0));
         let ws_connections = Arc::new(tokio::sync::Semaphore::new(512));
+        let storage = whippet::storage::StorageMonitor::new(config.storage.clone());
         let ctx = Arc::new(NodeContext {
             config,
             journal: Arc::clone(&journal),
@@ -93,6 +99,7 @@ impl TestNode {
             group_commit,
             hub,
             metrics,
+            storage,
             snapshots: SnapshotStore::new(snapshot_dir),
             started: Instant::now(),
             shutdown,

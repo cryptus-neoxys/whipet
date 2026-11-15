@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 COMPOSE := docker compose -f deploy/compose.yaml
 
-.PHONY: help secrets up down demo bench bench-smoke bench-sweep bench-tcp bench-fanout soak crash-test verify verify-strict verify-dev replay replay-strict replay-dev doctor reset logs build dashboard ci obs chaos ha ps
+.PHONY: help secrets up down demo bench bench-smoke bench-sweep bench-tcp bench-fanout bench-matcher soak crash-test crash-matrix verify verify-strict verify-dev replay replay-strict replay-dev doctor reset logs build dashboard ci obs chaos ha ps
 
 help:
 	@printf '%s\n' \
@@ -13,8 +13,10 @@ help:
 		'make bench-sweep batch-size sweep (1/10/100/256)' \
 		'make bench-tcp   binary TCP sweep (1k/5k/10k)' \
 		'make bench-fanout WebSocket fanout (1/10/100 subscribers)' \
+		'make bench-matcher criterion benches for the matcher, journal, and MD hub' \
 		'make soak         10-minute steady-state soak' \
-		'make crash-test   kill/restart/replay proof' \
+		'make crash-test   kill/restart/replay proof (Docker stack)' \
+		'make crash-matrix Rust failure-injection tests (append-before-commit, writer failure)' \
 		'make verify      healthcheck, crossing pair, snapshot hash check (lenient dev path; WHIPPET_PARTITIONS overrides 16)' \
 		'make verify-strict fail-closed verify: exit non-zero when no snapshot exists (WHIPPET_PARTITIONS)' \
 		'make verify-dev  alias for the lenient verify path' \
@@ -69,6 +71,16 @@ soak:
 
 crash-test:
 	@scripts/crash-test.sh
+
+# Deterministic failure-injection tests: no Docker required.
+crash-matrix:
+	cargo test -p whippet --test crash_idempotency --test shard_failures
+
+# Criterion microbenchmarks. Developer tools, not CI gates.
+bench-matcher:
+	cargo bench -p whippet-engine --bench engine
+	cargo bench -p whippet-journal --bench append
+	cargo bench -p whippet-marketdata --bench md
 
 # `verify` stays lenient so a fresh stack can be inspected before the first
 # snapshot is written; it prints "no snapshots; nothing verified". Use

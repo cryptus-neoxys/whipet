@@ -94,6 +94,9 @@ pub enum TcpErrorCode {
     /// Turbo admission rejected the command because the bounded uncommitted
     /// window is full. Retry shortly; nothing was journaled.
     WindowFull = 9,
+    /// A monitored volume is at the critical threshold; ingress is refused
+    /// until space is reclaimed. Nothing was journaled.
+    StoragePressure = 10,
 }
 
 impl TcpErrorCode {

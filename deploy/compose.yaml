@@ -154,6 +154,13 @@ services:
       WHIPPET_IGGY_USER: ${IGGY_ROOT_USERNAME:-whippet}
       WHIPPET_IGGY_PASSWORD_FILE: /run/secrets/iggy_root_password
       WHIPPET_SNAPSHOT_DIR: /data/snapshots
+      # The bounded-storage guard samples free space on both data volumes. The
+      # node's snapshot volume is read/write; Iggy's is mounted read-only, so
+      # the monitor can only measure it and can never delete log data.
+      WHIPPET_DATA_DIR: /data
+      WHIPPET_IGGY_DATA_DIR: /iggy-data
+      WHIPPET_DISK_WARN_PCT: ${WHIPPET_DISK_WARN_PCT:-70}
+      WHIPPET_DISK_CRIT_PCT: ${WHIPPET_DISK_CRIT_PCT:-85}
       # Snapshot often enough that `make verify` and `make replay` exercise the
       # snapshot path during a short demo.
       WHIPPET_SNAPSHOT_EVERY: ${WHIPPET_SNAPSHOT_EVERY:-1000}
@@ -168,6 +175,8 @@ services:
       - iggy_root_password
     volumes:
       - whippet-data:/data
+      # Read-only: the node measures Iggy's volume, it never writes or trims it.
+      - iggy-data:/iggy-data:ro
     ports:
       - "8080:8080"
       - "8081:8081"

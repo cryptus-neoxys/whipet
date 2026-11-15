@@ -10,7 +10,7 @@
 //! states and asserts that precondition instead of assuming it.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
@@ -74,6 +74,11 @@ fn test_node_with(
         rate_limit_per_sec: 0,
         ws_per_ip: 0,
         turbo: TurboConfig::default(),
+        storage: whippet::storage::StorageConfig {
+            whippet_dir: tempdir.path().join("data"),
+            iggy_dir: None,
+            ..whippet::storage::StorageConfig::default()
+        },
     };
     let journal = Arc::new(Journal::memory());
     let engine_journals = vec![Arc::clone(&journal)];
@@ -94,6 +99,7 @@ fn test_node_with(
     let (shutdown, _) = watch::channel(false);
     let rate_limiter = Arc::new(whippet::ratelimit::RateLimiter::new(0));
     let ws_connections = Arc::new(tokio::sync::Semaphore::new(512));
+    let storage = whippet::storage::StorageMonitor::new(config.storage.clone());
     let ctx = Arc::new(NodeContext {
         config,
         journal: Arc::clone(&journal),
@@ -102,6 +108,7 @@ fn test_node_with(
         group_commit,
         hub,
         metrics,
+        storage,
         snapshots: SnapshotStore::new(tempdir.path().join("snapshots")),
         started: Instant::now(),
         shutdown,
@@ -168,6 +175,9 @@ fn spawn_matcher(
     // `u64::MAX` is the writer's "nothing durable yet" sentinel, so no periodic
     // snapshot can open during the test; the final batch is what we inspect.
     let appended = Arc::new(AtomicU64::new(u64::MAX));
+    // Ring-occupancy counters this test does not observe.
+    let input_queued = Arc::new(AtomicU32::new(0));
+    let output_queued = Arc::new(AtomicU32::new(0));
     std::thread::Builder::new()
         .name("turbo-test-matcher".into())
         .spawn(move || {
@@ -184,6 +194,8 @@ fn spawn_matcher(
                 // Turbo local seq starts at 0 too, which is the precondition the
                 // differential test asserts before comparing hashes.
                 0,
+                input_queued,
+                output_queued,
             )
         })
         .expect("spawn the matcher")

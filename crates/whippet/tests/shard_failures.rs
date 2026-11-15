@@ -9,7 +9,7 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -314,6 +314,7 @@ async fn output_append_retries_then_commits_without_a_gap() {
         snapshot_tx,
         snapshot_writer,
         Arc::clone(&appended),
+        Arc::new(AtomicU32::new(0)),
     )
     .await
     .expect("the second append attempt succeeds");
@@ -377,6 +378,7 @@ async fn output_append_failure_forever_stops_without_committing() {
         snapshot_tx,
         snapshot_writer,
         Arc::clone(&appended),
+        Arc::new(AtomicU32::new(0)),
     )
     .await
     .expect_err("a permanently failing append must stop the shard");
@@ -451,7 +453,17 @@ async fn full_rings_block_producers_instead_of_growing() {
         .name("ring-test-matcher".to_string())
         .spawn(move || {
             run_matcher(
-                ctx, 0, engine, input_rx, output_tx, recycle_tx, appended, 0, 0,
+                ctx,
+                0,
+                engine,
+                input_rx,
+                output_tx,
+                recycle_tx,
+                appended,
+                0,
+                0,
+                Arc::new(AtomicU32::new(0)),
+                Arc::new(AtomicU32::new(0)),
             )
         })
         .expect("spawn the matcher");
@@ -540,6 +552,7 @@ async fn reader_gap_or_overlap_fails_the_shard_and_stops_polling() {
                 sender,
                 recycle_rx,
                 shutdown_rx,
+                Arc::new(AtomicU32::new(0)),
             ),
         )
         .await
@@ -608,6 +621,7 @@ async fn a_durable_order_record_releases_the_turbo_window_slot() {
                 snapshot_tx,
                 snapshot_writer,
                 appended,
+                Arc::new(AtomicU32::new(0)),
             )
             .await
         })
@@ -691,6 +705,7 @@ async fn a_failed_order_append_stops_the_shard_without_committing() {
         snapshot_tx,
         snapshot_writer,
         Arc::clone(&appended),
+        Arc::new(AtomicU32::new(0)),
     )
     .await
     .expect_err("a permanently failing write-behind must stop the shard");

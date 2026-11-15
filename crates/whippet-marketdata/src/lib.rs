@@ -12,7 +12,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,17 @@ const PUBLISH_INTERVAL: Duration = Duration::from_millis(50);
 /// never suppresses a scheduled 20 Hz tick. A dirty hub always publishes
 /// immediately; only back-to-back publishes with no new events are skipped.
 const PUBLISH_COALESCE_WINDOW: Duration = Duration::from_millis(45);
+
+/// Rolling window, in seconds, behind [`Metrics::window_summary`]. Long
+/// enough to smooth a scrape's worth of samples, short enough that a soak
+/// sees a degradation minutes after it starts instead of a process-lifetime
+/// average that never recovers.
+pub const LATENCY_WINDOW_SECS: u64 = 10;
+
+/// Per-shard metric slots for consumer lag and ring occupancy. A shard
+/// number at or above this folds into the last slot, so an unexpected shard
+/// count still surfaces lag instead of dropping it silently.
+const METRIC_SHARD_SLOTS: usize = 256;
 
 #[derive(Debug, Clone, Copy)]
 struct OrderRef {
@@ -428,6 +439,73 @@ pub struct LatencySummary {
     pub samples: u64,
 }
 
+/// Latency percentiles over the rolling window, in microseconds.
+///
+/// Companion to the process-lifetime percentiles in [`MetricsView`]: a soak
+/// scrapes this to see the current tail instead of a lifetime average that
+/// never recovers. `secs` is the nominal window length.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WindowSummary {
+    pub ingress_p50_us: f64,
+    pub ingress_p99_us: f64,
+    pub match_p50_us: f64,
+    pub match_p99_us: f64,
+    /// Nominal window length in seconds, i.e. [`LATENCY_WINDOW_SECS`] unless
+    /// the [`Metrics`] was built with [`Metrics::with_window_secs`].
+    pub secs: u64,
+}
+
+/// Lifetime and rolling-window latency histograms behind one mutex.
+///
+/// One lock holds all four histograms plus the window clock, so recording a
+/// sample costs exactly one lock acquisition for both the lifetime and the
+/// windowed percentile. Shard merges take the same lock and stay off the
+/// per-command path.
+struct LatencyState {
+    ingress: Histogram<u64>,
+    match_latency: Histogram<u64>,
+    /// Nominal window length in seconds. [`Metrics::with_window_secs`]
+    /// shortens it for tests; `0` rotates on every sample.
+    window_secs: u64,
+    window_started: Instant,
+    window_ingress: Histogram<u64>,
+    window_match: Histogram<u64>,
+}
+
+impl LatencyState {
+    /// Open a fresh window once the current one has run its nominal length.
+    ///
+    /// Called on every record and merge path: the first sample after the
+    /// window expires opens the next window, so a window spans one interval
+    /// plus at most the gap to its first sample. Read paths do not rotate;
+    /// see [`Metrics::window_summary`] for why.
+    fn rotate_if_due(&mut self, now: Instant) {
+        if now.duration_since(self.window_started).as_secs() >= self.window_secs {
+            self.window_ingress.clear();
+            self.window_match.clear();
+            self.window_started = now;
+        }
+    }
+
+    /// Window percentiles, or zeroes once the window has expired.
+    ///
+    /// An expired window is reported as empty and left for the next record to
+    /// rotate: a scrape that lands just past the boundary must not discard a
+    /// populated window it is about to read, and an idle node honestly has no
+    /// current latency to report.
+    fn window_percentiles(&self, now: Instant) -> (f64, f64, f64, f64) {
+        if now.duration_since(self.window_started).as_secs() >= self.window_secs {
+            return (0.0, 0.0, 0.0, 0.0);
+        }
+        (
+            percentile_of(&self.window_ingress, 50.0),
+            percentile_of(&self.window_ingress, 99.0),
+            percentile_of(&self.window_match, 50.0),
+            percentile_of(&self.window_match, 99.0),
+        )
+    }
+}
+
 /// Shared metrics. Counters are atomics; percentiles come from HDR histograms
 /// at the edge, never from the match loop.
 pub struct Metrics {
@@ -439,10 +517,22 @@ pub struct Metrics {
     md_events: AtomicU64,
     engine_commands: AtomicU64,
     consumer_lag: AtomicU64,
+    /// Consumer lag per shard slot (see [`METRIC_SHARD_SLOTS`]). Zero entries
+    /// are omitted from [`Metrics::consumer_lag_by_shard`] to keep the metric
+    /// cardinality bounded.
+    consumer_lag_by_shard: [AtomicU64; METRIC_SHARD_SLOTS],
     iggy_connected: AtomicBool,
     partition_count: AtomicU64,
-    ingress: Mutex<Histogram<u64>>,
-    match_latency: Mutex<Histogram<u64>>,
+    /// Lifetime and rolling-window latency histograms behind one mutex, so a
+    /// sample costs one lock acquisition and the lifetime and windowed
+    /// percentiles can never disagree about ordering.
+    latency: Mutex<LatencyState>,
+    /// Input/output ring occupancy per shard slot, with the capacity the
+    /// reporter last saw. Zero entries are omitted from
+    /// [`Metrics::ring_depths`].
+    ring_input_depth: [AtomicU32; METRIC_SHARD_SLOTS],
+    ring_output_depth: [AtomicU32; METRIC_SHARD_SLOTS],
+    ring_capacity: [AtomicU32; METRIC_SHARD_SLOTS],
     /// Gateway receive -> turbo match ack. Empty in durable mode.
     turbo_ack: Mutex<Histogram<u64>>,
     /// One histogram per [`Stage`]. Indexed by `Stage::index`.
@@ -460,6 +550,13 @@ struct RateState {
 
 impl Metrics {
     pub fn new(mode: Mode, partitions: u32) -> Self {
+        Self::with_window_secs(mode, partitions, LATENCY_WINDOW_SECS)
+    }
+
+    /// Like [`Metrics::new`], with a shortened latency window so tests can
+    /// exercise rotation without sleeping. `0` rotates on every sample, which
+    /// leaves each window holding only its most recent sample.
+    pub fn with_window_secs(mode: Mode, partitions: u32, window_secs: u64) -> Self {
         Self {
             orders_ingressed: AtomicU64::new(0),
             orders_matched: AtomicU64::new(0),
@@ -469,10 +566,20 @@ impl Metrics {
             md_events: AtomicU64::new(0),
             engine_commands: AtomicU64::new(0),
             consumer_lag: AtomicU64::new(0),
+            consumer_lag_by_shard: std::array::from_fn(|_| AtomicU64::new(0)),
+            ring_input_depth: std::array::from_fn(|_| AtomicU32::new(0)),
+            ring_output_depth: std::array::from_fn(|_| AtomicU32::new(0)),
+            ring_capacity: std::array::from_fn(|_| AtomicU32::new(0)),
             iggy_connected: AtomicBool::new(false),
             partition_count: AtomicU64::new(u64::from(partitions)),
-            ingress: Mutex::new(new_histogram()),
-            match_latency: Mutex::new(new_histogram()),
+            latency: Mutex::new(LatencyState {
+                ingress: new_histogram(),
+                match_latency: new_histogram(),
+                window_secs,
+                window_started: Instant::now(),
+                window_ingress: new_histogram(),
+                window_match: new_histogram(),
+            }),
             turbo_ack: Mutex::new(new_histogram()),
             stages: std::array::from_fn(|_| Mutex::new(new_histogram())),
             rate: Mutex::new(RateState {
@@ -502,16 +609,87 @@ impl Metrics {
         self.consumer_lag.store(lag, Ordering::Relaxed);
     }
 
+    /// Consumer lag of one shard, in records.
+    ///
+    /// The node's lag sweep sets both this and the aggregate
+    /// [`Metrics::set_consumer_lag`]: the aggregate is what an alert sums,
+    /// the per-shard list is what says which partition determines recovery
+    /// time. A shard number at or above [`METRIC_SHARD_SLOTS`] folds into the
+    /// last slot so its lag stays visible.
+    pub fn set_consumer_lag_for_shard(&self, shard: u32, lag: u64) {
+        self.consumer_lag_by_shard[shard_slot(shard)].store(lag, Ordering::Relaxed);
+    }
+
+    /// Nonzero per-shard consumer lag as `(shard, lag)`, sorted by shard.
+    ///
+    /// Zero entries are omitted, so an idle cluster exports nothing and the
+    /// metric cardinality stays bounded by the configured shard count.
+    pub fn consumer_lag_by_shard(&self) -> Vec<(u32, u64)> {
+        self.consumer_lag_by_shard
+            .iter()
+            .enumerate()
+            .map(|(slot, lag)| (slot as u32, lag.load(Ordering::Relaxed)))
+            .filter(|&(_, lag)| lag != 0)
+            .collect()
+    }
+
+    /// Input/output ring occupancy of one shard, in batches, plus the ring
+    /// capacity the caller reports.
+    ///
+    /// Called by the matcher thread about once per second, never from the
+    /// send/recv path: the queued counts are `Relaxed` atomics the producers
+    /// and consumers already maintain.
+    pub fn set_ring_depths(&self, shard: u32, input: u32, output: u32, capacity: u32) {
+        let slot = shard_slot(shard);
+        self.ring_input_depth[slot].store(input, Ordering::Relaxed);
+        self.ring_output_depth[slot].store(output, Ordering::Relaxed);
+        self.ring_capacity[slot].store(capacity, Ordering::Relaxed);
+    }
+
+    /// Nonzero ring occupancy as `(shard, input, output, capacity)`, sorted by
+    /// shard. A shard is listed when any of the three values is nonzero, so a
+    /// ring with a set capacity but no queued batches still exports its
+    /// occupancy as zero.
+    pub fn ring_depths(&self) -> Vec<(u32, u32, u32, u32)> {
+        self.ring_input_depth
+            .iter()
+            .zip(&self.ring_output_depth)
+            .zip(&self.ring_capacity)
+            .enumerate()
+            .map(|(slot, ((input, output), capacity))| {
+                (
+                    slot as u32,
+                    input.load(Ordering::Relaxed),
+                    output.load(Ordering::Relaxed),
+                    capacity.load(Ordering::Relaxed),
+                )
+            })
+            .filter(|&(_, input, output, capacity)| input != 0 || output != 0 || capacity != 0)
+            .collect()
+    }
+
     pub fn record_ingress(&self) {
         self.orders_ingressed.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One lock acquisition for the lifetime and windowed ingress percentiles.
     pub fn record_ingress_latency_us(&self, micros: u64) {
-        record(&self.ingress, micros);
+        let value = micros.min(STAGE_US_MAX);
+        if let Ok(mut state) = self.latency.lock() {
+            state.rotate_if_due(Instant::now());
+            let _ = state.ingress.record(value);
+            let _ = state.window_ingress.record(value);
+        }
     }
 
+    /// One lock acquisition for the lifetime and windowed match percentiles.
     pub fn record_match_latency_us(&self, micros: u64) {
-        record(&self.match_latency, micros);
+        let value = micros.min(STAGE_US_MAX);
+        if let Ok(mut state) = self.latency.lock() {
+            state.rotate_if_due(Instant::now());
+            let _ = state.match_latency.record(value);
+            let _ = state.window_match.record(value);
+        }
     }
 
     /// Turbo acknowledgement latency: gateway receive to match-complete ack.
@@ -606,12 +784,26 @@ impl Metrics {
         }
     }
 
-    /// Drain a shard's match-latency histogram into the global one and clear
-    /// the source. Both histograms are built by [`new_histogram`], so
-    /// [`Histogram::add`] cannot fail; the value-by-value replay is a
-    /// lossless fallback for a config mismatch that cannot happen today.
+    /// Drain a shard's match-latency histogram into the global lifetime and
+    /// windowed match histograms and clear the source. Both targets are
+    /// built by [`new_histogram`], so [`Histogram::add`] cannot fail; the
+    /// value-by-value replay is a lossless fallback for a config mismatch
+    /// that cannot happen today. The window takes the merged samples too:
+    /// the hot path records match latency in `ShardMetrics`, so a merge is
+    /// the only way windowed match percentiles ever get samples.
     pub(crate) fn merge_match_latency(&self, source: &mut Histogram<u64>) {
-        merge_histogram(&self.match_latency, source);
+        if source.is_empty() {
+            return;
+        }
+        // A poisoned lock leaves `source` unmerged and uncleaned, so the next
+        // merge retries instead of dropping the samples.
+        let Ok(mut state) = self.latency.lock() else {
+            return;
+        };
+        state.rotate_if_due(Instant::now());
+        add_or_replay(&mut state.match_latency, source);
+        add_or_replay(&mut state.window_match, source);
+        source.clear();
     }
 
     /// Drain a shard's per-stage histogram into the global one for `stage`
@@ -624,9 +816,9 @@ impl Metrics {
 
     #[cfg(test)]
     fn match_latency_sample_count(&self) -> u64 {
-        self.match_latency
+        self.latency
             .lock()
-            .map(|histogram| histogram.len())
+            .map(|state| state.match_latency.len())
             .unwrap_or(0)
     }
 
@@ -636,6 +828,41 @@ impl Metrics {
             .lock()
             .map(|histogram| histogram.len())
             .unwrap_or(0)
+    }
+
+    /// Test hook: rotate the latency window immediately instead of waiting
+    /// for it to elapse, so rotation tests do not sleep.
+    #[cfg(test)]
+    fn rotate_window_now(&self) {
+        let Ok(mut state) = self.latency.lock() else {
+            return;
+        };
+        state.window_ingress.clear();
+        state.window_match.clear();
+        state.window_started = Instant::now();
+    }
+
+    /// Percentiles over the rolling latency window, plus the nominal window
+    /// length in seconds.
+    ///
+    /// A window that has expired without new samples reports zeroes: an idle
+    /// node has no current latency, and replaying its last window as current
+    /// would not be honest. The read path does not rotate; the first record
+    /// after expiry opens the next window, so a scrape landing just past the
+    /// boundary never discards a populated window it is about to read.
+    pub fn window_summary(&self) -> WindowSummary {
+        let Ok(state) = self.latency.lock() else {
+            return WindowSummary::default();
+        };
+        let (ingress_p50_us, ingress_p99_us, match_p50_us, match_p99_us) =
+            state.window_percentiles(Instant::now());
+        WindowSummary {
+            ingress_p50_us,
+            ingress_p99_us,
+            match_p50_us,
+            match_p99_us,
+            secs: state.window_secs,
+        }
     }
 
     pub fn snapshot(&self) -> MetricsView {
@@ -652,6 +879,22 @@ impl Metrics {
             }
             state.rate
         };
+        // One lock acquisition for all four lifetime percentiles. A poisoned
+        // lock reports zeroes, exactly as the previous per-histogram reads did.
+        let (ingress_p50_us, ingress_p99_us, match_p50_us, match_p99_us) = match self.latency.lock()
+        {
+            Ok(state) => (
+                percentile_of(&state.ingress, 50.0),
+                percentile_of(&state.ingress, 99.0),
+                percentile_of(&state.match_latency, 50.0),
+                percentile_of(&state.match_latency, 99.0),
+            ),
+            Err(_) => (0.0, 0.0, 0.0, 0.0),
+        };
+        // The window read is its own lock acquisition after the lifetime
+        // one. It rotate-expires exactly like `window_summary`, so both
+        // expositions agree: an idle node reports zeroes, not stale tails.
+        let window = self.window_summary();
         MetricsView {
             mode: self.mode,
             orders_ingressed: orders,
@@ -662,10 +905,15 @@ impl Metrics {
             md_events: self.md_events.load(Ordering::Relaxed),
             engine_commands: self.engine_commands.load(Ordering::Relaxed),
             consumer_lag: self.consumer_lag.load(Ordering::Relaxed),
-            ingress_p50_us: percentile(&self.ingress, 50.0),
-            ingress_p99_us: percentile(&self.ingress, 99.0),
-            match_p50_us: percentile(&self.match_latency, 50.0),
-            match_p99_us: percentile(&self.match_latency, 99.0),
+            ingress_p50_us,
+            ingress_p99_us,
+            match_p50_us,
+            match_p99_us,
+            ingress_window_p50_us: window.ingress_p50_us,
+            ingress_window_p99_us: window.ingress_p99_us,
+            match_window_p50_us: window.match_p50_us,
+            match_window_p99_us: window.match_p99_us,
+            window_secs: window.secs,
             throughput_orders_s: rate,
             uptime_s: uptime,
             iggy_connected: self.iggy_connected.load(Ordering::Relaxed),
@@ -688,17 +936,14 @@ fn record(histogram: &Mutex<Histogram<u64>>, value: u64) {
     }
 }
 
-fn percentile(histogram: &Mutex<Histogram<u64>>, quantile: f64) -> f64 {
-    histogram
-        .lock()
-        .map(|histogram| {
-            if histogram.is_empty() {
-                0.0
-            } else {
-                histogram.value_at_quantile(quantile / 100.0) as f64
-            }
-        })
-        .unwrap_or(0.0)
+/// Percentile of an unlocked histogram, shared by the lifetime and window
+/// read paths. An empty histogram reports zero, never NaN.
+fn percentile_of(histogram: &Histogram<u64>, quantile: f64) -> f64 {
+    if histogram.is_empty() {
+        0.0
+    } else {
+        histogram.value_at_quantile(quantile / 100.0) as f64
+    }
 }
 
 /// Drain `source` into `target` under `target`'s mutex and clear the source.
@@ -716,15 +961,22 @@ fn merge_histogram(target: &Mutex<Histogram<u64>>, source: &mut Histogram<u64>) 
     let Ok(mut histogram) = target.lock() else {
         return;
     };
-    if histogram.add(&*source).is_err() {
+    add_or_replay(&mut histogram, source);
+    source.clear();
+}
+
+/// Add `source` into `target` without clearing it, falling back to a
+/// value-by-value replay if the HDR configs disagree. Callers clear the
+/// source once, after it has reached every target.
+fn add_or_replay(target: &mut Histogram<u64>, source: &Histogram<u64>) {
+    if target.add(source).is_err() {
         for sample in source.iter_recorded() {
             let value = sample.value_iterated_to();
             for _ in 0..sample.count_at_value() {
-                let _ = histogram.record(value);
+                let _ = target.record(value);
             }
         }
     }
-    source.clear();
 }
 
 /// One lock acquisition for all three stage percentiles and the sample count.
@@ -744,6 +996,12 @@ fn latency_summary(histogram: &Mutex<Histogram<u64>>) -> LatencySummary {
             }
         })
         .unwrap_or_default()
+}
+
+/// Slot for a shard number: identity below [`METRIC_SHARD_SLOTS`], folded
+/// into the last slot at or above it.
+fn shard_slot(shard: u32) -> usize {
+    (shard as usize).min(METRIC_SHARD_SLOTS - 1)
 }
 
 fn micros_since(start: Instant) -> u64 {
@@ -2290,5 +2548,183 @@ mod shard_metrics_tests {
         assert_eq!(merged.samples, 2);
         assert_eq!(merged.p50_us, direct_summary.p50_us);
         assert_eq!(merged.p99_us, direct_summary.p99_us);
+    }
+}
+
+#[cfg(test)]
+mod latency_window_tests {
+    use super::*;
+
+    fn metrics() -> Metrics {
+        Metrics::new(
+            ExchangeConfig::default().mode,
+            ExchangeConfig::default().partitions,
+        )
+    }
+
+    #[test]
+    fn window_tracks_samples_and_rotation_keeps_the_lifetime() {
+        let metrics = metrics();
+        for _ in 0..50 {
+            metrics.record_ingress_latency_us(100);
+        }
+        for _ in 0..50 {
+            metrics.record_match_latency_us(200);
+        }
+
+        // The lifetime view and the window agree while the window is fresh.
+        let view = metrics.snapshot();
+        assert!(view.ingress_p50_us > 0.0);
+        assert!(view.match_p99_us > 0.0);
+        let window = metrics.window_summary();
+        assert_eq!(window.secs, LATENCY_WINDOW_SECS);
+        assert!(window.ingress_p50_us > 0.0);
+        assert!(window.match_p99_us > 0.0);
+
+        // Forced rotation empties the window but never the lifetime data.
+        metrics.rotate_window_now();
+        let rotated = metrics.window_summary();
+        assert_eq!(rotated.secs, LATENCY_WINDOW_SECS);
+        assert_eq!(rotated.ingress_p50_us, 0.0);
+        assert_eq!(rotated.ingress_p99_us, 0.0);
+        assert_eq!(rotated.match_p50_us, 0.0);
+        assert_eq!(rotated.match_p99_us, 0.0);
+        let lifetime = metrics.snapshot();
+        assert_eq!(lifetime.ingress_p99_us, view.ingress_p99_us);
+        assert_eq!(lifetime.match_p99_us, view.match_p99_us);
+
+        // The next sample opens a fresh window without touching the lifetime.
+        metrics.record_ingress_latency_us(300);
+        let reopened = metrics.window_summary();
+        assert!(reopened.ingress_p99_us > 0.0);
+        assert_eq!(reopened.match_p99_us, 0.0);
+    }
+
+    #[test]
+    fn window_p99_reflects_a_recent_slow_sample_before_the_lifetime_moves() {
+        let metrics = metrics();
+        for _ in 0..20 {
+            metrics.record_ingress_latency_us(100);
+        }
+        let before_window = metrics.window_summary();
+        assert_eq!(before_window.ingress_p99_us, 100.0);
+
+        // One slow sample: the window tail jumps immediately.
+        metrics.record_ingress_latency_us(50_000);
+        let after_window = metrics.window_summary();
+        assert!(
+            after_window.ingress_p99_us >= 49_000.0,
+            "window p99 = {}",
+            after_window.ingress_p99_us
+        );
+        assert_ne!(
+            before_window.ingress_p99_us, after_window.ingress_p99_us,
+            "the window must react to the recent slow sample"
+        );
+
+        // 21 samples with one outlier: the lifetime median is untouched.
+        let lifetime = metrics.snapshot();
+        assert_eq!(lifetime.ingress_p50_us, 100.0);
+    }
+
+    #[test]
+    fn zero_length_window_reports_empty_until_the_next_sample_opens_one() {
+        // A window of 0 rotates on every sample, so the read path reports it
+        // as expired: an honest "no current latency" without sleeping.
+        let metrics = Metrics::with_window_secs(
+            ExchangeConfig::default().mode,
+            ExchangeConfig::default().partitions,
+            0,
+        );
+        metrics.record_ingress_latency_us(100);
+        metrics.record_match_latency_us(200);
+        let window = metrics.window_summary();
+        assert_eq!(window.secs, 0);
+        assert_eq!(window.ingress_p99_us, 0.0);
+        assert_eq!(window.match_p99_us, 0.0);
+        // The lifetime percentiles still see every sample.
+        let view = metrics.snapshot();
+        assert!(view.ingress_p50_us > 0.0);
+        assert!(view.match_p50_us > 0.0);
+    }
+
+    #[test]
+    fn shard_merges_feed_the_windowed_match_percentiles() {
+        // The hot path records match latency in ShardMetrics, so a merge must
+        // be the path that fills the window, not only the lifetime histogram.
+        let global = metrics();
+        let shard = ShardMetrics::new();
+        for sample in 0..100u64 {
+            shard.record_match_latency_us(150 + sample);
+        }
+        shard.merge_into(&global);
+
+        let window = global.window_summary();
+        assert!(
+            window.match_p50_us > 0.0,
+            "window match p50 = 0 after merge"
+        );
+        assert!(window.match_p99_us > 0.0);
+        // The merged samples did not touch the windowed ingress histogram.
+        assert_eq!(window.ingress_p99_us, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod shard_lag_and_ring_tests {
+    use super::*;
+
+    fn metrics() -> Metrics {
+        Metrics::new(
+            ExchangeConfig::default().mode,
+            ExchangeConfig::default().partitions,
+        )
+    }
+
+    #[test]
+    fn per_shard_lag_lists_only_nonzero_shards() {
+        let metrics = metrics();
+        assert!(metrics.consumer_lag_by_shard().is_empty());
+
+        metrics.set_consumer_lag_for_shard(3, 42);
+        metrics.set_consumer_lag_for_shard(7, 9);
+        assert_eq!(metrics.consumer_lag_by_shard(), vec![(3, 42), (7, 9)]);
+
+        // The aggregate is independent: the node sets both, one at a time.
+        assert_eq!(metrics.snapshot().consumer_lag, 0);
+        metrics.set_consumer_lag(51);
+        assert_eq!(metrics.snapshot().consumer_lag, 51);
+        assert_eq!(metrics.consumer_lag_by_shard(), vec![(3, 42), (7, 9)]);
+
+        // Resetting a shard to zero removes it from the list.
+        metrics.set_consumer_lag_for_shard(3, 0);
+        assert_eq!(metrics.consumer_lag_by_shard(), vec![(7, 9)]);
+    }
+
+    #[test]
+    fn lag_beyond_the_slot_count_folds_into_the_last_slot() {
+        let metrics = metrics();
+        metrics.set_consumer_lag_for_shard(u32::try_from(METRIC_SHARD_SLOTS).unwrap() + 44, 5);
+        assert_eq!(
+            metrics.consumer_lag_by_shard(),
+            vec![(METRIC_SHARD_SLOTS as u32 - 1, 5)]
+        );
+    }
+
+    #[test]
+    fn ring_depths_round_trip_and_omit_zero_shards() {
+        let metrics = metrics();
+        assert!(metrics.ring_depths().is_empty());
+
+        metrics.set_ring_depths(2, 1, 0, 2);
+        metrics.set_ring_depths(5, 2, 1, 2);
+        assert_eq!(metrics.ring_depths(), vec![(2, 1, 0, 2), (5, 2, 1, 2)]);
+
+        // A report with empty rings keeps the shard listed by its capacity.
+        metrics.set_ring_depths(2, 0, 0, 2);
+        assert_eq!(metrics.ring_depths(), vec![(2, 0, 0, 2), (5, 2, 1, 2)]);
+        // And a capacity of zero (unreported shard) drops off the list.
+        metrics.set_ring_depths(5, 0, 0, 0);
+        assert_eq!(metrics.ring_depths(), vec![(2, 0, 0, 2)]);
     }
 }

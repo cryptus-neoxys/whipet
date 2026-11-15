@@ -37,6 +37,7 @@ use whippet_marketdata::{LatencySummary, Metrics, Stage};
 
 use crate::context::NodeContext;
 use crate::ratelimit::RateLimiter;
+use crate::storage::StorageState;
 use crate::turbo::{self, TurboAck};
 
 /// How long a turbo request waits for the shard's match ack before the gateway
@@ -262,17 +263,44 @@ fn invalid_json(error: serde_json::Error) -> (StatusCode, Json<ApiError>) {
 /// Refuse new orders when no matcher is running. Without this the gateway
 /// acknowledges orders that will never be matched.
 fn ensure_shards_ready(ctx: &NodeContext) -> Result<(), (StatusCode, Json<ApiError>)> {
-    if ctx.shards_ok() {
-        Ok(())
-    } else {
-        Err((
+    if !ctx.shards_ok() {
+        return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ApiError::new(
                 "shard_unavailable",
                 "the matching shard is not running; orders are not being accepted",
             )),
-        ))
+        ));
     }
+    let storage = ctx.storage.snapshot();
+    if storage.state == StorageState::Critical {
+        let volume = storage
+            .iggy
+            .filter(|iggy| iggy.available && iggy.used_pct >= ctx.storage.config().crit_pct)
+            .map(|iggy| (iggy.name, iggy.used_pct))
+            .or_else(|| {
+                (storage.whippet.available
+                    && storage.whippet.used_pct >= ctx.storage.config().crit_pct)
+                    .then_some((storage.whippet.name, storage.whippet.used_pct))
+            });
+        let detail = volume.map_or_else(
+            || "a monitored volume is at the critical threshold".to_string(),
+            |(name, used_pct)| {
+                format!(
+                    "the {name} volume is {used_pct}% full (critical at {}%)",
+                    ctx.storage.config().crit_pct
+                )
+            },
+        );
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::new(
+                "storage_pressure",
+                format!("{detail}; new orders are not being accepted"),
+            )),
+        ));
+    }
+    Ok(())
 }
 
 fn window_full() -> (StatusCode, Json<ApiError>) {
@@ -1048,8 +1076,10 @@ async fn health(State(ctx): State<Arc<NodeContext>>) -> Json<HealthView> {
     let journal_ready =
         ctx.config.journal == crate::config::JournalKind::Memory || metrics.iggy_connected;
     let shards_ok = ctx.shards_ok();
+    let storage = ctx.storage.snapshot();
+    let storage_ok = storage.state != StorageState::Critical;
     Json(HealthView {
-        status: if journal_ready && shards_ok {
+        status: if journal_ready && shards_ok && storage_ok {
             "ok".into()
         } else {
             "degraded".into()
@@ -1059,6 +1089,8 @@ async fn health(State(ctx): State<Arc<NodeContext>>) -> Json<HealthView> {
         iggy_addr: ctx.config.iggy_addr.clone(),
         journal: ctx.config.journal.as_str().to_string(),
         shards_ok,
+        storage_ok,
+        storage_state: storage.state.as_str().to_string(),
         version: env!("CARGO_PKG_VERSION").into(),
         uptime_s: ctx.started.elapsed().as_secs(),
         partitions: ctx.exchange().partitions,
@@ -1071,6 +1103,7 @@ struct ReadinessView {
     ready: bool,
     journal: bool,
     shards_ok: bool,
+    storage: bool,
 }
 
 /// Machine readiness: 200 only when the journal answers and every shard is
@@ -1085,7 +1118,8 @@ async fn readyz(State(ctx): State<Arc<NodeContext>>) -> impl IntoResponse {
         true
     };
     let shards_ok = ctx.shards_ok();
-    let ready = journal && shards_ok;
+    let storage_ok = ctx.storage.state() != StorageState::Critical;
+    let ready = journal && shards_ok && storage_ok;
     let status = if ready {
         StatusCode::OK
     } else {
@@ -1097,6 +1131,7 @@ async fn readyz(State(ctx): State<Arc<NodeContext>>) -> impl IntoResponse {
             ready,
             journal,
             shards_ok,
+            storage: storage_ok,
         }),
     )
 }
@@ -1163,6 +1198,103 @@ async fn prometheus(
     body.push_str(&format!(
         "whippet_group_commit_partitions {}\n",
         ctx.group_commit.writer_count()
+    ));
+    let window = ctx.metrics.window_summary();
+    body.push_str("# HELP whippet_latency_window_secs Rolling latency-window length.\n");
+    body.push_str("# TYPE whippet_latency_window_secs gauge\n");
+    body.push_str(&format!("whippet_latency_window_secs {}\n", window.secs));
+    body.push_str("# HELP whippet_ingress_window_p50_us Rolling gateway ingress p50.\n");
+    body.push_str("# TYPE whippet_ingress_window_p50_us gauge\n");
+    body.push_str(&format!(
+        "whippet_ingress_window_p50_us {}\n",
+        window.ingress_p50_us
+    ));
+    body.push_str("# HELP whippet_ingress_window_p99_us Rolling gateway ingress p99.\n");
+    body.push_str("# TYPE whippet_ingress_window_p99_us gauge\n");
+    body.push_str(&format!(
+        "whippet_ingress_window_p99_us {}\n",
+        window.ingress_p99_us
+    ));
+    body.push_str("# HELP whippet_match_window_p50_us Rolling matcher service-time p50.\n");
+    body.push_str("# TYPE whippet_match_window_p50_us gauge\n");
+    body.push_str(&format!(
+        "whippet_match_window_p50_us {}\n",
+        window.match_p50_us
+    ));
+    body.push_str("# HELP whippet_match_window_p99_us Rolling matcher service-time p99.\n");
+    body.push_str("# TYPE whippet_match_window_p99_us gauge\n");
+    body.push_str(&format!(
+        "whippet_match_window_p99_us {}\n",
+        window.match_p99_us
+    ));
+    body.push_str(
+        "# HELP whippet_consumer_lag_by_shard Records waiting behind each shard consumer.\n",
+    );
+    body.push_str("# TYPE whippet_consumer_lag_by_shard gauge\n");
+    for (shard, lag) in ctx.metrics.consumer_lag_by_shard() {
+        body.push_str(&format!(
+            "whippet_consumer_lag_by_shard{{shard=\"{shard}\"}} {lag}\n"
+        ));
+    }
+    body.push_str("# HELP whippet_input_ring_occupancy Queued input batches per shard.\n");
+    body.push_str("# TYPE whippet_input_ring_occupancy gauge\n");
+    body.push_str("# HELP whippet_output_ring_occupancy Queued output batches per shard.\n");
+    body.push_str("# TYPE whippet_output_ring_occupancy gauge\n");
+    body.push_str("# HELP whippet_ring_capacity Batch capacity of each shard ring.\n");
+    body.push_str("# TYPE whippet_ring_capacity gauge\n");
+    for (shard, input, output, capacity) in ctx.metrics.ring_depths() {
+        body.push_str(&format!(
+            "whippet_input_ring_occupancy{{shard=\"{shard}\"}} {input}\n"
+        ));
+        body.push_str(&format!(
+            "whippet_output_ring_occupancy{{shard=\"{shard}\"}} {output}\n"
+        ));
+        body.push_str(&format!(
+            "whippet_ring_capacity{{shard=\"{shard}\"}} {capacity}\n"
+        ));
+    }
+    let storage = ctx.storage.snapshot();
+    body.push_str("# HELP whippet_disk_free_bytes Free bytes on a monitored data volume.\n");
+    body.push_str("# TYPE whippet_disk_free_bytes gauge\n");
+    body.push_str("# HELP whippet_disk_used_pct Used percentage of a monitored data volume.\n");
+    body.push_str("# TYPE whippet_disk_used_pct gauge\n");
+    body.push_str(
+        "# HELP whippet_disk_monitor_ok 1 when the volume usage was read successfully.\n",
+    );
+    body.push_str("# TYPE whippet_disk_monitor_ok gauge\n");
+    for volume in std::iter::once(Some(storage.whippet))
+        .chain([storage.iggy])
+        .flatten()
+    {
+        body.push_str(&format!(
+            "whippet_disk_monitor_ok{{volume=\"{}\"}} {}\n",
+            volume.name,
+            u8::from(volume.available)
+        ));
+        if volume.available {
+            body.push_str(&format!(
+                "whippet_disk_free_bytes{{volume=\"{}\"}} {}\n",
+                volume.name, volume.free_bytes
+            ));
+            body.push_str(&format!(
+                "whippet_disk_used_pct{{volume=\"{}\"}} {}\n",
+                volume.name, volume.used_pct
+            ));
+        }
+    }
+    body.push_str(
+        "# HELP whippet_storage_warning 1 when a volume is at or above the warning threshold.\n",
+    );
+    body.push_str("# TYPE whippet_storage_warning gauge\n");
+    body.push_str(&format!(
+        "whippet_storage_warning {}\n",
+        u8::from(storage.state != StorageState::Ok)
+    ));
+    body.push_str("# HELP whippet_storage_critical 1 when a volume is at the critical threshold and ingress is refused.\n");
+    body.push_str("# TYPE whippet_storage_critical gauge\n");
+    body.push_str(&format!(
+        "whippet_storage_critical {}\n",
+        u8::from(storage.state == StorageState::Critical)
     ));
     if let Some(turbo) = &ctx.turbo {
         // The window is read live from each shard's admission gate. In this

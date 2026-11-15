@@ -2,7 +2,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -440,6 +440,13 @@ pub async fn run_engine_shard(
     // first append.
     let appended_offset = Arc::new(AtomicU64::new(committed_offset.unwrap_or(u64::MAX)));
 
+    // Queued batch counts for the ring-occupancy metric. The producer
+    // increments after a send succeeds and the consumer decrements after it
+    // receives, so the shared `Relaxed` atomic is the live ring depth; the
+    // matcher reads both once a second, never on the send/recv path.
+    let input_queued = Arc::new(AtomicU32::new(0));
+    let output_queued = Arc::new(AtomicU32::new(0));
+
     // The input edge is the only mode-specific part of the shard. Durable polls
     // the orders log; turbo batches the admitted lane entries. Both hand the
     // matcher an `InputBatch` through the same bounded ring, so the ring stays
@@ -450,7 +457,12 @@ pub async fn run_engine_shard(
             // The write-behind owns the orders log; the reader's buffer
             // recycler has no user in this mode.
             drop(recycle_rx);
-            tokio::spawn(feed_turbo(turbo_rx, input_tx, ctx.shutdown.subscribe()))
+            tokio::spawn(feed_turbo(
+                turbo_rx,
+                input_tx,
+                Arc::clone(&input_queued),
+                ctx.shutdown.subscribe(),
+            ))
         }
         None => tokio::spawn(read_orders(
             Arc::clone(&ctx),
@@ -461,11 +473,13 @@ pub async fn run_engine_shard(
             input_tx,
             recycle_rx,
             ctx.shutdown.subscribe(),
+            Arc::clone(&input_queued),
         )),
     };
 
     let matcher_ctx = Arc::clone(&ctx);
     let matcher_appended = Arc::clone(&appended_offset);
+    let matcher_output_queued = Arc::clone(&output_queued);
     let matcher = std::thread::Builder::new()
         .name(format!("whippet-shard-{shard_id}"))
         .spawn(move || {
@@ -479,10 +493,11 @@ pub async fn run_engine_shard(
                 matcher_appended,
                 next_offset.saturating_sub(1),
                 next_offset,
+                input_queued,
+                matcher_output_queued,
             )
         })
         .with_context(|| format!("spawning matcher thread for shard {shard_id}"))?;
-
     let result = run_writer(
         Arc::clone(&ctx),
         journal.as_ref(),
@@ -493,6 +508,7 @@ pub async fn run_engine_shard(
         snapshot_tx,
         snapshot_writer,
         Arc::clone(&appended_offset),
+        output_queued,
     )
     .await;
 
@@ -685,6 +701,7 @@ pub async fn read_orders<J: JournalOps + 'static>(
     sender: mpsc::Sender<InputBatch>,
     mut recycle: mpsc::Receiver<Vec<whippet_journal::PayloadRecord>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    input_queued: Arc<AtomicU32>,
 ) {
     let mut next_offset = start_offset;
     let mut poll_failures: u32 = 0;
@@ -758,6 +775,8 @@ pub async fn read_orders<J: JournalOps + 'static>(
         if sender.send(InputBatch::durable(records)).await.is_err() {
             break;
         }
+        // Ring occupancy: one queued batch more for the matcher to receive.
+        input_queued.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -773,6 +792,7 @@ pub async fn read_orders<J: JournalOps + 'static>(
 pub async fn feed_turbo(
     mut turbo: mpsc::Receiver<TurboEntry>,
     sender: mpsc::Sender<InputBatch>,
+    input_queued: Arc<AtomicU32>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
@@ -794,6 +814,8 @@ pub async fn feed_turbo(
         if sender.send(InputBatch::turbo(entries)).await.is_err() {
             break;
         }
+        // Ring occupancy: one queued batch more for the matcher to receive.
+        input_queued.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -817,6 +839,8 @@ pub fn run_matcher(
     appended_offset: Arc<AtomicU64>,
     start_last_offset: u64,
     start_turbo_seq: u64,
+    input_queued: Arc<AtomicU32>,
+    output_queued: Arc<AtomicU32>,
 ) {
     let mut out = EngineOutput::with_capacity(BATCH_CAPACITY, BATCH_CAPACITY);
     // Per-shard recorder: no global lock on the match path. It is merged into
@@ -838,6 +862,9 @@ pub fn run_matcher(
     let mut snapshot_pending = false;
 
     while let Some(batch) = input.blocking_recv() {
+        // The reader counted this batch when its send succeeded; the ring
+        // occupancy drops by one as soon as the matcher holds it.
+        input_queued.fetch_sub(1, Ordering::Relaxed);
         let mut executions: Vec<JournalMessage> = Vec::with_capacity(BATCH_CAPACITY);
         let mut md_messages: Vec<JournalMessage> = Vec::with_capacity(BATCH_CAPACITY);
         let mut orders: Vec<TurboJournalRecord> = Vec::with_capacity(BATCH_CAPACITY);
@@ -994,9 +1021,17 @@ pub fn run_matcher(
             .record_stage_us(Stage::EngineProcess, process_us);
         // Hand the polled buffer back for reuse.
         let _ = recycle.try_send(batch.records);
-        // One global merge per second, not one lock per command.
+        // One global merge per second, not one lock per command. The ring
+        // gauges ride the same cadence: the reader/matcher/writer maintain
+        // the queued counts, the matcher just reads and publishes them.
         if last_merge.elapsed() >= Duration::from_secs(1) {
             shard_metrics.merge_into(&ctx.metrics);
+            ctx.metrics.set_ring_depths(
+                shard_id,
+                input_queued.load(Ordering::Relaxed),
+                output_queued.load(Ordering::Relaxed),
+                SHARD_RING_CAPACITY as u32,
+            );
             last_merge = Instant::now();
         }
 
@@ -1012,8 +1047,16 @@ pub fn run_matcher(
             .is_err()
         {
             shard_metrics.merge_into(&ctx.metrics);
+            ctx.metrics.set_ring_depths(
+                shard_id,
+                input_queued.load(Ordering::Relaxed),
+                output_queued.load(Ordering::Relaxed),
+                SHARD_RING_CAPACITY as u32,
+            );
             return;
         }
+        // Ring occupancy: one queued batch more for the writer to receive.
+        output_queued.fetch_add(1, Ordering::Relaxed);
     }
     shard_metrics.merge_into(&ctx.metrics);
 
@@ -1050,14 +1093,28 @@ pub fn run_matcher(
         sequence: snapshot_sequence,
         snapshot: final_state,
     });
-    let _ = output.blocking_send(OutputBatch {
-        executions: Vec::new(),
-        md: Vec::new(),
-        orders: Vec::new(),
-        last_offset,
-        snapshot: final_snapshot,
-        final_batch: true,
-    });
+    if output
+        .blocking_send(OutputBatch {
+            executions: Vec::new(),
+            md: Vec::new(),
+            orders: Vec::new(),
+            last_offset,
+            snapshot: final_snapshot,
+            final_batch: true,
+        })
+        .is_ok()
+    {
+        // Ring occupancy: the writer drains the final batch like any other.
+        output_queued.fetch_add(1, Ordering::Relaxed);
+    }
+    // Final ring-occupancy report: the queued counters are what the gauges
+    // will read until a successor shard updates them.
+    ctx.metrics.set_ring_depths(
+        shard_id,
+        input_queued.load(Ordering::Relaxed),
+        output_queued.load(Ordering::Relaxed),
+        SHARD_RING_CAPACITY as u32,
+    );
 }
 
 /// Turn one processed turbo command into its acknowledgement.
@@ -1169,6 +1226,7 @@ pub async fn run_writer<J: JournalOps + ?Sized>(
     snapshot_tx: mpsc::Sender<SnapshotJob>,
     snapshot_writer: tokio::task::JoinHandle<()>,
     appended_offset: Arc<AtomicU64>,
+    output_queued: Arc<AtomicU32>,
 ) -> Result<()> {
     let mut watermark = CommitWatermark::new(committed_offset);
     let mut commit_retry = CommitRetry::new();
@@ -1191,7 +1249,12 @@ pub async fn run_writer<J: JournalOps + ?Sized>(
     loop {
         let mut batch = tokio::select! {
             batch = output.recv() => match batch {
-                Some(batch) => batch,
+                Some(batch) => {
+                    // The matcher counted this batch when its send succeeded;
+                    // the ring occupancy drops as soon as the writer holds it.
+                    output_queued.fetch_sub(1, Ordering::Relaxed);
+                    batch
+                }
                 None => break,
             },
             _ = commit_tick.tick() => {
@@ -1217,6 +1280,7 @@ pub async fn run_writer<J: JournalOps + ?Sized>(
                 Ok(next) => {
                     merge_output_batch(&mut batch, next);
                     coalesced += 1;
+                    output_queued.fetch_sub(1, Ordering::Relaxed);
                 }
                 Err(_) => break,
             }

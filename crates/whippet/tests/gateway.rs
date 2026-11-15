@@ -65,6 +65,7 @@ fn node_with_ws_cap(
 ) -> Arc<NodeContext> {
     let mut config = node.ctx.config.clone();
     configure(&mut config);
+    let storage = whippet::storage::StorageMonitor::new(config.storage.clone());
     let rate_limiter = Arc::new(whippet::ratelimit::RateLimiter::new(
         config.rate_limit_per_sec,
     ));
@@ -76,6 +77,7 @@ fn node_with_ws_cap(
         group_commit: node.ctx.group_commit.clone(),
         hub: Arc::clone(&node.ctx.hub),
         metrics: Arc::clone(&node.ctx.metrics),
+        storage,
         snapshots: node.ctx.snapshots.clone(),
         started: node.ctx.started,
         shutdown: node.ctx.shutdown.clone(),
@@ -1656,6 +1658,7 @@ fn ctx_with_engine_pool(
         group_commit: node.ctx.group_commit.clone(),
         hub: Arc::clone(&node.ctx.hub),
         metrics: Arc::clone(&node.ctx.metrics),
+        storage: Arc::clone(&node.ctx.storage),
         snapshots: node.ctx.snapshots.clone(),
         started: node.ctx.started,
         shutdown: node.ctx.shutdown.clone(),
@@ -1739,6 +1742,88 @@ async fn scoped_tokens_attribute_orders_to_distinct_participants() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["code"], "participant_mismatch");
+}
+
+#[tokio::test]
+async fn critical_storage_pressure_rejects_orders_and_readiness() {
+    let node = TestNode::new();
+    let dir = tempfile::tempdir().expect("temp dir");
+    // A real filesystem is always more than 2% used, so this forces Critical
+    // without filling a disk. The monitor is built from the overridden config.
+    let ctx = node_with(&node, |config| {
+        config.storage.warn_pct = 1;
+        config.storage.crit_pct = 2;
+        config.storage.whippet_dir = dir.path().to_path_buf();
+        config.storage.iggy_dir = None;
+    });
+    let app = gateway::router(ctx);
+
+    let (status, body) = post(
+        &app,
+        "/api/orders",
+        json!({
+            "symbol": "BTC-USD",
+            "side": "buy",
+            "order_type": "limit",
+            "price_cents": 6_000_000,
+            "qty": 1,
+            "client_order_id": "storage-full-1",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "storage_pressure");
+    assert!(
+        node.orders(symbol()).is_empty(),
+        "a storage-pressure rejection must not reach the journal"
+    );
+
+    let (status, body) = get(&app, "/readyz").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["storage"], false);
+    assert_eq!(body["ready"], false);
+
+    let (status, body) = get(&app, "/api/health").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "degraded");
+    assert_eq!(body["storage_state"], "critical");
+    assert_eq!(body["storage_ok"], false);
+}
+
+#[tokio::test]
+async fn warning_storage_keeps_accepting_orders() {
+    let node = TestNode::new();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let ctx = node_with(&node, |config| {
+        config.storage.warn_pct = 1;
+        config.storage.crit_pct = 99;
+        config.storage.whippet_dir = dir.path().to_path_buf();
+        config.storage.iggy_dir = None;
+    });
+    let app = gateway::router(ctx);
+
+    let (status, body) = post(
+        &app,
+        "/api/orders",
+        json!({
+            "symbol": "BTC-USD",
+            "side": "buy",
+            "order_type": "limit",
+            "price_cents": 6_000_000,
+            "qty": 1,
+            "client_order_id": "storage-warn-1",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(node.orders(symbol()).len(), 1);
+
+    let (status, body) = get(&app, "/readyz").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["storage"], true);
+    let (_, body) = get(&app, "/api/health").await;
+    assert_eq!(body["storage_state"], "warn");
+    assert_eq!(body["status"], "ok");
 }
 
 #[tokio::test]

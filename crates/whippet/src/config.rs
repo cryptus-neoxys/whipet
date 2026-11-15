@@ -9,6 +9,7 @@ use whippet_core::error::CoreError;
 use whippet_core::ids::Symbol;
 
 use crate::auth::ApiToken;
+use crate::storage::StorageConfig;
 use crate::turbo::TurboConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +88,40 @@ pub struct NodeArgs {
     pub snapshot_dir: PathBuf,
     #[arg(long, env = "WHIPPET_SNAPSHOT_EVERY", default_value_t = 10_000)]
     pub snapshot_every: u64,
+    /// Root of the node's own data volume. The bounded-storage monitor samples
+    /// free space on the filesystem that holds this path.
+    #[arg(
+        long,
+        env = "WHIPPET_DATA_DIR",
+        default_value = crate::storage::DEFAULT_DATA_DIR
+    )]
+    pub data_dir: PathBuf,
+    /// Iggy's data volume as seen from this container, typically a read-only
+    /// mount. When the path does not exist the monitor samples only the
+    /// Whippet volume.
+    #[arg(
+        long,
+        env = "WHIPPET_IGGY_DATA_DIR",
+        default_value = crate::storage::DEFAULT_IGGY_DATA_DIR
+    )]
+    pub iggy_data_dir: PathBuf,
+    /// Volume usage percentage that starts reporting a storage warning. Must be
+    /// inside 1..=99 and below the critical threshold.
+    #[arg(
+        long,
+        env = "WHIPPET_DISK_WARN_PCT",
+        default_value_t = crate::storage::DEFAULT_WARN_PCT
+    )]
+    pub disk_warn_pct: u8,
+    /// Volume usage percentage that reports critical storage pressure and is
+    /// meant to fail readiness and durable admission. Same bounds as the
+    /// warning, and above it.
+    #[arg(
+        long,
+        env = "WHIPPET_DISK_CRIT_PCT",
+        default_value_t = crate::storage::DEFAULT_CRIT_PCT
+    )]
+    pub disk_crit_pct: u8,
     #[arg(
         long,
         env = "WHIPPET_DASHBOARD_DIR",
@@ -171,6 +206,8 @@ pub struct NodeConfig {
     /// Turbo window limits. Validated even in durable mode so a bad value
     /// fails at startup, not when an operator flips `WHIPPET_MODE`.
     pub turbo: TurboConfig,
+    /// Disk thresholds and volume roots for the bounded-storage guard.
+    pub storage: StorageConfig,
 }
 
 impl NodeConfig {
@@ -233,6 +270,17 @@ impl NodeConfig {
                 "partitions must be between 1 and 256".into(),
             ));
         }
+        // A missing Iggy mount is reported rather than fatal: the node can run
+        // before the volume is attached, and the monitor then samples only its
+        // own data volume.
+        let iggy_dir = args.iggy_data_dir.is_dir().then_some(args.iggy_data_dir);
+        let storage = StorageConfig {
+            warn_pct: args.disk_warn_pct,
+            crit_pct: args.disk_crit_pct,
+            whippet_dir: args.data_dir,
+            iggy_dir,
+        };
+        storage.validate().map_err(ConfigError::Invalid)?;
 
         let api_participant = args.api_participant;
         if api_participant.is_empty() || api_participant.len() > 64 {
@@ -284,6 +332,7 @@ impl NodeConfig {
             rate_limit_per_sec: args.rate_limit_per_sec,
             ws_per_ip: args.ws_per_ip,
             turbo,
+            storage,
         })
     }
 }
@@ -418,6 +467,63 @@ mod tests {
     struct Cli {
         #[command(flatten)]
         node: NodeArgs,
+    }
+
+    #[test]
+    fn storage_thresholds_default_and_validate() {
+        let cli = Cli::parse_from(["test"]);
+        let config = NodeConfig::from_args(cli.node).unwrap();
+        assert_eq!(config.storage.warn_pct, 70);
+        assert_eq!(config.storage.crit_pct, 85);
+        assert!(config.storage.validate().is_ok());
+
+        // warn >= crit, and either threshold outside 1..=99, are startup errors.
+        for args in [
+            ["--disk-warn-pct", "70", "--disk-crit-pct", "70"],
+            ["--disk-warn-pct", "90", "--disk-crit-pct", "85"],
+            ["--disk-warn-pct", "0", "--disk-crit-pct", "85"],
+            ["--disk-warn-pct", "70", "--disk-crit-pct", "100"],
+        ] {
+            let cli = Cli::parse_from(["test", args[0], args[1], args[2], args[3]]);
+            assert!(
+                NodeConfig::from_args(cli.node).is_err(),
+                "{args:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn storage_volumes_are_configured_from_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let iggy = dir.path().join("iggy");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&iggy).unwrap();
+        let cli = Cli::parse_from([
+            "test",
+            "--data-dir",
+            data.to_str().unwrap(),
+            "--iggy-data-dir",
+            iggy.to_str().unwrap(),
+            "--disk-warn-pct",
+            "60",
+            "--disk-crit-pct",
+            "80",
+        ]);
+        let config = NodeConfig::from_args(cli.node).unwrap();
+        assert_eq!(config.storage.whippet_dir, data);
+        assert_eq!(config.storage.iggy_dir.as_deref(), Some(iggy.as_path()));
+        assert_eq!(config.storage.warn_pct, 60);
+        assert_eq!(config.storage.crit_pct, 80);
+    }
+
+    #[test]
+    fn a_missing_iggy_volume_is_reported_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let iggy = dir.path().join("not-mounted");
+        let cli = Cli::parse_from(["test", "--iggy-data-dir", iggy.to_str().unwrap()]);
+        let config = NodeConfig::from_args(cli.node).unwrap();
+        assert_eq!(config.storage.iggy_dir, None);
     }
 
     #[test]

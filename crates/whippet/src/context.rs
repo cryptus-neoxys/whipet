@@ -11,6 +11,7 @@ use whippet_marketdata::{MdHub, Metrics};
 use crate::config::NodeConfig;
 use crate::ratelimit::RateLimiter;
 use crate::snapshot::SnapshotStore;
+use crate::storage::StorageMonitor;
 use crate::turbo::TurboIngress;
 
 /// Caps the engine journal pool. Each entry is one Iggy connection; 16
@@ -102,6 +103,11 @@ pub struct NodeContext {
     pub group_commit: GroupCommit,
     pub hub: Arc<MdHub>,
     pub metrics: Arc<Metrics>,
+    /// Bounded-storage guard. A background task refreshes it every five
+    /// seconds; readiness and durable admission read the cached state without
+    /// doing I/O. `Critical` means a data volume crossed the configured
+    /// threshold; `Warn` is alert-only and does not block ingress.
+    pub storage: Arc<StorageMonitor>,
     pub snapshots: SnapshotStore,
     pub started: Instant,
     pub shutdown: watch::Sender<bool>,

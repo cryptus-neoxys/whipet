@@ -129,14 +129,15 @@ while kill -0 "${BENCH_PID}" 2>/dev/null || [ "${count}" -eq 0 ]; do
     t=$((count * INTERVAL))
     state="$(curl -fsS --max-time 5 "${GATEWAY}/api/state" 2>/dev/null || true)"
     health="$(curl -fsS --max-time 5 "${GATEWAY}/api/health" 2>/dev/null || true)"
+    metrics_text="$(curl -fsS --max-time 5 "${GATEWAY}/metrics" 2>/dev/null || true)"
     rss=""
     if [ -n "${NODE_CID}" ]; then
         rss="$(docker stats --no-stream --format '{{.MemUsage}}' "${NODE_CID}" 2>/dev/null | awk '{print $1}' || true)"
     fi
-    python3 - "${t}" "${state}" "${health}" "${rss}" >>"${SAMPLES}" <<'PY'
-import json, sys
+    python3 - "${t}" "${state}" "${health}" "${rss}" "${metrics_text}" >>"${SAMPLES}" <<'PY'
+import json, re, sys
 
-t, state_raw, health_raw, rss_raw = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+t, state_raw, health_raw, rss_raw, metrics_text = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 try:
     state = json.loads(state_raw)
     metrics = state["metrics"]
@@ -150,15 +151,27 @@ try:
     shards_ok = json.loads(health_raw)["shards_ok"]
 except Exception:
     shards_ok = None
+
+
+def metric_gauge(text, name):
+    match = re.search(r"^" + re.escape(name) + r"\s+([0-9.eE+-]+)$", text, re.MULTILINE)
+    return float(match.group(1)) if match else None
 print(json.dumps({
     "t": int(t),
     "p50_us": metrics.get("ingress_p50_us"),
     "p99_us": metrics.get("ingress_p99_us"),
+    # Drift is judged on the rolling window, not the process-lifetime p99.
+    "window_p50_us": metrics.get("ingress_window_p50_us"),
+    "window_p99_us": metrics.get("ingress_window_p99_us"),
+    "match_window_p99_us": metrics.get("match_window_p99_us"),
     "lag": metrics.get("consumer_lag"),
     "rss": rss_raw or None,
     "shards_ok": shards_ok,
     "mode": mode,
     "guarantee": guarantee,
+    "disk_free_iggy_bytes": metric_gauge(metrics_text, 'whippet_disk_free_bytes{volume="iggy"}'),
+    "disk_free_whippet_bytes": metric_gauge(metrics_text, 'whippet_disk_free_bytes{volume="whippet"}'),
+    "storage_critical": metric_gauge(metrics_text, "whippet_storage_critical"),
 }))
 PY
     count=$((count + 1))
@@ -192,9 +205,39 @@ with open(samples_path) as handle:
         if line:
             samples.append(json.loads(line))
 
-p99 = [s["p99_us"] for s in samples if isinstance(s.get("p99_us"), (int, float))]
+p99 = [
+    s["window_p99_us"]
+    for s in samples
+    if isinstance(s.get("window_p99_us"), (int, float))
+    and s.get("window_p99_us") > 0
+]
+if not p99:
+    # Older nodes do not expose a rolling window; fall back to lifetime p99 and
+    # label the basis so the drift gate cannot be mistaken for a steady-state one.
+    p99 = [s["p99_us"] for s in samples if isinstance(s.get("p99_us"), (int, float))]
+p50 = [
+    s["window_p50_us"]
+    for s in samples
+    if isinstance(s.get("window_p50_us"), (int, float))
+    and s.get("window_p50_us") > 0
+]
+
+
+def median(values):
+    if not values:
+        return None
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+# A drift verdict needs enough samples to compare two edges; the Rust soak
+# helper uses the same minimum. Short dev runs report medians and are
+# "skipped", never "passed".
 edge = max(1, int(len(p99) * 0.10))
-if len(p99) >= 5:
+if len(p99) >= 20:
     first = sum(p99[:edge]) / edge
     last = sum(p99[-edge:]) / edge
     drift = 0.0 if first == 0 else (last - first) / first * 100.0
@@ -222,9 +265,17 @@ summary = {
     "duration_secs": duration,
     "interval_secs": int(os.environ.get("INTERVAL", "10")),
     "samples": len(samples),
+    "p99_basis": "window" if samples and samples[0].get("window_p99_us") is not None else "lifetime",
     "first_p99_us": first,
     "last_p99_us": last,
+    "window_p50_median_us": median(p50),
+    "window_p99_median_us": median(p99),
+    "window_p99_max_us": max(p99, default=None),
     "drift_pct": drift,
+    "disk_free_iggy_start": next((s["disk_free_iggy_bytes"] for s in samples if s.get("disk_free_iggy_bytes") is not None), None),
+    "disk_free_iggy_end": next((s["disk_free_iggy_bytes"] for s in reversed(samples) if s.get("disk_free_iggy_bytes") is not None), None),
+    "min_disk_free_iggy": min((s["disk_free_iggy_bytes"] for s in samples if s.get("disk_free_iggy_bytes") is not None), default=None),
+    "storage_critical_seen": any(s.get("storage_critical") == 1 for s in samples),
     "shards_ok": shards_ok,
     "bench_exit": bench_status,
     "verdict": "fail" if failed else ("pass" if drift is not None else "skipped"),

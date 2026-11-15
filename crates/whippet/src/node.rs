@@ -22,6 +22,7 @@ use crate::engine_runner::{run_engine_shard, run_md_shard};
 use crate::gateway;
 use crate::ratelimit::RateLimiter;
 use crate::snapshot::SnapshotStore;
+use crate::storage::{StorageMonitor, StorageSnapshot, StorageState};
 use crate::tcp;
 use crate::turbo::TurboIngress;
 
@@ -122,6 +123,22 @@ pub async fn run(args: NodeArgs) -> Result<()> {
             "turbo ingress ready: acknowledgements are match-complete, not journal-durable"
         );
     }
+    // The bounded-storage guard samples both data volumes before the context
+    // exists, so the boot log below already reports the state the node starts
+    // with. It never deletes anything; it only measures and classifies.
+    let storage = StorageMonitor::new(config.storage.clone());
+    info!(
+        whippet_dir = %config.storage.whippet_dir.display(),
+        iggy_dir = config
+            .storage
+            .iggy_dir
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "not mounted".to_string()),
+        warn_pct = config.storage.warn_pct,
+        crit_pct = config.storage.crit_pct,
+        "storage monitor sampling the node and Iggy data volumes"
+    );
     let ctx = Arc::new(NodeContext {
         config: config.clone(),
         journal: Arc::clone(&journal),
@@ -130,6 +147,7 @@ pub async fn run(args: NodeArgs) -> Result<()> {
         group_commit,
         hub: Arc::clone(&hub),
         metrics: Arc::clone(&metrics),
+        storage,
         snapshots: SnapshotStore::new(config.snapshot_dir.clone()),
         started: Instant::now(),
         shutdown,
@@ -142,6 +160,7 @@ pub async fn run(args: NodeArgs) -> Result<()> {
 
     hub.spawn_publisher();
     spawn_health_monitor(Arc::clone(&ctx));
+    spawn_storage_monitor(Arc::clone(&ctx));
 
     let mut handles = Vec::new();
     for shard in ctx.active_shards() {
@@ -334,6 +353,83 @@ async fn connect_iggy_with_pending(config: &NodeConfig, pending_bytes: usize) ->
     unreachable!("loop returns or bails")
 }
 
+/// How often the bounded-storage guard re-samples both data volumes. Five
+/// seconds matches the Iggy health cycle: fast enough that a soak cannot fill a
+/// volume between checks, slow enough to stay out of the log.
+const STORAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Re-samples the node and Iggy data volumes and logs only state transitions.
+///
+/// The first sample happens in [`StorageMonitor::new`]; this task reports the
+/// boot state once and then logs only when the aggregate state changes, so a
+/// steady disk costs one line at startup rather than one every five seconds.
+fn spawn_storage_monitor(ctx: Arc<NodeContext>) {
+    tokio::spawn(async move {
+        let mut shutdown = ctx.shutdown.subscribe();
+        let mut last = None;
+        log_storage_state(&ctx, &mut last, ctx.storage.snapshot());
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => return,
+                _ = sleep(STORAGE_REFRESH_INTERVAL) => {
+                    let snapshot = ctx.storage.refresh();
+                    log_storage_state(&ctx, &mut last, snapshot);
+                }
+            }
+        }
+    });
+}
+
+/// One line per state transition, with the numbers an operator needs to act:
+/// free bytes and used percent per known volume, plus the thresholds in force.
+fn log_storage_state(
+    ctx: &NodeContext,
+    last: &mut Option<StorageState>,
+    snapshot: StorageSnapshot,
+) {
+    if last.replace(snapshot.state) == Some(snapshot.state) {
+        return;
+    }
+    let whippet = snapshot.whippet;
+    let iggy = snapshot.iggy;
+    let iggy_free_bytes = iggy.map(|stat| stat.free_bytes);
+    let iggy_used_pct = iggy.map(|stat| stat.used_pct);
+    let (warn_pct, crit_pct) = (ctx.config.storage.warn_pct, ctx.config.storage.crit_pct);
+    match snapshot.state {
+        StorageState::Ok => info!(
+            state = snapshot.state.as_str(),
+            whippet_free_bytes = whippet.free_bytes,
+            whippet_used_pct = whippet.used_pct,
+            iggy_free_bytes,
+            iggy_used_pct,
+            warn_pct,
+            crit_pct,
+            "storage pressure is below the warning threshold"
+        ),
+        StorageState::Warn => warn!(
+            state = snapshot.state.as_str(),
+            whippet_available = whippet.available,
+            whippet_free_bytes = whippet.free_bytes,
+            whippet_used_pct = whippet.used_pct,
+            iggy_free_bytes,
+            iggy_used_pct,
+            warn_pct,
+            crit_pct,
+            "storage usage is at or above the warning threshold, or a volume is unreadable; ingress stays open"
+        ),
+        StorageState::Critical => tracing::error!(
+            state = snapshot.state.as_str(),
+            whippet_free_bytes = whippet.free_bytes,
+            whippet_used_pct = whippet.used_pct,
+            iggy_free_bytes,
+            iggy_used_pct,
+            warn_pct,
+            crit_pct,
+            "storage usage is at or above the critical threshold; readiness and durable admission should fail"
+        ),
+    }
+}
+
 fn spawn_health_monitor(ctx: Arc<NodeContext>) {
     tokio::spawn(async move {
         let mut shutdown = ctx.shutdown.subscribe();
@@ -436,15 +532,22 @@ async fn refresh_lag(ctx: &NodeContext) {
                 .committed(whippet_journal::Topic::Orders, shard, &consumer)
                 .await
             else {
-                return 0u64;
+                return (shard, 0u64);
             };
-            journal
+            let lag = journal
                 .lag(whippet_journal::Topic::Orders, shard, committed)
                 .await
-                .unwrap_or(0)
+                .unwrap_or(0);
+            (shard, lag)
         }))
         .await;
-    let total = per_shard.into_iter().fold(0u64, u64::saturating_add);
+    // Keep the aggregate for compatibility and the per-shard series so one
+    // lagging partition is visible instead of averaged away.
+    let mut total = 0u64;
+    for (shard, lag) in per_shard {
+        ctx.metrics.set_consumer_lag_for_shard(shard, lag);
+        total = total.saturating_add(lag);
+    }
     ctx.metrics.set_consumer_lag(total);
 }
 

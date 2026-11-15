@@ -302,6 +302,16 @@ async fn handle_submit(
         );
     }
 
+    if ctx.storage.state() == crate::storage::StorageState::Critical {
+        return (
+            error_response(
+                TcpErrorCode::StoragePressure,
+                "a monitored volume is at the critical threshold; new orders are not being accepted",
+            ),
+            false,
+        );
+    }
+
     // A token authorizes one participant, not just "some valid client". A
     // token holder cannot submit an order attributed to another desk. HTTP
     // derives the id from the token's participant name; TCP clients send the
@@ -559,6 +569,16 @@ mod tests {
     /// A node whose shared HTTP/TCP limiter allows `per_sec` frames per second
     /// per source address; `0` disables it.
     fn test_node_with_rate_limit(api_token: Option<&str>, per_sec: u32) -> TestNode {
+        test_node_full(api_token, per_sec, None)
+    }
+
+    /// Like [`test_node_with_rate_limit`], with an explicit storage config so a
+    /// test can force the critical threshold without filling a disk.
+    fn test_node_full(
+        api_token: Option<&str>,
+        per_sec: u32,
+        storage: Option<crate::storage::StorageConfig>,
+    ) -> TestNode {
         let dir = tempfile::tempdir().expect("temp dir");
         let exchange = ExchangeConfig::default();
         let config = NodeConfig {
@@ -581,6 +601,11 @@ mod tests {
             rate_limit_per_sec: per_sec,
             ws_per_ip: 0,
             turbo: crate::turbo::TurboConfig::default(),
+            storage: storage.unwrap_or_else(|| crate::storage::StorageConfig {
+                whippet_dir: dir.path().join("data"),
+                iggy_dir: None,
+                ..crate::storage::StorageConfig::default()
+            }),
         };
         let journal = Arc::new(Journal::memory());
         let hub = MdHub::new(exchange, config.iggy_addr.clone(), "memory".into(), None);
@@ -595,6 +620,7 @@ mod tests {
         );
         let rate_limiter = Arc::new(crate::ratelimit::RateLimiter::new(per_sec));
         let ws_connections = Arc::new(Semaphore::new(512));
+        let storage = crate::storage::StorageMonitor::new(config.storage.clone());
         let ctx = Arc::new(NodeContext {
             config,
             journal: Arc::clone(&journal),
@@ -603,6 +629,7 @@ mod tests {
             group_commit,
             hub,
             metrics,
+            storage,
             snapshots: SnapshotStore::new(dir.path().join("snapshots")),
             started: Instant::now(),
             shutdown,
@@ -685,6 +712,62 @@ mod tests {
             error_code(&response),
             Some(TcpErrorCode::Unauthorized.as_u16())
         );
+        let partition = Symbol::new("BTC-USD")
+            .unwrap()
+            .partition(node.ctx.exchange().partitions);
+        assert!(
+            node.memory()
+                .read(Topic::Orders, partition, 0, 10)
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn critical_storage_pressure_rejects_a_tcp_submit() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let node = test_node_full(
+            Some("s3cret"),
+            0,
+            Some(crate::storage::StorageConfig {
+                warn_pct: 1,
+                crit_pct: 2,
+                whippet_dir: dir.path().to_path_buf(),
+                iggy_dir: None,
+            }),
+        );
+        let mut state = ConnectionState::new(&node.ctx);
+        let (response, close) = handle_request(
+            &node.ctx,
+            &node.ctx.group_commit,
+            &mut state,
+            TcpRequest::Hello {
+                token: "s3cret".into(),
+            },
+        )
+        .await;
+        assert_eq!(
+            response,
+            TcpResponse::HelloAck {
+                ok: true,
+                message: "ok".into(),
+            }
+        );
+        assert!(!close);
+
+        let (response, close) = handle_request(
+            &node.ctx,
+            &node.ctx.group_commit,
+            &mut state,
+            TcpRequest::Submit {
+                commands: vec![authed_command("BTC-USD", 1)],
+            },
+        )
+        .await;
+        assert_eq!(
+            error_code(&response),
+            Some(TcpErrorCode::StoragePressure.as_u16())
+        );
+        assert!(!close, "a storage rejection keeps the connection usable");
         let partition = Symbol::new("BTC-USD")
             .unwrap()
             .partition(node.ctx.exchange().partitions);
