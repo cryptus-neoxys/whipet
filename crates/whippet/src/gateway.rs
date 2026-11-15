@@ -927,9 +927,14 @@ struct ReadinessView {
 /// Machine readiness: 200 only when the journal answers and every shard is
 /// alive. `/api/health` stays the human-readable JSON view.
 async fn readyz(State(ctx): State<Arc<NodeContext>>) -> impl IntoResponse {
-    let ingress = ctx.journal.ping().await;
-    let engine = ctx.engine_journal.ping().await;
-    let journal = ingress && engine;
+    // The node's health monitor pings the ingress client and every engine-pool
+    // entry once per cycle and caches the aggregate. Probes do no journal I/O,
+    // and a dead non-zero pool client makes the node not-ready.
+    let journal = if ctx.journal.is_iggy() {
+        ctx.metrics.iggy_connected()
+    } else {
+        true
+    };
     let shards_ok = ctx.shards_ok();
     let ready = journal && shards_ok;
     let status = if ready {

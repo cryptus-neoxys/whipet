@@ -955,11 +955,7 @@ pub async fn run_writer<J: JournalOps + ?Sized>(
 pub async fn run_md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
     let journal = ctx.engine_journal_for(shard_id);
     let consumer = format!("whippet-md-p{shard_id}");
-    let committed_offset = match ctx
-        .engine_journal
-        .committed(Topic::Md, shard_id, &consumer)
-        .await
-    {
+    let committed_offset = match journal.committed(Topic::Md, shard_id, &consumer).await {
         Ok(offset) => offset,
         Err(error) => {
             anyhow::bail!(

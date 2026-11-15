@@ -15,7 +15,9 @@ use whippet_journal::group::{GroupCommit, GroupCommitConfig};
 use whippet_journal::{IggyJournal, Journal};
 
 use crate::config::{JournalKind, NodeArgs, NodeConfig};
-use crate::context::{NodeContext, engine_journal_pool_size};
+use crate::context::{
+    BYTES_PER_MIB, NodeContext, engine_journal_pending_budget, engine_journal_pool_size,
+};
 use crate::engine_runner::{run_engine_shard, run_md_shard};
 use crate::gateway;
 use crate::ratelimit::RateLimiter;
@@ -36,13 +38,26 @@ pub async fn run(args: NodeArgs) -> Result<()> {
         .ok()
         .and_then(|value| value.parse::<usize>().ok());
     let pool_size = engine_journal_pool_size(shard_count, clients_override);
-    let engine_journals = open_engine_journal_pool(&config, &journal, pool_size).await?;
-    // The observer (health ping, lag sweep, gateway health probe) shares pool
-    // entry 0 rather than opening another connection.
+    // Total client-side pending budget for the engine pool, in MiB
+    // (WHIPPET_ENGINE_JOURNAL_PENDING_MIB, default 256), split across the
+    // pool with a 16 MiB per-client floor. The ingress client keeps its own
+    // budget via `IggyJournal::connect`. In memory mode the budget is unused:
+    // every pool entry is the ingress Arc.
+    let pending_override = std::env::var("WHIPPET_ENGINE_JOURNAL_PENDING_MIB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    let (pending_total_bytes, pending_per_client_bytes) =
+        engine_journal_pending_budget(pending_override, pool_size);
+    let engine_journals =
+        open_engine_journal_pool(&config, &journal, pool_size, pending_per_client_bytes).await?;
+    // The observer (gateway health probe) shares pool entry 0 rather than
+    // opening another connection.
     let engine_journal = Arc::clone(&engine_journals[0]);
     info!(
         clients = pool_size,
         shards = shard_count,
+        pending_total_mib = pending_total_bytes / BYTES_PER_MIB,
+        pending_per_client_mib = pending_per_client_bytes / BYTES_PER_MIB,
         "engine journal client pool ready"
     );
     journal
@@ -192,13 +207,16 @@ pub async fn run(args: NodeArgs) -> Result<()> {
 const DEFAULT_WS_CONNECTIONS: usize = 2_048;
 
 /// One engine journal client per pool entry. In `iggy` mode each entry is a
-/// fresh Iggy TCP connection with its own response loop; in `memory` mode
-/// every entry is the ingress journal's `Arc`, so the pool adds no state.
-/// No entry is dropped before `NodeContext` is, so no connection leaks.
+/// fresh Iggy TCP connection with its own response loop and its own slice of
+/// the pool's pending budget (`IggyJournal::connect_with_pending`); in
+/// `memory` mode every entry is the ingress journal's `Arc`, so the pool adds
+/// no state and the budget does not multiply. No entry is dropped before
+/// `NodeContext` is, so no connection leaks.
 async fn open_engine_journal_pool(
     config: &NodeConfig,
     ingress: &Arc<Journal>,
     size: usize,
+    pending_bytes: usize,
 ) -> Result<Vec<Arc<Journal>>> {
     match config.journal {
         JournalKind::Iggy => {
@@ -206,7 +224,9 @@ async fn open_engine_journal_pool(
             for _ in 0..size {
                 // connect_iggy retries until Iggy accepts; each call opens a
                 // dedicated client for one pool entry.
-                pool.push(Arc::new(connect_iggy(config).await?));
+                pool.push(Arc::new(
+                    connect_iggy_with_pending(config, pending_bytes).await?,
+                ));
             }
             Ok(pool)
         }
@@ -245,11 +265,21 @@ async fn open_journal(config: &NodeConfig) -> Result<Arc<Journal>> {
     })
 }
 
+/// Ingress client: the full default pending budget (`IggyJournal::connect`).
 async fn connect_iggy(config: &NodeConfig) -> Result<Journal> {
+    connect_iggy_with_pending(config, whippet_journal::DEFAULT_PENDING_MAX_BYTES).await
+}
+
+async fn connect_iggy_with_pending(config: &NodeConfig, pending_bytes: usize) -> Result<Journal> {
     let mut delay = Duration::from_millis(250);
     for attempt in 1..=120 {
-        match IggyJournal::connect(&config.iggy_addr, &config.iggy_user, &config.iggy_password)
-            .await
+        match IggyJournal::connect_with_pending(
+            &config.iggy_addr,
+            &config.iggy_user,
+            &config.iggy_password,
+            pending_bytes,
+        )
+        .await
         {
             Ok(journal) => {
                 info!(attempt, "connected to Iggy");
@@ -276,35 +306,58 @@ async fn connect_iggy(config: &NodeConfig) -> Result<Journal> {
 fn spawn_health_monitor(ctx: Arc<NodeContext>) {
     tokio::spawn(async move {
         let mut shutdown = ctx.shutdown.subscribe();
-        // Both connections matter: an ingress link that is up while the engine
-        // link is down still means orders are accepted and never matched.
-        let connected = if ctx.journal.is_iggy() {
-            ctx.journal.ping().await && ctx.engine_journal.ping().await
-        } else {
-            true
-        };
+        let connected = health_cycle(&ctx).await;
         ctx.metrics.set_iggy_connected(connected);
         refresh_lag(&ctx).await;
         loop {
             tokio::select! {
-                    _ = shutdown.changed() => return,
-                    _ = sleep(Duration::from_secs(5)) => {
-                        // Both connections matter: an ingress link that is up while the engine
-            // link is down still means orders are accepted and never matched.
-            let connected = if ctx.journal.is_iggy() {
-                ctx.journal.ping().await && ctx.engine_journal.ping().await
-            } else {
-                true
-            };
-                        ctx.metrics.set_iggy_connected(connected);
-                        refresh_lag(&ctx).await;
-                        if !connected {
-                            warn!("Iggy health check failed");
-                        }
-                    }
+                _ = shutdown.changed() => return,
+                _ = sleep(Duration::from_secs(5)) => {
+                    let connected = health_cycle(&ctx).await;
+                    ctx.metrics.set_iggy_connected(connected);
+                    refresh_lag(&ctx).await;
                 }
+            }
         }
     });
+}
+
+/// One health cycle: ping the ingress journal and every engine pool entry
+/// concurrently, then refresh the consumer-lag sweep. The result is cached
+/// into the single `iggy_connected` metric flag; no per-request path pings
+/// the whole pool.
+///
+/// Every pool entry is its own Iggy connection, so each must answer: an
+/// ingress link that is up while any engine link is down still means orders
+/// are accepted and never matched.
+async fn health_cycle(ctx: &NodeContext) -> bool {
+    let connected = if ctx.journal.is_iggy() {
+        let mut pings = Vec::with_capacity(ctx.engine_journals.len() + 1);
+        pings.push(ctx.journal.ping());
+        pings.extend(ctx.engine_journals.iter().map(|journal| journal.ping()));
+        let pings = futures_util::future::join_all(pings).await;
+        let down = pings.iter().filter(|&&up| !up).count();
+        if down > 0 {
+            warn!(
+                down,
+                clients = pings.len(),
+                "engine journal pool has unhealthy clients"
+            );
+        }
+        all_healthy(pings)
+    } else {
+        // Memory mode: every handle is the same Arc and pings always succeed.
+        true
+    };
+    if !connected {
+        warn!("Iggy health check failed");
+    }
+    connected
+}
+
+/// The pool (ingress included) is healthy only when every ping came back.
+fn all_healthy(pings: impl IntoIterator<Item = bool>) -> bool {
+    pings.into_iter().all(|up| up)
 }
 
 async fn shutdown_signal() {
@@ -338,17 +391,23 @@ async fn refresh_lag(ctx: &NodeContext) {
     // shards). Issue every shard's pair concurrently and sum the results;
     // error handling is unchanged — a shard that fails either call contributes
     // nothing to the total.
+    //
+    // Each shard reads through its own pool entry (`engine_journal_for`),
+    // so the sweep no longer funnels every round trip through entry 0 and
+    // contends with shard 0. When the pool is smaller than the shard count,
+    // modulo selection hands several shards the same journal; that is fine,
+    // those round trips stay concurrent.
     let per_shard =
         futures_util::future::join_all(ctx.active_shards().iter().map(|&shard| async move {
+            let journal = ctx.engine_journal_for(shard);
             let consumer = format!("whippet-engine-p{shard}");
-            let Ok(Some(committed)) = ctx
-                .engine_journal
+            let Ok(Some(committed)) = journal
                 .committed(whippet_journal::Topic::Orders, shard, &consumer)
                 .await
             else {
                 return 0u64;
             };
-            ctx.engine_journal
+            journal
                 .lag(whippet_journal::Topic::Orders, shard, committed)
                 .await
                 .unwrap_or(0)
@@ -356,4 +415,20 @@ async fn refresh_lag(ctx: &NodeContext) {
         .await;
     let total = per_shard.into_iter().fold(0u64, u64::saturating_add);
     ctx.metrics.set_consumer_lag(total);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::all_healthy;
+
+    #[test]
+    fn pool_health_requires_every_ping() {
+        // An empty pool is vacuously healthy; the constructors never build one.
+        assert!(all_healthy([]));
+        assert!(all_healthy([true]));
+        assert!(all_healthy([true, true, true]));
+        // One dead client downgrades the whole pool, wherever it sits.
+        assert!(!all_healthy([false, true, true]));
+        assert!(!all_healthy([true, true, false]));
+    }
 }

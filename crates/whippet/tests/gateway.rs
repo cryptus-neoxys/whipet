@@ -1578,3 +1578,118 @@ async fn memory_mode_pool_shares_one_journal_arc() {
     }
     assert!(Arc::ptr_eq(&ctx.journal, &ctx.engine_journal));
 }
+
+#[test]
+fn engine_journal_pool_size_covers_one_three_and_sixteen() {
+    // The default matches the shard count for the small, medium, and cap
+    // pool sizes.
+    assert_eq!(whippet::context::engine_journal_pool_size(1, None), 1);
+    assert_eq!(whippet::context::engine_journal_pool_size(3, None), 3);
+    assert_eq!(whippet::context::engine_journal_pool_size(16, None), 16);
+    // The override takes those sizes too, and clamps past the cap.
+    assert_eq!(whippet::context::engine_journal_pool_size(16, Some(1)), 1);
+    assert_eq!(whippet::context::engine_journal_pool_size(16, Some(3)), 3);
+    assert_eq!(whippet::context::engine_journal_pool_size(3, Some(16)), 16);
+    assert_eq!(
+        whippet::context::engine_journal_pool_size(3, Some(1_024)),
+        whippet::context::MAX_ENGINE_JOURNAL_CLIENTS
+    );
+}
+
+#[test]
+fn engine_journal_pending_budget_splits_the_total_with_a_floor() {
+    use whippet::context::{
+        BYTES_PER_MIB, MAX_ENGINE_JOURNAL_PENDING_MIB, MIN_ENGINE_JOURNAL_PENDING_MIB,
+        engine_journal_pending_budget,
+    };
+    let mib = BYTES_PER_MIB;
+    assert_eq!(MIN_ENGINE_JOURNAL_PENDING_MIB, 16);
+    assert_eq!(MAX_ENGINE_JOURNAL_PENDING_MIB, 4096);
+
+    // Pool of one keeps the whole default budget.
+    let (total, per) = engine_journal_pending_budget(None, 1);
+    assert_eq!(total, 256 * mib);
+    assert_eq!(per, 256 * mib);
+
+    // Pool of three: 256 MiB / 3 = 89,478,485 bytes (~85.33 MiB) per client;
+    // the split is byte-accurate, so nothing of the total is left unspent.
+    let (total, per) = engine_journal_pending_budget(None, 3);
+    assert_eq!(total, 256 * mib);
+    assert_eq!(per, total / 3);
+    assert_eq!(per, 89_478_485);
+
+    // Pool of sixteen: the default lands exactly on the 16 MiB floor.
+    let (total, per) = engine_journal_pending_budget(None, 16);
+    assert_eq!(total, 256 * mib);
+    assert_eq!(per, 16 * mib);
+
+    // A total at the floor is smaller than the floor across three clients:
+    // each client is still floored at 16 MiB, so the effective spend (48
+    // MiB) exceeds the configured total. That is the documented trade: no
+    // client is starved.
+    let (total, per) = engine_journal_pending_budget(Some(16), 3);
+    assert_eq!(total, 16 * mib);
+    assert_eq!(per, 16 * mib);
+
+    // Overrides clamp into [16, 4096] MiB before the split.
+    assert_eq!(engine_journal_pending_budget(Some(0), 3).0, 16 * mib);
+    assert_eq!(
+        engine_journal_pending_budget(Some(usize::MAX), 3).0,
+        4096 * mib
+    );
+}
+
+/// A context over the test node's state with a hand-built engine pool, the
+/// way an iggy-mode pool is wired: distinct handles per entry and the
+/// observer sharing entry 0.
+fn ctx_with_engine_pool(
+    node: &TestNode,
+    pool: Vec<Arc<whippet_journal::Journal>>,
+    observer: Arc<whippet_journal::Journal>,
+) -> Arc<NodeContext> {
+    Arc::new(NodeContext {
+        config: node.ctx.config.clone(),
+        journal: Arc::clone(&node.ctx.journal),
+        engine_journals: pool,
+        engine_journal: observer,
+        group_commit: node.ctx.group_commit.clone(),
+        hub: Arc::clone(&node.ctx.hub),
+        metrics: Arc::clone(&node.ctx.metrics),
+        snapshots: node.ctx.snapshots.clone(),
+        started: node.ctx.started,
+        shutdown: node.ctx.shutdown.clone(),
+        shards_ok: Arc::clone(&node.ctx.shards_ok),
+        rate_limiter: Arc::clone(&node.ctx.rate_limiter),
+        ws_connections: Arc::clone(&node.ctx.ws_connections),
+        snapshot_lock: Arc::clone(&node.ctx.snapshot_lock),
+    })
+}
+
+#[tokio::test]
+async fn engine_journal_for_selects_distinct_entries_when_the_pool_has_them() {
+    // Memory mode shares one Arc (`memory_mode_pool_shares_one_journal_arc`),
+    // so distinct handles only exist in iggy mode. This test wires two
+    // distinct memory journals into the pool to pin the selection contract
+    // that mode relies on: shard 0 gets entry 0 (the observer's twin) and
+    // shard 1 gets a different handle.
+    let node = TestNode::new();
+    let first = Arc::new(whippet_journal::Journal::memory());
+    let second = Arc::new(whippet_journal::Journal::memory());
+    assert!(
+        !Arc::ptr_eq(&first, &second),
+        "the two pool entries must be distinct journals"
+    );
+    let ctx = ctx_with_engine_pool(
+        &node,
+        vec![Arc::clone(&first), Arc::clone(&second)],
+        Arc::clone(&first),
+    );
+    assert!(Arc::ptr_eq(ctx.engine_journal_for(0), &first));
+    assert!(Arc::ptr_eq(ctx.engine_journal_for(1), &second));
+    assert!(
+        !Arc::ptr_eq(ctx.engine_journal_for(0), ctx.engine_journal_for(1)),
+        "shards 0 and 1 must select different pool entries here"
+    );
+    // The observer still shares entry 0, and shard 0 still resolves to it.
+    assert!(Arc::ptr_eq(ctx.engine_journal_for(0), &ctx.engine_journal));
+}

@@ -486,6 +486,15 @@ impl Metrics {
         self.iggy_connected.store(connected, Ordering::Relaxed);
     }
 
+    /// The last health-cycle result for every journal client.
+    ///
+    /// The node's health monitor pings the ingress client and every engine-pool
+    /// entry once per cycle and caches the aggregate here, so a readiness probe
+    /// does no I/O and a dead non-zero pool client is visible.
+    pub fn iggy_connected(&self) -> bool {
+        self.iggy_connected.load(Ordering::Relaxed)
+    }
+
     pub fn set_consumer_lag(&self, lag: u64) {
         self.consumer_lag.store(lag, Ordering::Relaxed);
     }

@@ -211,6 +211,15 @@ pub struct AppendResult {
 /// Maximum number of non-routing header names remembered per connection.
 const HEADER_KEY_CACHE_LIMIT: usize = 32;
 
+/// Default client-side pending-operations byte budget, per client.
+///
+/// Demo headroom: Iggy's default pool (256 active/retained mutations, 64 MiB
+/// of frozen frames) can fill under batch or concurrent gateway load. This
+/// only sizes the client-side frame pool; it is not a durability or
+/// offset-semantics change. The engine journal pool splits its own budget
+/// across clients via `IggyJournal::connect_with_pending`.
+pub const DEFAULT_PENDING_MAX_BYTES: usize = 256 * 1024 * 1024;
+
 /// Parsed `HeaderKey`s for the routing header set.
 ///
 /// Iggy's `HeaderKey` owns a `Bytes` copy of the key text, so
@@ -465,17 +474,34 @@ pub struct IggyJournal {
 impl IggyJournal {
     /// Connect with a username/password. The local demo uses the bootstrap
     /// account; production-style PATs and scoped users are Phase 2.
+    ///
+    /// Uses [`DEFAULT_PENDING_MAX_BYTES`] as the client-side pending budget.
+    /// Call [`IggyJournal::connect_with_pending`] to size it explicitly.
     pub async fn connect(address: &str, username: &str, password: &str) -> Result<Self> {
+        Self::connect_with_pending(address, username, password, DEFAULT_PENDING_MAX_BYTES).await
+    }
+
+    /// Connect with an explicit client-side pending-operations byte budget.
+    ///
+    /// The engine journal pool calls this with a per-client slice of the
+    /// node's total budget (`WHIPPET_ENGINE_JOURNAL_PENDING_MIB`), so opening
+    /// more clients cannot silently multiply the memory cost. All other
+    /// connection settings are identical to [`IggyJournal::connect`].
+    pub async fn connect_with_pending(
+        address: &str,
+        username: &str,
+        password: &str,
+        pending_bytes: usize,
+    ) -> Result<Self> {
+        let pending_bytes = NonZeroUsize::new(pending_bytes).ok_or_else(|| {
+            JournalError::InvalidConfig("pending operations budget must be non-zero".to_string())
+        })?;
         let client = IggyClient::builder()
             .with_tcp()
             .with_server_address(address.to_string())
-            // Demo headroom: Iggy's default pool (256 active/retained mutations,
-            // 64 MiB of frozen frames) can fill under batch or concurrent
-            // gateway load. This only sizes the client-side frame pool; it is
-            // not a durability or offset-semantics change.
             .with_pending_operations(PendingOperationsConfig {
                 max_operations: NonZeroUsize::new(4096).expect("4096 is non-zero"),
-                max_bytes: NonZeroUsize::new(256 * 1024 * 1024).expect("256 MiB is non-zero"),
+                max_bytes: pending_bytes,
             })
             .with_no_delay()
             .with_auto_sign_in(AutoLogin::Enabled(Credentials::UsernamePassword(
@@ -1475,6 +1501,22 @@ mod tests {
         );
         assert_eq!(JournalError::NotConnected.operation_id(), None);
         assert_eq!(JournalError::NoConfirmation.operation_id(), None);
+    }
+
+    #[test]
+    fn default_pending_budget_is_the_demonstrated_256_mib() {
+        assert_eq!(DEFAULT_PENDING_MAX_BYTES, 256 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn connect_with_pending_rejects_a_zero_budget_before_connecting() {
+        // Validation happens before any I/O: a zero budget is a caller bug,
+        // not a connection failure.
+        let error = IggyJournal::connect_with_pending("127.0.0.1:1", "u", "p", 0)
+            .await
+            .err()
+            .expect("a zero pending budget must be rejected");
+        assert!(matches!(error, JournalError::InvalidConfig(_)));
     }
 
     #[test]

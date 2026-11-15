@@ -28,6 +28,50 @@ pub fn engine_journal_pool_size(shard_count: usize, override_clients: Option<usi
         .clamp(1, MAX_ENGINE_JOURNAL_CLIENTS)
 }
 
+/// One MiB, used by the pending-budget arithmetic below.
+pub const BYTES_PER_MIB: usize = 1024 * 1024;
+
+/// Default total pending-operations budget for the engine pool, in MiB
+/// (`WHIPPET_ENGINE_JOURNAL_PENDING_MIB` when unset).
+pub const DEFAULT_ENGINE_JOURNAL_PENDING_MIB: usize = 256;
+
+/// Smallest accepted total pending budget, in MiB.
+pub const MIN_ENGINE_JOURNAL_PENDING_MIB: usize = 16;
+
+/// Largest accepted total pending budget, in MiB.
+pub const MAX_ENGINE_JOURNAL_PENDING_MIB: usize = 4096;
+
+/// Per-client floor. A pool this large can exceed the configured total:
+/// `total / pool_size` below the floor is raised back to it, so a client is
+/// never starved into swapping its pending frames to the wire.
+pub const ENGINE_JOURNAL_PENDING_FLOOR_BYTES: usize = 16 * BYTES_PER_MIB;
+
+/// Split the engine pool's total pending-operations budget across
+/// `pool_size` clients.
+///
+/// `override_mib` is the parsed `WHIPPET_ENGINE_JOURNAL_PENDING_MIB` value
+/// (or `None`); it is clamped into
+/// `[MIN_ENGINE_JOURNAL_PENDING_MIB, MAX_ENGINE_JOURNAL_PENDING_MIB]`. The
+/// total is then divided across the pool with a per-client floor of
+/// [`ENGINE_JOURNAL_PENDING_FLOOR_BYTES`]:
+/// `per_client = max(16 MiB, total / pool_size)`. Returns
+/// `(total_bytes, per_client_bytes)`; the caller logs both and passes the
+/// per-client value to `IggyJournal::connect_with_pending`.
+pub fn engine_journal_pending_budget(
+    override_mib: Option<usize>,
+    pool_size: usize,
+) -> (usize, usize) {
+    let total_mib = override_mib
+        .unwrap_or(DEFAULT_ENGINE_JOURNAL_PENDING_MIB)
+        .clamp(
+            MIN_ENGINE_JOURNAL_PENDING_MIB,
+            MAX_ENGINE_JOURNAL_PENDING_MIB,
+        );
+    let total_bytes = total_mib * BYTES_PER_MIB;
+    let per_client_bytes = (total_bytes / pool_size.max(1)).max(ENGINE_JOURNAL_PENDING_FLOOR_BYTES);
+    (total_bytes, per_client_bytes)
+}
+
 /// Shared node state. Every task holds an `Arc<NodeContext>`; none of the
 /// fields is mutable after startup.
 pub struct NodeContext {
@@ -43,9 +87,11 @@ pub struct NodeContext {
     /// ingress journal), so the pool is a no-op.
     pub engine_journals: Vec<Arc<Journal>>,
     /// Observer handle into the engine journal pool: a clone of pool entry 0.
-    /// The health-monitor ping, the consumer-lag sweep in `node.rs`, and the
-    /// gateway health probe use this handle. It deliberately shares the first
-    /// pool entry instead of opening a dedicated Iggy connection, so
+    /// The health monitor pings every pool entry and caches the aggregate in
+    /// [`Metrics`], so `/readyz` does not use this handle. The consumer-lag
+    /// sweep and both shard consumers select through
+    /// [`NodeContext::engine_journal_for`]. The observer deliberately shares
+    /// the first pool entry rather than opening another connection, so
     /// observing costs no extra client. Never use it for shard traffic; use
     /// [`NodeContext::engine_journal_for`].
     pub engine_journal: Arc<Journal>,
