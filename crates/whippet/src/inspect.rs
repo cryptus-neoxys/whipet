@@ -12,7 +12,7 @@
 //!
 //! [`Journal`]: whippet_journal::Journal
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use whippet_core::ids::{OrderId, ParticipantId, Symbol};
@@ -272,13 +272,6 @@ pub fn build_order_trace(
 ) -> OrderTrace {
     let allowed = |symbol: Symbol| symbols.is_none_or(|symbols| symbols.contains(&symbol));
 
-    // Every decoded command on the partition, not only the traced order's: an
-    // execution is caused by whichever order produced it.
-    let mut command_at: BTreeMap<u64, &Command> = BTreeMap::new();
-    for (offset, command) in orders {
-        command_at.insert(*offset, command);
-    }
-
     let mut order_events = Vec::new();
     for (offset, command) in orders {
         if command.order_id != order_id || !allowed(command.symbol) {
@@ -330,16 +323,34 @@ pub fn build_order_trace(
     }
     exec_events.sort_unstable_by_key(|event| (event.cause_offset, event.seq));
 
+    // Resolve only the offsets the traced executions actually reference. A
+    // full offset->command map cost one allocation per order on a million-
+    // record partition to answer a handful of lookups.
+    let mut command_at: HashMap<u64, Option<&Command>> = HashMap::with_capacity(exec_events.len());
+    for event in &exec_events {
+        command_at.entry(event.cause_offset).or_insert(None);
+    }
+    if !command_at.is_empty() {
+        for (offset, command) in orders {
+            if let Some(slot) = command_at.get_mut(offset) {
+                *slot = Some(command);
+            }
+        }
+    }
+
     // A cause offset must land on a decoded NewOrder or Cancel record for the
     // same symbol. Halt and resume emit market data, never execution reports,
     // so a control record at the cause offset is evidence of a bad record or a
     // bad reader, not a resolved cause.
     let mut unresolved_cause_offsets = Vec::new();
     for event in &exec_events {
-        let resolved = command_at.get(&event.cause_offset).is_some_and(|command| {
-            matches!(command.kind, CommandKind::NewOrder | CommandKind::Cancel)
-                && command.symbol == event.symbol
-        });
+        let resolved = command_at
+            .get(&event.cause_offset)
+            .and_then(|command| *command)
+            .is_some_and(|command| {
+                matches!(command.kind, CommandKind::NewOrder | CommandKind::Cancel)
+                    && command.symbol == event.symbol
+            });
         if !resolved {
             unresolved_cause_offsets.push(event.cause_offset);
         }

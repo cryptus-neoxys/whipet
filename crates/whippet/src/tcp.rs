@@ -29,6 +29,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
+use whippet_core::ids::ParticipantId;
 use whippet_core::ids::Symbol;
 use whippet_core::protocol::{Command, CommandKind};
 use whippet_core::tcp::{TCP_BATCH_MAX, TcpErrorCode, TcpRequest, TcpResponse, body_len};
@@ -109,7 +110,9 @@ struct ConnectionState {
     authorized: bool,
     /// Participant bound to the token that authorized this connection. `None`
     /// on an anonymous node; every submitted command must carry this identity.
-    participant: Option<String>,
+    /// Store the derived id, not the name: a submit frame is compared with one
+    /// integer instead of running BLAKE3 on every frame.
+    participant_id: Option<ParticipantId>,
     peer: IpAddr,
     limiter: Arc<RateLimiter>,
 }
@@ -129,7 +132,7 @@ impl ConnectionState {
         Self {
             // Anonymous ingress is only possible when no token is configured.
             authorized: !ctx.config.auth_required(),
-            participant: None,
+            participant_id: None,
             peer,
             limiter,
         }
@@ -247,7 +250,7 @@ fn handle_hello(
     match ctx.config.participant_for(token) {
         Some(participant) => {
             state.authorized = true;
-            state.participant = Some(participant.to_string());
+            state.participant_id = Some(ParticipantId::derive(participant));
             (hello_ack(true), false)
         }
         None => (hello_ack(false), true),
@@ -316,20 +319,18 @@ async fn handle_submit(
     // token holder cannot submit an order attributed to another desk. HTTP
     // derives the id from the token's participant name; TCP clients send the
     // numeric id, so compare against the same derivation.
-    if let Some(participant) = &state.participant {
-        let expected = whippet_core::ids::ParticipantId::derive(participant);
-        if commands
+    if let Some(expected) = state.participant_id
+        && commands
             .iter()
             .any(|command| command.participant != expected)
-        {
-            return (
-                error_response(
-                    TcpErrorCode::Unauthorized,
-                    "this token is bound to a different participant",
-                ),
-                false,
-            );
-        }
+    {
+        return (
+            error_response(
+                TcpErrorCode::Unauthorized,
+                "this token is bound to a different participant",
+            ),
+            false,
+        );
     }
     let symbol = match validate_batch(ctx, &commands) {
         Ok(symbol) => symbol,
@@ -806,7 +807,7 @@ mod tests {
             }
         );
         assert!(!close);
-        assert_eq!(state.participant.as_deref(), Some("api"));
+        assert_eq!(state.participant_id, Some(ParticipantId::derive("api")));
 
         // A different participant id is refused before anything is journaled.
         let (response, close) = handle_request(

@@ -987,22 +987,33 @@ impl Metrics {
             }
             state.rate
         };
-        // One lock acquisition for all four lifetime percentiles. A poisoned
+        // One lock for the lifetime and rolling-window percentiles. A poisoned
         // lock reports zeroes, exactly as the previous per-histogram reads did.
-        let (ingress_p50_us, ingress_p99_us, match_p50_us, match_p99_us) = match self.latency.lock()
-        {
-            Ok(state) => (
-                percentile_of(&state.ingress, 50.0),
-                percentile_of(&state.ingress, 99.0),
-                percentile_of(&state.match_latency, 50.0),
-                percentile_of(&state.match_latency, 99.0),
-            ),
-            Err(_) => (0.0, 0.0, 0.0, 0.0),
+        // The window expiry rule matches `window_summary`: a read after the
+        // window has run reports zeroes rather than a stale tail.
+        let (lifetime, window) = match self.latency.lock() {
+            Ok(state) => {
+                let now = Instant::now();
+                let (w50, w99, mw50, mw99) = state.window_percentiles(now);
+                (
+                    (
+                        percentile_of(&state.ingress, 50.0),
+                        percentile_of(&state.ingress, 99.0),
+                        percentile_of(&state.match_latency, 50.0),
+                        percentile_of(&state.match_latency, 99.0),
+                    ),
+                    WindowSummary {
+                        ingress_p50_us: w50,
+                        ingress_p99_us: w99,
+                        match_p50_us: mw50,
+                        match_p99_us: mw99,
+                        secs: state.window_secs,
+                    },
+                )
+            }
+            Err(_) => ((0.0, 0.0, 0.0, 0.0), WindowSummary::default()),
         };
-        // The window read is its own lock acquisition after the lifetime
-        // one. It rotate-expires exactly like `window_summary`, so both
-        // expositions agree: an idle node reports zeroes, not stale tails.
-        let window = self.window_summary();
+        let (ingress_p50_us, ingress_p99_us, match_p50_us, match_p99_us) = lifetime;
         MetricsView {
             mode: self.mode,
             orders_ingressed: orders,
@@ -1239,7 +1250,10 @@ impl ShardMetrics {
 pub struct MdFeedEvent {
     pub symbol: Symbol,
     pub seq: u64,
-    pub frame: Arc<str>,
+    /// Pre-serialized JSON frame. `Bytes` lets every WebSocket subscriber
+    /// clone the buffer (refcount bump) instead of copying the UTF-8 payload
+    /// into a fresh `String` per subscriber.
+    pub frame: bytes::Bytes,
 }
 
 /// Market-data hub. Cloneable handle shared by the consumer, HTTP API, and
@@ -1531,14 +1545,15 @@ impl MdHub {
             // Integers, enum codes, and a fixed ASCII symbol: infallible while
             // the DTOs stay that shape. Skip rather than panic if that ever
             // changes; the sequence gap makes the consumer resnapshot.
-            let Ok(frame) = serde_json::to_string(&message) else {
+            let Ok(frame) = serde_json::to_vec(&message) else {
                 debug_assert!(false, "MdFeedMessage must serialize");
                 continue;
             };
+            let frame = bytes::Bytes::from(frame);
             let feed_event = Arc::new(MdFeedEvent {
                 symbol: event.symbol,
                 seq: event.seq.0,
-                frame: Arc::from(frame),
+                frame,
             });
             if self.feed.send(feed_event).is_ok() {
                 sent += 1;
@@ -2605,8 +2620,8 @@ mod tests {
         assert_eq!(latest.trades.len(), 70);
     }
 
-    fn decode_feed(frame: &str) -> MdFeedMessage {
-        serde_json::from_str(frame).expect("feed frame is JSON")
+    fn decode_feed(frame: &[u8]) -> MdFeedMessage {
+        serde_json::from_slice(frame).expect("feed frame is JSON")
     }
 
     #[test]

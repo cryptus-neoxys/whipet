@@ -1058,6 +1058,17 @@ wall-clock claims:
   gateway batch counter is one atomic per batch, not one per order.
 - The MD apply loop no longer does a linear instrument lookup per event in
   release builds; the lookup existed only for a `debug_assert`.
+- Sequenced-feed frames are `Bytes`: serialized once per event, then each
+  WebSocket subscriber takes a refcount and a zero-copy `Utf8Bytes` view
+  instead of copying the frame. The old path allocated and copied once per
+  subscriber per event.
+- `Metrics::snapshot` takes one latency lock for lifetime and windowed
+  percentiles instead of two.
+- `order-trace` maps only the cause offsets its executions reference, not
+  every command on the partition; a 1M-record trace no longer builds a
+  million-node map.
+- A batch derives the authenticated participant once, and a TCP connection
+  stores the derived participant id instead of re-deriving it per frame.
 
 No stage-timing claim is made for these; the durable path is append-bound and
 the existing dev-loop tables already carry the measurement caveat.

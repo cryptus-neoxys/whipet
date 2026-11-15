@@ -407,7 +407,8 @@ async fn submit_order(
     };
     ctx.metrics
         .record_stage_us(Stage::GatewayParse, split_elapsed(&mut stage_at));
-    let validated = validate_order_ref(&ctx, &request, caller, &participants);
+    let caller_id = caller.map(ParticipantId::derive);
+    let validated = validate_order_ref(&ctx, &request, caller, caller_id, &participants);
     ctx.metrics
         .record_stage_us(Stage::GatewayValidate, split_elapsed(&mut stage_at));
     let validated = validated?;
@@ -717,6 +718,9 @@ fn validate_batch<'a>(
         )
     })?;
     let partition = symbol.partition(ctx.exchange().partitions);
+    // The caller identity is fixed for the request; derive it once instead of
+    // running BLAKE3 for every order in a 256-order batch.
+    let caller_id = caller.map(ParticipantId::derive);
     let mut validated = Vec::with_capacity(request.orders.len());
     for (index, order) in request.orders.iter().enumerate() {
         let order_symbol = Symbol::new(order.symbol).map_err(|_| {
@@ -733,7 +737,7 @@ fn validate_batch<'a>(
                 ),
             ));
         }
-        let order = validate_order_ref(ctx, order, caller, participants)
+        let order = validate_order_ref(ctx, order, caller, caller_id, participants)
             .map_err(|error| with_index(index, error))?;
         validated.push(order);
     }
@@ -756,6 +760,7 @@ fn validate_order_ref(
     ctx: &NodeContext,
     request: &OrderRequestRef<'_>,
     caller: Option<&str>,
+    caller_id: Option<ParticipantId>,
     participants: &ParticipantCache,
 ) -> Result<ValidatedOrder, (StatusCode, Json<ApiError>)> {
     // `Symbol::new` copies at most 16 bytes and never allocates on success;
@@ -776,6 +781,7 @@ fn validate_order_ref(
         request.client_order_id,
         request.participant,
         caller,
+        caller_id,
         Some(participants),
     )
 }
@@ -795,7 +801,12 @@ fn validate_cancel(
             format!("unknown symbol {}", request.symbol),
         )
     })?;
-    resolve_participant_id(caller, request.participant.as_deref(), Some(participants))
+    resolve_participant_id(
+        caller,
+        None,
+        request.participant.as_deref(),
+        Some(participants),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -809,6 +820,7 @@ fn validate_fields(
     client_order_id: Option<&str>,
     participant: Option<&str>,
     caller: Option<&str>,
+    caller_id: Option<ParticipantId>,
     participants: Option<&ParticipantCache>,
 ) -> Result<ValidatedOrder, (StatusCode, Json<ApiError>)> {
     let instrument = ctx
@@ -852,7 +864,7 @@ fn validate_fields(
         // syscall, a String, and a BLAKE3 pass per order for no benefit.
         None => OrderId(uuid::Uuid::new_v4().as_u128()),
     };
-    let participant = resolve_participant_id(caller, participant, participants)?;
+    let participant = resolve_participant_id(caller, caller_id, participant, participants)?;
     Ok(ValidatedOrder {
         symbol,
         side,
@@ -1277,11 +1289,13 @@ fn check_participant<'a>(
 /// through the bounded derivation cache when one is supplied.
 fn resolve_participant_id(
     caller: Option<&str>,
+    caller_id: Option<ParticipantId>,
     requested: Option<&str>,
     participants: Option<&ParticipantCache>,
 ) -> Result<ParticipantId, (StatusCode, Json<ApiError>)> {
     let name = check_participant(caller, requested)?;
-    Ok(match (caller, participants) {
+    Ok(match (caller_id, participants) {
+        (Some(id), _) => id,
         (None, Some(cache)) => cache.get_or_derive(name),
         _ => ParticipantId::derive(name),
     })
@@ -2233,8 +2247,16 @@ async fn md_feed_loop(mut socket: WebSocket, ctx: Arc<NodeContext>, symbol: Symb
                             continue;
                         }
                         last_seq = event.seq;
+                        // `Utf8Bytes::try_from(Bytes)` validates and keeps the
+                        // same allocation; the old `&str` conversion copied the
+                        // whole frame for every subscriber.
+                        let Ok(frame) =
+                            axum::extract::ws::Utf8Bytes::try_from(event.frame.clone())
+                        else {
+                            continue;
+                        };
                         if socket
-                            .send(Message::Text(event.frame.as_ref().into()))
+                            .send(Message::Text(frame))
                             .await
                             .is_err()
                         {
