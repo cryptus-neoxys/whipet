@@ -12,9 +12,8 @@ use serde::{Deserialize, Serialize};
 use whippet_core::config::{ExchangeConfig, InstrumentConfig};
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Seq, Symbol};
 use whippet_core::protocol::{
-    Command, CommandKind, ExecKind, ExecutionReport, FLAG_MAKER, FLAG_RESTED, FLAG_TAKER,
-    MD_FLAG_HALTED, MdEvent, MdKind, MdOrder, MdSnapshot, OrderType, RejectReason, SessionState,
-    Side, TradingStatus,
+    Command, CommandKind, ExecKind, ExecutionReport, FLAG_MAKER, FLAG_RESTED, FLAG_TAKER, MdEvent,
+    MdKind, MdOrder, MdSnapshot, OrderType, RejectReason, SessionState, Side, TradingStatus,
 };
 
 use crate::book::{Book, BookError, BookSnapshot, RestingOrder, hash_book_snapshot};
@@ -1331,6 +1330,7 @@ fn hex(bytes: &[u8; 32]) -> String {
 mod tests {
     use super::*;
     use whippet_core::config::InstrumentConfig;
+    use whippet_core::protocol::MD_FLAG_HALTED;
 
     fn config() -> InstrumentConfig {
         let mut config = InstrumentConfig::new("BTC-USD", 100, 100, 200).unwrap();
