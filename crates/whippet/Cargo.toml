@@ -37,7 +37,9 @@ whippet-marketdata.workspace = true
 whippet-sim.workspace = true
 
 [dev-dependencies]
+bytes.workspace = true
 http-body-util = "0.1"
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 whippet-testkit.workspace = true

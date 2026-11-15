@@ -3904,6 +3904,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bincode",
+ "bytes",
  "chrono",
  "clap",
  "futures-util",
