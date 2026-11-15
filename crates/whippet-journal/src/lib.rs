@@ -69,9 +69,15 @@ impl JournalError {
 
 pub type Result<T> = std::result::Result<T, JournalError>;
 
+/// One journal message: a payload and its header set.
+///
+/// The payload is [`Bytes`], so the borrowed append hands it to the Iggy frame
+/// with a refcount bump instead of a copy, and the owned append moves it
+/// outright. The constructors still take `Vec<u8>`; `Bytes::from(Vec<u8>)` is
+/// zero-copy, so building a message costs no extra copy.
 #[derive(Debug, Clone)]
 pub struct JournalMessage {
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
     pub headers: JournalHeaders,
 }
 
@@ -123,7 +129,7 @@ impl JournalHeaders {
 impl JournalMessage {
     pub fn new(payload: Vec<u8>, headers: Vec<(String, String)>) -> Self {
         Self {
-            payload,
+            payload: Bytes::from(payload),
             headers: JournalHeaders::Pairs(headers),
         }
     }
@@ -137,7 +143,7 @@ impl JournalMessage {
     /// end.
     pub fn new_static(payload: Vec<u8>, headers: Vec<(&'static str, String)>) -> Self {
         Self {
-            payload,
+            payload: Bytes::from(payload),
             headers: JournalHeaders::Pairs(
                 headers
                     .into_iter()
@@ -156,7 +162,7 @@ impl JournalMessage {
     /// build the argument.
     pub fn new_named(payload: Vec<u8>, headers: Vec<(HeaderName, String)>) -> Self {
         Self {
-            payload,
+            payload: Bytes::from(payload),
             headers: JournalHeaders::Named(headers),
         }
     }
@@ -611,8 +617,9 @@ impl IggyJournal {
         Ok(())
     }
 
-    /// Append a borrowed batch. Payloads are copied into the Iggy frames; use
-    /// [`IggyJournal::append_owned`] when the caller can give up the messages.
+    /// Append a borrowed batch. Payloads are handed to the Iggy frames with a
+    /// [`Bytes`] refcount bump; use [`IggyJournal::append_owned`] when the
+    /// caller can give up the messages.
     ///
     /// Batches larger than 256 messages (Iggy's default `message_bus.max_batch`)
     /// are split into contiguous `send_messages` calls. [`AppendResult::base_offset`]
@@ -632,9 +639,7 @@ impl IggyJournal {
         }
         let mut iggy_messages = Vec::with_capacity(messages.len());
         for message in messages {
-            iggy_messages.push(
-                self.iggy_message(Bytes::copy_from_slice(&message.payload), &message.headers)?,
-            );
+            iggy_messages.push(self.iggy_message(message.payload.clone(), &message.headers)?);
         }
         let count = messages.len() as u32;
         let first = self
@@ -648,9 +653,9 @@ impl IggyJournal {
 
     /// Append a batch the caller no longer needs.
     ///
-    /// The payload buffers move into the Iggy frames instead of being copied,
-    /// which removes one allocation and one memcpy per message. Chunking and
-    /// error semantics match [`IggyJournal::append`].
+    /// The payload buffers move into the Iggy frames instead of being cloned,
+    /// which saves even the borrowed path's refcount bump per message.
+    /// Chunking and error semantics match [`IggyJournal::append`].
     pub async fn append_owned(
         &self,
         topic: Topic,
@@ -664,7 +669,7 @@ impl IggyJournal {
         let mut iggy_messages = Vec::with_capacity(messages.len());
         for message in messages {
             let JournalMessage { payload, headers } = message;
-            iggy_messages.push(self.iggy_message(Bytes::from(payload), &headers)?);
+            iggy_messages.push(self.iggy_message(payload, &headers)?);
         }
         let first = self
             .dispatch(topic, partition, &mut iggy_messages, count)
@@ -1020,7 +1025,10 @@ impl MemoryJournal {
                 .map(|(index, message)| MemoryRecord {
                     offset: base_offset + index as u64,
                     timestamp_ns: now_ns(),
-                    payload: message.payload.clone(),
+                    // Dev path: convert to the owned storage format at the
+                    // storage boundary; the Iggy path hands the `Bytes` on
+                    // without a copy.
+                    payload: message.payload.to_vec(),
                     headers: message.headers.to_pairs(),
                 }),
         );
@@ -1044,11 +1052,15 @@ impl MemoryJournal {
         let count = messages.len() as u32;
         log.reserve(messages.len());
         for (index, message) in messages.into_iter().enumerate() {
+            let JournalMessage { payload, headers } = message;
             log.push(MemoryRecord {
                 offset: base_offset + index as u64,
                 timestamp_ns: now_ns(),
-                payload: message.payload,
-                headers: message.headers.into_pairs(),
+                // Dev path: convert to the owned storage format. Zero-copy
+                // when the `Bytes` is uniquely held, which append_owned's
+                // move guarantees.
+                payload: payload.into(),
+                headers: headers.into_pairs(),
             });
         }
         AppendResult {
@@ -1527,7 +1539,7 @@ mod tests {
             vec![9],
             vec![("symbol", "ETH-USD".to_string()), ("seq", "3".to_string())],
         );
-        assert_eq!(message.payload, vec![9]);
+        assert_eq!(message.payload, Bytes::from_static(&[9u8]));
         assert!(!message.headers.is_named(), "new_static is the pair path");
         assert_eq!(
             message.headers.to_pairs(),
@@ -1547,7 +1559,7 @@ mod tests {
                 (HeaderName::Seq, "3".to_string()),
             ],
         );
-        assert_eq!(message.payload, vec![9]);
+        assert_eq!(message.payload, Bytes::from_static(&[9u8]));
         assert!(message.headers.is_named());
         assert_eq!(
             message
@@ -1708,6 +1720,72 @@ mod tests {
         );
         assert_eq!(empty.count, 0);
         assert_eq!(journal.high_watermark(Topic::Orders, 0), 4);
+    }
+
+    #[test]
+    fn borrowed_and_owned_appends_produce_identical_payloads_and_offsets() {
+        let journal = MemoryJournal::new();
+        let payloads: Vec<Vec<u8>> = vec![vec![1, 2, 3], vec![4], vec![5, 6, 7, 8]];
+        let messages_for = || {
+            payloads
+                .iter()
+                .map(|payload| JournalMessage::new(payload.clone(), vec![]))
+                .collect::<Vec<_>>()
+        };
+
+        // The same payload set goes through both APIs: the borrowed append
+        // first, the owned append right after, continuing the same log.
+        let borrowed = journal.append(Topic::Md, 7, &messages_for());
+        let owned = journal.append_owned(Topic::Md, 7, messages_for());
+
+        assert_eq!(borrowed.partition, owned.partition);
+        assert_eq!(borrowed.base_offset, 0);
+        assert_eq!(
+            owned.base_offset,
+            borrowed.base_offset + payloads.len() as u64,
+            "the owned append continues the borrowed append's offsets"
+        );
+        assert_eq!(borrowed.count as usize, payloads.len());
+        assert_eq!(owned.count as usize, payloads.len());
+
+        let records = journal.read(Topic::Md, 7, 0, 10);
+        assert_eq!(records.len(), 2 * payloads.len());
+        for (index, expected) in payloads.iter().enumerate() {
+            let from_borrowed = &records[index];
+            let from_owned = &records[index + payloads.len()];
+            assert_eq!(from_borrowed.offset, index as u64);
+            assert_eq!(from_owned.offset, index as u64 + payloads.len() as u64);
+            assert_eq!(from_borrowed.payload, *expected);
+            assert_eq!(
+                from_owned.payload, *expected,
+                "the owned append stores the same payload bytes at its own offset"
+            );
+        }
+    }
+
+    #[test]
+    fn borrowed_and_owned_payload_handoffs_build_identical_frames() {
+        let keys = HeaderKeys::new().expect("routing header keys parse");
+        let headers = vec![("seq".to_string(), "1".to_string())];
+
+        // The borrowed append clones the shared payload into the frame; the
+        // owned append moves it. Both route through the same frame builders,
+        // so the wire result must be byte-identical.
+        let borrowed_message = JournalMessage::new(vec![1, 2, 3], headers.clone());
+        let borrowed_frame = build_iggy_message(&keys, borrowed_message.payload.clone(), &headers)
+            .expect("borrowed frame");
+
+        let owned_message = JournalMessage::new(vec![1, 2, 3], headers.clone());
+        let JournalHeaders::Pairs(owned_pairs) = owned_message.headers.clone() else {
+            unreachable!("new produces the pair header set");
+        };
+        let owned_frame =
+            build_iggy_message(&keys, owned_message.payload, &owned_pairs).expect("owned frame");
+
+        assert_eq!(
+            borrowed_frame.payload, owned_frame.payload,
+            "the cloned handoff and the moved handoff carry identical payload bytes"
+        );
     }
 
     #[test]
