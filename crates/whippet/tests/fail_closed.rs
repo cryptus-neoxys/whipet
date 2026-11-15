@@ -82,6 +82,33 @@ fn write_snapshot(dir: &Path, exchange: &ExchangeConfig, symbol: Symbol, applied
     shard
 }
 
+/// Write a snapshot file the way an older node (or a hand edit) could have,
+/// bypassing the writer's save-time invariants. Used to prove the *reader*
+/// still fails closed on state the current writer refuses to produce.
+fn write_raw_snapshot(dir: &Path, exchange: &ExchangeConfig, symbol: Symbol, applied: u64) {
+    let shard = symbol.partition(exchange.partitions);
+    let mut engine = ShardEngine::new(shard, exchange);
+    let mut out = EngineOutput::with_capacity(8, 8);
+    for (offset, command) in orders(symbol, applied).iter().enumerate() {
+        engine
+            .process(command, offset as u64, &mut out)
+            .expect("apply command");
+        out.clear();
+    }
+
+    // Format: `WHIPSNP1`, little-endian u32 version (5), bincode snapshot.
+    // The constants are private to the store on purpose; only the reader trust
+    // boundary is under test here.
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"WHIPSNP1");
+    bytes.extend_from_slice(&5u32.to_le_bytes());
+    bytes.extend_from_slice(
+        &bincode::serialize(&engine.snapshot_state()).expect("snapshot serializes"),
+    );
+    std::fs::write(dir.join(format!("partition-{shard}.snapshot")), bytes)
+        .expect("raw snapshot writes");
+}
+
 fn replay_args(dir: &Path, partition: u32, require_snapshot: bool) -> ReplayArgs {
     ReplayArgs {
         iggy_addr: "127.0.0.1:8090".into(),
@@ -235,7 +262,12 @@ async fn replay_require_snapshot_rejects_a_snapshot_with_no_applied_commands() {
 
     // The node's resume rule: a snapshot from a shard that never applied a
     // command is not a resume point, so it must not satisfy --require-snapshot.
-    write_snapshot(dir.path(), &exchange, symbol, 0);
+    //
+    // The writer refuses to persist this state, so the test writes the raw v5
+    // bytes directly. That is the legacy/hand-written file the reader must
+    // still reject; going through `write_snapshot` would only prove the
+    // writer-side guard.
+    write_raw_snapshot(dir.path(), &exchange, symbol, 0);
     let journal = memory_journal(partition, &orders(symbol, 6), 5);
 
     let error = replay_with_journal(replay_args(dir.path(), partition, true), journal)
