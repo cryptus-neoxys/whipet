@@ -251,13 +251,14 @@ The design rules:
   would run ahead of the writer is deferred to the next batch boundary where
   the gate is open. The snapshot never claims a resume offset whose outputs
   were lost.
-- **Live hash.** The matcher calls `snapshot_state()`, which computes the
-  engine's own `state_hash`; the writer saves those hashes and, for the final
-  snapshot, rebuilds the shard to verify them before the atomic rename. An
-  off-loop hash was tried and reverted: at ~170k orders it disagreed with the
-  restored engine on one shard, so the node does not use it. The snapshot file
-  format is version 2 (`SymbolSnapshot` carries the per-symbol config,
-  `BookSnapshot` carries `min_price_ticks`); version 1 files are rejected.
+- **Off-loop hash.** The matcher calls `snapshot_state_without_hash`; the
+  blocking writer fills the per-symbol hashes and verifies the final snapshot
+  by rebuilding it. The earlier ~170k-order mismatch was a dedup-count bug:
+  the off-loop hash used the insertion-walk length where the live hash uses
+  the distinct-id count, and a re-admitted id made them differ. The fix is
+  pinned by a 100-engine × 200k-command test. The snapshot file format is
+  version 3 (per-symbol config, `BookSnapshot.min_price_ticks`, and the dedup
+  terminal-eviction order); versions 1 and 2 are rejected.
 - **Per-shard metrics.** Each matcher records into its own lock-free
   `ShardMetrics`, merged into the global `Metrics` once per second and once
   on exit, instead of taking a global histogram lock per command.
@@ -375,11 +376,11 @@ replays the tail after the snapshot's maximum `last_offset`. `--to` is
 inclusive. `--expect-hash` turns a hash mismatch into a non-zero exit.
 
 On a local single-node run (M4, Docker Desktop, dev-loop), partition 1 had a
-snapshot at offset 108466. Full replay from offset 0 and snapshot-seeded replay
-from offset 108467 both produced:
+snapshot at offset 158548. Full replay from offset 0 and snapshot-seeded replay
+from offset 158549 both produced:
 
 ```text
-state_hash = ceddf1c94cfdb121541ae726d4001fb43daaf92dc54a8ef19216761a5330e510
+state_hash = c2b9838ba8438245697c93b5396113cbeb38b3a136ae174842f11b1e39536739
 ```
 
 Equal hashes mean the snapshot state plus the replayed tail matches a replay

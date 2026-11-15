@@ -10,6 +10,21 @@ Whippet is pre-1.0; minor releases may change internal APIs.
 
 ### Added
 
+- Snapshot format v3 carries the dedup terminal-eviction order, so a restored
+  table evicts at the same point as a continuous replay. The dedup capacity is
+  no longer inflated by the insertion-walk length; a 33.9k-record replay tail
+  now matches full replay.
+- The off-loop snapshot hash is restored with the distinct-id dedup count fix
+  and pinned by a 100-engine × 200k-command stress test.
+- Snapshot cadence is configurable (`WHIPPET_SNAPSHOT_MIN_INTERVAL_SECS`,
+  default 30 s, 5–300 s).
+- Per-IP WebSocket sub-limit (`WHIPPET_WS_PER_IP`, default off), plus
+  `whippet_ws_connections` / `whippet_ws_rejected_total`.
+- `GatewayValidate` and cancel stage samples; TCP batch rate cost.
+- Turbo design in ADR 0013.
+
+### Added
+
 - Separate Iggy connections for ingress and the engine, so a slow output
   append cannot head-of-line block the gateway.
 - Shared sharded per-IP rate limiter for HTTP and TCP, charged per order;

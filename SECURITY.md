@@ -83,7 +83,7 @@ private network with synthetic data only.
 | Client mTLS | Not implemented and not claimed. Apache Iggy does not currently support client mTLS. |
 | Audit | No hash chain, no signed checkpoints, no audit verifier. |
 | Surveillance | Not implemented. |
-| Rate limiting | Optional per-IP token bucket (`WHIPPET_RATE_LIMIT_PER_SEC`, default off), shared by HTTP and TCP and charged per order; plus global TCP (1,024) and WebSocket (2,048) connection caps. There is no per-participant quota. |
+| Rate limiting | Optional per-IP token bucket (`WHIPPET_RATE_LIMIT_PER_SEC`, default off), shared by HTTP and TCP and charged per order; plus global TCP (1,024) and WebSocket (2,048) connection caps; a per-IP WebSocket sub-limit is available through `WHIPPET_WS_PER_IP` (off by default, because the benchmark and reverse-proxy deployments share one peer address). There is no per-participant quota. |
 | Cluster | Single node. No RF3, no failover, no zero-loss-across-a-node-failure claim. |
 
 ### Known gaps

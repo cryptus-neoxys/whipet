@@ -79,9 +79,9 @@ run_writer (async task, owns the journal client for outputs)
   open. The snapshot can therefore never claim a resume offset whose outputs
   were lost.
 - **The snapshot hash moves off the shard.** The matcher calls
-  `snapshot_state()` with the live hash; the blocking writer saves it and
-  verifies the final snapshot by rebuilding. (An off-loop hash was tried and
-  reverted after a ~170k-order shard disagreed with the restored engine.) The clone still happens
+  `snapshot_state_without_hash`; the blocking writer fills the hashes and
+  verifies the final snapshot by rebuilding. The earlier ~170k-order mismatch
+  was a dedup-count bug, fixed and pinned by a stress test. The clone still happens
   on the matcher thread at the snapshot interval; the hash and the file write
   happen on the writer.
 - **Per-shard metrics.** Each matcher records into its own `ShardMetrics`

@@ -203,8 +203,8 @@ single-order path was p50 838 ms with 40k errors before the tranche.
 
 The 5,000/s single-order path was p50 838 ms with 40k errors before group
 commit. The replay proof was rerun after the tranche: full and snapshot-seeded
-replay both end at `ceddf1c94cfdb121541ae726d4001fb43daaf92dc54a8ef19216761a5330e510`
-from snapshot offset 108466 (tail 364).
+replay both end at `c2b9838ba8438245697c93b5396113cbeb38b3a136ae174842f11b1e39536739`
+from snapshot offset 158548 (tail 271).
 
 ### Phase 1.5c (implemented; dev-loop measured)
 
@@ -219,7 +219,7 @@ p50 is within host noise while the tail moved.
 | Workstream | Change | Expected effect | Status |
 |---|---|---|---|
 | Shard thread and rings | One dedicated OS thread (`whippet-shard-<id>`) per active shard; bounded input ring (reader → matcher) and output ring (matcher → writer), capacity 2, plus a recycle channel that returns the polled buffer to the reader; the matcher does no I/O and no await; the reader/writer tasks own the journal edge | Removes the runtime migration and interleaving jitter from the match path; bounds in-flight memory per shard; backpressure when a ring fills instead of unbounded queueing | Implemented ([ADR 0010](adr/0010-shard-thread-and-journal-pipeline.md)); end-to-end sweep pending |
-| Snapshot hash | The matcher supplies the engine's live `state_hash`; the writer saves it and verifies the final snapshot by rebuilding. Snapshots are gated by `appended_offset` | The final snapshot cannot claim a bad hash; a periodic snapshot is checked on restore. Off-loop hash was reverted after a scale mismatch | Implemented; off-loop variant reverted |
+| Snapshot hash | The matcher calls `snapshot_state_without_hash`; the writer fills the hashes and verifies the final snapshot by rebuilding. Snapshots are gated by `appended_offset`; cadence is 30 s (5–300). | Removes the hash from the match path; the final snapshot cannot claim a bad hash. The earlier scale mismatch was a dedup-count bug, now fixed and pinned by a 100-engine × 200k test | Implemented |
 | Per-shard metrics | Each matcher records into its own lock-free `ShardMetrics` (counters + local histogram), merged into the global `Metrics` once per second and on exit | Removes one `Mutex<Histogram>` lock per command from every shard's serial path | Implemented; merge cost measured below |
 | Gateway/journal allocation pass | Per-event allocations on the edges: `execution_message`/`md_message` payload `Vec` + header `String`s remain the target; the reader's per-batch read `Vec` is now recycled | Lower CPU and allocation per event; fewer transient allocations per output | Partially implemented (recycle channel); message-construction pass pending |
 
@@ -258,15 +258,29 @@ rate limiter across HTTP and TCP, caps WebSocket connections, verifies the
 final snapshot at write time, and moves the last stage sample off the matcher
 thread.
 
-Dev-loop soak after the split (fresh stack, 5,000/s, batch 10, 60 s): p50
-**1.14 ms**, p99 **0.54 s**, 0 errors. The p50 is the per-role clients; the
-p99 is the periodic snapshot path (live hash and clone on the matcher,
-serialize/fsync on the writer), not matching. `engine_process` stays at 4 µs
-and `md_apply` at 3 µs. An off-loop hash was tried and reverted after a
-~170k-order shard disagreed with the restored engine; correctness wins over
-the snapshot tail. A 10-minute soak still fails the 5% drift gate on Docker
-Desktop; the next step is a copy-on-write snapshot or a longer cadence, then
-the Linux run.
+Snapshot stage split at 170k commands / 68k dedup entries (targeted release
+bench, shared host):
+
+| Stage | Thread | Time |
+|---|---|---:|
+| `matcher_clone_with_hash` (old path) | shard | 5.55 ms |
+| `matcher_clone_only` (new path) | shard | **0.28 ms** |
+| `writer_hash` (`hash_symbol_snapshot`) | writer | 5.35 ms |
+| `writer_serialize` (+fsync) | writer | **38.7 ms** |
+
+The clone was the shard stall; the writer's serialize/fsync dominates the
+periodic tail. At 225k commands the split was clone 0.4–0.6 ms, hash 8.1–8.3 ms,
+write 33.8–38.1 ms. The v3 terminal-order field grows the snapshot by roughly a
+third; encoding it more compactly is a known follow-up.
+
+Dev-loop soak after the split (fresh stack, 5,000/s, batch 10, 90 s): p50
+**2.22 ms**, p99 **76.5 ms**, 0 errors over 450,000 orders. The p99 is the
+periodic snapshot path (clone/serialize/fsync), not matching; the off-loop
+hash is restored and the cadence is 30 s. `engine_process` stays at 4 µs and
+`md_apply` at 3 µs. A full-vs-seeded replay with a 33.9k-record tail matches
+after the dedup terminal-queue fix. A 10-minute soak still fails the 5% drift
+gate on Docker Desktop; the next step is a copy-on-write snapshot, then the
+Linux run.
 
 ### Phase 1.5d (implemented)
 

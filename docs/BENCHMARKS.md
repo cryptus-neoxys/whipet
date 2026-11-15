@@ -508,8 +508,8 @@ mode, not a latency result.
 
 The replay proof was rerun after the change. Full replay and snapshot-seeded
 replay both end at
-`ceddf1c94cfdb121541ae726d4001fb43daaf92dc54a8ef19216761a5330e510` from
-snapshot offset 108466 (tail 364). This is a correctness check, not a latency
+`c2b9838ba8438245697c93b5396113cbeb38b3a136ae174842f11b1e39536739` from
+snapshot offset 158548 (tail 271). This is a correctness check, not a latency
 measurement.
 
 ## TCP-ingress sweep (dev-loop measured, headline pending)
@@ -638,11 +638,13 @@ not a scaling trend. These are `dev-loop`, one-run numbers, not headline
 results.
 
 With the ingress driver batched (`--ingress-batch 10`, 10,000 orders/s) and
-envelope parsing, 500 subscribers delivered 20 fps and ~245 KB/s/client with
-0 ingress errors and 0 stalled clients. A 1,000-subscriber run fails through
-Docker Desktop's host port proxy with a socket reset before the node's 2,048
-WebSocket cap is reached; the node itself is not the limit. Treat 1,000 as a
-native-Linux/direct-network target, not a Docker Desktop result.
+envelope parsing, 100 subscribers stayed at 20 fps with 0 stalled clients. A
+500-subscriber run on a long log produced one stalled client and ~1% ingress
+errors, and a 1,000-subscriber run times out through Docker Desktop's host
+port proxy before the node's 2,048 WebSocket cap and the (default-off) per-IP
+sub-limit are reached. The per-IP cap is not the cause; the host proxy and the
+long-log snapshot tail are. Treat 100 as the validated Docker Desktop shape
+and 1,000 as a native-Linux/direct-network target.
 
 ### Method
 
@@ -1055,6 +1057,58 @@ For a `dev-loop` run on macOS or inside a container, set
 `WHIPPET_VIRTUALIZATION=docker-desktop` (or `orbstack`, `linux-vm`) so the
 manifest records the environment explicitly. The scope label is `dev-loop`
 either way on a non-native-Linux host.
+
+### Linux headline run
+
+The native Linux headline is one reproducible command that produces every
+artifact the README links. No numbers are quoted yet; results are pending
+until this runs on bare metal.
+
+```sh
+scripts/bench-linux.sh all
+```
+
+What it runs (defaults; every knob is in the script header):
+
+- Fresh stack (`scripts/reset.sh`) before the matrix, simulator stopped.
+- L1: 1 symbol, rates 1k/5k/10k/25k/50k x batches 1/10/100/256,
+  300 s measured, 60 s warmup, 5 repetitions.
+- L2: 3 configured symbols at 10k/s x batches 1/10/100/256
+  (labelled `L2-3sym`).
+- F1: fanout 1/10/100/1,000 subscribers with
+  `--parse envelope --ingress-rate 10000 --ingress-batch 10`.
+  The 1,000-subscriber row needs a direct network; Docker Desktop's host
+  proxy fails around 1,000 concurrent WebSockets.
+- R1: `scripts/replay.sh` proof (full vs snapshot-seeded hashes must match).
+- R2: replay + live 10k/s batch-10 proof (background load plus replay).
+- Host gate: refuses a headline from a container or VM (no `/.dockerenv`,
+  no hypervisor CPU flag, no container cgroup, `systemd-detect-virt` none).
+  `WHIPPET_ALLOW_VIRTUALIZED=1` downgrades to `dev-loop`, never headline.
+- Method card records `lscpu`, kernel, governor, SMT, isolcpus, `numactl`,
+  Docker version, and the exact image digest.
+
+Artifact layout (written by the script, never committed automatically):
+
+```text
+docs/benchmarks/2026-11-linux/
+├── README.md        # method card (generated, results pending)
+├── MANIFESTS.txt    # file index for the run
+└── raw/
+    ├── <run-id>.json               # bench / fanout manifests
+    ├── linux-<stamp>-*.txt         # lscpu, kernel, governor, SMT, ...
+    └── linux-<stamp>-replay-R*.log # R1 / R2 replay proof
+```
+
+Acceptance checklist before quoting any number:
+
+- [ ] Host labelled `native`, not a VM or container run.
+- [ ] 5 repetitions on every headline row, 60 s warmup.
+- [ ] Raw manifests linked next to every table; manifest wins on conflict.
+- [ ] Replay proof attached (R1 hashes match; R2 under live load).
+- [ ] Steady-state note reported; `dev-loop` never presented as headline.
+
+**Status: pending.** The runner, matrix, and method card exist. No native
+Linux manifests have been recorded yet.
 
 ## Publishing a run
 

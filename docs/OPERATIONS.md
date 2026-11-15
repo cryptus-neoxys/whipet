@@ -22,12 +22,13 @@ credentials explicitly.
 | `WHIPPET_API_PARTICIPANT` | `api` | Participant identity used when a bearer token is configured. |
 | `WHIPPET_RATE_LIMIT_PER_SEC` | `0` | Optional per-IP ingress limit; `0` disables. Shared by HTTP and TCP, charged per order (a 256-order batch costs 256 tokens). |
 | `WHIPPET_MAX_WS_CONNECTIONS` | `2048` | Concurrent WebSocket subscriber cap. |
+| `WHIPPET_WS_PER_IP` | `0` | Per-IP WebSocket subscriber sub-limit; `0` disables it. The fanout benchmark leaves it off because all subscribers share one host. |
 | `WHIPPET_JOURNAL` | `iggy` | `iggy` for the demo, `memory` for tests and brokerless development. |
 | `WHIPPET_MODE` | `durable` | Only `durable` is enabled. `turbo` is rejected at startup with a Phase 2 message. |
 | `WHIPPET_SYMBOLS` | `BTC-USD,ETH-USD,SOL-USD` | Comma-separated subset of the built-in instruments. Unknown symbols are rejected. |
 | `WHIPPET_PARTITIONS` | `16` | Trading partitions, 1-256. This is a create-time contract; see below. |
 | `WHIPPET_SNAPSHOT_DIR` | `data/snapshots` | Directory for `partition-<N>.snapshot` files. |
-| `WHIPPET_SNAPSHOT_EVERY` | `10000` | Commands per symbol between state snapshots. The node also enforces a 15-second minimum interval, so a high-throughput run snapshots at most once per 15 s. Values below 1 are clamped to 1. |
+| `WHIPPET_SNAPSHOT_EVERY` | `10000` | Commands per symbol between state snapshots. The node also enforces a minimum interval (default 30 s, `WHIPPET_SNAPSHOT_MIN_INTERVAL_SECS`, clamped 5–300 s), so a high-throughput run snapshots at most once per interval. Values below 1 are clamped to 1. |
 | `WHIPPET_HTTP_TRACE` | unset | Set to `1` to enable per-request `tower-http` trace spans; off by default for throughput. |
 
 Concurrent single-order submissions on one partition are coalesced into one
