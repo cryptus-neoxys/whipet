@@ -34,6 +34,7 @@ pub mod fanout;
 pub mod soak;
 
 use std::collections::VecDeque;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::Arc;
@@ -352,7 +353,24 @@ struct SteadyState {
     flagged: bool,
 }
 
+/// Machine-readable steady-state outcome. "Too few windows" is `Skipped`, never
+/// `Passed`: a short run cannot support a steady-state claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SteadyVerdict {
+    Passed,
+    Flagged,
+    Skipped,
+}
+
 impl SteadyState {
+    fn verdict(&self) -> SteadyVerdict {
+        match self.drift_pct {
+            None => SteadyVerdict::Skipped,
+            Some(_) if self.flagged => SteadyVerdict::Flagged,
+            Some(_) => SteadyVerdict::Passed,
+        }
+    }
+
     fn note(&self, repetition: u32) -> String {
         match self.drift_pct {
             Some(drift) => {
@@ -542,6 +560,8 @@ pub async fn run(config: BenchConfig) -> Result<BenchManifest> {
     let mut repetitions = Vec::new();
     let mut mix = MixCounts::default();
     let mut steady_notes = Vec::new();
+    let mut steady_flagged = false;
+    let mut steady_skipped = false;
 
     for index in 0..config.repetitions.max(1) {
         tracing::info!(
@@ -555,12 +575,17 @@ pub async fn run(config: BenchConfig) -> Result<BenchManifest> {
         );
         let started_at = Utc::now().to_rfc3339();
         let stats = run_repetition(&client, &config, &exchange, &run_id, index).await?;
-        if stats.steady.flagged {
-            tracing::warn!(
-                repetition = index,
-                drift_pct = stats.steady.drift_pct.unwrap_or_default(),
-                "steady-state drift exceeds 5%; the run is not steady state"
-            );
+        match stats.steady.verdict() {
+            SteadyVerdict::Flagged => {
+                steady_flagged = true;
+                tracing::warn!(
+                    repetition = index,
+                    drift_pct = stats.steady.drift_pct.unwrap_or_default(),
+                    "steady-state drift exceeds 5%; the run is not steady state"
+                );
+            }
+            SteadyVerdict::Skipped => steady_skipped = true,
+            SteadyVerdict::Passed => {}
         }
         steady_notes.push(stats.steady.note(index));
         mix.merge(&stats.mix);
@@ -576,13 +601,15 @@ pub async fn run(config: BenchConfig) -> Result<BenchManifest> {
 
     // Headline = the repetition with the median p99, never the best run.
     let mut ordered: Vec<&RepetitionResult> = repetitions.iter().collect();
-    ordered.sort_by(|a, b| a.latency.p99.partial_cmp(&b.latency.p99).unwrap());
+    ordered.sort_by(|a, b| a.latency.p99.total_cmp(&b.latency.p99));
     let median = ordered[ordered.len() / 2];
 
     let workload = workload_spec(&config, &exchange, transport);
 
     let host = host_info();
-    let mut labels = vec![scope_label(&host)];
+    let git_sha_value = git_sha();
+    let git_dirty_value = git_dirty();
+    let image_digest_value = image_digest();
     let mut notes = vec![
         "Open-loop absolute-deadline pacing; latency measured from the scheduled deadline.".into(),
         "M4/Docker Desktop is a dev-loop measurement, not a headline claim.".into(),
@@ -611,8 +638,32 @@ pub async fn run(config: BenchConfig) -> Result<BenchManifest> {
     }
     notes.extend(steady_notes);
 
+    // Provenance gaps are recorded, not left blank. A valid dev run is not a
+    // failure because the tree is dirty or the image was built locally, but the
+    // manifest must say so before anyone quotes it.
+    if git_dirty_value {
+        notes.push(
+            "git_dirty=true: the working tree had uncommitted changes when this run started, so \
+             git_sha does not uniquely identify the measured code."
+                .into(),
+        );
+    }
+    if git_sha_value == "unknown" {
+        notes.push(
+            "git_sha is \"unknown\": the harness could not read a commit (git missing or \
+             WHIPPET_GIT_SHA unset); this manifest is not tied to a commit."
+                .into(),
+        );
+    }
+    if image_digest_value.is_none() {
+        notes.push(
+            "image_digest is null: WHIPPET_IMAGE_DIGEST was unset or \"unknown\", so this run \
+             cannot be tied to a built image."
+                .into(),
+        );
+    }
+
     if mix.overloaded_slots > 0 {
-        labels.push("invalid-overload".into());
         notes.push(format!(
             "INVALID as a latency measurement: {} slot(s) ({} orders) were dropped because the \
              in-flight cap of {} was saturated. Drops are overload, not errors, and are excluded \
@@ -650,19 +701,28 @@ pub async fn run(config: BenchConfig) -> Result<BenchManifest> {
             );
         }
     }
-    if generator_bound_run {
-        labels.push("generator-bound".into());
-    }
+
+    let steady_verdict = if steady_flagged {
+        SteadyVerdict::Flagged
+    } else if steady_skipped {
+        SteadyVerdict::Skipped
+    } else {
+        SteadyVerdict::Passed
+    };
+    let labels = run_labels(
+        host.scope_label(),
+        mix.overloaded_slots,
+        generator_bound_run,
+        steady_verdict,
+    );
 
     let manifest = BenchManifest {
         schema_version: MANIFEST_SCHEMA_VERSION,
         run_id: run_id.clone(),
         created_at: Utc::now().to_rfc3339(),
-        git_sha: git_sha(),
-        git_dirty: git_dirty(),
-        image_digest: std::env::var("WHIPPET_IMAGE_DIGEST")
-            .ok()
-            .filter(|value| !value.is_empty() && value != "unknown"),
+        git_sha: git_sha_value,
+        git_dirty: git_dirty_value,
+        image_digest: image_digest_value,
         host,
         workload,
         throughput: median.throughput.clone(),
@@ -673,9 +733,12 @@ pub async fn run(config: BenchConfig) -> Result<BenchManifest> {
         labels,
     };
 
-    std::fs::create_dir_all(&config.output_dir)?;
-    let path = config.output_dir.join(format!("{run_id}.json"));
-    std::fs::write(&path, serde_json::to_string_pretty(&manifest)?)?;
+    // The honesty rules are part of the run, not an after-the-fact audit: a
+    // manifest that fails them is not written.
+    manifest
+        .check_invariants()
+        .map_err(|error| BenchError::Config(format!("manifest invariants: {error}")))?;
+    let path = write_manifest(&config.output_dir, &run_id, &manifest)?;
     tracing::info!(
         path = %path.display(),
         p50_us = manifest.latency.p50,
@@ -684,6 +747,64 @@ pub async fn run(config: BenchConfig) -> Result<BenchManifest> {
         "benchmark manifest written"
     );
     Ok(manifest)
+}
+
+/// Validity labels in one place so the rules are executable and testable:
+/// host scope first, then an overload verdict, a generator verdict, and one
+/// steady-state verdict. An invalid run is labelled; it is never made to look
+/// like a clean one.
+fn run_labels(
+    scope: &str,
+    overloaded_slots: u64,
+    generator_bound_run: bool,
+    steady: SteadyVerdict,
+) -> Vec<String> {
+    let mut labels = vec![scope.to_string()];
+    if overloaded_slots > 0 {
+        labels.push("invalid-overload".into());
+    }
+    if generator_bound_run {
+        labels.push("generator-bound".into());
+    }
+    labels.push(
+        match steady {
+            SteadyVerdict::Passed => "steady-state",
+            SteadyVerdict::Flagged => "not-steady-state",
+            SteadyVerdict::Skipped => "steady-state-skipped",
+        }
+        .into(),
+    );
+    labels
+}
+
+/// Write the manifest fully or not at all. Serialization happens before the
+/// file is created, the file is created exclusively (a `run_id` may not
+/// overwrite an earlier artifact), and a write error removes the partial file
+/// instead of leaving truncated JSON that looks like a result.
+fn write_manifest(output_dir: &Path, run_id: &str, manifest: &BenchManifest) -> Result<PathBuf> {
+    std::fs::create_dir_all(output_dir)?;
+    let path = output_dir.join(format!("{run_id}.json"));
+    let json = serde_json::to_vec_pretty(manifest)?;
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(BenchError::Config(format!(
+                "manifest {} already exists; a run_id must be unique per run",
+                path.display()
+            )));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if let Err(error) = file.write_all(&json).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(error.into());
+    }
+    Ok(path)
 }
 
 fn validate_config(config: &BenchConfig) -> Result<()> {
@@ -720,6 +841,31 @@ fn validate_config(config: &BenchConfig) -> Result<()> {
         return Err(BenchError::Config(
             "tcp_addr must not be empty when transport = tcp".into(),
         ));
+    }
+    if config.label.trim().is_empty() {
+        return Err(BenchError::Config(
+            "label must not be empty; it is the workload name in the manifest".into(),
+        ));
+    }
+    if config.mode.trim().is_empty() {
+        return Err(BenchError::Config(
+            "mode must not be empty; it is the workload mode in the manifest".into(),
+        ));
+    }
+    if config.symbols.is_empty() {
+        return Err(BenchError::Config(
+            "symbols must contain at least one symbol".into(),
+        ));
+    }
+    for (index, symbol) in config.symbols.iter().enumerate() {
+        if symbol.trim().is_empty() {
+            return Err(BenchError::Config(format!("symbols[{index}] is empty")));
+        }
+        if config.symbols[..index].contains(symbol) {
+            return Err(BenchError::Config(format!(
+                "symbols contains {symbol} more than once"
+            )));
+        }
     }
     Ok(())
 }
@@ -1012,7 +1158,7 @@ async fn run_repetition(
     let period_ns = pacing.period_ns;
     let pacer = std::thread::spawn(move || {
         for slot in 0..total_slots {
-            let deadline = start + Duration::from_nanos(period_ns.saturating_mul(slot));
+            let deadline = slot_deadline(start, period_ns, slot);
             wait_until(deadline);
             if tick_tx.blocking_send(Tick { slot, deadline }).is_err() {
                 break;
@@ -1025,9 +1171,7 @@ async fn run_repetition(
         let deadline = tick.deadline;
         // Slip is measured when the generator hands the slot to the request
         // side, so it includes pacer lateness and async wakeup.
-        let slip_us = Instant::now()
-            .saturating_duration_since(deadline)
-            .as_micros() as u64;
+        let slip_us = since_deadline_us(deadline, Instant::now());
         let measured = slot >= pacing.warmup_slots;
         let slot_orders = pacing.orders_in_slot(slot).max(1) as usize;
         if measured {
@@ -1370,7 +1514,7 @@ fn spawn_ingress(
             _ => false,
         };
         if measured {
-            let latency_us = completed.saturating_duration_since(deadline).as_micros() as u64;
+            let latency_us = since_deadline_us(deadline, completed);
             let _ = tx
                 .send(Sample {
                     latency_us,
@@ -1587,7 +1731,7 @@ async fn complete_frame(pending: Option<PendingFrame>, ack: AckEvent, tx: &mpsc:
         _ => (false, None),
     };
     if measured {
-        let latency_us = ack.received.saturating_duration_since(deadline).as_micros() as u64;
+        let latency_us = since_deadline_us(deadline, ack.received);
         let stages = StageSample {
             send_us: written.saturating_duration_since(deadline).as_micros() as u64,
             wire_us: ack.received.saturating_duration_since(written).as_micros() as u64,
@@ -1626,7 +1770,7 @@ async fn fail_pending(pending: &mut VecDeque<PendingFrame>, tx: &mpsc::Sender<Sa
             permit,
         } = job;
         if measured {
-            let latency_us = now.saturating_duration_since(deadline).as_micros() as u64;
+            let latency_us = since_deadline_us(deadline, now);
             let _ = tx
                 .send(Sample {
                     latency_us,
@@ -1911,6 +2055,19 @@ struct Tick {
     deadline: Instant,
 }
 
+/// A slot's absolute deadline on the open-loop schedule. Every deadline is
+/// derived from the run start, so a late wakeup never shifts the schedule.
+fn slot_deadline(start: Instant, period_ns: u64, slot: u64) -> Instant {
+    start + Duration::from_nanos(period_ns.saturating_mul(slot))
+}
+
+/// Coordinated-omission correction: latency is completion minus the absolute
+/// deadline, never completion minus the send time. A request that queued
+/// before it left still carries its lateness.
+fn since_deadline_us(deadline: Instant, at: Instant) -> u64 {
+    at.saturating_duration_since(deadline).as_micros() as u64
+}
+
 /// Sleep until a little before the deadline, then spin the last few tens of
 /// microseconds. This runs on a dedicated OS thread, not on a Tokio worker.
 fn wait_until(deadline: Instant) {
@@ -1988,11 +2145,10 @@ fn generate_order(
 }
 
 pub fn scope_label(host: &HostInfo) -> String {
-    if host.virtualization == "native" && host.os.eq_ignore_ascii_case("linux") {
-        "headline".into()
-    } else {
-        "dev-loop".into()
-    }
+    // One rule for the harness and the manifest: `headline` only for native
+    // Linux. Docker Desktop, OrbStack, Linux VMs, macOS, and containers are
+    // dev-loop runs regardless of what the host claims.
+    host.scope_label().to_string()
 }
 
 /// A container is never a headline host, whatever `WHIPPET_VIRTUALIZATION`
@@ -2516,7 +2672,12 @@ mod tests {
         ));
 
         let symbol = Symbol::new("BTC-USD").unwrap();
-        for weight in [2u32, 3] {
+        // The second frame's deadline is deliberately in the past: the pacer
+        // was late by 25 ms. Its latency must be completion minus that absolute
+        // deadline, not completion minus the write, and each order in the frame
+        // inherits the same lateness (weight), not one sample per batch.
+        let late_by = Duration::from_millis(25);
+        for (position, weight) in [2u32, 3].into_iter().enumerate() {
             let commands: Vec<Command> = (0..weight)
                 .map(|index| {
                     Command::new_order(
@@ -2533,12 +2694,17 @@ mod tests {
                 .collect();
             let frame = TcpRequest::Submit { commands }.encode();
             let permit = Arc::clone(&semaphore).try_acquire_owned().unwrap();
+            let (deadline, slip_us) = if position == 0 {
+                (Instant::now(), 0)
+            } else {
+                (Instant::now() - late_by, late_by.as_micros() as u64)
+            };
             job_tx
                 .send(TcpJob {
                     frame,
                     weight,
-                    deadline: Instant::now(),
-                    slip_us: 0,
+                    deadline,
+                    slip_us,
                     window: 0,
                     measured: true,
                     permit,
@@ -2550,14 +2716,31 @@ mod tests {
         worker.await.unwrap().unwrap();
         server.await.unwrap();
         let mut weights = Vec::new();
+        let mut late_sample_seen = false;
         while let Some(sample) = sample_rx.recv().await {
             assert!(sample.ok);
             assert!(sample.stages.is_some());
             let stages = sample.stages.unwrap();
             assert!(stages.server_offset_ns.is_some());
+            // Latency is measured from the deadline, so it is never smaller
+            // than the slip recorded when the slot was dispatched.
+            assert!(sample.latency_us >= sample.slip_us);
+            if sample.slip_us > 0 {
+                assert!(
+                    sample.latency_us >= late_by.as_micros() as u64,
+                    "latency {}µs ignored the {}µs late deadline",
+                    sample.latency_us,
+                    late_by.as_micros()
+                );
+                late_sample_seen = true;
+            }
             weights.push(sample.weight);
         }
+        assert!(late_sample_seen, "the late frame produced no sample");
+        // One sample per frame carrying its order count, so 5 orders produce 5
+        // latency observations, not 2.
         assert_eq!(weights, [2, 3]);
+        assert_eq!(weights.iter().sum::<u32>(), 5);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2617,6 +2800,10 @@ mod tests {
         server.abort();
 
         assert_eq!(manifest.workload.transport, "tcp");
+        manifest
+            .check_invariants()
+            .expect("the harness writes only manifests that satisfy the invariants");
+        assert!(uuid::Uuid::parse_str(&manifest.run_id).is_ok());
         assert!(!manifest.stages.is_empty());
         let names: Vec<&str> = manifest
             .stages
@@ -2634,9 +2821,54 @@ mod tests {
         assert!(send.latency.count > 0);
         assert!(send.latency.p99 >= send.latency.p50);
         // The manifest itself records the transport, not only the config.
-        let written =
-            std::fs::read_to_string(output_dir.join(format!("{}.json", manifest.run_id))).unwrap();
+        let path = output_dir.join(format!("{}.json", manifest.run_id));
+        let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.contains("\"transport\": \"tcp\""));
+        let restored: BenchManifest = serde_json::from_str(&written).unwrap();
+        assert_eq!(restored, manifest);
+        restored
+            .check_invariants()
+            .expect("the on-disk JSON round-trips into a valid manifest");
+
+        // A run_id may not overwrite an earlier artifact: a second write to the
+        // same name is refused and the first file is left intact.
+        let error = write_manifest(&output_dir, &manifest.run_id, &manifest).unwrap_err();
+        assert!(error.to_string().contains("already exists"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+        let json_files = std::fs::read_dir(&output_dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.path().to_string_lossy().ends_with(".json"))
+            .count();
+        assert_eq!(
+            json_files, 1,
+            "a refused write must not leave a second file"
+        );
+        let _ = std::fs::remove_dir_all(&output_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_run_does_not_write_a_manifest() {
+        let output_dir =
+            std::env::temp_dir().join(format!("whippet-bench-{}", uuid::Uuid::new_v4()));
+        let config = BenchConfig {
+            transport: "tcp".into(),
+            // Port 1 is reliably closed on localhost: the repetition fails
+            // before the pacer starts, so no manifest can be plausible.
+            tcp_addr: "127.0.0.1:1".into(),
+            rate_per_sec: 100,
+            duration_secs: 1,
+            warmup_secs: 0,
+            repetitions: 1,
+            output_dir: output_dir.clone(),
+            label: "failed-test".into(),
+            ..BenchConfig::default()
+        };
+        assert!(run(config).await.is_err());
+        assert!(
+            !output_dir.exists() || std::fs::read_dir(&output_dir).unwrap().next().is_none(),
+            "a failed run left an artifact behind"
+        );
         let _ = std::fs::remove_dir_all(&output_dir);
     }
 
@@ -2740,5 +2972,201 @@ mod tests {
         // Some flow is aggressive, so the resting book does not grow
         // monotonically; most of it still rests.
         assert!(passive > 600 && passive < 900);
+    }
+
+    /// Nearest-rank percentile over a sorted vector, the brute-force definition
+    /// the HDR summaries must agree with.
+    fn sorted_percentile(sorted: &[u64], quantile: f64) -> f64 {
+        assert!(!sorted.is_empty());
+        let rank = ((sorted.len() as f64) * quantile).ceil().max(1.0) as usize;
+        sorted[rank.min(sorted.len()) - 1] as f64
+    }
+
+    #[test]
+    fn summarize_agrees_with_a_sorted_vector_percentile() {
+        // Deterministic, deliberately uneven samples so the percentiles land on
+        // different values instead of all on the median.
+        let samples: Vec<u64> = (1..=10_000u64)
+            .map(|index| (index * 37) % 50_000 + 1)
+            .chain([1, 60_000])
+            .collect();
+        let mut sorted = samples.clone();
+        sorted.sort_unstable();
+        let mut histogram = new_histogram();
+        for sample in &samples {
+            histogram.record(*sample).unwrap();
+        }
+        let summary = summarize(&histogram);
+
+        assert_eq!(summary.count, samples.len() as u64);
+        assert!(summary.min <= sorted[0] as f64);
+        assert!(summary.max >= *sorted.last().unwrap() as f64);
+        // HDR keeps three significant digits, so a percentile is reported
+        // within 0.1% of the brute-force rank. Allow one microsecond of slack.
+        for (name, reported, quantile) in [
+            ("p50", summary.p50, 0.50),
+            ("p90", summary.p90, 0.90),
+            ("p99", summary.p99, 0.99),
+            ("p999", summary.p999, 0.999),
+            ("p9999", summary.p9999, 0.9999),
+        ] {
+            let expected = sorted_percentile(&sorted, quantile);
+            let tolerance = 1.0 + expected * 0.002;
+            assert!(
+                (reported - expected).abs() <= tolerance,
+                "{name}: reported {reported} vs sorted {expected}"
+            );
+        }
+        assert!(summary.min <= summary.p50);
+        assert!(summary.p50 <= summary.p99);
+        assert!(summary.p99 <= summary.p999);
+        assert!(summary.p999 <= summary.max);
+    }
+
+    #[test]
+    fn slot_deadlines_are_absolute_and_monotonic() {
+        let start = Instant::now();
+        assert_eq!(slot_deadline(start, 1_000_000, 0), start);
+        assert_eq!(
+            slot_deadline(start, 1_000_000, 1).duration_since(start),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            slot_deadline(start, 1_000_000, 1_000).duration_since(start),
+            Duration::from_secs(1)
+        );
+        for slot in 1..64u64 {
+            assert!(
+                slot_deadline(start, 1_000_000, slot) > slot_deadline(start, 1_000_000, slot - 1)
+            );
+        }
+        // A late wakeup does not move the next deadline: the schedule is
+        // absolute, so lateness accumulates as slip instead of being hidden.
+        let late = start + Duration::from_millis(5);
+        let deadline = slot_deadline(start, 1_000_000, 2);
+        assert_eq!(deadline.duration_since(start), Duration::from_millis(2));
+        assert_eq!(since_deadline_us(deadline, late), 3_000);
+        // An early completion is clamped to zero; latency is never signed.
+        assert_eq!(since_deadline_us(deadline, start), 0);
+        // A zero-period schedule is not allowed to divide by zero anywhere.
+        assert_eq!(slot_deadline(start, 0, 9), start);
+    }
+
+    #[test]
+    fn steady_state_verdicts_are_skipped_or_flagged_not_passed() {
+        let windows = |count: usize, last_value: u64| -> Vec<Histogram<u64>> {
+            (0..count)
+                .map(|index| {
+                    let mut histogram = new_histogram();
+                    let value = if index + 10 >= count {
+                        last_value
+                    } else {
+                        1_000
+                    };
+                    for _ in 0..100 {
+                        histogram.record(value).unwrap();
+                    }
+                    histogram
+                })
+                .collect()
+        };
+
+        // Fewer than 20 windows is skipped, not passed.
+        let short = check_steady_state(&windows(19, 1_000));
+        assert_eq!(short.verdict(), SteadyVerdict::Skipped);
+        let labels = run_labels("dev-loop", 0, false, short.verdict());
+        assert!(labels.contains(&"steady-state-skipped".to_string()));
+        assert!(!labels.contains(&"steady-state".to_string()));
+
+        // More than 5% drift between the first and last ten windows is flagged.
+        let drifting = check_steady_state(&windows(30, 1_200));
+        assert_eq!(drifting.verdict(), SteadyVerdict::Flagged);
+        let labels = run_labels("dev-loop", 0, false, drifting.verdict());
+        assert!(labels.contains(&"not-steady-state".to_string()));
+        assert!(!labels.contains(&"steady-state".to_string()));
+
+        // A flat run is within tolerance.
+        let flat = check_steady_state(&windows(30, 1_000));
+        assert_eq!(flat.verdict(), SteadyVerdict::Passed);
+        let labels = run_labels("dev-loop", 0, false, flat.verdict());
+        assert!(labels.contains(&"steady-state".to_string()));
+    }
+
+    #[test]
+    fn an_overloaded_run_is_labelled_and_keeps_its_real_throughput() {
+        let labels = run_labels("dev-loop", 7, false, SteadyVerdict::Skipped);
+        assert_eq!(
+            labels,
+            ["dev-loop", "invalid-overload", "steady-state-skipped"]
+        );
+        let labels = run_labels("dev-loop", 0, true, SteadyVerdict::Passed);
+        assert!(labels.contains(&"generator-bound".to_string()));
+        // The scope label is always first so a reader cannot miss the host
+        // class, whatever else is on the manifest.
+        assert_eq!(labels.first().map(String::as_str), Some("dev-loop"));
+    }
+
+    #[tokio::test]
+    async fn an_overloaded_slot_fabricates_no_latency_sample() {
+        // A dropped slot sends nothing to the collector. The summary stays
+        // empty and the run is labelled instead of inventing a sample.
+        let (tx, rx) = mpsc::channel::<Sample>(8);
+        drop(tx);
+        let collected = collect(rx, 1).await;
+        assert_eq!(collected.completed, 0);
+        assert_eq!(collected.errors, 0);
+        assert_eq!(collected.latency.count, 0);
+        assert_eq!(collected.slip.count, 0);
+        assert!(collected.latency.p99 == 0.0);
+        let labels = run_labels("dev-loop", 1, false, SteadyVerdict::Skipped);
+        assert!(labels.contains(&"invalid-overload".to_string()));
+    }
+
+    #[test]
+    fn scope_labels_never_call_macos_or_a_container_a_headline() {
+        let host = |virtualization: &str, os: &str| HostInfo {
+            hostname: "host".into(),
+            os: os.into(),
+            kernel: "kernel".into(),
+            cpu_model: "cpu".into(),
+            physical_cores: 8,
+            logical_cores: 8,
+            memory_bytes: 8 * 1024 * 1024 * 1024,
+            virtualization: virtualization.into(),
+            docker_version: None,
+            governor: None,
+            smt_enabled: None,
+            isolated_cores: None,
+        };
+        assert_eq!(scope_label(&host("native", "Linux")), "headline");
+        assert_eq!(scope_label(&host("native", "Darwin")), "dev-loop");
+        assert_eq!(scope_label(&host("docker-desktop", "Linux")), "dev-loop");
+        assert_eq!(scope_label(&host("orbstack", "Linux")), "dev-loop");
+        assert_eq!(scope_label(&host("linux-vm", "Linux")), "dev-loop");
+        assert_eq!(scope_label(&host("container", "Linux")), "dev-loop");
+        // macOS can never produce a headline claim, whatever the CPU is.
+        assert_ne!(scope_label(&host("native", "macOS")), "headline");
+    }
+
+    #[test]
+    fn config_validation_rejects_an_empty_label_or_duplicate_symbols() {
+        let empty_label = BenchConfig {
+            label: "  ".into(),
+            ..BenchConfig::default()
+        };
+        assert!(validate_config(&empty_label).is_err());
+
+        let duplicate = BenchConfig {
+            symbols: vec!["BTC-USD".into(), "BTC-USD".into()],
+            ..BenchConfig::default()
+        };
+        assert!(validate_config(&duplicate).is_err());
+
+        let empty_symbol = BenchConfig {
+            symbols: vec!["".into()],
+            ..BenchConfig::default()
+        };
+        assert!(validate_config(&empty_symbol).is_err());
+        assert!(validate_config(&BenchConfig::default()).is_ok());
     }
 }
