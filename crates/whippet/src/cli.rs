@@ -12,7 +12,7 @@ use iggy::prelude::{
 use reqwest::Client;
 use whippet_bench::BenchConfig;
 use whippet_core::config::{ExchangeConfig, Mode};
-use whippet_core::ids::{OrderId, Symbol};
+use whippet_core::ids::{OrderId, ParticipantId, Symbol};
 use whippet_core::protocol::{Command, ExecutionReport};
 use whippet_engine::ShardEngine;
 use whippet_journal::{IggyJournal, Journal, PayloadRecord, Topic};
@@ -23,6 +23,7 @@ use crate::inspect::{
     AUDIT_TOPIC_PARTITIONS, AuditFilter, AuditRecord, ExecRole, OrderTrace, build_order_trace,
     filter_audit, parse_order_id,
 };
+use crate::positions::{POSITIONS_NOTICE, PositionReport, build_positions};
 use crate::retention::{RetentionDecision, RetentionInput, evaluate, explain};
 use crate::snapshot::SnapshotStore;
 use crate::surveillance::{SurveillanceConfig, SurveillanceReport, analyze};
@@ -1717,4 +1718,192 @@ fn indicators_cell(indicators: &[crate::surveillance::Indicator]) -> String {
         .map(|indicator| indicator.as_str())
         .collect::<Vec<_>>()
         .join(",")
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct PositionsArgs {
+    #[arg(long, env = "WHIPPET_IGGY_ADDR", default_value = "127.0.0.1:8090")]
+    pub iggy_addr: String,
+    #[arg(long, env = "WHIPPET_IGGY_USER", default_value = "iggy")]
+    pub iggy_user: String,
+    #[arg(long, env = "WHIPPET_IGGY_PASSWORD", default_value = "iggy")]
+    pub iggy_password: String,
+    /// Read the Iggy password from a file, as the node does.
+    #[arg(long, env = "WHIPPET_IGGY_PASSWORD_FILE")]
+    pub iggy_password_file: Option<PathBuf>,
+    /// Partition that owns the symbols. BTC-USD is partition 1 with 16 partitions.
+    #[arg(long, default_value_t = 1)]
+    pub partition: u32,
+    /// Restrict the reconstruction to these symbols. Omit to fold every symbol
+    /// on the partition.
+    #[arg(long, value_delimiter = ',')]
+    pub symbols: Vec<Symbol>,
+    /// Only this participant id, a u64. Participant names are derived by the
+    /// gateway from credentials and are never stored in the orders log, so a
+    /// name cannot be resolved offline; pass the numeric id the engine saw.
+    #[arg(long)]
+    pub participant: Option<u64>,
+    /// Print the report as one JSON document instead of a table.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Reconstruct per-participant positions and cash flow from the orders and
+/// executions logs. Read-only: it reads both topics from offset 0 and never
+/// appends or commits.
+pub async fn run_positions(args: PositionsArgs) -> Result<()> {
+    // Validate before connecting so a bad invocation is a usage error, not a
+    // connection attempt followed by an error.
+    if args.partition == 0 {
+        bail!("--partition must be at least 1");
+    }
+    let password = read_password(&args.iggy_password, args.iggy_password_file.as_deref())?;
+    let journal = Journal::Iggy(
+        IggyJournal::connect(&args.iggy_addr, &args.iggy_user, &password)
+            .await
+            .with_context(|| format!("connecting to Iggy at {}", args.iggy_addr))?,
+    );
+    positions_with_journal(args, &journal).await.map(|_| ())
+}
+
+/// The positions core, with the journal injected so the reconstruction can be
+/// tested on the memory journal. `run_positions` supplies the Iggy journal.
+///
+/// Both topics are read from offset 0 on one partition with
+/// [`read_topic_from_start`], decoded, and folded by
+/// [`build_positions`]. The report is a reconstruction, not a settlement
+/// ledger: no balances, deposits, fees, or margin, and participant attribution
+/// depends on the orders log. Malformed records are counted in one summary
+/// line, never logged per record. No fills is a valid empty report and exits
+/// zero.
+///
+/// Returns the report that was printed, so tests can assert on the rows
+/// without scraping stdout.
+#[doc(hidden)]
+pub async fn positions_with_journal(
+    args: PositionsArgs,
+    journal: &Journal,
+) -> Result<PositionReport> {
+    if args.partition == 0 {
+        bail!("--partition must be at least 1");
+    }
+
+    let orders_consumer = format!("whippet-positions-orders-p{}", args.partition);
+    let order_payloads =
+        read_topic_from_start(journal, Topic::Orders, args.partition, &orders_consumer).await?;
+    let order_records = order_payloads.len() as u64;
+    let mut orders = Vec::with_capacity(order_payloads.len());
+    let mut skipped_orders = 0u64;
+    for payload in order_payloads {
+        match Command::decode(&payload.payload) {
+            Ok(command) => orders.push((payload.offset, command)),
+            Err(_) => skipped_orders += 1,
+        }
+    }
+
+    let executions_consumer = format!("whippet-positions-executions-p{}", args.partition);
+    let execution_payloads = read_topic_from_start(
+        journal,
+        Topic::Executions,
+        args.partition,
+        &executions_consumer,
+    )
+    .await?;
+    let execution_records = execution_payloads.len() as u64;
+    let mut executions = Vec::with_capacity(execution_payloads.len());
+    let mut skipped_executions = 0u64;
+    for payload in execution_payloads {
+        match ExecutionReport::decode(&payload.payload) {
+            Ok(report) => executions.push(report),
+            Err(_) => skipped_executions += 1,
+        }
+    }
+
+    let symbols = (!args.symbols.is_empty()).then_some(args.symbols.as_slice());
+    let mut report = build_positions(args.partition, &orders, &executions, symbols);
+    if let Some(participant) = args.participant {
+        report.retain_participant(ParticipantId(participant));
+    }
+
+    // The notice and the read summary go to stderr so `--json` stdout stays a
+    // single parseable document.
+    eprintln!("{POSITIONS_NOTICE}");
+    eprintln!(
+        "positions: read {order_records} order record(s) and {execution_records} execution \
+         record(s) from offset 0 on partition {} ({skipped_orders} order, {skipped_executions} \
+         execution undecodable); read-only, nothing committed",
+        args.partition
+    );
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if report.participants.is_empty() {
+        println!(
+            "no positions: no fill on partition {} matched the requested filters; \
+             read-only, nothing committed",
+            args.partition
+        );
+    } else {
+        print_positions(&report);
+    }
+    Ok(report)
+}
+
+fn print_positions(report: &PositionReport) {
+    println!("whippet positions  partition={}", report.partition);
+    println!(
+        "{:>12}  {:<10}  {:>10}  {:>8}  {:>9}  {:>5}  {:>14}  {:>14}  {:>10}",
+        "participant",
+        "symbol",
+        "net_qty",
+        "buy_qty",
+        "sell_qty",
+        "fills",
+        "cash_cents",
+        "notional_cents",
+        "unresolved"
+    );
+    let mut rows = 0usize;
+    for position in &report.participants {
+        for row in &position.symbols {
+            rows += 1;
+            println!(
+                "{:>12}  {:<10}  {:>10}  {:>8}  {:>9}  {:>5}  {:>14}  {:>14}  {:>10}",
+                position.participant.0,
+                row.symbol,
+                row.net_qty,
+                row.buy_qty,
+                row.sell_qty,
+                row.fills,
+                row.cash_cents,
+                row.notional_cents,
+                row.unresolved_maker_fills,
+            );
+        }
+        println!(
+            "total {:>6}  {:<10}  {:>10}  {:>8}  {:>9}  {:>5}  {:>14}  {:>14}  {:>10}",
+            position.participant.0,
+            "-",
+            position.net_qty,
+            position.buy_qty,
+            position.sell_qty,
+            position.fills,
+            position.cash_cents,
+            position.notional_cents,
+            position.unresolved_maker_fills,
+        );
+    }
+    let fills: u64 = report
+        .participants
+        .iter()
+        .map(|position| position.fills)
+        .sum();
+    println!(
+        "positions: {} participant(s), {rows} symbol row(s), {fills} fill leg(s); \
+         unresolved maker leg(s): {}, unattributable aggressor fill(s): {}; \
+         read-only, nothing committed",
+        report.participants.len(),
+        report.unresolved_maker_fills,
+        report.unresolved_aggressor_fills,
+    );
 }
