@@ -151,6 +151,14 @@ proves determinism, not durability. In durable it proves both.
 
 ## Crash and recovery
 
+Startup precondition (audit): a turbo node attached to a non-empty orders
+log must fail at startup unless a `seq_base` record exists that anchors the
+local-seq domain to the log. Without that anchor, a turbo restart cannot tell
+whether the existing log records belong to the seq space it is about to
+assign, so starting would risk assigning duplicate cause_offsets. A fresh
+(empty) log needs no anchor; a non-empty log without one is a startup error,
+not a silent seq reset.
+
 Recovery code is shared with durable and does not change in shape:
 
 1. The shard loads `data/snapshots/partition-<N>.snapshot` (format v2) and
@@ -238,7 +246,7 @@ guarantee text describes:
 
 | Series | Type | Meaning |
 |---|---|---|
-| `whippet_turbo_uncommitted_window` | gauge | Commands currently matched and acked but not journaled, per shard (or summed; pick one and document it) |
+| `whippet_turbo_uncommitted_window` | gauge, per shard (`...{shard="<id>"}`) | Commands currently matched and acked but not journaled on that shard |
 | `whippet_turbo_journal_lag` | gauge | Distance between the matcher's current seq and the last seq appended to the orders log, in commands |
 | `whippet_turbo_window_drops_total` | counter | Commands rejected because the window was full |
 | `whippet_turbo_ack_latency_microseconds` | histogram | Gateway receive → match complete, per acked command |

@@ -20,7 +20,7 @@ credentials explicitly.
 | `WHIPPET_IGGY_PASSWORD_FILE` | unset | Read the Iggy password from a file instead of the environment. Compose points this at `/run/secrets/iggy_root_password`; the container entrypoint also exports the value. |
 | `WHIPPET_API_TOKEN` | unset | Optional bearer token for `/api/orders`, `/api/orders/batch`, and `/api/cancel`. |
 | `WHIPPET_API_PARTICIPANT` | `api` | Participant identity used when a bearer token is configured. |
-| `WHIPPET_RATE_LIMIT_PER_SEC` | `0` | Optional per-IP ingress limit; `0` disables. Shared by HTTP and TCP, charged per order (a 256-order batch costs 256 tokens). |
+| `WHIPPET_RATE_LIMIT_PER_SEC` | `0` | Optional per-IP ingress limit; `0` disables. Shared by HTTP and TCP, charged per order before validation: a batch reserves `N` tokens for its `N` orders up front, and a batch larger than the per-second budget is rejected. A rejected request returns HTTP 429 `rate_limited` with a `Retry-After: 1` header (TCP returns the `RateLimited` error code). |
 | `WHIPPET_MAX_WS_CONNECTIONS` | `2048` | Concurrent WebSocket subscriber cap. |
 | `WHIPPET_WS_PER_IP` | `0` | Per-IP WebSocket subscriber sub-limit; `0` disables it. The fanout benchmark leaves it off because all subscribers share one host. |
 | `WHIPPET_JOURNAL` | `iggy` | `iggy` for the demo, `memory` for tests and brokerless development. |
@@ -29,6 +29,7 @@ credentials explicitly.
 | `WHIPPET_PARTITIONS` | `16` | Trading partitions, 1-256. This is a create-time contract; see below. |
 | `WHIPPET_SNAPSHOT_DIR` | `data/snapshots` | Directory for `partition-<N>.snapshot` files. |
 | `WHIPPET_SNAPSHOT_EVERY` | `10000` | Commands per symbol between state snapshots. The node also enforces a minimum interval (default 30 s, `WHIPPET_SNAPSHOT_MIN_INTERVAL_SECS`, clamped 5–300 s), so a high-throughput run snapshots at most once per interval. Values below 1 are clamped to 1. |
+| `WHIPPET_ENGINE_JOURNAL_CLIENTS` | active shard count | Engine-side Iggy connections in the per-shard pool, 1–16, clamped to that range. Defaults to the active shard count (one connection per active shard). `engine_journal_for(shard)` maps each shard deterministically to one pool client; the shard reader/writer, the MD consumer, and the lag observer (`committed`/`lag` per active shard) all use the engine pool, never the ingress client. |
 | `WHIPPET_HTTP_TRACE` | unset | Set to `1` to enable per-request `tower-http` trace spans; off by default for throughput. |
 
 Concurrent single-order submissions on one partition are coalesced into one
@@ -38,8 +39,11 @@ effect is visible in `/metrics` as `whippet_group_commit_batches_total` versus
 `whippet_group_commit_messages_total`.
 
 `POST /api/orders/batch` accepts up to 256 orders of one symbol and performs one
-Iggy append. Mixed-symbol batches are rejected with `mixed_symbols`; an invalid
-order rejects the whole batch. `?acks=none` returns only the batch summary
+Iggy append. The batch is charged against the rate limit before validation, so
+a large batch cannot spend validation work outside its budget; the 429
+response carries `Retry-After: 1`. Mixed-symbol batches are rejected with
+`mixed_symbols`; an invalid order rejects the whole batch. `?acks=none`
+returns only the batch summary
 (partition, base offset, count) and is intended for the bench and fire-and-forget
 clients.
 | `WHIPPET_DASHBOARD_DIR` | `apps/dashboard/dist` | Static dashboard assets. If `index.html` is missing, the API serves a build-instructions page. |
@@ -370,6 +374,20 @@ A snapshot is only meaningful with its `last_offset` and state hash.
 --expect-hash <hex>` checks that the log still produces the expected state.
 Neither command proves that the snapshot is the newest possible state.
 
+Fail-closed verification and replay:
+
+- `whippet verify --require-snapshot` exits non-zero when a shard has no
+  snapshot file instead of reporting "no snapshots" as success.
+- `whippet verify --partitions 4` checks shards `0..4` with a 4-partition
+  exchange layout (a snapshot written with one partition count must be
+  verified with the same count, not the 16-partition default).
+- `whippet replay --require-snapshot` refuses to fall back to a full replay
+  from zero when the snapshot is missing or unusable (no applied commands,
+  ahead of the engine's committed offset, or at/past the log head); the replay
+  summary reports the broker's committed offset, the log head, and the tail
+  length after the snapshot so an empty or stale snapshot is visible in the
+  summary.
+
 Restore:
 
 1. Stop the node.
@@ -410,8 +428,9 @@ Upgrade procedure:
 4. Record the new image digest in `WHIPPET_IMAGE_DIGEST` for new manifests.
 5. Update this table and the manifest docs.
 
-Rollback: pin both artifacts back. Snapshots use format version 1 with a
-`WHIPSNP1` magic and bincode. A snapshot-format change is a data migration, not
+Rollback: pin both artifacts back. Snapshots use format version 4 with a
+`WHIPSNP1` magic and bincode; versions 3 and older are rejected. A
+snapshot-format change is a data migration, not
 a rolling upgrade; reset the data if the format is not compatible.
 
 The phase gates for larger changes are in [ROADMAP.md](ROADMAP.md).

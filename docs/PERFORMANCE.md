@@ -270,8 +270,10 @@ bench, shared host):
 
 The clone was the shard stall; the writer's serialize/fsync dominates the
 periodic tail. At 225k commands the split was clone 0.4–0.6 ms, hash 8.1–8.3 ms,
-write 33.8–38.1 ms. The v3 terminal-order field grows the snapshot by roughly a
-third; encoding it more compactly is a known follow-up.
+write 33.8–38.1 ms. Snapshot format v4 stores the terminal-eviction order as
+`u32` indices into the dedup walk instead of full `OrderId`s, so the file is
+smaller than v3; versions 3 and older are rejected. Serialize/fsync remains
+the dominant snapshot cost.
 
 Dev-loop soak after the split (fresh stack, 5,000/s, batch 10, 90 s): p50
 **2.22 ms**, p99 **76.5 ms**, 0 errors over 450,000 orders. The p99 is the

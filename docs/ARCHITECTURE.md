@@ -257,8 +257,9 @@ The design rules:
   the off-loop hash used the insertion-walk length where the live hash uses
   the distinct-id count, and a re-admitted id made them differ. The fix is
   pinned by a 100-engine × 200k-command test. The snapshot file format is
-  version 3 (per-symbol config, `BookSnapshot.min_price_ticks`, and the dedup
-  terminal-eviction order); versions 1 and 2 are rejected.
+  version 4 (per-symbol config, `BookSnapshot.min_price_ticks`, and the dedup
+  terminal-eviction order stored as `u32` indices into the dedup walk instead
+  of full `OrderId`s); versions 3 and older are rejected.
 - **Per-shard metrics.** Each matcher records into its own lock-free
   `ShardMetrics`, merged into the global `Metrics` once per second and once
   on exit, instead of taking a global histogram lock per command.
@@ -328,11 +329,18 @@ BLAKE3 state hash.
 A shard snapshot contains all symbol states for one partition and is written
 to `data/snapshots/partition-<N>.snapshot`:
 
-- Magic `WHIPSNP1`, format version `2`, then a bincode payload. Version 1
-  files are rejected: `SymbolSnapshot` now carries the per-symbol config and
-  `BookSnapshot` carries `min_price_ticks`, so the state hash can be
-  reproduced from the snapshot alone. An existing deployment must rebuild
-  snapshots (replay, or a graceful-shutdown final snapshot) before upgrading.
+- Magic `WHIPSNP1`, format version `4`, then a bincode payload. The v4
+  terminal-eviction order is stored as `u32` indices into the dedup walk
+  instead of full `OrderId`s, so the file is smaller than v3. Version 3 and
+  older files are rejected: `SymbolSnapshot` now carries the per-symbol config
+  and `BookSnapshot` carries `min_price_ticks`, plus the compact eviction
+  order, so the state hash can be reproduced from the snapshot alone. An
+  existing deployment must rebuild snapshots (replay, or a graceful-shutdown
+  final snapshot) before upgrading. The writer's serialize/fsync remains the
+  dominant snapshot cost: at 170k commands / 68k dedup entries the measured
+  stage split is clone-only 0.28 ms on the shard, hash 5.35 ms on the writer,
+  and serialize (+fsync) 38.7 ms (see
+  [PERFORMANCE.md](PERFORMANCE.md#phase-15e-implemented-dev-loop-measured)).
 - Written to a temporary file, `fsync`ed, then renamed over the previous
   snapshot. A reader never sees a partial file.
 - Triggered when a symbol reaches `WHIPPET_SNAPSHOT_EVERY` commands (default
@@ -374,6 +382,12 @@ and never commits an offset. With `--from`, it starts at that offset and
 ignores any snapshot. Without `--from`, it restores the partition snapshot and
 replays the tail after the snapshot's maximum `last_offset`. `--to` is
 inclusive. `--expect-hash` turns a hash mismatch into a non-zero exit.
+`--require-snapshot` fails closed when the snapshot file is missing instead of
+falling back to a full replay from zero; the replay summary reports the
+broker's committed offset, the log head, and the tail length after the snapshot
+so an empty or stale snapshot is visible. `whippet verify --require-snapshot`
+applies the same rule to verification, and `whippet verify --partitions`
+checks a non-default partition-count layout.
 
 On a local single-node run (M4, Docker Desktop, dev-loop), partition 1 had a
 snapshot at offset 158548. Full replay from offset 0 and snapshot-seeded replay
