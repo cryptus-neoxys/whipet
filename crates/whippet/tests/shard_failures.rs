@@ -206,7 +206,7 @@ impl JournalOps for FakeJournal {
 
 /// A drained snapshot queue, so `run_writer`'s shutdown join completes.
 fn snapshot_sink() -> (
-    mpsc::Sender<whippet::snapshot::SequencedSnapshot>,
+    mpsc::Sender<whippet::engine_runner::SnapshotJob>,
     tokio::task::JoinHandle<()>,
 ) {
     let (sender, mut receiver) = mpsc::channel(2);

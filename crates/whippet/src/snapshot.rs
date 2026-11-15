@@ -4,7 +4,9 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use whippet_engine::ShardSnapshot;
+use whippet_core::config::ExchangeConfig;
+use whippet_core::ids::Symbol;
+use whippet_engine::{ShardEngine, ShardSnapshot, fill_symbol_hashes};
 
 const MAGIC: &[u8; 8] = b"WHIPSNP1";
 /// Version 2 added the per-symbol config and the book's `min_price_ticks` so
@@ -25,6 +27,15 @@ pub enum SnapshotError {
     BadVersion(u32),
     #[error("snapshot shard {found} does not match requested shard {expected}")]
     WrongShard { found: u32, expected: u32 },
+    /// The off-loop re-hash disagreed with the snapshot about to be persisted.
+    /// This is the check that keeps a hashing bug from becoming the resume
+    /// point: the write is refused and the previous file is left in place.
+    #[error("snapshot hash mismatch for shard {shard}: {detail}")]
+    HashMismatch { shard: u32, detail: String },
+    /// A symbol carried an all-zero hash after the writer filled it, which means
+    /// the snapshot was never hashed or the hash computation is broken.
+    #[error("snapshot shard {shard} has an unhashed symbol {symbol}: state_hash is all zeros")]
+    UnhashedSymbol { shard: u32, symbol: Symbol },
 }
 
 #[derive(Clone)]
@@ -131,19 +142,29 @@ pub fn is_newer(last_written: Option<u64>, sequence: u64) -> bool {
     }
 }
 
-/// Serialises snapshot writes and refuses to overwrite newer state.
+/// Serialises snapshot writes, verifies them, and refuses to overwrite newer
+/// state.
 ///
 /// `save` is blocking (temp file, fsync, rename), so this type is meant to be
 /// driven from a dedicated writer thread/task, never from the shard loop.
+///
+/// Verification happens here, off the shard loop and before the atomic rename:
+/// the shard hands over an unhashed snapshot, the writer fills the per-symbol
+/// hashes, rebuilds the shard from the snapshot and refuses to persist it if
+/// the rebuilt state hash disagrees. A failed check leaves the previous file
+/// untouched, so a hash bug can never become the resume point.
 pub struct SnapshotWriter {
     store: SnapshotStore,
+    exchange: ExchangeConfig,
     last_written: Option<u64>,
 }
 
 impl SnapshotWriter {
-    pub fn new(store: SnapshotStore) -> Self {
+    /// The only constructor: every write is verified against `exchange`.
+    pub fn with_exchange(store: SnapshotStore, exchange: ExchangeConfig) -> Self {
         Self {
             store,
+            exchange,
             last_written: None,
         }
     }
@@ -157,22 +178,147 @@ impl SnapshotWriter {
     ///
     /// Returns `Ok(None)` when the request was dropped by the stale-sequence
     /// guard, and `Ok(Some(path))` when it reached disk. A failed write leaves
-    /// the guard untouched so a newer snapshot can still be persisted.
+    /// the guard untouched so a newer snapshot can still be persisted, and the
+    /// previously saved file intact.
     pub fn write(&mut self, request: SequencedSnapshot) -> Result<Option<PathBuf>, SnapshotError> {
+        self.write_inner(request, true)
+    }
+
+    /// Fill and persist without the full rebuild verification.
+    ///
+    /// Used for periodic snapshots, where the cost of rebuilding the shard is
+    /// a p99 spike. Restore still verifies every snapshot, so a bad unverified
+    /// file is rejected rather than used. It can still be the only candidate
+    /// on disk after a SIGKILL; recovery then falls back to the previous valid
+    /// snapshot or a full replay.
+    pub fn write_unverified(
+        &mut self,
+        request: SequencedSnapshot,
+    ) -> Result<Option<PathBuf>, SnapshotError> {
+        self.write_inner(request, false)
+    }
+
+    fn write_inner(
+        &mut self,
+        mut request: SequencedSnapshot,
+        verify: bool,
+    ) -> Result<Option<PathBuf>, SnapshotError> {
         if !is_newer(self.last_written, request.sequence) {
             return Ok(None);
+        }
+        // The shard loop only cloned the state; hashing happens here so the
+        // match loop does not pay for it.
+        //
+        // Keep any hashes the caller did supply: `fill_symbol_hashes` recomputes
+        // unconditionally, which would silently repair a corrupted stored hash.
+        // A non-zero hash that disagrees with the recomputed one is a bug and
+        // must be rejected instead.
+        let provided: Vec<[u8; 32]> = request
+            .snapshot
+            .symbols
+            .iter()
+            .map(|symbol| symbol.state_hash)
+            .collect();
+        fill_symbol_hashes(&mut request.snapshot);
+        for (symbol, provided) in request.snapshot.symbols.iter().zip(&provided) {
+            if *provided != [0u8; 32] && *provided != symbol.state_hash {
+                return Err(SnapshotError::HashMismatch {
+                    shard: request.snapshot.shard_id,
+                    detail: format!(
+                        "symbol {} stored hash {} does not match recomputed {}",
+                        symbol.symbol,
+                        hex(provided),
+                        hex(&symbol.state_hash)
+                    ),
+                });
+            }
+        }
+        if verify {
+            self.verify(&request.snapshot)?;
         }
         let path = self.store.save(&request.snapshot)?;
         self.last_written = Some(request.sequence);
         Ok(Some(path))
     }
+
+    /// Reject a snapshot whose hashes do not survive an off-loop restore.
+    ///
+    /// Runs before [`SnapshotStore::save`], so a rejected snapshot never touches
+    /// the on-disk file.
+    fn verify(&self, snapshot: &ShardSnapshot) -> Result<(), SnapshotError> {
+        for symbol in &snapshot.symbols {
+            if symbol.state_hash == [0u8; 32] {
+                return Err(SnapshotError::UnhashedSymbol {
+                    shard: snapshot.shard_id,
+                    symbol: symbol.symbol,
+                });
+            }
+        }
+        // `from_snapshot` already compares every symbol hash with the stored
+        // one; an `Err` here is that mismatch (or a shard/symbol layout that
+        // cannot be restored), so the snapshot is not a safe resume point.
+        let restored =
+            ShardEngine::from_snapshot(&self.exchange, snapshot.clone()).map_err(|error| {
+                SnapshotError::HashMismatch {
+                    shard: snapshot.shard_id,
+                    detail: error.to_string(),
+                }
+            })?;
+        for symbol in &snapshot.symbols {
+            let Some(engine) = restored.engine(symbol.symbol) else {
+                return Err(SnapshotError::HashMismatch {
+                    shard: snapshot.shard_id,
+                    detail: format!("restored shard is missing symbol {}", symbol.symbol),
+                });
+            };
+            let actual = engine.state_hash();
+            if actual != symbol.state_hash {
+                return Err(SnapshotError::HashMismatch {
+                    shard: snapshot.shard_id,
+                    detail: format!(
+                        "symbol {} restored hash {} does not match stored {}",
+                        symbol.symbol,
+                        hex(&actual),
+                        hex(&symbol.state_hash)
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn hex(bytes: &[u8; 32]) -> String {
+    let mut output = String::with_capacity(64);
+    for byte in bytes {
+        use std::fmt::Write;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use whippet_core::config::ExchangeConfig;
+    use whippet_core::config::{InstrumentConfig, Mode};
     use whippet_engine::ShardEngine;
+
+    /// A single-instrument exchange so the shard owns exactly one symbol and a
+    /// hash mismatch is easy to locate.
+    fn test_exchange() -> ExchangeConfig {
+        ExchangeConfig {
+            venue: "test".into(),
+            partitions: 16,
+            mode: Mode::Durable,
+            instruments: vec![InstrumentConfig::new("BTC-USD", 100, 40_000, 90_000).unwrap()],
+        }
+    }
+
+    fn test_shard(exchange: &ExchangeConfig) -> u32 {
+        Symbol::new("BTC-USD")
+            .unwrap()
+            .partition(exchange.partitions)
+    }
 
     #[test]
     fn snapshot_round_trip_and_hash_verification() {
@@ -187,6 +333,137 @@ mod tests {
         let restored = ShardEngine::from_snapshot(&exchange, loaded).unwrap();
         assert_eq!(restored.state_hash(), engine.state_hash());
         assert!(store.load(4).unwrap().is_none());
+    }
+
+    #[test]
+    fn writer_verifies_and_restores_the_same_hash() {
+        let exchange = test_exchange();
+        let shard_id = test_shard(&exchange);
+        let engine = ShardEngine::new(shard_id, &exchange);
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path());
+        let mut writer = SnapshotWriter::with_exchange(store.clone(), exchange.clone());
+
+        let path = writer
+            .write(SequencedSnapshot {
+                sequence: 1,
+                snapshot: engine.snapshot_state_without_hash(),
+            })
+            .unwrap()
+            .expect("a verifiable snapshot is persisted");
+        assert_eq!(path, store.path(shard_id));
+
+        let loaded = store.load(shard_id).unwrap().unwrap();
+        assert!(
+            loaded
+                .symbols
+                .iter()
+                .all(|symbol| symbol.state_hash != [0u8; 32]),
+            "the writer left a symbol unhashed"
+        );
+        let restored = ShardEngine::from_snapshot(&exchange, loaded).unwrap();
+        assert_eq!(restored.state_hash(), engine.state_hash());
+        assert_eq!(writer.last_written(), Some(1));
+    }
+
+    #[test]
+    fn corrupted_symbol_hash_is_rejected_and_file_is_unchanged() {
+        let exchange = test_exchange();
+        let shard_id = test_shard(&exchange);
+        let engine = ShardEngine::new(shard_id, &exchange);
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path());
+        let mut writer = SnapshotWriter::with_exchange(store.clone(), exchange.clone());
+
+        let path = writer
+            .write(SequencedSnapshot {
+                sequence: 1,
+                snapshot: engine.snapshot_state_without_hash(),
+            })
+            .unwrap()
+            .expect("valid snapshot writes");
+        let on_disk = fs::read(&path).unwrap();
+
+        let mut corrupted = engine.snapshot_state();
+        corrupted.symbols[0].state_hash[0] ^= 0xff;
+        let error = writer
+            .write(SequencedSnapshot {
+                sequence: 2,
+                snapshot: corrupted,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(error, SnapshotError::HashMismatch { shard, .. } if shard == shard_id),
+            "expected HashMismatch, got {error:?}"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            on_disk,
+            "a rejected snapshot rewrote the file"
+        );
+        assert_eq!(
+            writer.last_written(),
+            Some(1),
+            "a rejected snapshot advanced the guard"
+        );
+
+        // The previous snapshot is still a valid resume point.
+        let loaded = store.load(shard_id).unwrap().unwrap();
+        let restored = ShardEngine::from_snapshot(&exchange, loaded).unwrap();
+        assert_eq!(restored.state_hash(), engine.state_hash());
+    }
+
+    #[test]
+    fn unhashed_snapshot_is_filled_by_the_writer() {
+        let exchange = test_exchange();
+        let shard_id = test_shard(&exchange);
+        let engine = ShardEngine::new(shard_id, &exchange);
+        let unhashed = engine.snapshot_state_without_hash();
+        assert!(
+            unhashed
+                .symbols
+                .iter()
+                .all(|symbol| symbol.state_hash == [0u8; 32]),
+            "test precondition: the shard snapshot must start unhashed"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path());
+        let mut writer = SnapshotWriter::with_exchange(store.clone(), exchange.clone());
+        let path = writer
+            .write(SequencedSnapshot {
+                sequence: 1,
+                snapshot: unhashed,
+            })
+            .unwrap()
+            .expect("the writer fills the hashes and saves");
+        assert!(path.exists());
+
+        let loaded = store.load(shard_id).unwrap().unwrap();
+        let expected = engine.snapshot_state();
+        assert_eq!(loaded.symbols[0].state_hash, expected.symbols[0].state_hash);
+        let restored = ShardEngine::from_snapshot(&exchange, loaded).unwrap();
+        assert_eq!(restored.state_hash(), engine.state_hash());
+    }
+
+    #[test]
+    fn verify_rejects_an_all_zero_hash() {
+        // `write` fills zeros before verifying, so exercise the guard directly:
+        // a zero hash that survives the fill is an unhashed/broken snapshot.
+        let exchange = test_exchange();
+        let shard_id = test_shard(&exchange);
+        let engine = ShardEngine::new(shard_id, &exchange);
+        let dir = tempfile::tempdir().unwrap();
+        let writer = SnapshotWriter::with_exchange(SnapshotStore::new(dir.path()), exchange);
+        let snapshot = engine.snapshot_state_without_hash();
+
+        match writer.verify(&snapshot) {
+            Err(SnapshotError::UnhashedSymbol { shard, symbol }) => {
+                assert_eq!(shard, shard_id);
+                assert_eq!(symbol, Symbol::new("BTC-USD").unwrap());
+            }
+            other => panic!("expected UnhashedSymbol, got {other:?}"),
+        }
     }
 
     #[test]
@@ -217,16 +494,18 @@ mod tests {
 
     #[test]
     fn stale_snapshot_never_overwrites_newer_state() {
+        let exchange = test_exchange();
+        let shard_id = test_shard(&exchange);
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::new(dir.path());
-        let engine = ShardEngine::new(3, &ExchangeConfig::default());
-        let path = store.path(3);
-        let mut writer = SnapshotWriter::new(store);
+        let engine = ShardEngine::new(shard_id, &exchange);
+        let path = store.path(shard_id);
+        let mut writer = SnapshotWriter::with_exchange(store, exchange);
 
         let written = writer
             .write(SequencedSnapshot {
                 sequence: 7,
-                snapshot: engine.snapshot_state(),
+                snapshot: engine.snapshot_state_without_hash(),
             })
             .unwrap();
         assert_eq!(written.as_deref(), Some(path.as_path()));
@@ -237,7 +516,7 @@ mod tests {
         let stale = writer
             .write(SequencedSnapshot {
                 sequence: 6,
-                snapshot: engine.snapshot_state(),
+                snapshot: engine.snapshot_state_without_hash(),
             })
             .unwrap();
         assert!(stale.is_none());
@@ -248,7 +527,7 @@ mod tests {
         let newer = writer
             .write(SequencedSnapshot {
                 sequence: 8,
-                snapshot: engine.snapshot_state(),
+                snapshot: engine.snapshot_state_without_hash(),
             })
             .unwrap();
         assert!(newer.is_some());
@@ -263,12 +542,14 @@ mod tests {
         let blocker = dir.path().join("blocked");
         fs::write(&blocker, b"not a directory").unwrap();
         let store = SnapshotStore::new(blocker.join("snapshots"));
-        let engine = ShardEngine::new(3, &ExchangeConfig::default());
-        let mut writer = SnapshotWriter::new(store);
+        let exchange = test_exchange();
+        let shard_id = test_shard(&exchange);
+        let engine = ShardEngine::new(shard_id, &exchange);
+        let mut writer = SnapshotWriter::with_exchange(store, exchange);
 
         let result = writer.write(SequencedSnapshot {
             sequence: 4,
-            snapshot: engine.snapshot_state(),
+            snapshot: engine.snapshot_state_without_hash(),
         });
         assert!(result.is_err());
         assert_eq!(writer.last_written(), None);

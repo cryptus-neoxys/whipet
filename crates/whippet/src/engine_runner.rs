@@ -54,6 +54,11 @@ const SNAPSHOT_QUEUE_CAPACITY: usize = 2;
 #[doc(hidden)]
 pub const SHARD_RING_CAPACITY: usize = 2;
 
+/// Consecutive poll failures before the shard fails closed. At 250 ms per
+/// retry this is ~10 s, long enough to ride a broker restart, short enough
+/// that ingress stops acknowledging orders that cannot be matched.
+const POLL_FAILURE_BUDGET: u32 = 40;
+
 /// Minimum spacing between engine-state snapshots. The snapshot is bounded by
 /// the dedup window, but it still costs hash + serialize + fsync, so 15 s keeps
 /// the tail spikes rare without making the replay window large.
@@ -185,13 +190,7 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
         .snapshots
         .load(shard_id)
         .with_context(|| format!("loading snapshot for shard {shard_id}"))?;
-    let snapshot_last_offset = loaded.as_ref().and_then(|snapshot| {
-        snapshot
-            .symbols
-            .iter()
-            .map(|symbol| symbol.last_offset)
-            .max()
-    });
+    let snapshot_last_offset = loaded.as_ref().and_then(resume_offset);
     let engine = match loaded {
         Some(snapshot) => {
             let mut engine = ShardEngine::from_snapshot(exchange, snapshot)
@@ -219,24 +218,30 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
     let consumer = format!("whippet-engine-p{shard_id}");
     // A shard's journal handle is cloned once and threaded through the reader
     // and writer explicitly, so the journal edge can be substituted in tests.
-    let journal = Arc::clone(&ctx.journal);
-    // The snapshot is authoritative for the resume point, so its offset is
-    // treated as already acknowledged: the watermark must not fire a redundant
-    // commit on the first batch after a restore.
-    let committed_offset = match snapshot_last_offset {
-        Some(offset) => Some(offset),
-        None => match journal.committed(Topic::Orders, shard_id, &consumer).await {
-            Ok(offset) => offset,
-            Err(error) => {
-                anyhow::bail!(
-                    "could not read committed offset for shard {shard_id}: {error}; refusing to replay from zero"
-                );
-            }
-        },
+    let journal = Arc::clone(&ctx.engine_journal);
+    // Read the broker's committed offset even when a snapshot exists. The
+    // snapshot is authoritative for the resume point, but the watermark must
+    // start at the highest acknowledged offset so a crash during replay cannot
+    // move the committed offset backwards.
+    let journal_committed = match journal.committed(Topic::Orders, shard_id, &consumer).await {
+        Ok(offset) => offset,
+        Err(error) => {
+            anyhow::bail!(
+                "could not read committed offset for shard {shard_id}: {error}; refusing to replay from zero"
+            );
+        }
     };
-    let next_offset = match committed_offset {
+    // No snapshot means the engine state is empty, so the only correct resume
+    // point is the start of the log. Starting at the committed offset would
+    // skip every order before it and diverge from a clean replay.
+    let next_offset = match snapshot_last_offset {
         Some(offset) => offset.saturating_add(1),
         None => 0,
+    };
+    let committed_offset = match (snapshot_last_offset, journal_committed) {
+        (Some(snapshot), Some(journal)) => Some(snapshot.max(journal)),
+        (Some(snapshot), None) => Some(snapshot),
+        (None, journal) => journal,
     };
 
     // Publish a snapshot immediately so a fresh dashboard has a state even
@@ -281,12 +286,15 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
     // instead of allocating a Vec per batch.
     let (recycle_tx, recycle_rx) =
         mpsc::channel::<Vec<whippet_journal::PayloadRecord>>(SHARD_RING_CAPACITY);
-    let (snapshot_tx, snapshot_rx) = mpsc::channel::<SequencedSnapshot>(SNAPSHOT_QUEUE_CAPACITY);
+    let (snapshot_tx, snapshot_rx) = mpsc::channel::<SnapshotJob>(SNAPSHOT_QUEUE_CAPACITY);
     let snapshot_writer = spawn_snapshot_writer(Arc::clone(&ctx), shard_id, snapshot_rx);
     // Highest offset whose executions/MD are actually in the journal. A
     // periodic snapshot is only taken once this catches up with the matcher,
     // otherwise the snapshot could claim an offset whose outputs were lost.
-    let appended_offset = Arc::new(AtomicU64::new(committed_offset.unwrap_or(0)));
+    // Highest offset whose outputs are durable; `u64::MAX` means "nothing
+    // durable yet", so the snapshot gate cannot open at offset 0 before the
+    // first append.
+    let appended_offset = Arc::new(AtomicU64::new(committed_offset.unwrap_or(u64::MAX)));
 
     let reader = tokio::spawn(read_orders(
         Arc::clone(&ctx),
@@ -355,10 +363,31 @@ pub fn join_matcher(
     Ok(())
 }
 
+/// Resume offset for a snapshot, if it is a real resume point.
+///
+/// A snapshot from a shard that never applied a command has none. Treating its
+/// `last_offset: 0` as one would make the next boot start at offset 1 and
+/// silently skip the first order.
+pub(crate) fn resume_offset(snapshot: &whippet_engine::ShardSnapshot) -> Option<u64> {
+    snapshot
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.commands > 0)
+        .map(|symbol| symbol.last_offset)
+        .max()
+}
+
 /// One poll's worth of orders, handed to the matcher thread.
 #[doc(hidden)]
 pub struct InputBatch {
     pub records: Vec<whippet_journal::PayloadRecord>,
+}
+
+/// A snapshot handed to the writer, with whether to pay for the full rebuild.
+#[doc(hidden)]
+pub struct SnapshotJob {
+    pub request: SequencedSnapshot,
+    pub verify: bool,
 }
 
 /// One batch of matcher output, handed to the async writer.
@@ -387,6 +416,7 @@ pub async fn read_orders<J: JournalOps + 'static>(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut next_offset = start_offset;
+    let mut poll_failures: u32 = 0;
     loop {
         // Reuse the buffer the matcher returned; `read_payloads_into` clears it.
         let mut records = recycle.try_recv().unwrap_or_default();
@@ -405,11 +435,27 @@ pub async fn read_orders<J: JournalOps + 'static>(
         let count = match result {
             Ok(count) => count,
             Err(error) => {
-                warn!(shard = shard_id, error = %error, "order poll failed; retrying");
+                poll_failures += 1;
+                warn!(
+                    shard = shard_id,
+                    attempt = poll_failures,
+                    error = %error,
+                    "order poll failed; retrying"
+                );
+                if poll_failures >= POLL_FAILURE_BUDGET {
+                    ctx.mark_shard_failed();
+                    error!(
+                        shard = shard_id,
+                        attempts = poll_failures,
+                        "order poll failed persistently; shard stopped so ingress can fail closed"
+                    );
+                    break;
+                }
                 sleep(Duration::from_millis(250)).await;
                 continue;
             }
         };
+        poll_failures = 0;
         if count == 0 {
             if !journal.is_iggy() {
                 sleep(Duration::from_millis(1)).await;
@@ -478,8 +524,10 @@ pub fn run_matcher(
         let mut process_us: u64 = 0;
         // If a snapshot was deferred, this boundary is a candidate: the state
         // is still at `last_offset`, which the writer may now have caught up to.
+        let durable = appended_offset.load(Ordering::Acquire);
         let mut snapshot = if snapshot_pending
-            && appended_offset.load(Ordering::Acquire) >= last_offset
+            && durable != u64::MAX
+            && durable >= last_offset
             && last_snapshot_at.elapsed() >= SNAPSHOT_MIN_INTERVAL
         {
             snapshot_pending = false;
@@ -539,7 +587,9 @@ pub fn run_matcher(
         }
 
         if snapshot.is_none() && snapshot_due {
-            if appended_offset.load(Ordering::Acquire) >= last_offset
+            let durable = appended_offset.load(Ordering::Acquire);
+            if durable != u64::MAX
+                && durable >= last_offset
                 && last_snapshot_at.elapsed() >= SNAPSHOT_MIN_INTERVAL
             {
                 last_snapshot_at = Instant::now();
@@ -584,15 +634,19 @@ pub fn run_matcher(
     // Input closed: shutdown. Build the final snapshot here, where the engine
     // lives, and let the writer persist it inside the shutdown budget.
     snapshot_sequence += 1;
-    let final_snapshot = SequencedSnapshot {
+    let final_state = engine.snapshot_state_without_hash();
+    // A shard that never applied a command has no resume point; persisting an
+    // empty snapshot would make the next boot start after offset 0.
+    let has_commands = final_state.symbols.iter().any(|symbol| symbol.commands > 0);
+    let final_snapshot = has_commands.then_some(SequencedSnapshot {
         sequence: snapshot_sequence,
-        snapshot: engine.snapshot_state_without_hash(),
-    };
+        snapshot: final_state,
+    });
     let _ = output.blocking_send(OutputBatch {
         executions: Vec::new(),
         md: Vec::new(),
         last_offset,
-        snapshot: Some(final_snapshot),
+        snapshot: final_snapshot,
         final_batch: true,
     });
 }
@@ -608,13 +662,17 @@ pub async fn run_writer<J: JournalOps + ?Sized>(
     consumer: String,
     committed_offset: Option<u64>,
     mut output: mpsc::Receiver<OutputBatch>,
-    snapshot_tx: mpsc::Sender<SequencedSnapshot>,
+    snapshot_tx: mpsc::Sender<SnapshotJob>,
     snapshot_writer: tokio::task::JoinHandle<()>,
     appended_offset: Arc<AtomicU64>,
 ) -> Result<()> {
     let mut watermark = CommitWatermark::new(committed_offset);
     let mut commit_retry = CommitRetry::new();
     let mut final_snapshot: Option<SequencedSnapshot> = None;
+    // The writer owns its own stage recorder; merging it once a second keeps
+    // the global stage histograms off the per-batch path.
+    let writer_metrics = ShardMetrics::new();
+    let mut last_writer_merge = Instant::now();
 
     let mut shutdown_exec = ctx.shutdown.subscribe();
     let mut shutdown_md = ctx.shutdown.subscribe();
@@ -673,7 +731,7 @@ pub async fn run_writer<J: JournalOps + ?Sized>(
             );
         }
 
-        ctx.metrics.record_stage_us(
+        writer_metrics.record_stage_us(
             Stage::EngineAppend,
             append_started.elapsed().as_micros() as u64,
         );
@@ -689,10 +747,14 @@ pub async fn run_writer<J: JournalOps + ?Sized>(
             &mut commit_retry,
         )
         .await;
-        ctx.metrics.record_stage_us(
+        writer_metrics.record_stage_us(
             Stage::EngineCommit,
             commit_started.elapsed().as_micros() as u64,
         );
+        if last_writer_merge.elapsed() >= Duration::from_secs(1) {
+            writer_metrics.merge_into(&ctx.metrics);
+            last_writer_merge = Instant::now();
+        }
 
         if batch.final_batch {
             final_snapshot = batch.snapshot;
@@ -701,7 +763,10 @@ pub async fn run_writer<J: JournalOps + ?Sized>(
 
         if let Some(snapshot) = batch.snapshot {
             let sequence = snapshot.sequence;
-            match snapshot_tx.try_send(snapshot) {
+            match snapshot_tx.try_send(SnapshotJob {
+                request: snapshot,
+                verify: false,
+            }) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => warn!(
                     shard = shard_id,
@@ -719,7 +784,15 @@ pub async fn run_writer<J: JournalOps + ?Sized>(
     }
 
     if let Some(snapshot) = final_snapshot {
-        match tokio::time::timeout(FINAL_SNAPSHOT_SEND_TIMEOUT, snapshot_tx.send(snapshot)).await {
+        match tokio::time::timeout(
+            FINAL_SNAPSHOT_SEND_TIMEOUT,
+            snapshot_tx.send(SnapshotJob {
+                request: snapshot,
+                verify: true,
+            }),
+        )
+        .await
+        {
             Ok(Ok(())) => {}
             Ok(Err(_)) => warn!(
                 shard = shard_id,
@@ -744,6 +817,7 @@ pub async fn run_writer<J: JournalOps + ?Sized>(
         }
     }
 
+    writer_metrics.merge_into(&ctx.metrics);
     // Close the queue so the writer drains and exits, then wait for the flush.
     drop(snapshot_tx);
     match tokio::time::timeout(FINAL_SNAPSHOT_JOIN_TIMEOUT, snapshot_writer).await {
@@ -760,7 +834,11 @@ pub async fn run_writer<J: JournalOps + ?Sized>(
 /// Consume the canonical market-data log and apply it to the dashboard cache.
 pub async fn run_md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
     let consumer = format!("whippet-md-p{shard_id}");
-    let committed_offset = match ctx.journal.committed(Topic::Md, shard_id, &consumer).await {
+    let committed_offset = match ctx
+        .engine_journal
+        .committed(Topic::Md, shard_id, &consumer)
+        .await
+    {
         Ok(offset) => offset,
         Err(error) => {
             anyhow::bail!(
@@ -783,31 +861,40 @@ pub async fn run_md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
     // Reused across polls: a poll's worth of decoded deltas is applied in one
     // hub-lock batch.
     let mut events: Vec<MdEvent> = Vec::with_capacity(BATCH_CAPACITY);
+    let mut poll_failures: u32 = 0;
 
     loop {
         let records = tokio::select! {
             _ = shutdown.changed() => {
                 if let Some(offset) = watermark.pending() {
-                    match commit_once(ctx.journal.as_ref(), Topic::Md, shard_id, &consumer, offset).await {
+                    match commit_once(ctx.engine_journal.as_ref(), Topic::Md, shard_id, &consumer, offset).await {
                         Ok(()) => watermark.mark_committed(offset, Instant::now()),
                         Err(error) => warn!(shard = shard_id, offset, error = %error, "final MD offset commit failed"),
                     }
                 }
                 return Ok(());
             }
-            result = ctx.journal.read_payloads(Topic::Md, shard_id, &consumer, next_offset, BATCH_CAPACITY as u32, 100) => result,
+            result = ctx.engine_journal.read_payloads(Topic::Md, shard_id, &consumer, next_offset, BATCH_CAPACITY as u32, 100) => result,
         };
         let records = match records {
             Ok(records) => records,
             Err(error) => {
-                warn!(shard = shard_id, error = %error, "MD poll failed; retrying");
+                poll_failures += 1;
+                warn!(shard = shard_id, attempt = poll_failures, error = %error, "MD poll failed; retrying");
+                if poll_failures >= POLL_FAILURE_BUDGET {
+                    ctx.mark_shard_failed();
+                    anyhow::bail!(
+                        "MD poll failed {poll_failures} times on shard {shard_id}; the dashboard feed is stopped"
+                    );
+                }
                 sleep(Duration::from_millis(250)).await;
                 continue;
             }
         };
+        poll_failures = 0;
         if records.is_empty() {
             maybe_commit(
-                ctx.journal.as_ref(),
+                ctx.engine_journal.as_ref(),
                 Topic::Md,
                 shard_id,
                 &consumer,
@@ -815,7 +902,7 @@ pub async fn run_md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
                 &mut commit_retry,
             )
             .await;
-            if !ctx.journal.is_iggy() {
+            if !ctx.engine_journal.is_iggy() {
                 sleep(Duration::from_millis(1)).await;
             }
             continue;
@@ -867,7 +954,7 @@ pub async fn run_md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
         watermark.note_applied(last_offset);
         next_offset = last_offset.saturating_add(1);
         maybe_commit(
-            ctx.journal.as_ref(),
+            ctx.engine_journal.as_ref(),
             Topic::Md,
             shard_id,
             &consumer,
@@ -1087,15 +1174,24 @@ async fn commit_once<J: JournalOps + ?Sized>(
 fn spawn_snapshot_writer(
     ctx: Arc<NodeContext>,
     shard_id: u32,
-    mut pending: mpsc::Receiver<SequencedSnapshot>,
+    mut pending: mpsc::Receiver<SnapshotJob>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
-        let mut writer = SnapshotWriter::new(ctx.snapshots.clone());
-        while let Some(mut request) = pending.blocking_recv() {
+        // The verified writer rebuilds the shard from the snapshot before the
+        // atomic rename, so a bad off-loop hash is rejected, not persisted.
+        let mut writer =
+            SnapshotWriter::with_exchange(ctx.snapshots.clone(), ctx.exchange().clone());
+        while let Some(job) = pending.blocking_recv() {
+            let SnapshotJob {
+                mut request,
+                verify,
+            } = job;
             let sequence = request.sequence;
-            // The shard only cloned the state; the hash is computed here, on
-            // the blocking writer, so the match loop does not pay it.
+            // Fill before collecting diagnostics; the writer recomputes and
+            // compares the same values, so this only makes the log truthful.
             whippet_engine::fill_symbol_hashes(&mut request.snapshot);
+            // The shard only cloned the state; the writer fills and (for the
+            // final snapshot) verifies the hash, so the match loop pays neither.
             // Diagnostics are built here, off the shard loop.
             let hashes: Vec<String> = request
                 .snapshot
@@ -1104,7 +1200,11 @@ fn spawn_snapshot_writer(
                 .map(|symbol| hex(&symbol.state_hash))
                 .collect();
             let started = Instant::now();
-            let result = writer.write(request);
+            let result = if verify {
+                writer.write(request)
+            } else {
+                writer.write_unverified(request)
+            };
             // `Metrics` has no snapshot-duration recorder and `context.rs` is
             // owned elsewhere, so the duration is logged rather than recorded.
             // TODO(lead): add a `snapshot_duration_us` histogram to `Metrics`.
@@ -1123,14 +1223,17 @@ fn spawn_snapshot_writer(
                     sequence, "snapshot is older than the last one written; skipped"
                 ),
                 Err(error) => {
+                    // A failed snapshot costs a resume point, not matching:
+                    // the log is canonical. Do not fail ingress for a
+                    // transient ENOSPC or read-only mount; the next snapshot
+                    // retries. A dead writer is handled at the send site.
                     warn!(
                         shard = shard_id,
                         sequence,
                         error = %error,
                         duration_us,
-                        "snapshot write failed"
+                        "snapshot write failed; matching continues, the log is still canonical"
                     );
-                    ctx.mark_shard_failed();
                 }
             }
         }
@@ -1240,6 +1343,27 @@ fn hex(bytes: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_snapshot_has_no_resume_offset() {
+        let exchange = whippet_core::config::ExchangeConfig::default();
+        let engine = ShardEngine::new(1, &exchange);
+        let snapshot = engine.snapshot_state_without_hash();
+        assert!(snapshot.symbols.iter().all(|symbol| symbol.commands == 0));
+        assert_eq!(resume_offset(&snapshot), None);
+    }
+
+    #[test]
+    fn a_snapshot_with_commands_resumes_after_its_offset() {
+        let exchange = whippet_core::config::ExchangeConfig::default();
+        let engine = ShardEngine::new(1, &exchange);
+        let mut snapshot = engine.snapshot_state_without_hash();
+        if let Some(symbol) = snapshot.symbols.first_mut() {
+            symbol.commands = 1;
+            symbol.last_offset = 42;
+        }
+        assert_eq!(resume_offset(&snapshot), Some(42));
+    }
 
     const INTERVAL: u64 = COMMIT_INTERVAL_RECORDS;
 
