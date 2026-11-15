@@ -12,15 +12,42 @@ use crate::config::NodeConfig;
 use crate::ratelimit::RateLimiter;
 use crate::snapshot::SnapshotStore;
 
+/// Caps the engine journal pool. Each entry is one Iggy connection; 16
+/// matches the demo partition count. Nodes with more shards wrap around via
+/// modulo selection instead of opening unbounded connections.
+pub const MAX_ENGINE_JOURNAL_CLIENTS: usize = 16;
+
+/// Pool sizing for the engine journal clients: the
+/// `WHIPPET_ENGINE_JOURNAL_CLIENTS` override wins when it parses, otherwise
+/// the pool matches the number of active shards. Both paths clamp into
+/// `[1, MAX_ENGINE_JOURNAL_CLIENTS]` so the pool is never empty and never
+/// larger than the cap.
+pub fn engine_journal_pool_size(shard_count: usize, override_clients: Option<usize>) -> usize {
+    override_clients
+        .unwrap_or(shard_count)
+        .clamp(1, MAX_ENGINE_JOURNAL_CLIENTS)
+}
+
 /// Shared node state. Every task holds an `Arc<NodeContext>`; none of the
 /// fields is mutable after startup.
 pub struct NodeContext {
     pub config: NodeConfig,
     /// Ingress journal. The gateway and TCP listener append Orders here.
     pub journal: Arc<Journal>,
-    /// Engine-side journal. The shard reader/writer and MD consumer use a
-    /// separate connection so a slow output append cannot head-of-line block
-    /// ingress on the shared Iggy client.
+    /// Engine-side journal pool. In `iggy` mode every entry is its own Iggy
+    /// client (its own TCP connection and response loop), so one shard's
+    /// appends and reads cannot head-of-line block another shard, and neither
+    /// can the MD consumer or the lag sweep. Engine shards must select an
+    /// entry through [`NodeContext::engine_journal_for`], never by indexing
+    /// the pool directly. In `memory` mode every entry is the same `Arc` (the
+    /// ingress journal), so the pool is a no-op.
+    pub engine_journals: Vec<Arc<Journal>>,
+    /// Observer handle into the engine journal pool: a clone of pool entry 0.
+    /// The health-monitor ping, the consumer-lag sweep in `node.rs`, and the
+    /// gateway health probe use this handle. It deliberately shares the first
+    /// pool entry instead of opening a dedicated Iggy connection, so
+    /// observing costs no extra client. Never use it for shard traffic; use
+    /// [`NodeContext::engine_journal_for`].
     pub engine_journal: Arc<Journal>,
     /// One writer per `(topic, partition)` for Orders ingress. Every route
     /// (single order, batch, cancel, TCP) uses this so a partition has exactly
@@ -36,9 +63,24 @@ pub struct NodeContext {
     pub rate_limiter: Arc<RateLimiter>,
     /// Caps concurrent WebSocket subscribers.
     pub ws_connections: Arc<Semaphore>,
+    /// Serializes snapshot serialization/fsync across shards. Three shard
+    /// writers fsyncing at once contend with Iggy's WAL on the same volume.
+    pub snapshot_lock: Arc<std::sync::Mutex<()>>,
 }
 
 impl NodeContext {
+    /// Deterministic pool selection for an engine shard: `shard_id % len`.
+    /// The same shard always gets the same client, and every result is an
+    /// entry of the pool. Panics only if the pool is empty, which is a
+    /// construction bug; every constructor builds at least one entry.
+    pub fn engine_journal_for(&self, shard_id: u32) -> &Arc<Journal> {
+        assert!(
+            !self.engine_journals.is_empty(),
+            "engine journal pool must not be empty"
+        );
+        &self.engine_journals[shard_id as usize % self.engine_journals.len()]
+    }
+
     pub fn mark_shard_failed(&self) {
         self.shards_ok.store(false, Ordering::Relaxed);
     }

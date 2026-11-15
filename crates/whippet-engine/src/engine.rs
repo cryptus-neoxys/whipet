@@ -107,9 +107,12 @@ pub struct SymbolSnapshot {
     pub config: SymbolConfigSnapshot,
     pub book: BookSnapshot,
     pub dedup: Vec<(OrderId, DedupEntry)>,
-    /// Terminal ids in eviction order, snapshotted so a restored table evicts
-    /// at the same point as a continuous replay. Not part of the state hash.
-    pub dedup_terminal: Vec<OrderId>,
+    /// Indices into [`SymbolSnapshot::dedup`] for the terminal ids in eviction
+    /// order, snapshotted so a restored table evicts at the same point as a
+    /// continuous replay. A `u32` is 4 bytes per terminal id, where serde
+    /// writes an [`OrderId`] as a 32-character hex string (40 bytes). Not part
+    /// of the state hash.
+    pub dedup_terminal_idx: Vec<u32>,
     pub exec_seq: Seq,
     pub md_seq: Seq,
     pub last_offset: u64,
@@ -757,6 +760,20 @@ impl SymbolEngine {
         *hasher.finalize().as_bytes()
     }
 
+    /// Snapshot after compacting the dedup queues.
+    ///
+    /// The node uses this path so the saved insertion walk is exactly the live
+    /// walk; the plain `snapshot_state` stays for tests that do not need it.
+    pub fn snapshot_state_compacted(&mut self) -> SymbolSnapshot {
+        self.dedup.compact();
+        self.snapshot_state()
+    }
+
+    pub fn snapshot_state_without_hash_compacted(&mut self) -> SymbolSnapshot {
+        self.dedup.compact();
+        self.snapshot_state_without_hash()
+    }
+
     pub fn snapshot_state(&self) -> SymbolSnapshot {
         let mut snapshot = self.snapshot_state_without_hash();
         snapshot.state_hash = self.state_hash();
@@ -767,12 +784,16 @@ impl SymbolEngine {
     /// `state_hash` zeroed. The caller fills it later, off the shard thread,
     /// with [`hash_symbol_snapshot`].
     pub fn snapshot_state_without_hash(&self) -> SymbolSnapshot {
+        // One walk, reused for both the serialized entries and the compact
+        // terminal queue: walking the dedup table twice was pure cost.
+        let dedup = self.dedup.entries_in_order();
+        let dedup_terminal_idx = self.dedup.terminal_indices(&dedup);
         SymbolSnapshot {
             symbol: self.config.symbol,
             config: SymbolConfigSnapshot::from_config(&self.config),
             book: self.book.snapshot(),
-            dedup: self.dedup.entries_in_order(),
-            dedup_terminal: self.dedup.terminal_order(),
+            dedup,
+            dedup_terminal_idx,
             exec_seq: self.exec_seq,
             md_seq: self.md_seq,
             last_offset: self.last_offset,
@@ -795,7 +816,7 @@ impl SymbolEngine {
             dedup: DedupTable::from_entries(
                 dedup_capacity,
                 snapshot.dedup,
-                snapshot.dedup_terminal,
+                snapshot.dedup_terminal_idx,
             ),
             exec_seq: snapshot.exec_seq,
             md_seq: snapshot.md_seq,
@@ -1320,6 +1341,22 @@ mod tests {
         let restored = SymbolEngine::from_snapshot(config(), snapshot).unwrap();
         assert_eq!(restored.state_hash(), engine.state_hash());
         assert_eq!(restored.book().best_ask(), engine.book().best_ask());
+    }
+
+    #[test]
+    fn malformed_terminal_indices_do_not_break_a_restore() {
+        // Terminal indices are not hashed, so a corrupt list must be skipped
+        // rather than panic or fail a snapshot that is otherwise intact.
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Buy, 100, 10, 1, 1), 0);
+        process(&mut engine, &limit(Side::Sell, 105, 4, 2, 2), 1);
+        let mut snapshot = engine.snapshot_state_without_hash();
+        // Out of range, and an index that points at a non-terminal entry.
+        snapshot.dedup_terminal_idx = vec![u32::MAX, 0];
+        snapshot.state_hash = hash_symbol_snapshot(&snapshot);
+        let restored = SymbolEngine::from_snapshot(config(), snapshot).expect("restores");
+        assert_eq!(restored.state_hash(), engine.state_hash());
+        assert!(restored.dedup().terminal_order().is_empty());
     }
 
     #[test]

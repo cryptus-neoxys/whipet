@@ -166,16 +166,82 @@ impl DedupTable {
     }
 
     /// The terminal ids in eviction order. Not part of the state hash, but
-    /// snapshotted so a restored table evicts at the same point as a
-    /// continuous replay.
+    /// snapshotted (as [`DedupTable::terminal_indices`]) so a restored table
+    /// evicts at the same point as a continuous replay.
+    /// Drop ids that were evicted but are still sitting in the order deques.
+    ///
+    /// `hash_into` already skips them, so this does not change the state hash.
+    /// It makes the snapshot walk equal the live walk, which a restored table
+    /// needs if one of those ids is re-admitted after the tail.
+    pub fn compact(&mut self) {
+        let map = &self.map;
+        self.insertion_order.retain(|id| map.contains_key(id));
+        self.terminal_order.retain(|id| map.contains_key(id));
+    }
+
     pub fn terminal_order(&self) -> Vec<OrderId> {
         self.terminal_order.iter().copied().collect()
     }
 
+    /// The terminal queue as indices into an insertion-order walk.
+    ///
+    /// The snapshot stores these instead of the terminal ids themselves: a
+    /// `u32` is 4 bytes per terminal id, where serde writes an [`OrderId`] as a
+    /// 32-character hex string (40 bytes with bincode's length prefix). At the
+    /// 100k dedup window that is a multi-megabyte difference, and the writer's
+    /// serialize+fsync is the dominant snapshot cost. Indices are not hashed,
+    /// so they cannot move the state hash.
+    ///
+    /// `entries` must be the exact walk the snapshot will carry (see
+    /// [`DedupTable::entries_in_order`]): the indices are positions in that
+    /// slice. An id that was evicted and re-admitted appears more than once in
+    /// the walk, so the index of its **last** occurrence is used. The terminal
+    /// queue is then mapped in order, which preserves duplicate queue entries
+    /// exactly as the live deque has them.
+    ///
+    /// Build the walk once and pass it to both this and the snapshot, instead
+    /// of walking the table twice.
+    pub fn terminal_indices(&self, entries: &[(OrderId, DedupEntry)]) -> Vec<u32> {
+        let mut last: FxHashMap<OrderId, u32> = FxHashMap::default();
+        last.reserve(entries.len());
+        for (index, (order_id, _)) in entries.iter().enumerate() {
+            // A walk longer than `u32::MAX` cannot be addressed by the compact
+            // form. That is unreachable through a 256 MiB snapshot cap; drop
+            // the unreachable positions rather than truncate silently.
+            let Ok(index) = u32::try_from(index) else {
+                continue;
+            };
+            last.insert(*order_id, index);
+        }
+        let mut indices = Vec::with_capacity(self.terminal_order.len());
+        for order_id in &self.terminal_order {
+            if let Some(index) = last.get(order_id) {
+                indices.push(*index);
+            }
+        }
+        indices
+    }
+
+    /// Rebuild a table from a snapshot walk and the terminal-queue indices
+    /// produced by [`DedupTable::terminal_indices`].
+    ///
+    /// Out-of-range indices and indices that point at a non-terminal entry are
+    /// skipped: a corrupt snapshot must not panic the restore path. Skipping
+    /// cannot desynchronise a valid snapshot because [`DedupTable::terminal_indices`]
+    /// only emits in-range, terminal ids.
+    ///
+    /// Known gap, predating the compact terminal form: `entries` is the walk
+    /// filtered to the live map, so insertion-order entries for ids that were
+    /// already evicted at snapshot time are not carried. If such an id is
+    /// re-admitted after the restore it is walked fewer times than a continuous
+    /// table would walk it, which can move the *dedup state hash* after the
+    /// tail (eviction order is unaffected, and the restored hash at the
+    /// snapshot point still matches). Carrying the dead entries would cost an
+    /// order id per entry, so they are not part of the snapshot.
     pub fn from_entries(
         capacity: usize,
         entries: Vec<(OrderId, DedupEntry)>,
-        terminal: Vec<OrderId>,
+        terminal_idx: Vec<u32>,
     ) -> Self {
         // Use the configured capacity, not the insertion-walk length: an id
         // that was evicted and re-admitted appears more than once in `entries`,
@@ -183,24 +249,30 @@ impl DedupTable {
         // capacity would make the restored table evict later than a continuous
         // replay, and the two states diverge once the tail is long enough.
         let mut table = Self::new(capacity);
-        for (order_id, entry) in entries {
-            table.insertion_order.push_back(order_id);
-            table.map.insert(order_id, entry);
+        for (order_id, entry) in &entries {
+            table.insertion_order.push_back(*order_id);
+            table.map.insert(*order_id, *entry);
         }
         // Rebuild the eviction queue in its original transition order. An id
-        // that was evicted and re-admitted appears once in the queue, so this
-        // cannot be reconstructed from the insertion walk alone.
-        for order_id in terminal {
-            let terminal = table.map.get(&order_id).is_some_and(|entry| {
+        // that was evicted and re-admitted appears once per terminal transition
+        // in the queue, so this cannot be reconstructed from the insertion walk
+        // alone; `terminal_idx` is what carries it.
+        let mut terminal_order = VecDeque::with_capacity(terminal_idx.len());
+        for index in terminal_idx {
+            let Some((order_id, _)) = entries.get(index as usize) else {
+                continue;
+            };
+            let terminal = table.map.get(order_id).is_some_and(|entry| {
                 matches!(
                     entry.status,
                     DedupStatus::Filled | DedupStatus::Cancelled | DedupStatus::Rejected
                 )
             });
             if terminal {
-                table.terminal_order.push_back(order_id);
+                terminal_order.push_back(*order_id);
             }
         }
+        table.terminal_order = terminal_order;
         table
     }
 
@@ -359,6 +431,25 @@ mod tests {
     }
 
     #[test]
+    fn compact_preserves_the_hash_and_drops_dead_ids() {
+        let mut table = DedupTable::new(2);
+        for id in 1..=3u64 {
+            table.insert(OrderId(u128::from(id)), entry(id));
+            table.update(OrderId(u128::from(id)), DedupStatus::Filled);
+        }
+        assert!(table.insertion_order.len() > table.len());
+        let mut before = blake3::Hasher::new();
+        table.hash_into(&mut before);
+
+        table.compact();
+        let mut after = blake3::Hasher::new();
+        table.hash_into(&mut after);
+        assert_eq!(before.finalize(), after.finalize());
+        assert_eq!(table.insertion_order.len(), table.len());
+        assert_eq!(table.terminal_order.len(), table.len());
+    }
+
+    #[test]
     fn snapshot_restore_preserves_capacity_and_eviction() {
         let mut table = DedupTable::new(4);
         for id in 1..=4u64 {
@@ -375,7 +466,8 @@ mod tests {
         let walk = table.entries_in_order();
         assert!(walk.len() > table.len(), "test precondition: re-admission");
 
-        let mut restored = DedupTable::from_entries(4, walk, table.terminal_order());
+        let terminal_idx = table.terminal_indices(&walk);
+        let mut restored = DedupTable::from_entries(4, walk, terminal_idx);
         assert_eq!(restored.capacity(), 4, "restored capacity must not inflate");
         assert_eq!(restored.len(), table.len());
 
@@ -398,12 +490,84 @@ mod tests {
         table.update(OrderId(5), DedupStatus::Filled);
         table.insert(OrderId(1), entry(1));
         table.update(OrderId(1), DedupStatus::Filled);
-        let mut restored =
-            DedupTable::from_entries(2, table.entries_in_order(), table.terminal_order());
+        let walk = table.entries_in_order();
+        let terminal_idx = table.terminal_indices(&walk);
+        let mut restored = DedupTable::from_entries(2, walk, terminal_idx);
         table.insert(OrderId(9), entry(9));
         restored.insert(OrderId(9), entry(9));
         assert_eq!(table.contains(OrderId(5)), restored.contains(OrderId(5)));
         assert_eq!(table.contains(OrderId(1)), restored.contains(OrderId(1)));
+    }
+
+    #[test]
+    fn terminal_indices_restore_the_same_queue_after_an_evicted_id_is_readmitted() {
+        // Id 1 is terminal, evicted, then re-admitted and terminal again. The
+        // walk contains it twice, so the compact form must resolve the id via
+        // its last occurrence, and the restored queue must match the live one
+        // transition for transition.
+        let mut table = DedupTable::new(4);
+        for id in 1..=4u64 {
+            table.insert(OrderId(u128::from(id)), entry(id));
+            table.update(OrderId(u128::from(id)), DedupStatus::Filled);
+        }
+        table.insert(OrderId(5), entry(5));
+        table.update(OrderId(5), DedupStatus::Filled);
+        table.insert(OrderId(1), entry(9));
+        table.update(OrderId(1), DedupStatus::Filled);
+
+        let walk = table.entries_in_order();
+        assert_eq!(
+            walk.iter()
+                .filter(|(order_id, _)| *order_id == OrderId(1))
+                .count(),
+            2,
+            "test precondition: the re-admitted id appears twice"
+        );
+        let live_queue = table.terminal_order();
+        let terminal_idx = table.terminal_indices(&walk);
+
+        // Every index resolves to the id it encodes, in queue order.
+        let resolved: Vec<OrderId> = terminal_idx
+            .iter()
+            .map(|index| walk[*index as usize].0)
+            .collect();
+        assert_eq!(resolved, live_queue);
+
+        let mut restored = DedupTable::from_entries(4, walk, terminal_idx);
+        assert_eq!(
+            restored.terminal_order(),
+            live_queue,
+            "the restored eviction queue diverged"
+        );
+
+        // And it evicts the same id as the continuous table on the next insert.
+        table.insert(OrderId(6), entry(6));
+        restored.insert(OrderId(6), entry(6));
+        assert_eq!(restored.len(), table.len());
+        for id in 1..=6u64 {
+            assert_eq!(
+                table.contains(OrderId(u128::from(id))),
+                restored.contains(OrderId(u128::from(id))),
+                "id {id} differs between continuous and restored tables"
+            );
+        }
+        assert_eq!(restored.terminal_order(), table.terminal_order());
+    }
+
+    #[test]
+    fn malformed_terminal_indices_are_skipped_without_panicking() {
+        let mut table = DedupTable::new(4);
+        table.insert(OrderId(1), entry(1));
+        table.update(OrderId(1), DedupStatus::Filled);
+        table.insert(OrderId(2), entry(2));
+        let walk = table.entries_in_order();
+
+        // 0 is a terminal entry, 1 is a non-terminal entry, 9 and u32::MAX are
+        // out of range. A corrupt snapshot must degrade, not abort the restore.
+        let restored = DedupTable::from_entries(4, walk, vec![0, 1, 9, u32::MAX]);
+        assert_eq!(restored.terminal_order(), vec![OrderId(1)]);
+        assert_eq!(restored.len(), 2);
+        assert!(restored.contains(OrderId(2)));
     }
 
     #[test]

@@ -9,11 +9,13 @@ use whippet_core::ids::Symbol;
 use whippet_engine::{ShardEngine, ShardSnapshot, fill_symbol_hashes};
 
 const MAGIC: &[u8; 8] = b"WHIPSNP1";
-/// Version 3 adds the dedup terminal-eviction order so a restored table
-/// evicts at the same point as a continuous replay. Version 2 added the
-/// per-symbol config and the book's `min_price_ticks`; version 1 is rejected
-/// rather than misread.
-const VERSION: u32 = 3;
+/// Version 4 stores the dedup terminal-eviction queue as `u32` indices into the
+/// insertion-order walk rather than `OrderId`s, which cuts that payload from 40
+/// to 4 bytes per terminal id (~3.4 MB at the 100k dedup window) without
+/// changing the state hash. Version 3 added the terminal order; version 2 added
+/// the per-symbol config and the book's `min_price_ticks`. Older versions are
+/// rejected rather than misread.
+const VERSION: u32 = 4;
 const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -549,20 +551,25 @@ mod tests {
     }
 
     #[test]
-    fn version_one_snapshot_is_rejected_not_misread() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = SnapshotStore::new(dir.path());
-        let path = store.path(3);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let mut file = fs::File::create(&path).unwrap();
-        file.write_all(MAGIC).unwrap();
-        file.write_all(&1u32.to_le_bytes()).unwrap();
-        file.write_all(&[0u8; 8]).unwrap();
-        drop(file);
+    fn older_snapshot_versions_are_rejected_not_misread() {
+        // v4 changed the dedup terminal payload from `OrderId`s to `u32`
+        // indices into the dedup walk. A v3 file must fail loudly rather than
+        // deserialize into the new layout: the index list would read as ids.
+        for version in [1u32, 2, 3] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = SnapshotStore::new(dir.path());
+            let path = store.path(3);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut file = fs::File::create(&path).unwrap();
+            file.write_all(MAGIC).unwrap();
+            file.write_all(&version.to_le_bytes()).unwrap();
+            file.write_all(&[0u8; 8]).unwrap();
+            drop(file);
 
-        match store.load(3) {
-            Err(SnapshotError::BadVersion(1)) => {}
-            other => panic!("expected BadVersion(1), got {other:?}"),
+            match store.load(3) {
+                Err(SnapshotError::BadVersion(found)) => assert_eq!(found, version),
+                other => panic!("expected BadVersion({version}), got {other:?}"),
+            }
         }
     }
 

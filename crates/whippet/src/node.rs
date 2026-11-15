@@ -10,11 +10,12 @@ use axum::serve::ListenerExt;
 use tokio::sync::{Semaphore, watch};
 use tokio::time::sleep;
 use tracing::{info, warn};
+use whippet_core::config::ExchangeConfig;
 use whippet_journal::group::{GroupCommit, GroupCommitConfig};
 use whippet_journal::{IggyJournal, Journal};
 
 use crate::config::{JournalKind, NodeArgs, NodeConfig};
-use crate::context::NodeContext;
+use crate::context::{NodeContext, engine_journal_pool_size};
 use crate::engine_runner::{run_engine_shard, run_md_shard};
 use crate::gateway;
 use crate::ratelimit::RateLimiter;
@@ -24,12 +25,26 @@ use crate::tcp;
 pub async fn run(args: NodeArgs) -> Result<()> {
     let config = NodeConfig::from_args(args)?;
     let journal = open_journal(&config).await?;
-    // The engine gets its own connection. Ingress and matching then cannot
-    // block each other on one Iggy client's response loop.
-    let engine_journal = match config.journal {
-        JournalKind::Iggy => open_journal(&config).await?,
-        JournalKind::Memory => Arc::clone(&journal),
-    };
+    // Engine journal pool: one Iggy client per entry, so a shard's appends
+    // and reads cannot head-of-line block another shard on a shared response
+    // loop. The default pool size is the number of active shards, clamped to
+    // [1, MAX_ENGINE_JOURNAL_CLIENTS]; WHIPPET_ENGINE_JOURNAL_CLIENTS
+    // overrides it. Memory mode shares the ingress journal Arc, so extra
+    // entries are free there.
+    let shard_count = active_shard_count(&config.exchange);
+    let clients_override = std::env::var("WHIPPET_ENGINE_JOURNAL_CLIENTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    let pool_size = engine_journal_pool_size(shard_count, clients_override);
+    let engine_journals = open_engine_journal_pool(&config, &journal, pool_size).await?;
+    // The observer (health ping, lag sweep, gateway health probe) shares pool
+    // entry 0 rather than opening another connection.
+    let engine_journal = Arc::clone(&engine_journals[0]);
+    info!(
+        clients = pool_size,
+        shards = shard_count,
+        "engine journal client pool ready"
+    );
     journal
         .ensure_topics(&config.exchange)
         .await
@@ -66,6 +81,7 @@ pub async fn run(args: NodeArgs) -> Result<()> {
     let ctx = Arc::new(NodeContext {
         config: config.clone(),
         journal: Arc::clone(&journal),
+        engine_journals,
         engine_journal,
         group_commit,
         hub: Arc::clone(&hub),
@@ -76,6 +92,7 @@ pub async fn run(args: NodeArgs) -> Result<()> {
         shards_ok: Arc::new(AtomicBool::new(true)),
         rate_limiter,
         ws_connections,
+        snapshot_lock: Arc::new(std::sync::Mutex::new(())),
     });
 
     hub.spawn_publisher();
@@ -173,6 +190,42 @@ pub async fn run(args: NodeArgs) -> Result<()> {
 /// Caps concurrent WebSocket subscribers. Each holds a task and an egress
 /// stream; this is a memory/bandwidth guard, not a user limit.
 const DEFAULT_WS_CONNECTIONS: usize = 2_048;
+
+/// One engine journal client per pool entry. In `iggy` mode each entry is a
+/// fresh Iggy TCP connection with its own response loop; in `memory` mode
+/// every entry is the ingress journal's `Arc`, so the pool adds no state.
+/// No entry is dropped before `NodeContext` is, so no connection leaks.
+async fn open_engine_journal_pool(
+    config: &NodeConfig,
+    ingress: &Arc<Journal>,
+    size: usize,
+) -> Result<Vec<Arc<Journal>>> {
+    match config.journal {
+        JournalKind::Iggy => {
+            let mut pool = Vec::with_capacity(size);
+            for _ in 0..size {
+                // connect_iggy retries until Iggy accepts; each call opens a
+                // dedicated client for one pool entry.
+                pool.push(Arc::new(connect_iggy(config).await?));
+            }
+            Ok(pool)
+        }
+        JournalKind::Memory => Ok(vec![Arc::clone(ingress); size]),
+    }
+}
+
+/// Distinct partitions that own a configured symbol; the pool default sizes
+/// to this so one client per shard is the common case.
+fn active_shard_count(exchange: &ExchangeConfig) -> usize {
+    let mut shards: Vec<u32> = exchange
+        .instruments
+        .iter()
+        .map(|instrument| instrument.symbol.partition(exchange.partitions))
+        .collect();
+    shards.sort_unstable();
+    shards.dedup();
+    shards.len()
+}
 
 async fn open_journal(config: &NodeConfig) -> Result<Arc<Journal>> {
     Ok(match config.journal {

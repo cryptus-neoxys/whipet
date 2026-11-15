@@ -61,6 +61,10 @@ impl TestNode {
             ws_per_ip: 0,
         };
         let journal = Arc::new(Journal::memory());
+        // The test pool is one shared memory journal: every entry is the same
+        // Arc, mirroring the node's memory-mode wiring, so engine shards pick
+        // a client via `engine_journal_for` exactly as they do against Iggy.
+        let engine_journals = vec![Arc::clone(&journal), Arc::clone(&journal)];
         let group_commit = whippet_journal::group::GroupCommit::new(
             Arc::clone(&journal),
             whippet_journal::group::GroupCommitConfig {
@@ -81,7 +85,8 @@ impl TestNode {
         let ctx = Arc::new(NodeContext {
             config,
             journal: Arc::clone(&journal),
-            engine_journal: journal,
+            engine_journals,
+            engine_journal: Arc::clone(&journal),
             group_commit,
             hub,
             metrics,
@@ -91,6 +96,7 @@ impl TestNode {
             shards_ok: Arc::new(AtomicBool::new(true)),
             rate_limiter,
             ws_connections,
+            snapshot_lock: Arc::new(std::sync::Mutex::new(())),
         });
         Self { ctx, tempdir }
     }

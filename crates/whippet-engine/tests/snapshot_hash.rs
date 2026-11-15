@@ -304,6 +304,72 @@ fn a_snapshot_without_hash_restores_to_the_live_hash_at_scale() {
 }
 
 #[test]
+fn the_compact_terminal_queue_restores_eviction_parity_at_scale() {
+    // The snapshot carries the terminal queue as `u32` indices into the dedup
+    // walk rather than as order ids. At this scale the walk is longer than the
+    // map (ids were evicted and re-admitted), which is exactly where a wrong
+    // index, or resolution in the wrong order, would change which id the
+    // restored table evicts next.
+    let mut engine = run(3);
+    let live_queue = engine.dedup().terminal_order();
+    assert!(!live_queue.is_empty(), "the workload never terminalised");
+    let walk = engine.dedup().entries_in_order();
+    assert!(
+        walk.len() > engine.dedup().len(),
+        "the workload never re-admitted an evicted id (walk {}, map {})",
+        walk.len(),
+        engine.dedup().len()
+    );
+    drop(walk);
+
+    let mut snapshot = engine.snapshot_state_without_hash();
+    assert_eq!(snapshot.dedup_terminal_idx.len(), live_queue.len());
+    assert!(
+        snapshot.dedup_terminal_idx.len() * 4 < live_queue.len() * 40,
+        "the compact form should be far smaller than the ids it replaces"
+    );
+    snapshot.state_hash = hash_symbol_snapshot(&snapshot);
+    let mut restored = SymbolEngine::from_snapshot(config(), snapshot).expect("restores");
+    assert_eq!(restored.state_hash(), engine.state_hash());
+    assert_eq!(
+        restored.dedup().terminal_order(),
+        live_queue,
+        "the restored eviction queue diverged"
+    );
+
+    // Drive both engines through further evictions with the same commands and
+    // compare what is evicted. Membership and the queue are the parity the
+    // terminal payload has to preserve; the dedup hash walk is deliberately not
+    // compared here, because it also counts insertion-order entries for ids
+    // that were dead at snapshot time, which no snapshot form carries (see the
+    // note on `DedupTable::from_entries`).
+    let tail = generate(1_003);
+    let base = engine.commands();
+    let mut out = EngineOutput::with_capacity(32, 32);
+    for (index, command) in tail.iter().take(20_000).enumerate() {
+        let offset = base + index as u64;
+        engine.process(command, offset, &mut out);
+        out.clear();
+        restored.process(command, offset, &mut out);
+        out.clear();
+    }
+    assert_eq!(restored.dedup().len(), engine.dedup().len());
+    for id in 1..=ID_POOL {
+        let id = OrderId(u128::from(id));
+        assert_eq!(
+            restored.dedup().contains(id),
+            engine.dedup().contains(id),
+            "id {id} membership diverged after the tail"
+        );
+    }
+    assert_eq!(
+        restored.dedup().terminal_order(),
+        engine.dedup().terminal_order(),
+        "the restored eviction queue diverged after the tail"
+    );
+}
+
+#[test]
 fn shard_snapshot_without_hash_matches_the_shard_hash() {
     let mut eth = config();
     eth.symbol = Symbol::new("ETH-USD").expect("static symbol");

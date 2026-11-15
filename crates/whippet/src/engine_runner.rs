@@ -249,7 +249,7 @@ pub async fn run_engine_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()
     let consumer = format!("whippet-engine-p{shard_id}");
     // A shard's journal handle is cloned once and threaded through the reader
     // and writer explicitly, so the journal edge can be substituted in tests.
-    let journal = Arc::clone(&ctx.engine_journal);
+    let journal = Arc::clone(ctx.engine_journal_for(shard_id));
     // Read the broker's committed offset even when a snapshot exists. The
     // snapshot is authoritative for the resume point, but the watermark must
     // start at the highest acknowledged offset so a crash during replay cannot
@@ -939,6 +939,7 @@ pub async fn run_writer<J: JournalOps + ?Sized>(
 
 /// Consume the canonical market-data log and apply it to the dashboard cache.
 pub async fn run_md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
+    let journal = ctx.engine_journal_for(shard_id);
     let consumer = format!("whippet-md-p{shard_id}");
     let committed_offset = match ctx
         .engine_journal
@@ -973,14 +974,14 @@ pub async fn run_md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
         let records = tokio::select! {
             _ = shutdown.changed() => {
                 if let Some(offset) = watermark.pending() {
-                    match commit_once(ctx.engine_journal.as_ref(), Topic::Md, shard_id, &consumer, offset).await {
+                    match commit_once(journal.as_ref(), Topic::Md, shard_id, &consumer, offset).await {
                         Ok(()) => watermark.mark_committed(offset, Instant::now()),
                         Err(error) => warn!(shard = shard_id, offset, error = %error, "final MD offset commit failed"),
                     }
                 }
                 return Ok(());
             }
-            result = ctx.engine_journal.read_payloads(Topic::Md, shard_id, &consumer, next_offset, BATCH_CAPACITY as u32, 100) => result,
+            result = journal.read_payloads(Topic::Md, shard_id, &consumer, next_offset, BATCH_CAPACITY as u32, 100) => result,
         };
         let records = match records {
             Ok(records) => records,
@@ -1000,7 +1001,7 @@ pub async fn run_md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
         poll_failures = 0;
         if records.is_empty() {
             maybe_commit(
-                ctx.engine_journal.as_ref(),
+                journal.as_ref(),
                 Topic::Md,
                 shard_id,
                 &consumer,
@@ -1008,7 +1009,7 @@ pub async fn run_md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
                 &mut commit_retry,
             )
             .await;
-            if !ctx.engine_journal.is_iggy() {
+            if !journal.is_iggy() {
                 sleep(Duration::from_millis(1)).await;
             }
             continue;
@@ -1060,7 +1061,7 @@ pub async fn run_md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
         watermark.note_applied(last_offset);
         next_offset = last_offset.saturating_add(1);
         maybe_commit(
-            ctx.engine_journal.as_ref(),
+            journal.as_ref(),
             Topic::Md,
             shard_id,
             &consumer,
