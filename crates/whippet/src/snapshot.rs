@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use whippet_core::config::ExchangeConfig;
 use whippet_core::ids::Symbol;
-use whippet_engine::{ShardEngine, ShardSnapshot, fill_symbol_hashes};
+use whippet_engine::{ShardEngine, ShardSnapshot};
 
 const MAGIC: &[u8; 8] = b"WHIPSNP1";
 /// Version 2 added the per-symbol config and the book's `min_price_ticks` so
@@ -200,39 +200,17 @@ impl SnapshotWriter {
 
     fn write_inner(
         &mut self,
-        mut request: SequencedSnapshot,
+        request: SequencedSnapshot,
         verify: bool,
     ) -> Result<Option<PathBuf>, SnapshotError> {
         if !is_newer(self.last_written, request.sequence) {
             return Ok(None);
         }
-        // The shard loop only cloned the state; hashing happens here so the
-        // match loop does not pay for it.
-        //
-        // Keep any hashes the caller did supply: `fill_symbol_hashes` recomputes
-        // unconditionally, which would silently repair a corrupted stored hash.
-        // A non-zero hash that disagrees with the recomputed one is a bug and
-        // must be rejected instead.
-        let provided: Vec<[u8; 32]> = request
-            .snapshot
-            .symbols
-            .iter()
-            .map(|symbol| symbol.state_hash)
-            .collect();
-        fill_symbol_hashes(&mut request.snapshot);
-        for (symbol, provided) in request.snapshot.symbols.iter().zip(&provided) {
-            if *provided != [0u8; 32] && *provided != symbol.state_hash {
-                return Err(SnapshotError::HashMismatch {
-                    shard: request.snapshot.shard_id,
-                    detail: format!(
-                        "symbol {} stored hash {} does not match recomputed {}",
-                        symbol.symbol,
-                        hex(provided),
-                        hex(&symbol.state_hash)
-                    ),
-                });
-            }
-        }
+        // The matcher computes the live state hash with the engine; the
+        // writer must not recompute it from the snapshot. An off-loop hash was
+        // tried and reverted: at ~170k orders it disagreed with the restored
+        // engine hash on one shard, which would have persisted an unusable
+        // resume point. The final snapshot is still rebuilt and verified here.
         if verify {
             self.verify(&request.snapshot)?;
         }
@@ -347,7 +325,7 @@ mod tests {
         let path = writer
             .write(SequencedSnapshot {
                 sequence: 1,
-                snapshot: engine.snapshot_state_without_hash(),
+                snapshot: engine.snapshot_state(),
             })
             .unwrap()
             .expect("a verifiable snapshot is persisted");
@@ -378,7 +356,7 @@ mod tests {
         let path = writer
             .write(SequencedSnapshot {
                 sequence: 1,
-                snapshot: engine.snapshot_state_without_hash(),
+                snapshot: engine.snapshot_state(),
             })
             .unwrap()
             .expect("valid snapshot writes");
@@ -414,48 +392,37 @@ mod tests {
     }
 
     #[test]
-    fn unhashed_snapshot_is_filled_by_the_writer() {
+    fn unhashed_snapshot_is_rejected() {
         let exchange = test_exchange();
         let shard_id = test_shard(&exchange);
         let engine = ShardEngine::new(shard_id, &exchange);
-        let unhashed = engine.snapshot_state_without_hash();
-        assert!(
-            unhashed
-                .symbols
-                .iter()
-                .all(|symbol| symbol.state_hash == [0u8; 32]),
-            "test precondition: the shard snapshot must start unhashed"
-        );
+        let mut unhashed = engine.snapshot_state();
+        for symbol in &mut unhashed.symbols {
+            symbol.state_hash = [0u8; 32];
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::new(dir.path());
-        let mut writer = SnapshotWriter::with_exchange(store.clone(), exchange.clone());
-        let path = writer
-            .write(SequencedSnapshot {
-                sequence: 1,
-                snapshot: unhashed,
-            })
-            .unwrap()
-            .expect("the writer fills the hashes and saves");
-        assert!(path.exists());
-
-        let loaded = store.load(shard_id).unwrap().unwrap();
-        let expected = engine.snapshot_state();
-        assert_eq!(loaded.symbols[0].state_hash, expected.symbols[0].state_hash);
-        let restored = ShardEngine::from_snapshot(&exchange, loaded).unwrap();
-        assert_eq!(restored.state_hash(), engine.state_hash());
+        let mut writer = SnapshotWriter::with_exchange(store, exchange);
+        let result = writer.write(SequencedSnapshot {
+            sequence: 1,
+            snapshot: unhashed,
+        });
+        assert!(matches!(result, Err(SnapshotError::UnhashedSymbol { .. })));
     }
 
     #[test]
     fn verify_rejects_an_all_zero_hash() {
-        // `write` fills zeros before verifying, so exercise the guard directly:
-        // a zero hash that survives the fill is an unhashed/broken snapshot.
+        // The matcher supplies the live hash; a zero one is a broken snapshot.
         let exchange = test_exchange();
         let shard_id = test_shard(&exchange);
         let engine = ShardEngine::new(shard_id, &exchange);
         let dir = tempfile::tempdir().unwrap();
         let writer = SnapshotWriter::with_exchange(SnapshotStore::new(dir.path()), exchange);
-        let snapshot = engine.snapshot_state_without_hash();
+        let mut snapshot = engine.snapshot_state();
+        for symbol in &mut snapshot.symbols {
+            symbol.state_hash = [0u8; 32];
+        }
 
         match writer.verify(&snapshot) {
             Err(SnapshotError::UnhashedSymbol { shard, symbol }) => {
@@ -505,7 +472,7 @@ mod tests {
         let written = writer
             .write(SequencedSnapshot {
                 sequence: 7,
-                snapshot: engine.snapshot_state_without_hash(),
+                snapshot: engine.snapshot_state(),
             })
             .unwrap();
         assert_eq!(written.as_deref(), Some(path.as_path()));
@@ -516,7 +483,7 @@ mod tests {
         let stale = writer
             .write(SequencedSnapshot {
                 sequence: 6,
-                snapshot: engine.snapshot_state_without_hash(),
+                snapshot: engine.snapshot_state(),
             })
             .unwrap();
         assert!(stale.is_none());
@@ -527,7 +494,7 @@ mod tests {
         let newer = writer
             .write(SequencedSnapshot {
                 sequence: 8,
-                snapshot: engine.snapshot_state_without_hash(),
+                snapshot: engine.snapshot_state(),
             })
             .unwrap();
         assert!(newer.is_some());
@@ -549,7 +516,7 @@ mod tests {
 
         let result = writer.write(SequencedSnapshot {
             sequence: 4,
-            snapshot: engine.snapshot_state_without_hash(),
+            snapshot: engine.snapshot_state(),
         });
         assert!(result.is_err());
         assert_eq!(writer.last_written(), None);

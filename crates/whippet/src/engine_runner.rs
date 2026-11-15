@@ -535,7 +535,7 @@ pub fn run_matcher(
             snapshot_sequence += 1;
             Some(SequencedSnapshot {
                 sequence: snapshot_sequence,
-                snapshot: engine.snapshot_state_without_hash(),
+                snapshot: engine.snapshot_state(),
             })
         } else {
             None
@@ -596,7 +596,7 @@ pub fn run_matcher(
                 snapshot_sequence += 1;
                 snapshot = Some(SequencedSnapshot {
                     sequence: snapshot_sequence,
-                    snapshot: engine.snapshot_state_without_hash(),
+                    snapshot: engine.snapshot_state(),
                 });
             } else {
                 snapshot_pending = true;
@@ -1182,14 +1182,8 @@ fn spawn_snapshot_writer(
         let mut writer =
             SnapshotWriter::with_exchange(ctx.snapshots.clone(), ctx.exchange().clone());
         while let Some(job) = pending.blocking_recv() {
-            let SnapshotJob {
-                mut request,
-                verify,
-            } = job;
+            let SnapshotJob { request, verify } = job;
             let sequence = request.sequence;
-            // Fill before collecting diagnostics; the writer recomputes and
-            // compares the same values, so this only makes the log truthful.
-            whippet_engine::fill_symbol_hashes(&mut request.snapshot);
             // The shard only cloned the state; the writer fills and (for the
             // final snapshot) verifies the hash, so the match loop pays neither.
             // Diagnostics are built here, off the shard loop.

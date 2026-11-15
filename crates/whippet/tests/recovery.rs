@@ -45,13 +45,13 @@ fn snapshot_file_seeded_tail_replay_equals_full_replay() {
 
     let dir = tempfile::tempdir().expect("temp snapshot dir");
     let store = SnapshotStore::new(dir.path());
-    // The shard hands over an unhashed snapshot; the writer fills and verifies
-    // the hashes before the atomic rename.
+    // The matcher hands over the live state hash; the final-snapshot writer
+    // rebuilds and verifies it before the atomic rename.
     let mut writer = SnapshotWriter::with_exchange(store.clone(), exchange.clone());
     writer
         .write(SequencedSnapshot {
             sequence: 1,
-            snapshot: prefix.snapshot_state_without_hash(),
+            snapshot: prefix.snapshot_state(),
         })
         .expect("snapshot verifies")
         .expect("snapshot writes atomically");
@@ -102,7 +102,7 @@ fn corrupt_hash_is_rejected_and_previous_snapshot_survives() {
     let path = writer
         .write(SequencedSnapshot {
             sequence: 1,
-            snapshot: engine.snapshot_state_without_hash(),
+            snapshot: engine.snapshot_state(),
         })
         .expect("snapshot verifies")
         .expect("snapshot writes");
