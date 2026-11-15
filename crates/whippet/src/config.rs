@@ -370,6 +370,24 @@ impl NodeConfig {
         // duplicate participant is allowed (rotation, two tokens one desk).
         reject_duplicate_tokens(&api_tokens, "WHIPPET_API_TOKENS", "participant")?;
         reject_duplicate_tokens(&operator_tokens, "WHIPPET_OPERATOR_TOKENS", "operator")?;
+        if let Some(legacy) = api_token.as_deref()
+            && api_tokens.iter().any(|entry| entry.token == legacy)
+        {
+            return Err(ConfigError::Invalid(
+                "WHIPPET_API_TOKEN duplicates an entry in WHIPPET_API_TOKENS; a token must have one trading identity"
+                    .into(),
+            ));
+        }
+        // A token that appears in two role namespaces would grant both
+        // privileges (or make the metrics credential an admin credential).
+        // Roles are separate by design; reject the overlap at startup rather
+        // than silently choosing one.
+        validate_distinct_roles(
+            api_token.as_deref(),
+            &api_tokens,
+            &operator_tokens,
+            metrics_token.as_deref(),
+        )?;
 
         let exchange = exchange_config(&args.venue, args.partitions, mode, &args.symbols)?;
 
@@ -459,6 +477,42 @@ fn parse_operator_tokens(raw: &str) -> Result<Vec<ApiToken>, ConfigError> {
 ///
 /// A duplicate token would make the lookup order-dependent; a duplicate name
 /// is allowed (rotation, two tokens one identity).
+/// Reject a token string that appears in more than one credential role.
+fn validate_distinct_roles(
+    legacy_trading: Option<&str>,
+    trading: &[ApiToken],
+    operators: &[ApiToken],
+    metrics: Option<&str>,
+) -> Result<(), ConfigError> {
+    let mut entries: Vec<(&str, &'static str)> = Vec::new();
+    if let Some(token) = legacy_trading {
+        entries.push((token, "trading token (WHIPPET_API_TOKEN)"));
+    }
+    for entry in trading {
+        entries.push((entry.token.as_str(), "trading token (WHIPPET_API_TOKENS)"));
+    }
+    for entry in operators {
+        entries.push((
+            entry.token.as_str(),
+            "operator token (WHIPPET_OPERATOR_TOKENS)",
+        ));
+    }
+    if let Some(token) = metrics {
+        entries.push((token, "metrics token (WHIPPET_METRICS_TOKEN)"));
+    }
+    for (index, (token, role)) in entries.iter().enumerate() {
+        if let Some((_, other)) = entries[..index]
+            .iter()
+            .find(|(other_token, _)| other_token == token)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "the same bearer token is configured as both {other} and {role}; use a distinct token per role"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn reject_duplicate_tokens(tokens: &[ApiToken], env: &str, role: &str) -> Result<(), ConfigError> {
     for (index, entry) in tokens.iter().enumerate() {
         if tokens[..index]
@@ -714,6 +768,65 @@ mod tests {
         let config = NodeConfig::from_args(cli.node).unwrap();
         assert_eq!(config.participant_for("legacy"), Some("desk-1"));
         assert_eq!(config.participant_for("tok-a"), Some("alice"));
+    }
+
+    #[test]
+    fn credential_roles_cannot_share_a_token() {
+        // Trading + operator.
+        let cli = Cli::parse_from([
+            "test",
+            "--api-token",
+            "shared",
+            "--operator-tokens",
+            "shared:ops",
+        ]);
+        let error = match NodeConfig::from_args(cli.node) {
+            Ok(_) => panic!("shared token must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("both"), "{error}");
+
+        // Scoped trading + operator.
+        let cli = Cli::parse_from([
+            "test",
+            "--api-tokens",
+            "shared:alice",
+            "--operator-tokens",
+            "shared:ops",
+        ]);
+        assert!(NodeConfig::from_args(cli.node).is_err());
+
+        // Metrics + trading.
+        let cli = Cli::parse_from(["test", "--api-token", "shared", "--metrics-token", "shared"]);
+        assert!(NodeConfig::from_args(cli.node).is_err());
+
+        // Distinct tokens across all three roles are accepted.
+        let cli = Cli::parse_from([
+            "test",
+            "--api-token",
+            "trade",
+            "--operator-tokens",
+            "ops:ops1",
+            "--metrics-token",
+            "metrics",
+        ]);
+        assert!(NodeConfig::from_args(cli.node).is_ok());
+    }
+
+    #[test]
+    fn a_legacy_token_cannot_be_repeated_in_the_scoped_list() {
+        let cli = Cli::parse_from([
+            "test",
+            "--api-token",
+            "shared",
+            "--api-tokens",
+            "shared:alice",
+        ]);
+        let error = match NodeConfig::from_args(cli.node) {
+            Ok(_) => panic!("duplicate trading token must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("duplicates an entry"), "{error}");
     }
 
     #[test]
