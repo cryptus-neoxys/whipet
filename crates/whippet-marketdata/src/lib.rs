@@ -773,6 +773,13 @@ impl Metrics {
         self.orders_ingressed.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Batched form for a request that admits several orders at once.
+    pub fn record_ingress_n(&self, count: u64) {
+        if count != 0 {
+            self.orders_ingressed.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
     /// One lock acquisition for the lifetime and windowed ingress percentiles.
     pub fn record_ingress_latency_us(&self, micros: u64) {
         let value = micros.min(STAGE_US_MAX);
@@ -1426,13 +1433,18 @@ impl MdHub {
         let mut trades_applied = 0u64;
         let mut max_seq = 0u64;
         for event in events {
-            // Unknown symbols are skipped exactly as `apply` skips them.
+            // Unknown symbols are skipped exactly as `apply` skips them. The
+            // instrument lookup exists only to check the price scale in debug
+            // builds; in release the book lookup below is the whole check and
+            // the linear scan is dead work inside the hub lock.
+            #[cfg(debug_assertions)]
             let Some(instrument) = self.config.instrument(event.symbol) else {
                 continue;
             };
             let Some(book) = state.books.get_mut(&event.symbol) else {
                 continue;
             };
+            #[cfg(debug_assertions)]
             debug_assert_eq!(book.tick_size_cents, instrument.tick_size_cents);
             if !book.apply(event) {
                 continue;

@@ -946,12 +946,17 @@ pub fn run_matcher(
             let seq = next_turbo_seq;
             next_turbo_seq = next_turbo_seq.saturating_add(1);
             let started = Instant::now();
-            let ack = match engine.process(&entry.command, seq, &mut out) {
+            match engine.process(&entry.command, seq, &mut out) {
                 Ok(()) => {
                     let elapsed = started.elapsed().as_micros() as u64;
                     process_us = process_us.saturating_add(elapsed);
                     shard_metrics.record_match_latency_us(elapsed);
                     shard_metrics.record_engine_command();
+                    // Ack the match before building the output messages. The
+                    // engine state is final here; the ~1 us of encoding and
+                    // header allocation must not sit between match and ack.
+                    let ack = turbo_ack(seq, &entry.command, &out);
+                    let _ = entry.ack.send(ack);
                     for execution in &out.executions {
                         shard_metrics.record_execution();
                         if matches!(execution.kind, ExecKind::Accepted | ExecKind::Rejected) {
@@ -967,7 +972,6 @@ pub fn run_matcher(
                     for snapshot in &out.snapshots {
                         md_messages.push(snapshot_message(snapshot));
                     }
-                    turbo_ack(seq, &entry.command, &out)
                 }
                 Err(error) => {
                     // A command routed to the wrong shard: no state changed and
@@ -981,16 +985,16 @@ pub fn run_matcher(
                         error = %error,
                         "engine rejected a turbo command for this shard"
                     );
-                    TurboAck {
+                    // A client that gave up closed the receiver; the command
+                    // was still matched and is still journaled, so the shard
+                    // continues.
+                    let _ = entry.ack.send(TurboAck {
                         seq,
                         accepted: false,
                         reject: RejectReason::Internal,
-                    }
+                    });
                 }
-            };
-            // A client that gave up closed the receiver; the command was still
-            // matched and is still journaled, so the shard continues.
-            let _ = entry.ack.send(ack);
+            }
             orders.push(TurboJournalRecord {
                 message: entry.message,
                 admission: entry.admission,

@@ -652,9 +652,7 @@ async fn submit_orders(
     let durable_ack_ms = elapsed.as_secs_f64() * 1_000.0;
     // Throughput is per order, but latency is sampled once per batch: every
     // order in the batch shares the single durable round trip.
-    for _ in &validated {
-        ctx.metrics.record_ingress();
-    }
+    ctx.metrics.record_ingress_n(validated.len() as u64);
     ctx.metrics
         .record_ingress_latency_us(elapsed.as_micros() as u64);
 
@@ -849,7 +847,10 @@ fn validate_fields(
             }
             OrderId::derive(symbol, key)
         }
-        None => OrderId::derive(symbol, &uuid::Uuid::new_v4().to_string()),
+        // No idempotency key was supplied: the UUID's 128 random bits are the
+        // whole contract. Hashing its hyphenated string cost a getrandom
+        // syscall, a String, and a BLAKE3 pass per order for no benefit.
+        None => OrderId(uuid::Uuid::new_v4().as_u128()),
     };
     let participant = resolve_participant_id(caller, participant, participants)?;
     Ok(ValidatedOrder {

@@ -127,15 +127,16 @@ impl DedupTable {
     }
 
     pub fn update(&mut self, order_id: OrderId, status: DedupStatus) {
-        let was_terminal = self.map.get(&order_id).is_some_and(|entry| {
-            matches!(
-                entry.status,
-                DedupStatus::Filled | DedupStatus::Cancelled | DedupStatus::Rejected
-            )
-        });
-        if let Some(entry) = self.map.get_mut(&order_id) {
-            entry.status = status;
-        }
+        // One lookup: read the old status and write the new one from the same
+        // mutable borrow. This runs on every fill, rest, cancel, and reject.
+        let Some(entry) = self.map.get_mut(&order_id) else {
+            return;
+        };
+        let was_terminal = matches!(
+            entry.status,
+            DedupStatus::Filled | DedupStatus::Cancelled | DedupStatus::Rejected
+        );
+        entry.status = status;
         let is_terminal = matches!(
             status,
             DedupStatus::Filled | DedupStatus::Cancelled | DedupStatus::Rejected

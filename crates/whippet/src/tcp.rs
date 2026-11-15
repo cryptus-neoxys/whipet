@@ -399,9 +399,7 @@ async fn handle_submit(
             );
         }
         let elapsed = started.elapsed();
-        for _ in 0..count {
-            ctx.metrics.record_ingress();
-        }
+        ctx.metrics.record_ingress_n(u64::from(count));
         ctx.metrics
             .record_ingress_latency_us(elapsed.as_micros() as u64);
         ctx.metrics
@@ -420,9 +418,7 @@ async fn handle_submit(
     match group.append(Topic::Orders, partition, messages).await {
         Ok(append) => {
             let elapsed = started.elapsed();
-            for _ in 0..count {
-                ctx.metrics.record_ingress();
-            }
+            ctx.metrics.record_ingress_n(u64::from(count));
             // Latency is sampled once per batch: every command shares the one
             // durable append. Group commit may serve other connections in the
             // same append, but this caller's offsets still start at
