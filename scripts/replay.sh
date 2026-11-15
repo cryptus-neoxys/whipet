@@ -7,17 +7,21 @@
 #
 # Both must print the same state_hash and end at the same offset. The seeded
 # run passes --require-snapshot, so a missing snapshot, a snapshot with no
-# applied commands, a snapshot at the log head, or a snapshot ahead of the
-# engine's committed offset exits non-zero instead of quietly degrading to a
-# second full replay. The full replay starts at offset 0 by design and cannot
-# pass that flag (`seeded_from_snapshot` is false by definition).
+# applied commands, a snapshot at the log head, a snapshot ahead of the
+# engine's committed offset, or an undecodable tail record exits non-zero
+# instead of quietly degrading to a second full replay. The full replay starts
+# at offset 0 by design and cannot pass that flag (`seeded_from_snapshot` is
+# false by definition), so the script compares its own summary as well: neither
+# run may skip records, and a seeded run must decode exactly its tail.
 #
 # The simulator is stopped for the duration so no new orders arrive, then
 # restarted if it was running. The node stays up: stopping it flushes a
 # snapshot at the head, which would make the seeded replay decode no tail.
 #
 # Set WHIPPET_REPLAY_REQUIRE_SNAPSHOT=0 for the lenient dev path (also exposed
-# as `make replay-dev`).
+# as `make replay-dev`). WHIPPET_PARTITIONS and WHIPPET_SYMBOLS select the
+# routing the node was started with; unset values fall back to the compose
+# service environment (16 partitions, BTC/ETH/SOL).
 
 set -euo pipefail
 
@@ -61,6 +65,9 @@ if [ "${SIM_WAS_RUNNING}" -eq 1 ]; then
 fi
 
 run_replay() {
+    if [ -n "${WHIPPET_SYMBOLS:-}" ]; then
+        set -- --symbols "${WHIPPET_SYMBOLS}" "$@"
+    fi
     "${COMPOSE[@]}" run --rm --no-deps \
         -e WHIPPET_IGGY_ADDR=iggy:8090 \
         node replay \
@@ -101,15 +108,25 @@ seeded = parse(sys.argv[2])
 require_snapshot = sys.argv[3] == "1"
 print(
     f"full:   hash={full['state_hash']} last_offset={full['last_offset']} "
-    f"decoded={full['decoded']} seeded={full['seeded_from_snapshot']}"
+    f"decoded={full['decoded']} skipped={full['skipped']} "
+    f"seeded={full['seeded_from_snapshot']}"
 )
 print(
     f"seeded: hash={seeded['state_hash']} last_offset={seeded['last_offset']} "
-    f"decoded={seeded['decoded']} seeded={seeded['seeded_from_snapshot']} "
+    f"decoded={seeded['decoded']} skipped={seeded['skipped']} "
+    f"seeded={seeded['seeded_from_snapshot']} "
     f"snapshot_offset={seeded['snapshot_offset']} "
     f"committed_offset={seeded['committed_offset']} "
     f"head={seeded['head']} tail={seeded['tail']}"
 )
+if full["skipped"] != 0 or seeded["skipped"] != 0:
+    print(
+        f"replay: FAIL - undecodable records were skipped "
+        f"(full={full['skipped']}, seeded={seeded['skipped']}); "
+        f"the replay did not cover the whole log",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
 if full["state_hash"] != seeded["state_hash"]:
     print("replay: FAIL - state hashes differ", file=sys.stderr)
     raise SystemExit(1)
@@ -128,12 +145,34 @@ if not seeded["seeded_from_snapshot"]:
         "replay: note - no snapshot was available; the seeded replay was a full replay",
         file=sys.stderr,
     )
-elif seeded["decoded"] == 0:
-    print(
-        "replay: FAIL - the snapshot-seeded replay decoded no tail commands; "
-        "the snapshot is at the log head and proves nothing",
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
+else:
+    if seeded["decoded"] == 0:
+        print(
+            "replay: FAIL - the snapshot-seeded replay decoded no tail commands; "
+            "the snapshot is at the log head and proves nothing",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    if seeded["snapshot_offset"] is None or seeded["head"] is None:
+        print(
+            "replay: FAIL - the seeded replay did not report a snapshot offset "
+            "and log head",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    if seeded["head"] < seeded["snapshot_offset"]:
+        print(
+            f"replay: FAIL - snapshot offset {seeded['snapshot_offset']} is ahead "
+            f"of the log head {seeded['head']}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    if seeded["tail"] != seeded["decoded"]:
+        print(
+            f"replay: FAIL - the seeded replay decoded {seeded['decoded']} of "
+            f"{seeded['tail']} tail records",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
 print("replay: ok - both hashes match")
 PY

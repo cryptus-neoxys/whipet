@@ -15,8 +15,8 @@ help:
 		'make bench-fanout WebSocket fanout (1/10/100 subscribers)' \
 		'make soak         10-minute steady-state soak' \
 		'make crash-test   kill/restart/replay proof' \
-		'make verify      healthcheck, crossing pair, snapshot hash check (lenient dev path)' \
-		'make verify-strict fail-closed verify: exit non-zero when no snapshot exists' \
+		'make verify      healthcheck, crossing pair, snapshot hash check (lenient dev path; WHIPPET_PARTITIONS overrides 16)' \
+		'make verify-strict fail-closed verify: exit non-zero when no snapshot exists (WHIPPET_PARTITIONS)' \
 		'make verify-dev  alias for the lenient verify path' \
 		'make replay      full vs snapshot-seeded replay; seeded run must be seeded' \
 		'make replay-strict alias for replay (fail-closed proof)' \
@@ -76,14 +76,14 @@ crash-test:
 verify:
 	@$(COMPOSE) exec -T node /usr/local/bin/whippet healthcheck --gateway http://127.0.0.1:8080
 	@scripts/verify-demo.sh
-	@$(COMPOSE) exec -T node /usr/local/bin/whippet verify --snapshot-dir /data/snapshots --partitions 16
+	@$(COMPOSE) exec -T node /usr/local/bin/whippet verify --snapshot-dir /data/snapshots --partitions $${WHIPPET_PARTITIONS:-16}
 
 verify-dev: verify
 
 verify-strict:
 	@$(COMPOSE) exec -T node /usr/local/bin/whippet healthcheck --gateway http://127.0.0.1:8080
 	@scripts/verify-demo.sh
-	@$(COMPOSE) exec -T node /usr/local/bin/whippet verify --snapshot-dir /data/snapshots --partitions 16 --require-snapshot
+	@$(COMPOSE) exec -T node /usr/local/bin/whippet verify --snapshot-dir /data/snapshots --partitions $${WHIPPET_PARTITIONS:-16} --require-snapshot
 
 # scripts/replay.sh is fail-closed by default: the seeded replay passes
 # --require-snapshot and the comparison rejects an unseeded run.

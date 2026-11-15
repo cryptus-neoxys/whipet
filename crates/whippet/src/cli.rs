@@ -139,6 +139,12 @@ pub struct VerifyArgs {
     /// be verified with `--partitions 4`, not the 16-partition default.
     #[arg(long, default_value_t = 16)]
     pub partitions: u32,
+    /// Comma-separated symbols the node was started with. Defaults to the
+    /// built-in BTC-USD,ETH-USD,SOL-USD set. Pass the node's
+    /// `WHIPPET_SYMBOLS` when it ran a different universe, or the per-shard
+    /// checks reject a valid snapshot for a symbol the node never wrote.
+    #[arg(long, env = "WHIPPET_SYMBOLS")]
+    pub symbols: Option<String>,
     /// Exit non-zero when the directory holds no snapshots instead of reporting
     /// that nothing was verified. Use for CI and release proof; leave unset for
     /// the lenient dev path.
@@ -146,14 +152,29 @@ pub struct VerifyArgs {
     pub require_snapshot: bool,
 }
 
+/// Build the exchange layout a snapshot was written with.
+///
+/// `verify` and `replay` restore snapshots by symbol, so their universe must
+/// match the node's. The node derives it from `--symbols`/`WHIPPET_SYMBOLS`;
+/// when no list is supplied these commands keep the historical default
+/// (BTC-USD, ETH-USD, SOL-USD).
+fn snapshot_exchange(partitions: u32, symbols: Option<&str>) -> Result<ExchangeConfig> {
+    let Some(symbols) = symbols else {
+        return Ok(ExchangeConfig {
+            partitions,
+            ..ExchangeConfig::default()
+        });
+    };
+    let venue = ExchangeConfig::default().venue;
+    exchange_config(&venue, partitions, Mode::Durable, symbols)
+        .with_context(|| format!("invalid --symbols {symbols:?}"))
+}
+
 pub fn run_verify(args: VerifyArgs) -> Result<()> {
     if args.partitions == 0 {
         bail!("--partitions must be at least 1");
     }
-    let exchange = ExchangeConfig {
-        partitions: args.partitions,
-        ..ExchangeConfig::default()
-    };
+    let exchange = snapshot_exchange(args.partitions, args.symbols.as_deref())?;
     let store = SnapshotStore::new(args.snapshot_dir.clone());
     // Active shards own at least one configured symbol. A `--require-snapshot`
     // gate must cover every one of them, not just "some file exists".
@@ -261,6 +282,12 @@ pub struct ReplayArgs {
     pub snapshot_dir: PathBuf,
     #[arg(long, default_value_t = 16)]
     pub exchange_partitions: u32,
+    /// Comma-separated symbols the node was started with. Defaults to the
+    /// built-in BTC-USD,ETH-USD,SOL-USD set. Pass the node's
+    /// `WHIPPET_SYMBOLS` when it ran a different universe, or a valid snapshot
+    /// is rejected for a symbol the node never wrote.
+    #[arg(long, env = "WHIPPET_SYMBOLS")]
+    pub symbols: Option<String>,
     /// Fail unless the replay is seeded from a snapshot that was found, is a
     /// real resume point (applied commands > 0), sits before the log head, and
     /// is not ahead of the engine's committed offset. Without it a missing
@@ -291,10 +318,7 @@ pub async fn replay_with_journal(args: ReplayArgs, journal: Journal) -> Result<s
     if args.exchange_partitions == 0 {
         bail!("--exchange-partitions must be at least 1");
     }
-    let exchange = ExchangeConfig {
-        partitions: args.exchange_partitions,
-        ..ExchangeConfig::default()
-    };
+    let exchange = snapshot_exchange(args.exchange_partitions, args.symbols.as_deref())?;
     let store = SnapshotStore::new(args.snapshot_dir.clone());
     let snapshot = store
         .load(args.partition)
@@ -466,6 +490,17 @@ pub async fn replay_with_journal(args: ReplayArgs, journal: Journal) -> Result<s
             last_offset = record.offset;
             offset = record.offset.saturating_add(1);
         }
+    }
+
+    // A skipped record is a hole in the proof: the tail was not fully decoded,
+    // so matching hashes could still come from a shorter log. Strict mode
+    // refuses it; the lenient path reports the count in the summary instead.
+    if args.require_snapshot && skipped > 0 {
+        bail!(
+            "--require-snapshot: skipped {skipped} undecodable record(s) on partition {}; \
+             the replay does not prove the whole tail",
+            args.partition
+        );
     }
 
     let hash = hex(&engine.state_hash());

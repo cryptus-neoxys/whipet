@@ -14,7 +14,7 @@ use std::process::Command as ProcessCommand;
 
 use whippet::cli::{ReplayArgs, replay_with_journal};
 use whippet::snapshot::{SequencedSnapshot, SnapshotStore, SnapshotWriter};
-use whippet_core::config::ExchangeConfig;
+use whippet_core::config::{ExchangeConfig, InstrumentConfig};
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Symbol};
 use whippet_core::protocol::{Command, OrderType, Side};
 use whippet_engine::{EngineOutput, ShardEngine};
@@ -92,13 +92,20 @@ fn replay_args(dir: &Path, partition: u32, require_snapshot: bool) -> ReplayArgs
         to: None,
         snapshot_dir: dir.to_path_buf(),
         exchange_partitions: 4,
+        symbols: None,
         require_snapshot,
         expect_hash: None,
     }
 }
 
-fn verify_binary(dir: &Path, partitions: u32, require_snapshot: bool) -> std::process::Output {
+fn verify_binary(
+    dir: &Path,
+    partitions: u32,
+    symbols: Option<&str>,
+    require_snapshot: bool,
+) -> std::process::Output {
     let mut command = ProcessCommand::new(env!("CARGO_BIN_EXE_whippet"));
+    command.env_remove("WHIPPET_SYMBOLS");
     command.args([
         "verify",
         "--snapshot-dir",
@@ -106,6 +113,9 @@ fn verify_binary(dir: &Path, partitions: u32, require_snapshot: bool) -> std::pr
         "--partitions",
         &partitions.to_string(),
     ]);
+    if let Some(symbols) = symbols {
+        command.args(["--symbols", symbols]);
+    }
     if require_snapshot {
         command.arg("--require-snapshot");
     }
@@ -128,11 +138,41 @@ fn memory_journal(partition: u32, commands: &[Command], committed: u64) -> Journ
     Journal::Memory(memory)
 }
 
+/// A log where `garbage_at` holds an undecodable payload instead of an order,
+/// so the replay's `skipped` counter is non-zero.
+fn journal_with_undecodable_record(
+    partition: u32,
+    commands: &[Command],
+    garbage_at: usize,
+) -> Journal {
+    let memory = MemoryJournal::new();
+    let messages: Vec<JournalMessage> = commands
+        .iter()
+        .enumerate()
+        .map(|(index, command)| {
+            let payload = if index == garbage_at {
+                vec![0xff]
+            } else {
+                command.encode()
+            };
+            JournalMessage::new(payload, Vec::new())
+        })
+        .collect();
+    memory.append(Topic::Orders, partition, &messages);
+    memory.commit(
+        Topic::Orders,
+        partition,
+        &format!("whippet-engine-p{partition}"),
+        commands.len() as u64 - 1,
+    );
+    Journal::Memory(memory)
+}
+
 #[test]
 fn verify_require_snapshot_fails_on_an_empty_directory() {
     let dir = tempfile::tempdir().expect("temp snapshot dir");
 
-    let lenient = verify_binary(dir.path(), 4, false);
+    let lenient = verify_binary(dir.path(), 4, None, false);
     let stdout = String::from_utf8_lossy(&lenient.stdout);
     assert!(
         lenient.status.success(),
@@ -144,7 +184,7 @@ fn verify_require_snapshot_fails_on_an_empty_directory() {
         "the lenient path did not state that it verified nothing: {stdout}"
     );
 
-    let strict = verify_binary(dir.path(), 4, true);
+    let strict = verify_binary(dir.path(), 4, None, true);
     assert!(
         !strict.status.success(),
         "verify --require-snapshot passed on an empty snapshot directory"
@@ -167,7 +207,7 @@ fn verify_with_matching_partitions_accepts_a_four_partition_snapshot() {
     shards.sort_unstable();
     shards.dedup();
 
-    let output = verify_binary(dir.path(), 4, true);
+    let output = verify_binary(dir.path(), 4, None, true);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
@@ -281,4 +321,118 @@ async fn replay_require_snapshot_reports_head_and_tail_and_matches_a_full_replay
         "snapshot-seeded replay diverged from the full replay"
     );
     assert_eq!(full["last_offset"], seeded["last_offset"]);
+}
+
+#[tokio::test]
+async fn replay_require_snapshot_rejects_a_skipped_record() {
+    let exchange = four_partition_exchange();
+    let dir = tempfile::tempdir().expect("temp snapshot dir");
+    let symbol = btc();
+    let partition = symbol.partition(exchange.partitions);
+    let commands = orders(symbol, 20);
+    write_snapshot(dir.path(), &exchange, symbol, 10);
+
+    // Offset 12 (inside the snapshot tail) carries a payload that is not a
+    // command. The earlier offsets still decode, so the replay would normally
+    // print a hash and exit zero: a proof of nine records dressed up as ten.
+    let strict_args = ReplayArgs {
+        to: Some(19),
+        ..replay_args(dir.path(), partition, true)
+    };
+    let error = replay_with_journal(
+        strict_args,
+        journal_with_undecodable_record(partition, &commands, 12),
+    )
+    .await
+    .expect_err("--require-snapshot must not pass while skipping records");
+    let message = error.to_string();
+    assert!(
+        message.contains("skipped 1") && message.contains("undecodable"),
+        "the failure did not name the skipped count: {message}"
+    );
+
+    // The lenient path still completes and reports the count, so an operator
+    // can see what was skipped rather than guessing from stderr alone.
+    let lenient_args = ReplayArgs {
+        to: Some(19),
+        ..replay_args(dir.path(), partition, false)
+    };
+    let summary = replay_with_journal(
+        lenient_args,
+        journal_with_undecodable_record(partition, &commands, 12),
+    )
+    .await
+    .expect("the lenient replay still runs");
+    assert_eq!(summary["seeded_from_snapshot"], true);
+    assert_eq!(summary["skipped"], 1);
+    assert_eq!(summary["tail"], 10);
+    assert_eq!(summary["decoded"], 9, "one tail record was undecodable");
+}
+
+#[test]
+fn verify_symbols_selects_the_universe_the_node_wrote() {
+    let eth = Symbol::new("ETH-USD").expect("static symbol");
+    // 16 partitions keeps ETH (shard 5) apart from BTC (1) and SOL (12), so the
+    // failure without --symbols is the missing-shard gate, not a shard whose
+    // configured symbol set disagrees with the file.
+    let exchange = ExchangeConfig {
+        partitions: 16,
+        instruments: vec![
+            InstrumentConfig::new("ETH-USD", 10, 15_000, 45_000).expect("static config"),
+        ],
+        ..ExchangeConfig::default()
+    };
+    let dir = tempfile::tempdir().expect("temp snapshot dir");
+    // The node ran WHIPPET_SYMBOLS=ETH-USD, so only the ETH shard exists.
+    write_snapshot(dir.path(), &exchange, eth, 5);
+
+    let with_symbols = verify_binary(dir.path(), 16, Some("ETH-USD"), true);
+    assert!(
+        with_symbols.status.success(),
+        "verify --symbols ETH-USD failed: {}\n{}",
+        String::from_utf8_lossy(&with_symbols.stderr),
+        String::from_utf8_lossy(&with_symbols.stdout)
+    );
+
+    // The default universe (BTC/ETH/SOL) expects shards the node never wrote.
+    let without_symbols = verify_binary(dir.path(), 16, None, true);
+    assert!(
+        !without_symbols.status.success(),
+        "verify without --symbols accepted an ETH-only snapshot"
+    );
+    let stderr = String::from_utf8_lossy(&without_symbols.stderr);
+    assert!(
+        stderr.contains("missing snapshots for active shard"),
+        "unexpected failure: {stderr}"
+    );
+
+    for symbols in ["DOGE-USD", ""] {
+        let rejected = verify_binary(dir.path(), 16, Some(symbols), true);
+        assert!(
+            !rejected.status.success(),
+            "--symbols {symbols:?} was accepted"
+        );
+        let stderr = String::from_utf8_lossy(&rejected.stderr);
+        assert!(
+            stderr.contains("--symbols"),
+            "--symbols {symbols:?} failed without naming the flag: {stderr}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn replay_rejects_an_unknown_symbol_list() {
+    let dir = tempfile::tempdir().expect("temp snapshot dir");
+    let args = ReplayArgs {
+        symbols: Some("DOGE-USD".into()),
+        ..replay_args(dir.path(), 1, true)
+    };
+    let error = replay_with_journal(args, memory_journal(1, &[], 0))
+        .await
+        .expect_err("an unknown symbol must fail before touching the journal");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("--symbols") && message.contains("unknown symbol"),
+        "unexpected error: {message}"
+    );
 }

@@ -4,6 +4,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use bincode::Options;
 use whippet_core::config::ExchangeConfig;
 use whippet_core::ids::Symbol;
 use whippet_engine::{ShardEngine, ShardSnapshot, fill_symbol_hashes};
@@ -26,6 +27,11 @@ pub enum SnapshotError {
     Codec(#[from] bincode::Error),
     #[error("not a Whippet snapshot: {0}")]
     BadMagic(PathBuf),
+    /// The file, or a length prefix inside it, asks for more memory than a
+    /// snapshot can legitimately need. Refused before the allocation so a
+    /// truncated or crafted file cannot turn into an OOM.
+    #[error("snapshot {path} is too large to decode: {detail}")]
+    TooLarge { path: PathBuf, detail: String },
     #[error("unsupported snapshot version {0}")]
     BadVersion(u32),
     #[error("snapshot shard {found} does not match requested shard {expected}")]
@@ -102,7 +108,13 @@ impl SnapshotStore {
             Err(error) => return Err(SnapshotError::Io(error)),
         };
         if metadata.len() > MAX_SNAPSHOT_BYTES {
-            return Err(SnapshotError::BadMagic(path));
+            return Err(SnapshotError::TooLarge {
+                path,
+                detail: format!(
+                    "{} bytes exceeds the {MAX_SNAPSHOT_BYTES}-byte cap",
+                    metadata.len()
+                ),
+            });
         }
         let bytes = fs::read(&path)?;
         if bytes.len() < MAGIC.len() + 4 {
@@ -115,7 +127,7 @@ impl SnapshotStore {
         if version != VERSION {
             return Err(SnapshotError::BadVersion(version));
         }
-        let snapshot: ShardSnapshot = bincode::deserialize(&bytes[MAGIC.len() + 4..])?;
+        let snapshot = decode_snapshot(&path, &bytes[MAGIC.len() + 4..])?;
         if snapshot.shard_id != shard_id {
             return Err(SnapshotError::WrongShard {
                 found: snapshot.shard_id,
@@ -131,6 +143,48 @@ impl SnapshotStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
         }
+    }
+}
+
+/// Decode the bincode payload that follows the magic and version.
+///
+/// The options are the byte-compatible superset of `bincode::deserialize`:
+/// fixint encoding (the format the writer emits), a hard limit so a crafted
+/// length cannot drive a giant allocation, and trailing-byte rejection so a
+/// file with junk after a valid payload is not silently accepted.
+fn decode_snapshot(path: &Path, payload: &[u8]) -> Result<ShardSnapshot, SnapshotError> {
+    // The payload starts with `shard_id: u32` then the `symbols: Vec<..>`
+    // length prefix (a fixed 8-byte little-endian integer under fixint
+    // encoding). Every element costs more than one byte, so a count larger
+    // than the remaining payload cannot be a valid snapshot: reject it before
+    // serde can use it to size a container. This layout is part of the same
+    // versioned format as the struct itself.
+    if let Some(length_prefix) = payload.get(4..12) {
+        let declared = u64::from_le_bytes(length_prefix.try_into().expect("8-byte slice"));
+        if declared > payload.len() as u64 {
+            return Err(SnapshotError::TooLarge {
+                path: path.to_path_buf(),
+                detail: format!(
+                    "declared symbol count {declared} cannot fit in {} payload bytes",
+                    payload.len()
+                ),
+            });
+        }
+    }
+
+    let options = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(MAX_SNAPSHOT_BYTES)
+        .reject_trailing_bytes();
+    match options.deserialize(payload) {
+        Ok(snapshot) => Ok(snapshot),
+        Err(error) if matches!(&*error, bincode::ErrorKind::SizeLimit) => {
+            Err(SnapshotError::TooLarge {
+                path: path.to_path_buf(),
+                detail: format!("decoding exceeded the {MAX_SNAPSHOT_BYTES}-byte limit"),
+            })
+        }
+        Err(error) => Err(SnapshotError::Codec(error)),
     }
 }
 
@@ -570,6 +624,78 @@ mod tests {
                 Err(SnapshotError::BadVersion(found)) => assert_eq!(found, version),
                 other => panic!("expected BadVersion({version}), got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn trailing_bytes_after_a_valid_snapshot_are_rejected() {
+        // The old decode used `bincode::deserialize`, which allows trailing
+        // bytes: a file with junk appended to a valid payload still loaded.
+        let exchange = ExchangeConfig::default();
+        let shard_id = 3;
+        let engine = ShardEngine::new(shard_id, &exchange);
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path());
+        let path = store.save(&engine.snapshot_state()).unwrap();
+
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.push(0x00);
+        fs::write(&path, &bytes).unwrap();
+
+        match store.load(shard_id) {
+            Err(SnapshotError::Codec(error)) => assert!(
+                error
+                    .to_string()
+                    .contains("remaining after deserialization"),
+                "unexpected codec error: {error}"
+            ),
+            other => panic!("expected a trailing-bytes rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_over_cap_snapshot_file_is_reported_too_large() {
+        // Sparse file: costs no disk, but `metadata().len()` is over the cap.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path());
+        let path = store.path(0);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(MAX_SNAPSHOT_BYTES + 1).unwrap();
+        drop(file);
+
+        match store.load(0) {
+            Err(SnapshotError::TooLarge { detail, .. }) => {
+                assert!(detail.contains("cap"), "unexpected detail: {detail}");
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_crafted_symbol_count_is_rejected_before_allocating() {
+        // 8 magic bytes + version + shard id + a u64::MAX symbol count. The
+        // count is larger than the rest of the file, so it is refused instead
+        // of being used to size a container.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path());
+        let path = store.path(0);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(MAGIC).unwrap();
+        file.write_all(&VERSION.to_le_bytes()).unwrap();
+        file.write_all(&0u32.to_le_bytes()).unwrap();
+        file.write_all(&u64::MAX.to_le_bytes()).unwrap();
+        drop(file);
+
+        match store.load(0) {
+            Err(SnapshotError::TooLarge { detail, .. }) => {
+                assert!(
+                    detail.contains("declared symbol count"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
         }
     }
 
