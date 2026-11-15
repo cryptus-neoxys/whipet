@@ -31,7 +31,9 @@ use whippet_core::api::{
 };
 use whippet_core::config::{ExchangeConfig, Mode};
 use whippet_core::ids::{OrderId, Price, Seq, Symbol};
-use whippet_core::protocol::{MD_FLAG_HALTED, MdEvent, MdKind, MdSnapshot, SessionState, Side};
+use whippet_core::protocol::{
+    MD_FLAG_HALTED, MdEvent, MdKind, MdSnapshot, SessionState, Side, TradingStatus,
+};
 
 const TRADE_TAPE_LEN: usize = 250;
 const BOOK_DEPTH: usize = 20;
@@ -248,13 +250,15 @@ impl BookState {
                 self.last_trade_side = Some(event.side);
             }
             MdKind::Status => {
-                self.halted = event.flags & MD_FLAG_HALTED != 0;
-                // The session bits sit above the halt bit. A status event with
-                // an out-of-range session code leaves the current session
-                // standing: the halt flag is still applied, only the unknown
-                // field is ignored.
-                if let Ok(session) = SessionState::from_md_flags(event.flags) {
-                    self.session = session;
+                // One decoder for the halt + session combination. An
+                // out-of-range session code leaves the current session
+                // standing but still applies the halt bit; the accepted
+                // combination lives in `TradingStatus`.
+                if let Ok(status) = TradingStatus::from_md_flags(event.flags) {
+                    self.halted = status.halted;
+                    self.session = status.session;
+                } else {
+                    self.halted = event.flags & MD_FLAG_HALTED != 0;
                 }
             }
             MdKind::Bbo | MdKind::Snapshot => {}
@@ -270,12 +274,14 @@ impl BookState {
         }
         self.seq = snapshot.seq;
         self.last_cause_offset = snapshot.cause_offset;
-        self.halted = snapshot.flags & MD_FLAG_HALTED != 0;
-        // Same decoding as a status event. A legacy snapshot (pre-session, all
+        // Same decoder as a status event. A legacy snapshot (pre-session, all
         // status bits zero) decodes as pre-open here, matching the wire: the
         // session code is carried explicitly, not inferred.
-        if let Ok(session) = SessionState::from_md_flags(snapshot.flags) {
-            self.session = session;
+        if let Ok(status) = TradingStatus::from_md_flags(snapshot.flags) {
+            self.halted = status.halted;
+            self.session = status.session;
+        } else {
+            self.halted = snapshot.flags & MD_FLAG_HALTED != 0;
         }
         self.bids.clear();
         self.asks.clear();

@@ -190,6 +190,41 @@ impl fmt::Display for SessionState {
     }
 }
 
+/// The two independent status fields of one instrument, together.
+///
+/// The engine stores `session` and `halted` separately so the snapshot layout
+/// stays two fields, but every admission decision depends on the combination.
+/// This type is the single place that defines the accepted combination and
+/// the MD flag encoding, so the engine, hub, and tests cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TradingStatus {
+    pub session: SessionState,
+    pub halted: bool,
+}
+
+impl TradingStatus {
+    pub const fn new(session: SessionState, halted: bool) -> Self {
+        Self { session, halted }
+    }
+
+    /// New orders are admitted only in an open, running instrument. Cancels
+    /// are deliberately outside this predicate and remain allowed everywhere.
+    pub const fn can_accept_new_orders(self) -> bool {
+        matches!(self.session, SessionState::Open) && !self.halted
+    }
+
+    pub fn to_md_flags(self) -> u8 {
+        (if self.halted { MD_FLAG_HALTED } else { 0 }) | self.session.to_md_flags()
+    }
+
+    pub fn from_md_flags(flags: u8) -> Result<Self> {
+        Ok(Self {
+            session: SessionState::from_md_flags(flags)?,
+            halted: flags & MD_FLAG_HALTED != 0,
+        })
+    }
+}
+
 /// Input command kinds. Cancel, halt, resume and session control reuse the
 /// fixed `Command` layout so the journal, gateway, and replay tooling have one
 /// decoder.
@@ -1145,6 +1180,29 @@ mod tests {
         let bytes = event.encode();
         assert_eq!(bytes.len(), MD_EVENT_ENCODED_LEN);
         assert_eq!(MdEvent::decode(&bytes).unwrap(), event);
+    }
+
+    #[test]
+    fn trading_status_combinations_round_trip_and_gate_admission() {
+        for session in [
+            SessionState::PreOpen,
+            SessionState::Open,
+            SessionState::Closed,
+        ] {
+            for halted in [false, true] {
+                let status = TradingStatus::new(session, halted);
+                assert_eq!(
+                    TradingStatus::from_md_flags(status.to_md_flags()),
+                    Ok(status)
+                );
+                assert_eq!(
+                    status.can_accept_new_orders(),
+                    session == SessionState::Open && !halted,
+                    "session {session:?} halted {halted}"
+                );
+            }
+        }
+        assert!(TradingStatus::from_md_flags(0b1111_1111).is_err());
     }
 
     #[test]
