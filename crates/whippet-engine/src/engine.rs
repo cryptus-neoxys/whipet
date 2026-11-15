@@ -14,7 +14,7 @@ use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Seq, Symbol};
 use whippet_core::protocol::{
     Command, CommandKind, ExecKind, ExecutionReport, FLAG_MAKER, FLAG_RESTED, FLAG_TAKER,
     MD_FLAG_HALTED, MdEvent, MdKind, MdOrder, MdSnapshot, OrderType, RejectReason, SessionState,
-    Side,
+    Side, TradingStatus,
 };
 
 use crate::book::{Book, BookError, BookSnapshot, RestingOrder, hash_book_snapshot};
@@ -268,6 +268,13 @@ impl SymbolEngine {
         self.session
     }
 
+    /// The halt and session fields as one value. This is the single admission
+    /// predicate and MD flag encoding; the engine keeps the fields separate
+    /// only because the snapshot layout stores them separately.
+    pub fn trading_status(&self) -> TradingStatus {
+        TradingStatus::new(self.session, self.halted)
+    }
+
     /// Set the halt flag without an input command. This bypasses the log, so
     /// replay and snapshots only stay consistent when it is used before any
     /// command is logged (bootstrap/admin paths should prefer
@@ -359,8 +366,7 @@ impl SymbolEngine {
     /// session code. Both live in one byte so a Status event (and the trailing
     /// snapshot byte) is a complete venue-status view.
     fn status_flags(&self) -> u8 {
-        let halted = if self.halted { MD_FLAG_HALTED } else { 0 };
-        halted | self.session.to_md_flags()
+        self.trading_status().to_md_flags()
     }
 
     fn push_status(&mut self, out: &mut EngineOutput, command: &Command) {
@@ -1555,6 +1561,39 @@ mod tests {
         let out = process(&mut engine, &cancel, 1);
         assert_eq!(out.executions[0].kind, ExecKind::Cancelled);
         assert_eq!(engine.book().best_bid(), None);
+    }
+
+    #[test]
+    fn trading_status_tracks_both_fields_and_md_flags() {
+        let mut engine = SymbolEngine::new(config());
+        assert_eq!(
+            engine.trading_status(),
+            TradingStatus::new(SessionState::Open, false)
+        );
+        process(
+            &mut engine,
+            &Command::halt(symbol(), ParticipantId(1), 1),
+            0,
+        );
+        assert_eq!(
+            engine.trading_status(),
+            TradingStatus::new(SessionState::Open, true)
+        );
+        process(
+            &mut engine,
+            &Command::set_session(symbol(), SessionState::PreOpen, ParticipantId(1), 2),
+            1,
+        );
+        let status = engine.trading_status();
+        assert!(!status.can_accept_new_orders());
+        assert_eq!(status.session, SessionState::PreOpen);
+        assert!(status.halted);
+        let md_snapshot = engine.snapshot();
+        assert_eq!(
+            TradingStatus::from_md_flags(md_snapshot.flags),
+            Ok(status),
+            "the MD snapshot carries the same combination"
+        );
     }
 
     #[test]
