@@ -1579,6 +1579,17 @@ async fn prometheus(
     );
     body.push_str("# TYPE whippet_ws_rejected_total counter\n");
     body.push_str(&format!("whippet_ws_rejected_total {ws_rejected}\n"));
+    // Protocol violations on live sockets: an illegal lifecycle transition, or
+    // anything a handler refused rather than silently accepted. Zero on a
+    // healthy node; nonzero is a bug report, not an operator action.
+    body.push_str(
+        "# HELP whippet_ws_protocol_errors_total WebSocket protocol violations observed by the gateway.\n",
+    );
+    body.push_str("# TYPE whippet_ws_protocol_errors_total counter\n");
+    body.push_str(&format!(
+        "whippet_ws_protocol_errors_total {}\n",
+        ws_state.protocol_errors()
+    ));
     // Sequenced market-data feed: subscribers come from the hub's live
     // receiver count; sent/lagged/resyncs are the hub's feed bookkeeping.
     let (feed_sent, feed_lagged, feed_resyncs) = ctx.hub.feed_stats();
@@ -2110,15 +2121,20 @@ pub const WS_PER_IP_LIMIT: usize = 8;
 /// One router's WebSocket budget accounting.
 ///
 /// The global permit still lives in [`NodeContext::ws_connections`]; this only
-/// tracks the per-peer sub-limit plus the two gauge/counter series. It is
-/// created per router, so tests with their own router get their own counts.
-/// Peers are removed as soon as their count reaches zero, so the table is
-/// bounded by the number of live subscribers, not by every address ever seen.
+/// tracks the per-peer sub-limit plus the gauge and the counter series: active
+/// connections, refused upgrades, and protocol violations. It is created per
+/// router, so tests with their own router get their own counts. Peers are
+/// removed as soon as their count reaches zero, so the table is bounded by the
+/// number of live subscribers, not by every address ever seen.
 struct WsState {
     per_ip_limit: usize,
     per_ip: Mutex<HashMap<IpAddr, usize>>,
     active: AtomicU64,
     rejected: AtomicU64,
+    /// Protocol violations observed on a live socket: an illegal lifecycle
+    /// transition, or anything else the handlers refuse rather than silently
+    /// accept. Exposed as `whippet_ws_protocol_errors_total`.
+    protocol_errors: AtomicU64,
 }
 
 impl Default for WsState {
@@ -2143,6 +2159,7 @@ impl WsState {
             per_ip: Mutex::new(HashMap::new()),
             active: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
+            protocol_errors: AtomicU64::new(0),
         }
     }
 
@@ -2163,6 +2180,23 @@ impl WsState {
             rejected_total = total,
             "websocket upgrade rejected"
         );
+    }
+
+    /// Count one protocol violation on a live socket: an illegal lifecycle
+    /// transition or anything a handler refuses rather than silently accepts.
+    /// The counter is the durable signal; the log line is the immediate one.
+    fn record_protocol_error(&self, reason: &str) {
+        let total = self.protocol_errors.fetch_add(1, Ordering::Relaxed) + 1;
+        warn!(
+            reason,
+            protocol_errors_total = total,
+            "websocket protocol violation"
+        );
+    }
+
+    /// Protocol violations observed on this router's sockets.
+    fn protocol_errors(&self) -> u64 {
+        self.protocol_errors.load(Ordering::Relaxed)
     }
 
     /// Take the per-peer slot, or return the global permit so the caller can
@@ -2340,6 +2374,123 @@ struct MdFeedQuery {
     symbol: Option<String>,
 }
 
+/// Lifecycle of one `/ws/md` connection, tracked as a plain local value in the
+/// serving task — no mutex, no atomic: the task owns it exclusively, so the
+/// hot path pays nothing for it.
+///
+/// The documented transition table:
+///
+/// ```text
+/// Handshaking  -> SnapshotSent   the one initial snapshot frame was written
+/// Handshaking  -> Closed         no book for the symbol, or the send failed
+/// SnapshotSent -> Streaming      the first delta was forwarded
+/// SnapshotSent -> Lagged         the receiver lagged before its first delta
+/// SnapshotSent -> Closed
+/// Streaming    -> Lagged         a lag episode begins
+/// Streaming    -> Closed
+/// Lagged       -> Resyncing      the resync frame and fresh snapshot landed
+/// Lagged       -> Closed
+/// Resyncing    -> Streaming      the next delta after the resnapshot
+/// Resyncing    -> Lagged         a fresh lag episode; each counts once
+/// Resyncing    -> Closed
+/// Closed                         terminal: no frame is read or written after
+/// ```
+///
+/// [`MdFeedState::legal`] is the single source of truth for this table and is
+/// exhaustively unit-tested. Frames that carry no transition (a ping, a
+/// skipped backlog delta, a client text frame) leave the state untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MdFeedState {
+    /// Subscribed to the hub; the initial snapshot has not been written yet.
+    Handshaking,
+    /// The one initial snapshot was delivered; no delta forwarded yet.
+    SnapshotSent,
+    /// Forwarding deltas.
+    Streaming,
+    /// A `Lagged` was observed; the resync + fresh snapshot are being sent.
+    Lagged,
+    /// Resync delivered; awaiting the next delta to return to `Streaming`.
+    Resyncing,
+    /// Terminal. A connection here neither reads nor writes.
+    Closed,
+}
+
+impl MdFeedState {
+    /// Whether `from -> to` is in the documented table. `Closed -> Closed` is
+    /// deliberately absent: repeating a close is idempotent by design and is
+    /// handled by [`FeedLifecycle::close`], never re-entered through the
+    /// table.
+    fn legal(from: Self, to: Self) -> bool {
+        use MdFeedState::*;
+        matches!(
+            (from, to),
+            (Handshaking, SnapshotSent)
+                | (Handshaking, Closed)
+                | (SnapshotSent, Streaming)
+                | (SnapshotSent, Lagged)
+                | (SnapshotSent, Closed)
+                | (Streaming, Lagged)
+                | (Streaming, Closed)
+                | (Lagged, Resyncing)
+                | (Lagged, Closed)
+                | (Resyncing, Streaming)
+                | (Resyncing, Lagged)
+                | (Resyncing, Closed)
+        )
+    }
+}
+
+/// The [`MdFeedState`] of one connection plus where its violations are counted.
+struct FeedLifecycle {
+    state: MdFeedState,
+    ws_state: Arc<WsState>,
+}
+
+impl FeedLifecycle {
+    fn new(ws_state: Arc<WsState>) -> Self {
+        Self {
+            state: MdFeedState::Handshaking,
+            ws_state,
+        }
+    }
+
+    fn state(&self) -> MdFeedState {
+        self.state
+    }
+
+    /// Move to `to` when the table allows it. An illegal transition is a
+    /// coding bug: it is asserted (debug builds), logged, counted in
+    /// `whippet_ws_protocol_errors_total`, and the connection is forced to its
+    /// terminal state — never silently accepted. The `false` return tells the
+    /// caller to stop the loop.
+    fn advance(&mut self, to: MdFeedState, context: &str) -> bool {
+        let from = self.state;
+        if !MdFeedState::legal(from, to) {
+            debug_assert!(
+                false,
+                "illegal /ws/md feed transition {from:?} -> {to:?} ({context})"
+            );
+            self.state = MdFeedState::Closed;
+            self.ws_state.record_protocol_error(&format!(
+                "illegal /ws/md feed transition {from:?} -> {to:?} ({context})"
+            ));
+            return false;
+        }
+        self.state = to;
+        true
+    }
+
+    /// Enter the terminal state. Idempotent: closing an already-closed
+    /// connection is a no-op, not a second transition and not a metric.
+    fn close(&mut self) -> bool {
+        if self.state == MdFeedState::Closed {
+            return false;
+        }
+        self.state = MdFeedState::Closed;
+        true
+    }
+}
+
 /// `GET /ws/md?symbol=BTC-USD`: the sequenced market-data feed.
 ///
 /// Unlike the conflated `/ws` state stream, this endpoint forwards every
@@ -2349,6 +2500,11 @@ struct MdFeedQuery {
 /// `try_acquire_owned`, held for the connection lifetime, refused with the
 /// same JSON `ws_capacity` shape. The per-IP sub-limit stays a `/ws` concern;
 /// the feed's subscriber gauge is the hub's own receiver count.
+///
+/// Every early return below happens before the permit is acquired or releases
+/// it exactly once (the permit drops with the upgrade closure): the symbol is
+/// validated before any capacity is consumed, and a capacity rejection never
+/// held one.
 async fn md_feed_upgrade(
     ws: WebSocketUpgrade,
     State(ctx): State<Arc<NodeContext>>,
@@ -2382,37 +2538,71 @@ async fn md_feed_upgrade(
         .max_frame_size(64 * 1024)
         .on_upgrade(move |socket| async move {
             let _permit = permit;
-            md_feed_loop(socket, ctx, symbol).await;
+            md_feed_loop(socket, ctx, ws_state, symbol).await;
         })
 }
 
 /// Serve one sequenced feed connection.
 ///
-/// Ordering rules:
+/// The connection walks the [`MdFeedState`] table; every transition below is
+/// one of its documented edges. Ordering rules:
+///
 /// - Subscribe to the feed BEFORE taking the snapshot, so a delta applied
 ///   between the two calls waits in the receiver and is replayed after the
 ///   snapshot instead of being lost.
-/// - An event with `seq <= last_seq` raced the snapshot and is skipped;
-///   only strictly newer sequence numbers are forwarded.
+/// - Exactly one initial `snapshot` frame is written, after the upgrade and
+///   before any `delta`. A client that disconnects during the handshake gets
+///   nothing further: the failed send closes the connection and ends the task.
+/// - An event with `seq <= last_seq` raced the snapshot or belongs to another
+///   symbol and is skipped; only strictly newer sequences for this symbol are
+///   forwarded, so per-symbol `seq` strictly increases across the stream.
 /// - A lagged receiver means the client silently missed frames. The
 ///   slow-consumer policy is to resync, never to stall the node: count the
-///   drop, send `Resync`, then a fresh snapshot, and resume from its seq.
-/// - A failed send or a client close ends the task and releases the permit.
+///   drop once, send one `resync` frame, then one fresh snapshot, then return
+///   to streaming. tokio's broadcast reports at most one `Lagged` per overflow
+///   and drains the retained backlog as `Ok` values afterwards, so this cannot
+///   busy-loop or storm resyncs; a second overflow while recovering is a fresh
+///   episode and counts once more.
+/// - The resync frame names the snapshot's sequence, and that snapshot is the
+///   one the client receives: built under the hub lock at/after the seq the
+///   client is told to adopt, so it is never a stale book.
+/// - A failed send, a client close frame, or a closed hub ends the task. The
+///   state machine's [`FeedLifecycle::close`] is idempotent, so the
+///   connection enters `Closed` exactly once, the permit drops exactly once,
+///   and no frame is written afterwards.
 ///
 /// The delta frames arrive pre-serialized from the hub, so fan-out is one
 /// refcounted-string clone per subscriber, not a per-subscriber re-encode.
-async fn md_feed_loop(mut socket: WebSocket, ctx: Arc<NodeContext>, symbol: Symbol) {
+async fn md_feed_loop(
+    mut socket: WebSocket,
+    ctx: Arc<NodeContext>,
+    ws_state: Arc<WsState>,
+    symbol: Symbol,
+) {
+    let mut lifecycle = FeedLifecycle::new(ws_state);
+    // Subscribe first (see the ordering rules above): the snapshot below is
+    // taken after, so nothing can be lost in between.
     let mut receiver = ctx.hub.subscribe_feed();
     // The symbol was validated against the exchange config, so the hub has a
     // book for it; a missing snapshot is a wiring bug and ends the feed.
     let Some(snapshot) = ctx.hub.feed_snapshot(symbol) else {
+        warn!(
+            symbol = %symbol,
+            "the feed has no book for a validated symbol; closing the connection"
+        );
+        lifecycle.close();
         return;
     };
     let mut last_seq = snapshot.seq;
+    // The one initial snapshot frame, before any delta.
     if send_json(&mut socket, &MdFeedMessage::Snapshot(snapshot))
         .await
         .is_err()
     {
+        lifecycle.close();
+        return;
+    }
+    if !lifecycle.advance(MdFeedState::SnapshotSent, "initial snapshot delivered") {
         return;
     }
     loop {
@@ -2421,7 +2611,19 @@ async fn md_feed_loop(mut socket: WebSocket, ctx: Arc<NodeContext>, symbol: Symb
                 match delivered {
                     Ok(event) => {
                         if event.symbol != symbol || event.seq <= last_seq {
+                            // Pre-snapshot backlog or another symbol: skipped,
+                            // and not a lifecycle transition.
                             continue;
+                        }
+                        // The first forwarded delta leaves the handshake
+                        // behind; a delta after a resync returns to streaming.
+                        // Every later delta is already `Streaming`, which is
+                        // not a transition: `Streaming -> Streaming` is
+                        // deliberately absent from the table.
+                        if lifecycle.state() != MdFeedState::Streaming
+                            && !lifecycle.advance(MdFeedState::Streaming, "delta forwarded")
+                        {
+                            break;
                         }
                         last_seq = event.seq;
                         // `Utf8Bytes::try_from(Bytes)` validates and keeps the
@@ -2432,22 +2634,31 @@ async fn md_feed_loop(mut socket: WebSocket, ctx: Arc<NodeContext>, symbol: Symb
                         else {
                             continue;
                         };
-                        if socket
-                            .send(Message::Text(frame))
-                            .await
-                            .is_err()
-                        {
+                        if socket.send(Message::Text(frame)).await.is_err() {
+                            lifecycle.close();
                             break;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        if !lifecycle.advance(MdFeedState::Lagged, "receiver lagged") {
+                            break;
+                        }
+                        // Counted once per lag episode, before any frame work.
                         ctx.hub.record_feed_lagged();
-                        // Fresh state first, then announce the resync with the
-                        // seq the client must adopt, so a client that replays
-                        // its log sees the reason before the new baseline.
                         let Some(snapshot) = ctx.hub.feed_snapshot(symbol) else {
-                            continue;
+                            // A validated symbol whose book vanished is the
+                            // same wiring bug as at handshake time; resuming on
+                            // a stale local book is not an option.
+                            warn!(
+                                symbol = %symbol,
+                                "the feed lost the book for a validated symbol; closing the connection"
+                            );
+                            lifecycle.close();
+                            break;
                         };
+                        // The resync names the snapshot's own sequence and the
+                        // snapshot below is that exact image, so the client
+                        // never adopts a seq its baseline predates.
                         last_seq = snapshot.seq;
                         let resync = MdFeedMessage::Resync(MdFeedResync {
                             symbol,
@@ -2459,30 +2670,49 @@ async fn md_feed_loop(mut socket: WebSocket, ctx: Arc<NodeContext>, symbol: Symb
                                 .await
                                 .is_err()
                         {
+                            lifecycle.close();
                             break;
                         }
                         ctx.hub.record_feed_resync();
+                        if !lifecycle.advance(MdFeedState::Resyncing, "resync delivered") {
+                            break;
+                        }
                     }
                     // The hub is gone; nothing will ever be delivered again.
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        lifecycle.close();
+                        break;
+                    }
                 }
             }
             incoming = socket.next() => {
                 match incoming {
                     Some(Ok(Message::Ping(payload))) => {
                         if socket.send(Message::Pong(payload)).await.is_err() {
+                            lifecycle.close();
                             break;
                         }
                     }
-                    // The feed is send-only: any client text is ignored, and a
-                    // close frame (or a closed stream) ends the loop promptly.
-                    Some(Ok(Message::Close(_))) | None => break,
+                    // The feed is send-only: any client frame is ignored (a
+                    // malformed one surfaces as an `Err` below, which closes
+                    // instead of panicking), and a close frame (or a closed
+                    // stream) ends the loop promptly.
+                    Some(Ok(Message::Close(_))) | None => {
+                        lifecycle.close();
+                        break;
+                    }
                     Some(Ok(_)) => {}
-                    Some(Err(_)) => break,
+                    Some(Err(_)) => {
+                        lifecycle.close();
+                        break;
+                    }
                 }
             }
         }
     }
+    // `lifecycle` is Closed here exactly once; the permit drops with the
+    // upgrade closure when this task ends.
+    debug_assert_eq!(lifecycle.state(), MdFeedState::Closed);
 }
 
 async fn send_json<T: Serialize>(socket: &mut WebSocket, value: &T) -> Result<(), ()> {
@@ -2781,6 +3011,100 @@ mod tests {
         assert_eq!(error.code, "ws_capacity");
         assert!(error.error.contains("test cap"));
         assert_eq!(state.snapshot().1, 1, "the rejection is counted");
+    }
+
+    #[test]
+    fn ws_state_counts_protocol_errors_separately_from_rejections() {
+        let state = WsState::default();
+        state.record_protocol_error("test violation");
+        state.record_protocol_error("another violation");
+        assert_eq!(state.protocol_errors(), 2);
+        assert_eq!(
+            state.snapshot(),
+            (0, 0),
+            "violations are neither active connections nor upgrade rejections"
+        );
+    }
+
+    /// The `/ws/md` lifecycle walks its documented table end to end:
+    /// handshake, snapshot, streaming, one lag episode, back to streaming, and
+    /// a terminal close that is idempotent.
+    #[test]
+    fn md_feed_lifecycle_walks_the_documented_table() {
+        let ws_state = Arc::new(WsState::default());
+        let mut lifecycle = FeedLifecycle::new(Arc::clone(&ws_state));
+        assert_eq!(lifecycle.state(), MdFeedState::Handshaking);
+        assert!(lifecycle.advance(MdFeedState::SnapshotSent, "test"));
+        assert!(lifecycle.advance(MdFeedState::Streaming, "test"));
+        assert!(lifecycle.advance(MdFeedState::Lagged, "test"));
+        assert!(lifecycle.advance(MdFeedState::Resyncing, "test"));
+        assert!(lifecycle.advance(MdFeedState::Streaming, "test"));
+        assert!(lifecycle.close());
+        assert_eq!(lifecycle.state(), MdFeedState::Closed);
+        // Closing a closed connection is a no-op, not a second transition.
+        assert!(!lifecycle.close());
+        assert_eq!(lifecycle.state(), MdFeedState::Closed);
+        assert_eq!(ws_state.protocol_errors(), 0, "legal walks never count");
+    }
+
+    /// A lag may land before the first delta (`SnapshotSent -> Lagged`) and a
+    /// second overflow during recovery is a fresh episode
+    /// (`Resyncing -> Lagged`).
+    #[test]
+    fn md_feed_lifecycle_allows_lag_from_the_handshake_and_recovery_states() {
+        let ws_state = Arc::new(WsState::default());
+        let mut lifecycle = FeedLifecycle::new(Arc::clone(&ws_state));
+        assert!(lifecycle.advance(MdFeedState::SnapshotSent, "test"));
+        assert!(lifecycle.advance(MdFeedState::Lagged, "test"));
+        assert!(lifecycle.advance(MdFeedState::Resyncing, "test"));
+        assert!(lifecycle.advance(MdFeedState::Lagged, "test"));
+        assert!(lifecycle.advance(MdFeedState::Resyncing, "test"));
+        assert!(lifecycle.advance(MdFeedState::Streaming, "test"));
+    }
+
+    /// The table predicate refuses everything outside the documented edges:
+    /// reversals, skips past the snapshot, resync without lag, and anything
+    /// that leaves the terminal state.
+    #[test]
+    fn md_feed_lifecycle_table_refuses_illegal_transitions() {
+        use MdFeedState as S;
+        // Documented edges.
+        assert!(S::legal(S::Handshaking, S::SnapshotSent));
+        assert!(S::legal(S::Handshaking, S::Closed));
+        assert!(S::legal(S::SnapshotSent, S::Streaming));
+        assert!(S::legal(S::SnapshotSent, S::Lagged));
+        assert!(S::legal(S::SnapshotSent, S::Closed));
+        assert!(S::legal(S::Streaming, S::Lagged));
+        assert!(S::legal(S::Streaming, S::Closed));
+        assert!(S::legal(S::Lagged, S::Resyncing));
+        assert!(S::legal(S::Lagged, S::Closed));
+        assert!(S::legal(S::Resyncing, S::Streaming));
+        assert!(S::legal(S::Resyncing, S::Lagged));
+        assert!(S::legal(S::Resyncing, S::Closed));
+        // Reversals and skips.
+        assert!(!S::legal(S::Streaming, S::SnapshotSent));
+        assert!(
+            !S::legal(S::Handshaking, S::Streaming),
+            "no delta before the snapshot"
+        );
+        assert!(!S::legal(S::Handshaking, S::Lagged));
+        assert!(
+            !S::legal(S::Streaming, S::Resyncing),
+            "resync only through Lagged"
+        );
+        assert!(!S::legal(S::Lagged, S::SnapshotSent));
+        assert!(!S::legal(S::Resyncing, S::SnapshotSent));
+        // The terminal state is terminal.
+        for to in [
+            S::Handshaking,
+            S::SnapshotSent,
+            S::Streaming,
+            S::Lagged,
+            S::Resyncing,
+            S::Closed,
+        ] {
+            assert!(!S::legal(S::Closed, to), "Closed is terminal: {to:?}");
+        }
     }
 
     #[test]

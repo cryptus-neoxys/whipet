@@ -139,6 +139,115 @@ impl WsClient {
         assert_eq!(opcode, 0x1, "the feed only sends text frames");
         String::from_utf8(payload).expect("frame payload is utf-8")
     }
+
+    /// Frame length starting from the 7-bit value in the second header byte,
+    /// consuming the extended-length bytes when present.
+    async fn read_frame_length(&mut self, mut length: usize) -> usize {
+        if length == 126 {
+            let mut extended = [0u8; 2];
+            self.read_exact(&mut extended).await;
+            length = u16::from_be_bytes(extended) as usize;
+        } else if length == 127 {
+            let mut extended = [0u8; 8];
+            self.read_exact(&mut extended).await;
+            length = u64::from_be_bytes(extended) as usize;
+        }
+        length
+    }
+
+    /// `read_exact` that reports a clean EOF (a 0-byte read at a frame
+    /// boundary) as `false` instead of failing. The close-handshake
+    /// assertions must be able to say "the connection is over" without
+    /// treating it as a feed error.
+    async fn read_exact_or_eof(&mut self, buf: &mut [u8]) -> bool {
+        let mut filled = 0;
+        let from_pending = self.pending.len().min(buf.len());
+        buf[..from_pending].copy_from_slice(&self.pending[..from_pending]);
+        self.pending.drain(..from_pending);
+        filled += from_pending;
+        while filled < buf.len() {
+            let read = tokio::time::timeout(READ_TIMEOUT, self.stream.read(&mut buf[filled..]))
+                .await
+                .expect("read timed out; the feed stopped sending")
+                .expect("socket read");
+            if read == 0 {
+                assert_eq!(filled, 0, "the server closed mid-frame");
+                return false;
+            }
+            filled += read;
+        }
+        true
+    }
+
+    /// Read the next text frame, skipping control frames the server
+    /// interleaves (a pong answering a client ping, a close reply).
+    async fn read_text_frame(&mut self) -> String {
+        loop {
+            let mut header = [0u8; 2];
+            self.read_exact(&mut header).await;
+            let opcode = header[0] & 0x0f;
+            let length = self.read_frame_length(usize::from(header[1] & 0x7f)).await;
+            let mut payload = vec![0u8; length];
+            self.read_exact(&mut payload).await;
+            if opcode == 0x1 {
+                return String::from_utf8(payload).expect("frame payload is utf-8");
+            }
+            // Control frames carry no feed data; keep reading.
+        }
+    }
+
+    /// Consume frames until the connection is over: either the server ends it
+    /// (EOF) or it answers the close handshake with its own close frame. Any
+    /// text frame after a client close is a contract violation and fails the
+    /// test.
+    async fn read_until_server_close(&mut self) {
+        loop {
+            let mut header = [0u8; 2];
+            if !self.read_exact_or_eof(&mut header).await {
+                return; // EOF: the server ended the connection.
+            }
+            let opcode = header[0] & 0x0f;
+            let length = self.read_frame_length(usize::from(header[1] & 0x7f)).await;
+            let mut payload = vec![0u8; length];
+            if length > 0 && !self.read_exact_or_eof(&mut payload).await {
+                return;
+            }
+            assert_ne!(opcode, 0x1, "no text frame may follow the client's close");
+            if opcode == 0x8 {
+                return; // the server's close reply; the connection is over.
+            }
+        }
+    }
+
+    /// Write one masked client frame. Client-to-server frames must be masked
+    /// per RFC 6455; a fixed mask key is fine for tests. Returns the write
+    /// result so tests that intentionally touch a dead socket can ignore it.
+    async fn write_masked(&mut self, opcode: u8, payload: &[u8]) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let mask = [0x5au8, 0x3c, 0x96, 0xbc];
+        let len = payload.len();
+        let mut frame = Vec::with_capacity(payload.len() + 14);
+        frame.push(0x80 | opcode);
+        if len < 126 {
+            frame.push(0x80 | len as u8);
+        } else if len <= u16::MAX as usize {
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(&(len as u16).to_be_bytes());
+        } else {
+            frame.push(0x80 | 127);
+            frame.extend_from_slice(&(len as u64).to_be_bytes());
+        }
+        frame.extend_from_slice(&mask);
+        frame.extend(
+            payload
+                .iter()
+                .enumerate()
+                .map(|(i, byte)| byte ^ mask[i % 4]),
+        );
+        tokio::time::timeout(READ_TIMEOUT, self.stream.write_all(&frame))
+            .await
+            .expect("write timed out; the server stopped reading")
+    }
 }
 
 /// Raw WebSocket handshake for `/ws/md?{query}`. Returns the client, the HTTP
@@ -509,6 +618,47 @@ async fn md_feed_resyncs_a_lagged_consumer() {
     assert_eq!(metric_value(&text, "whippet_md_feed_sent_total "), 21.0);
 
     drop(client);
+}
+
+#[tokio::test]
+async fn md_feed_ignores_client_frames_and_ends_on_the_close_handshake() {
+    let node = TestNode::new();
+    let app = gateway::router(Arc::clone(&node.ctx));
+    let addr = spawn_server(app).await;
+
+    let (mut client, status, _) = open_md_feed(addr, "symbol=BTC-USD").await;
+    assert_eq!(status, 101);
+    let snapshot = client.read_text_frame().await;
+    let snapshot: Value = serde_json::from_str(&snapshot).expect("snapshot frame");
+    assert_eq!(snapshot["type"], "snapshot");
+
+    // The feed is send-only: a client text frame is ignored, not echoed and
+    // not a reason to drop the connection. A ping is still answered.
+    client
+        .write_masked(0x1, b"ignored by the feed")
+        .await
+        .expect("client text frame");
+    client
+        .write_masked(0x9, b"keepalive")
+        .await
+        .expect("client ping");
+
+    // The pong is a control frame, so the next text frame is the live delta:
+    // neither client frame advanced or broke the stream.
+    seed(&node.ctx.hub);
+    node.ctx.hub.apply(&add_event(1, 65_000, 2, 7));
+    let delta = client.read_text_frame().await;
+    let delta: Value = serde_json::from_str(&delta).expect("delta frame");
+    assert_eq!(delta["type"], "delta");
+    assert_eq!(delta["seq"], 1);
+
+    // A client close starts the closing handshake: the server answers with
+    // its own close frame and never sends feed data after it.
+    client
+        .write_masked(0x8, &[])
+        .await
+        .expect("client close frame");
+    client.read_until_server_close().await;
 }
 
 #[tokio::test]
