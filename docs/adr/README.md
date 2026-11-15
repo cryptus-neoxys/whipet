@@ -23,6 +23,7 @@ supersedes an earlier one.
 | [0015](0015-audited-instrument-control-plane.md) | Audited instrument halt/resume control plane | Accepted (implemented; log-ordered commands, operator tokens, audit topic) |
 | [0016](0016-sequenced-price-level-market-data-feed.md) | Sequenced price-level market-data feed | Accepted (implemented; `/ws/md`, snapshot + deltas + resync) |
 | [0017](0017-ingress-risk-and-position-reconstruction.md) | Ingress pre-trade risk and read-only position reconstruction | Accepted (per-order qty/notional guard + `whippet positions`; engine-enforced risk/ledger proposed) |
+| [0018](0018-instrument-session-state.md) | Instrument session state | Accepted (log-ordered `set_session`, snapshot v5, hub/dashboard visibility) |
 
 Template:
 

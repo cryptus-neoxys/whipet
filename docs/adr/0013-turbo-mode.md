@@ -161,7 +161,7 @@ not a silent seq reset.
 
 Recovery code is shared with durable and does not change in shape:
 
-1. The shard loads `data/snapshots/partition-<N>.snapshot` (format v4) and
+1. The shard loads `data/snapshots/partition-<N>.snapshot` (format v5) and
    verifies the state hash as today.
 2. The resume point is `resume_offset`'s maximum symbol `last_offset`, which in
    turbo is a **local seq**, recovered from the seq headers on replay, not from

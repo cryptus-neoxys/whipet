@@ -176,6 +176,24 @@ are enforced only by the messages cleaner — and the default stack disables
 it, so nothing trims the log. See
 [Log growth and retention](#log-growth-and-retention) for the exact state.
 
+## Session state
+
+`POST /api/admin/instruments/{symbol}/session` moves one instrument between
+`pre_open`, `open`, and `closed` (operator token required):
+
+```sh
+curl -X POST http://127.0.0.1:8080/api/admin/instruments/BTC-USD/session \
+  -H "Authorization: Bearer $WHIPPET_OPERATOR_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"state":"pre_open","reason":"auction"}'
+```
+
+The command is appended to the orders log and replayed; only `open` accepts
+new orders (`session_not_open` otherwise), while cancels stay allowed in every
+session. The state is shown on `/api/state`, the dashboard, and the sequenced
+feed; the audit record uses action `set_session` and carries the session. The
+snapshot format is v5 (session byte); v4 and older are rejected.
+
 ## Pre-trade ingress risk
 
 The gateway and TCP listener enforce two optional per-order limits before any
@@ -623,12 +641,12 @@ commit watermark). That is a full replay. If the log has been truncated by
 retention, replay from zero hits a gap and the shard fails closed; the safe
 reset for the demo is `make reset`.
 
-Upgrade path for the snapshot format: v3 and older files are rejected with
+Upgrade path for the snapshot format: v4 and older files are rejected with
 `BadVersion`, and a file that fails verification fails its shard closed (the
 shard is marked failed). There is no in-binary migration and no automatic
 fallback to a previous file or to a full replay. Delete or move the old
 snapshot files (or `make reset`), start the new node so it full-replays from
-0, and let it write v4. Recovery always requires operator action; the node
+0, and let it write v5. Recovery always requires operator action; the node
 never recovers silently.
 
 If you want to cold-copy the Iggy volume, stop the whole stack first. Do not
@@ -657,10 +675,10 @@ Upgrade procedure:
 4. Record the new image digest in `WHIPPET_IMAGE_DIGEST` for new manifests.
 5. Update this table and the manifest docs.
 
-Rollback: pin both artifacts back. Snapshots use format version 4 with a
+Rollback: pin both artifacts back. Snapshots use format version 5 with a
 `WHIPSNP1` magic and bincode; versions 3 and older are rejected with
 `BadVersion`, and a snapshot-format change is a data migration, not
 a rolling upgrade: delete or move the old files (or reset the data) and let
-the new node full-replay from 0 and write v4.
+the new node full-replay from 0 and write v5.
 
 The phase gates for larger changes are in [ROADMAP.md](ROADMAP.md).

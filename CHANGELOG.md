@@ -49,6 +49,11 @@ Whippet is pre-1.0; minor releases may change internal APIs.
 
 ### Added
 
+- Instrument session state: operator-only `POST /api/admin/instruments/{symbol}/session`
+  for `pre_open`/`open`/`closed`, log-ordered `CommandKind::SetSession`, only
+  `open` admitting new orders while cancels stay allowed, session visibility on
+  the dashboard/`/api/state`/feed, audited `set_session` records, and snapshot
+  format v5 (session byte; v4 and older rejected).
 - Ingress pre-trade risk: optional per-order quantity and notional caps
   (`WHIPPET_RISK_MAX_ORDER_QTY`, `WHIPPET_RISK_MAX_NOTIONAL_CENTS`), enforced by
   HTTP and TCP before the orders-log append with 422 `risk_limit` / TCP

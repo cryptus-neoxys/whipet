@@ -92,7 +92,7 @@ Safe response on critical (link: [ADR 0014](adr/0014-bounded-storage-and-replay-
 ## 3. Snapshot and verify
 
 Snapshots live in `WHIPPET_SNAPSHOT_DIR` (`data/snapshots` in the container)
-as `partition-<N>.snapshot` files. Format is v4 (`WHIPSNP1` magic); v3 and
+as `partition-<N>.snapshot` files. Format is v5 (`WHIPSNP1` magic); v4 and
 older are rejected with `BadVersion`. Each file is written to a temporary
 file, `fsync`ed, and renamed, so an individual file is never partial. A set
 of shard files is not a global point-in-time; shards snapshot independently,
@@ -216,6 +216,14 @@ workload (defaults 1,000 orders/s, batch 10, 20 s), SIGKILLs the node
 `make replay` and fails unless both replay hashes match. Raw output and a
 JSON summary land in `artifacts/bench/`. Status as documented: method
 recorded, results pending — see section 12.
+
+### Session state
+
+`POST /api/admin/instruments/{symbol}/session` with an operator token sets
+`pre_open`, `open`, or `closed`. Only `open` admits new orders
+(`session_not_open`); cancels remain allowed. The change is log-ordered,
+audited (`action: set_session`), visible in `/api/state` and the dashboard,
+and replayed by `verify`/`replay`. Snapshot v5 includes the session.
 
 ### Risk and positions
 
@@ -343,10 +351,10 @@ together, `make reset && make up`, then `make demo`, `make verify`, and a
 `whippet replay --expect-hash` check against a known log. Record the new
 image digest in `WHIPPET_IMAGE_DIGEST`.
 
-Snapshot version: v4 current; v3 and older rejected with `BadVersion`. A
+Snapshot version: v5 current; v4 and older rejected with `BadVersion`. A
 snapshot-format change is a data migration, not a rolling upgrade: delete or
 move the old files (or reset the data) and let the new node full-replay from
-0 and write v4.
+0 and write v5.
 
 `make reset` is destructive: it deletes the Iggy log, broker-stored consumer
 offsets, and snapshots in the named volume. It keeps host `data/`,

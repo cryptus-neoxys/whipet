@@ -313,7 +313,7 @@ The design rules:
   ~170k-order mismatch was a dedup-count bug: the off-loop hash used the
   insertion-walk length where the live hash uses the distinct-id count, and a
   re-admitted id made them differ. The fix is pinned by a 100-engine ×
-  200k-command test. The snapshot file format is version 4 (per-symbol config,
+  200k-command test. The snapshot file format is version 5 (per-symbol config,
   `BookSnapshot.min_price_ticks`, and the dedup terminal-eviction order stored
   as `u32` indices into the dedup walk instead of full `OrderId`s); versions 3
   and older are rejected.
@@ -415,7 +415,7 @@ BLAKE3 state hash.
 A shard snapshot contains all symbol states for one partition and is written
 to `data/snapshots/partition-<N>.snapshot`:
 
-- Magic `WHIPSNP1`, format version `4`, then a bincode payload. The v4
+- Magic `WHIPSNP1`, format version `5`, then a bincode payload. The v5
   terminal-eviction order is stored as `u32` indices into the dedup walk
   instead of full `OrderId`s, so the file is smaller than v3: the recovery
   test's 225,000-command workload (95,000 terminal ids) writes a 7,940,220-byte
@@ -426,7 +426,7 @@ to `data/snapshots/partition-<N>.snapshot`:
   so the state hash can be reproduced from the snapshot alone. There is no
   in-binary migration and no automatic fallback: delete or move the old
   snapshot files (or `make reset`), start the new node so it full-replays from
-  0, and let it write v4. The terminal queue is part of the state hash
+  0, and let it write v5. The terminal queue is part of the state hash
   (`DedupTable::hash_into` and `hash_symbol_snapshot` hash the live terminal
   ids in eviction order), so a reordered-but-valid `dedup_terminal_idx`
   changes the snapshot hash and `whippet verify` fails. Snapshots are taken
