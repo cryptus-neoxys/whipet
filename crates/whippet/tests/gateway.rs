@@ -71,6 +71,7 @@ fn node_with_ws_cap(
     Arc::new(NodeContext {
         config,
         journal: Arc::clone(&node.ctx.journal),
+        engine_journals: node.ctx.engine_journals.clone(),
         engine_journal: Arc::clone(&node.ctx.engine_journal),
         group_commit: node.ctx.group_commit.clone(),
         hub: Arc::clone(&node.ctx.hub),
@@ -81,6 +82,7 @@ fn node_with_ws_cap(
         shards_ok: Arc::clone(&node.ctx.shards_ok),
         rate_limiter,
         ws_connections: Arc::new(tokio::sync::Semaphore::new(ws_cap)),
+        snapshot_lock: Arc::new(std::sync::Mutex::new(())),
     })
 }
 
@@ -801,6 +803,95 @@ async fn per_ip_rate_limit_returns_429_with_retry_after() {
     assert_eq!(node.orders(symbol()).len(), 2, "the 429 must not append");
 }
 
+/// The batch budget is charged after parsing and before validation: a batch
+/// above the burst must be refused with 429 before the gateway spends any
+/// validate work, and nothing may reach the journal.
+#[tokio::test]
+async fn batch_budget_is_charged_before_validation() {
+    let node = TestNode::new();
+    let app = gateway::router(node_with(&node, |config| {
+        config.rate_limit_per_sec = 2;
+    }));
+    let peer: SocketAddr = "203.0.113.11:4000".parse().expect("peer address");
+    let limited = Ingress {
+        peer: Some(peer),
+        ..Ingress::default()
+    };
+    let validate_samples = || {
+        node.ctx
+            .metrics
+            .stage_snapshot()
+            .into_iter()
+            .find(|(candidate, _)| *candidate == Stage::GatewayValidate)
+            .map(|(_, summary)| summary.samples)
+            .expect("gateway_validate is always in the snapshot")
+    };
+    assert_eq!(validate_samples(), 0, "a fresh node has no samples");
+
+    // Three orders at a burst of 2: 1 token for the request plus 2 extra for
+    // the batch cannot fit, so the handler refuses before validating.
+    let orders: Vec<Value> = (0..3)
+        .map(|index| limit_order(&format!("pre-charge-{index}"), "alice"))
+        .collect();
+    let (status, headers, body) = post_with(
+        &app,
+        "/api/orders/batch",
+        json!({ "orders": orders }),
+        limited,
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["code"], "rate_limited");
+    assert_eq!(
+        headers
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        Some("1"),
+        "the handler's 429 carries the same Retry-After as the middleware"
+    );
+    assert!(node.orders(symbol()).is_empty(), "the 429 must not append");
+    assert_eq!(node.ctx.metrics.snapshot().orders_ingressed, 0);
+    assert_eq!(
+        validate_samples(),
+        0,
+        "a rate-limited batch must be refused before validation work"
+    );
+}
+
+/// A full 256-order batch fits a generous budget and appends all 256 orders.
+#[tokio::test]
+async fn a_full_batch_fits_a_generous_budget() {
+    let node = TestNode::new();
+    let app = gateway::router(node_with(&node, |config| {
+        config.rate_limit_per_sec = 1000;
+    }));
+    let peer: SocketAddr = "203.0.113.12:4000".parse().expect("peer address");
+    let ingress = Ingress {
+        peer: Some(peer),
+        ..Ingress::default()
+    };
+
+    let orders: Vec<Value> = (0..MAX_BATCH_ORDERS)
+        .map(|index| limit_order(&format!("full-{index}"), "alice"))
+        .collect();
+    let (status, _, body) = post_with(
+        &app,
+        "/api/orders/batch",
+        json!({ "orders": orders }),
+        ingress,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ack: BatchOrderAck = serde_json::from_value(body).expect("batch ack");
+    assert_eq!(ack.count, MAX_BATCH_ORDERS as u32);
+    assert_eq!(node.orders(symbol()).len(), MAX_BATCH_ORDERS);
+    assert_eq!(
+        node.ctx.metrics.snapshot().orders_ingressed,
+        MAX_BATCH_ORDERS as u64,
+        "one ingress record per order in the batch"
+    );
+}
+
 #[tokio::test]
 async fn malformed_bodies_share_one_rejection_contract() {
     let node = TestNode::new();
@@ -1428,4 +1519,62 @@ async fn escaped_json_strings_still_validate() {
         .await
         .expect("router responds");
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[test]
+fn engine_journal_pool_size_is_clamped_into_bounds() {
+    let max = whippet::context::MAX_ENGINE_JOURNAL_CLIENTS;
+    // Default is the shard count; a zero shard count still yields 1.
+    assert_eq!(whippet::context::engine_journal_pool_size(0, None), 1);
+    assert_eq!(whippet::context::engine_journal_pool_size(1, None), 1);
+    assert_eq!(whippet::context::engine_journal_pool_size(4, None), 4);
+    // The default never exceeds the cap.
+    assert_eq!(whippet::context::engine_journal_pool_size(1_024, None), max);
+    // Overrides clamp into [1, max]: no empty pool, no unbounded pool.
+    assert_eq!(whippet::context::engine_journal_pool_size(4, Some(0)), 1);
+    assert_eq!(whippet::context::engine_journal_pool_size(4, Some(2)), 2);
+    assert_eq!(
+        whippet::context::engine_journal_pool_size(4, Some(max + 64)),
+        max
+    );
+}
+
+#[test]
+fn engine_journal_for_is_deterministic_and_in_range() {
+    let node = common::TestNode::new();
+    let ctx = Arc::clone(&node.ctx);
+    // The pool is at least 1 and at most the configured maximum.
+    assert!(!ctx.engine_journals.is_empty());
+    assert!(ctx.engine_journals.len() <= whippet::context::MAX_ENGINE_JOURNAL_CLIENTS);
+    for shard in [0u32, 1, 7, 31, u32::MAX] {
+        let first = ctx.engine_journal_for(shard);
+        // The selection is a pool entry.
+        assert!(
+            ctx.engine_journals
+                .iter()
+                .any(|entry| Arc::ptr_eq(entry, first)),
+            "shard {shard} selected an entry outside the pool"
+        );
+        // The same shard selects the same entry every time.
+        assert!(
+            Arc::ptr_eq(first, ctx.engine_journal_for(shard)),
+            "shard {shard} selection is not deterministic"
+        );
+    }
+    // Shard 0 resolves to the observer entry.
+    assert!(Arc::ptr_eq(ctx.engine_journal_for(0), &ctx.engine_journal));
+}
+
+#[tokio::test]
+async fn memory_mode_pool_shares_one_journal_arc() {
+    let node = common::TestNode::new();
+    let ctx = Arc::clone(&node.ctx);
+    // Memory mode cannot multiplex clients: every entry is the same Arc.
+    for (index, entry) in ctx.engine_journals.iter().enumerate() {
+        assert!(
+            Arc::ptr_eq(&ctx.journal, entry),
+            "pool entry {index} must be the shared memory journal"
+        );
+    }
+    assert!(Arc::ptr_eq(&ctx.journal, &ctx.engine_journal));
 }

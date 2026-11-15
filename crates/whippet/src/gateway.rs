@@ -102,6 +102,24 @@ pub fn router(ctx: Arc<NodeContext>) -> Router {
     api.with_state(ctx)
 }
 
+/// The one 429 contract for ingress rate limiting, shared by the middleware
+/// and the batch handler: a JSON `ApiError` body plus `Retry-After: 1`, the
+/// same shape the WebSocket capacity rejection uses.
+pub(crate) fn too_many_requests() -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(ApiError::new(
+            "rate_limited",
+            "ingress rate limit exceeded; retry shortly",
+        )),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response
+}
+
 async fn rate_limit(
     State(limiter): State<Arc<RateLimiter>>,
     connect: Option<Extension<ConnectInfo<SocketAddr>>>,
@@ -113,18 +131,7 @@ async fn rate_limit(
     if let Some(Extension(ConnectInfo(address))) = connect
         && !limiter.check(address.ip())
     {
-        let mut response = (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(ApiError::new(
-                "rate_limited",
-                "ingress rate limit exceeded; retry shortly",
-            )),
-        )
-            .into_response();
-        response
-            .headers_mut()
-            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-        return response;
+        return too_many_requests();
     }
     next.run(request).await
 }
@@ -352,17 +359,19 @@ async fn submit_orders(
     headers: HeaderMap,
     Query(query): Query<BatchQuery>,
     body: Body,
-) -> ApiResult<BatchOrderAck> {
-    ensure_shards_ready(&ctx)?;
+) -> Result<Json<BatchOrderAck>, Response> {
+    ensure_shards_ready(&ctx).map_err(IntoResponse::into_response)?;
     let include_acks = query.acks.as_deref().is_none_or(|value| {
         !(value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("false"))
     });
     let started = Instant::now();
-    let caller = authenticate(&ctx, &headers)?;
+    let caller = authenticate(&ctx, &headers).map_err(IntoResponse::into_response)?;
     // See `submit_order`: the stage budget starts after auth, and every stage
     // below is a slice of this one clock, shared by the whole batch.
     let mut stage_at = Instant::now();
-    let bytes = read_json_body(&headers, body).await?;
+    let bytes = read_json_body(&headers, body)
+        .await
+        .map_err(IntoResponse::into_response)?;
     // Same split as `submit_order`: parse first, then validate every order.
     let owned;
     let request = match serde_json::from_slice::<BatchOrderRequestRef<'_>>(&bytes) {
@@ -389,30 +398,26 @@ async fn submit_orders(
                 // A body that cannot even be parsed is still parse time.
                 ctx.metrics
                     .record_stage_us(Stage::GatewayParse, split_elapsed(&mut stage_at));
-                return Err(invalid_json(borrow_error));
+                return Err(invalid_json(borrow_error).into_response());
             }
         },
     };
     ctx.metrics
         .record_stage_us(Stage::GatewayParse, split_elapsed(&mut stage_at));
+    // The middleware charged one token for the request; charge the rest of the
+    // batch here, after parsing and BEFORE validation, so a 256-order request
+    // cannot spend (or bypass) the per-second budget on validate work. The
+    // whole batch costs `len` tokens: 1 from the middleware plus `len - 1`.
+    if let Some(Extension(ConnectInfo(address))) = connect {
+        let extra = request.orders.len().saturating_sub(1) as u32;
+        if extra > 0 && !ctx.rate_limiter.charge(address.ip(), extra) {
+            return Err(too_many_requests());
+        }
+    }
     let validated = validate_batch(&ctx, &request, caller, &participants);
     ctx.metrics
         .record_stage_us(Stage::GatewayValidate, split_elapsed(&mut stage_at));
-    let (partition, validated) = validated?;
-    // The middleware charged one token for the request; charge the rest of the
-    // batch so a 256-order request cannot bypass the per-second budget.
-    if let Some(Extension(ConnectInfo(address))) = connect {
-        let extra = validated.len().saturating_sub(1) as u32;
-        if extra > 0 && !ctx.rate_limiter.charge(address.ip(), extra) {
-            return Err((
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(ApiError::new(
-                    "rate_limited",
-                    "ingress rate limit exceeded; retry shortly",
-                )),
-            ));
-        }
-    }
+    let (partition, validated) = validated.map_err(IntoResponse::into_response)?;
 
     // Pass 2: encode one command and header set per order.
     let timestamp_ns = now_ns();
@@ -436,7 +441,9 @@ async fn submit_orders(
         .await;
     ctx.metrics
         .record_stage_us(Stage::GatewayAppend, split_elapsed(&mut stage_at));
-    let append = append.map_err(journal_unavailable)?;
+    let append = append
+        .map_err(journal_unavailable)
+        .map_err(IntoResponse::into_response)?;
     let elapsed = started.elapsed();
     let durable_ack_ms = elapsed.as_secs_f64() * 1_000.0;
     // Throughput is per order, but latency is sampled once per batch: every
@@ -1335,6 +1342,10 @@ impl WsState {
         global: OwnedSemaphorePermit,
         ip: Option<IpAddr>,
     ) -> Result<WsLease, ()> {
+        // Same canonical form as the rate limiter, so `::ffff:1.2.3.4` and
+        // `1.2.3.4` are one peer for the per-IP cap too. The lease stores the
+        // canonical key so `Drop` releases the same entry.
+        let ip = ip.map(crate::ratelimit::canonical);
         if let Some(ip) = ip {
             let mut per_ip = self
                 .per_ip
@@ -1695,6 +1706,45 @@ mod tests {
         drop(leases);
         assert_eq!(state.snapshot().0, 0);
         assert_eq!(global.available_permits(), 64);
+    }
+
+    #[tokio::test]
+    async fn ws_per_ip_canonicalizes_ipv4_mapped_addresses() {
+        // `::ffff:127.0.0.1` and `127.0.0.1` are the same peer, so the mapped
+        // form cannot double the per-IP budget.
+        let state = Arc::new(WsState::with_limit(1));
+        let global = Arc::new(tokio::sync::Semaphore::new(8));
+        let v4: IpAddr = "127.0.0.1".parse().expect("plain IPv4");
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().expect("mapped IPv4");
+
+        let permit = Arc::clone(&global)
+            .try_acquire_owned()
+            .expect("global permit");
+        let lease = state
+            .acquire(permit, Some(mapped))
+            .expect("first form accepted");
+        assert_eq!(state.snapshot().0, 1);
+
+        let permit = Arc::clone(&global)
+            .try_acquire_owned()
+            .expect("global permit");
+        assert!(
+            state.acquire(permit, Some(v4)).is_err(),
+            "the plain form shares the mapped form's bucket"
+        );
+        assert_eq!(
+            global.available_permits(),
+            7,
+            "the refusal returns the permit"
+        );
+
+        // Dropping the lease frees the shared slot for either form.
+        drop(lease);
+        let permit = Arc::clone(&global)
+            .try_acquire_owned()
+            .expect("global permit");
+        let lease = state.acquire(permit, Some(v4)).expect("slot freed");
+        drop(lease);
     }
 
     #[tokio::test]

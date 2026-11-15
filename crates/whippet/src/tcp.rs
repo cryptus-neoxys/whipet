@@ -498,6 +498,7 @@ mod tests {
         let ctx = Arc::new(NodeContext {
             config,
             journal: Arc::clone(&journal),
+            engine_journals: vec![Arc::clone(&journal), Arc::clone(&journal)],
             engine_journal: journal,
             group_commit,
             hub,
@@ -508,6 +509,7 @@ mod tests {
             shards_ok: Arc::new(AtomicBool::new(true)),
             rate_limiter,
             ws_connections,
+            snapshot_lock: Arc::new(std::sync::Mutex::new(())),
         });
         TestNode { ctx, _dir: dir }
     }
@@ -880,6 +882,43 @@ mod tests {
             post_order(Arc::clone(&node.ctx), peer, "shared-tcp").await,
             StatusCode::TOO_MANY_REQUESTS,
             "the TCP submit already spent the shared budget"
+        );
+    }
+
+    /// The whole batch is charged before validation, so a batch above the
+    /// bucket burst is refused as `RateLimited` before any validate work.
+    #[tokio::test]
+    async fn a_batch_above_the_burst_is_rate_limited() {
+        let node = test_node(None);
+        let limiter = Arc::new(RateLimiter::new(2));
+        let peer = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let mut state = ConnectionState::with_peer(&node.ctx, peer, limiter);
+
+        let commands = vec![
+            command("BTC-USD", 1),
+            command("BTC-USD", 2),
+            command("BTC-USD", 3),
+        ];
+        let (response, close) = handle_request(
+            &node.ctx,
+            &node.ctx.group_commit,
+            &mut state,
+            TcpRequest::Submit { commands },
+        )
+        .await;
+        assert!(!close, "a rate-limited submit keeps the connection usable");
+        assert_eq!(
+            error_code(&response),
+            Some(TcpErrorCode::RateLimited.as_u16())
+        );
+        let partition = Symbol::new("BTC-USD")
+            .unwrap()
+            .partition(node.ctx.exchange().partitions);
+        assert!(
+            node.memory()
+                .read(Topic::Orders, partition, 0, 10)
+                .is_empty(),
+            "a rate-limited batch must journal nothing"
         );
     }
 

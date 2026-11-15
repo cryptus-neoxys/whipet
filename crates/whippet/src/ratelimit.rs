@@ -119,8 +119,9 @@ impl RateLimiter {
 }
 
 /// Treat an IPv4-mapped IPv6 address as the IPv4 address, so the two forms do
-/// not get separate budgets.
-fn canonical(ip: IpAddr) -> IpAddr {
+/// not get separate budgets. Also used for the WebSocket per-IP table, where
+/// `::ffff:1.2.3.4` and `1.2.3.4` must be the same peer.
+pub(crate) fn canonical(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => v6
             .to_ipv4_mapped()
