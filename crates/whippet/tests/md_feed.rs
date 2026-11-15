@@ -65,9 +65,68 @@ async fn spawn_server(app: Router) -> SocketAddr {
     addr
 }
 
-/// Raw WebSocket handshake for `/ws/md?{query}`. Returns the stream, the HTTP
+/// A WebSocket client over the raw test socket.
+///
+/// The HTTP read that consumes the 101 handshake may already contain the first
+/// WebSocket frame: the server can write the upgrade response and the snapshot
+/// in one turn, and the kernel hands them to one `read`. A real WebSocket
+/// client parses the response with a buffered reader and keeps the tail; this
+/// helper must do the same, or the first frame is silently swallowed and the
+/// test hangs waiting for bytes it already consumed.
+struct WsClient {
+    stream: TcpStream,
+    /// Bytes read past the end of the HTTP response, not yet parsed.
+    pending: Vec<u8>,
+}
+
+/// Every socket read in these tests is bounded, so a feed regression fails an
+/// assertion instead of hanging the suite.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+impl WsClient {
+    /// `read_exact` over the pending buffer first, then the socket.
+    async fn read_exact(&mut self, buf: &mut [u8]) {
+        let mut filled = 0;
+        let from_pending = self.pending.len().min(buf.len());
+        buf[..from_pending].copy_from_slice(&self.pending[..from_pending]);
+        self.pending.drain(..from_pending);
+        filled += from_pending;
+        while filled < buf.len() {
+            let read = tokio::time::timeout(READ_TIMEOUT, self.stream.read(&mut buf[filled..]))
+                .await
+                .expect("read timed out; the feed stopped sending")
+                .expect("socket read");
+            assert!(read > 0, "the server closed mid-frame");
+            filled += read;
+        }
+    }
+
+    /// Read one server-side WebSocket text frame. Server frames are unmasked,
+    /// so the payload is plain UTF-8 after the length header.
+    async fn read_frame(&mut self) -> String {
+        let mut header = [0u8; 2];
+        self.read_exact(&mut header).await;
+        let opcode = header[0] & 0x0f;
+        let mut length = usize::from(header[1] & 0x7f);
+        if length == 126 {
+            let mut extended = [0u8; 2];
+            self.read_exact(&mut extended).await;
+            length = u16::from_be_bytes(extended) as usize;
+        } else if length == 127 {
+            let mut extended = [0u8; 8];
+            self.read_exact(&mut extended).await;
+            length = u64::from_be_bytes(extended) as usize;
+        }
+        let mut payload = vec![0u8; length];
+        self.read_exact(&mut payload).await;
+        assert_eq!(opcode, 0x1, "the feed only sends text frames");
+        String::from_utf8(payload).expect("frame payload is utf-8")
+    }
+}
+
+/// Raw WebSocket handshake for `/ws/md?{query}`. Returns the client, the HTTP
 /// status, and any response body (the JSON rejection on a 4xx).
-async fn open_md_feed(addr: SocketAddr, query: &str) -> (TcpStream, u16, String) {
+async fn open_md_feed(addr: SocketAddr, query: &str) -> (WsClient, u16, String) {
     let mut stream = TcpStream::connect(addr)
         .await
         .expect("connect to the test server");
@@ -85,42 +144,53 @@ async fn open_md_feed(addr: SocketAddr, query: &str) -> (TcpStream, u16, String)
         .await
         .expect("write the handshake");
 
-    let mut response = Vec::new();
+    // Read the HTTP response head. Anything past the terminator is either the
+    // WebSocket feed the server already started sending, or the tail of a JSON
+    // rejection body; both are kept, never discarded.
+    let mut head = Vec::new();
     let mut chunk = [0u8; 1_024];
-    loop {
-        let read = stream.read(&mut chunk).await.expect("read the handshake");
+    let head_end = loop {
+        let read = tokio::time::timeout(READ_TIMEOUT, stream.read(&mut chunk))
+            .await
+            .expect("handshake read timed out; the server never answered")
+            .expect("handshake read");
         assert!(read > 0, "the server closed before answering the handshake");
-        response.extend_from_slice(&chunk[..read]);
-        if response.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
+        head.extend_from_slice(&chunk[..read]);
+        if let Some(end) = head.windows(4).position(|window| window == b"\r\n\r\n") {
+            break end + 4;
         }
-    }
-    // A rejection carries a JSON body with a declared length; read it fully so
-    // the caller can assert on the error code.
-    let mut body = String::new();
-    let declared = declared_body_length(&response);
-    if declared > 0 {
-        let head_end = response
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .expect("header terminator")
-            + 4;
-        body.push_str(&String::from_utf8_lossy(&response[head_end..]));
-        while body.len() < declared {
-            let read = stream
-                .read(&mut chunk)
-                .await
-                .expect("read the rejection body");
-            assert!(read > 0, "the server closed before the full body");
-            body.push_str(&String::from_utf8_lossy(&chunk[..read]));
+    };
+    let mut tail = head.split_off(head_end);
+    let body = match declared_body_length(&head) {
+        0 => String::new(),
+        declared => {
+            let mut body = String::from_utf8_lossy(&tail).into_owned();
+            while body.len() < declared {
+                let read = tokio::time::timeout(READ_TIMEOUT, stream.read(&mut chunk))
+                    .await
+                    .expect("rejection body read timed out")
+                    .expect("rejection body read");
+                assert!(read > 0, "the server closed before the full body");
+                body.push_str(&String::from_utf8_lossy(&chunk[..read]));
+            }
+            // The declared body was fully consumed; nothing behind it.
+            tail.clear();
+            body
         }
-    }
-    let status = String::from_utf8_lossy(&response)
+    };
+    let status = String::from_utf8_lossy(&head)
         .split_whitespace()
         .nth(1)
         .and_then(|status| status.parse().ok())
         .expect("a status line");
-    (stream, status, body)
+    (
+        WsClient {
+            stream,
+            pending: tail,
+        },
+        status,
+        body,
+    )
 }
 
 fn declared_body_length(response: &[u8]) -> usize {
@@ -133,40 +203,6 @@ fn declared_body_length(response: &[u8]) -> usize {
                 .flatten()
         })
         .unwrap_or(0)
-}
-
-/// Read one server-side WebSocket text frame. Server frames are unmasked, so
-/// the payload is plain UTF-8 after the length header.
-async fn read_text_frame(stream: &mut TcpStream) -> String {
-    let mut header = [0u8; 2];
-    stream
-        .read_exact(&mut header)
-        .await
-        .expect("frame header arrives");
-    let opcode = header[0] & 0x0f;
-    let mut length = usize::from(header[1] & 0x7f);
-    if length == 126 {
-        let mut extended = [0u8; 2];
-        stream
-            .read_exact(&mut extended)
-            .await
-            .expect("16-bit length");
-        length = u16::from_be_bytes(extended) as usize;
-    } else if length == 127 {
-        let mut extended = [0u8; 8];
-        stream
-            .read_exact(&mut extended)
-            .await
-            .expect("64-bit length");
-        length = u64::from_be_bytes(extended) as usize;
-    }
-    let mut payload = vec![0u8; length];
-    stream
-        .read_exact(&mut payload)
-        .await
-        .expect("frame payload arrives");
-    assert_eq!(opcode, 0x1, "the feed only sends text frames");
-    String::from_utf8(payload).expect("frame payload is utf-8")
 }
 
 /// Plain-text GET for `/metrics`, whose body is not JSON.
@@ -284,14 +320,11 @@ async fn md_feed_sends_a_snapshot_then_every_delta() {
     let app = gateway::router(Arc::clone(&node.ctx));
     let addr = spawn_server(app.clone()).await;
 
-    let (mut stream, status) = {
-        let (stream, status, _) = open_md_feed(addr, "symbol=BTC-USD").await;
-        (stream, status)
-    };
+    let (mut client, status, _) = open_md_feed(addr, "symbol=BTC-USD").await;
     assert_eq!(status, 101, "the upgrade is accepted");
 
     // First frame: the snapshot handshake at the hub's current sequence.
-    let snapshot = read_text_frame(&mut stream).await;
+    let snapshot = client.read_frame().await;
     let snapshot: Value = serde_json::from_str(&snapshot).expect("snapshot frame");
     assert_eq!(snapshot["type"], "snapshot");
     assert_eq!(snapshot["symbol"], "BTC-USD");
@@ -300,7 +333,7 @@ async fn md_feed_sends_a_snapshot_then_every_delta() {
     // Deltas are applied the way the engine's MD consumer would: straight
     // into the hub, which sequences and broadcasts them.
     node.ctx.hub.apply(&add_event(5, 65_000, 10, 1));
-    let delta = read_text_frame(&mut stream).await;
+    let delta = client.read_frame().await;
     let delta: Value = serde_json::from_str(&delta).expect("delta frame");
     assert_eq!(delta["type"], "delta");
     assert_eq!(delta["symbol"], "BTC-USD");
@@ -312,7 +345,7 @@ async fn md_feed_sends_a_snapshot_then_every_delta() {
 
     // The stream keeps flowing: the next event arrives as its own frame.
     node.ctx.hub.apply(&add_event(6, 65_100, 3, 2));
-    let delta = read_text_frame(&mut stream).await;
+    let delta = client.read_frame().await;
     let delta: Value = serde_json::from_str(&delta).expect("delta frame");
     assert_eq!(delta["type"], "delta");
     assert_eq!(delta["seq"], 6);
@@ -331,7 +364,7 @@ async fn md_feed_sends_a_snapshot_then_every_delta() {
     assert!(text.contains("# TYPE whippet_md_feed_lagged_total counter"));
     assert!(text.contains("# TYPE whippet_md_feed_resyncs_total counter"));
 
-    drop(stream);
+    drop(client);
 }
 
 #[tokio::test]
@@ -341,19 +374,19 @@ async fn md_feed_rejects_unknown_and_missing_symbols() {
     let addr = spawn_server(app).await;
 
     for query in ["symbol=DOGE-USD", "symbol=XRP-USD", "symbol="] {
-        let (stream, status, body) = open_md_feed(addr, query).await;
+        let (client, status, body) = open_md_feed(addr, query).await;
         assert_eq!(status, 400, "{query} must be refused, got body {body}");
         let error: Value = serde_json::from_str(&body).expect("json api error");
         assert_eq!(error["code"], "unknown_symbol", "{query}");
-        drop(stream);
+        drop(client);
     }
 
     // No query parameter at all is the same rejection.
-    let (stream, status, body) = open_md_feed(addr, "").await;
+    let (client, status, body) = open_md_feed(addr, "").await;
     assert_eq!(status, 400);
     let error: Value = serde_json::from_str(&body).expect("json api error");
     assert_eq!(error["code"], "unknown_symbol");
-    drop(stream);
+    drop(client);
 }
 
 #[tokio::test]
@@ -371,53 +404,50 @@ async fn md_feed_shares_the_ws_connection_cap() {
                 .expect("drain one permit")
         })
         .collect();
-    let (stream, status, body) = open_md_feed(addr, "symbol=BTC-USD").await;
+    let (client, status, body) = open_md_feed(addr, "symbol=BTC-USD").await;
     assert_eq!(status, 503, "an exhausted cap must refuse the upgrade");
     let error: Value = serde_json::from_str(&body).expect("json api error");
     assert_eq!(error["code"], "ws_capacity");
     assert_eq!(node.ctx.hub.feed_receiver_count(), 0);
-    drop(stream);
+    drop(client);
     drop(drained);
 }
 
 #[tokio::test]
+// Deliberately the default single-thread runtime: it is what makes the flood
+// below deterministic. The twenty `apply` calls run without a runtime turn,
+// so the serving task cannot drain frames mid-flood and the subscriber is
+// guaranteed to lag by exactly `20 - capacity` frames.
 async fn md_feed_resyncs_a_lagged_consumer() {
     // Four-frame feed buffer: twenty events through it lose sixteen.
     let (ctx, _tempdir) = feed_node(4);
     let app = gateway::router(Arc::clone(&ctx));
     let addr = spawn_server(app.clone()).await;
 
-    let (mut stream, status) = {
-        let (stream, status, _) = open_md_feed(addr, "symbol=BTC-USD").await;
-        (stream, status)
-    };
+    let (mut client, status, _) = open_md_feed(addr, "symbol=BTC-USD").await;
     assert_eq!(status, 101);
-    eprintln!("DBG: handshake done");
-    let snapshot = read_text_frame(&mut stream).await;
-    eprintln!("DBG: first frame: {}", &snapshot[..snapshot.len().min(120)]);
+    let snapshot = client.read_frame().await;
     let snapshot: Value = serde_json::from_str(&snapshot).expect("snapshot frame");
     assert_eq!(snapshot["type"], "snapshot");
     assert_eq!(snapshot["seq"], 0);
 
     // Apply twenty events synchronously: no runtime turn passes between them,
     // so the subscriber (capacity 4) is guaranteed to fall 16 frames behind.
-    eprintln!("DBG: receiver_count={}", ctx.hub.feed_receiver_count());
     for seq in 1..=20u64 {
         ctx.hub
             .apply(&add_event(seq, 65_000 + seq as i64, 1, seq as u128));
     }
-    eprintln!("DBG: flood applied, feed_stats={:?}", ctx.hub.feed_stats());
 
     // The slow-consumer policy is resync, never a stall: first the notice,
     // then a fresh full snapshot to rebuild from.
-    let resync = read_text_frame(&mut stream).await;
+    let resync = client.read_frame().await;
     let resync: Value = serde_json::from_str(&resync).expect("resync frame");
     assert_eq!(resync["type"], "resync");
     assert_eq!(resync["symbol"], "BTC-USD");
     assert_eq!(resync["reason"], "lagged 16");
     assert_eq!(resync["seq"], 20, "the resync names the sequence to adopt");
 
-    let snapshot = read_text_frame(&mut stream).await;
+    let snapshot = client.read_frame().await;
     let snapshot: Value = serde_json::from_str(&snapshot).expect("resync snapshot frame");
     assert_eq!(snapshot["type"], "snapshot");
     assert_eq!(
@@ -432,7 +462,7 @@ async fn md_feed_resyncs_a_lagged_consumer() {
 
     // The feed continues from the resnapshot.
     ctx.hub.apply(&add_event(21, 65_100, 1, 99));
-    let delta = read_text_frame(&mut stream).await;
+    let delta = client.read_frame().await;
     let delta: Value = serde_json::from_str(&delta).expect("delta frame");
     assert_eq!(delta["type"], "delta");
     assert_eq!(delta["seq"], 21);
@@ -446,7 +476,7 @@ async fn md_feed_resyncs_a_lagged_consumer() {
     assert_eq!(metric_value(&text, "whippet_md_feed_resyncs_total "), 1.0);
     assert_eq!(metric_value(&text, "whippet_md_feed_sent_total "), 21.0);
 
-    drop(stream);
+    drop(client);
 }
 
 #[tokio::test]
@@ -455,19 +485,16 @@ async fn md_feed_ends_when_the_client_closes() {
     let app = gateway::router(Arc::clone(&node.ctx));
     let addr = spawn_server(app).await;
 
-    let (mut stream, status) = {
-        let (stream, status, _) = open_md_feed(addr, "symbol=BTC-USD").await;
-        (stream, status)
-    };
+    let (mut client, status, _) = open_md_feed(addr, "symbol=BTC-USD").await;
     assert_eq!(status, 101);
-    let snapshot = read_text_frame(&mut stream).await;
+    let snapshot = client.read_frame().await;
     let snapshot: Value = serde_json::from_str(&snapshot).expect("snapshot frame");
     assert_eq!(snapshot["type"], "snapshot");
 
     // The permit lives with the connection. Dropping the client socket must
     // end the serving task and hand the permit back; the event below also
     // wakes the loop into a failed send in case close detection is lazy.
-    drop(stream);
+    drop(client);
     node.ctx.hub.apply(&add_event(1, 65_000, 1, 1));
 
     let semaphore = Arc::clone(&node.ctx.ws_connections);

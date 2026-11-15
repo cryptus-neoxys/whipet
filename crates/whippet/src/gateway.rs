@@ -2210,24 +2210,19 @@ async fn md_feed_upgrade(
 /// The delta frames arrive pre-serialized from the hub, so fan-out is one
 /// refcounted-string clone per subscriber, not a per-subscriber re-encode.
 async fn md_feed_loop(mut socket: WebSocket, ctx: Arc<NodeContext>, symbol: Symbol) {
-    eprintln!("DBG-SRV: loop entered for {symbol}");
     let mut receiver = ctx.hub.subscribe_feed();
     // The symbol was validated against the exchange config, so the hub has a
     // book for it; a missing snapshot is a wiring bug and ends the feed.
     let Some(snapshot) = ctx.hub.feed_snapshot(symbol) else {
-        eprintln!("DBG-SRV: no snapshot, exiting");
         return;
     };
     let mut last_seq = snapshot.seq;
-    eprintln!("DBG-SRV: subscribed, snapshot seq={}", snapshot.seq);
     if send_json(&mut socket, &MdFeedMessage::Snapshot(snapshot))
         .await
         .is_err()
     {
-        eprintln!("DBG-SRV: snapshot send failed, exiting");
         return;
     }
-    eprintln!("DBG-SRV: snapshot sent");
     loop {
         tokio::select! {
             delivered = receiver.recv() => {
