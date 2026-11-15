@@ -136,7 +136,7 @@ impl JournalOps for FakeJournal {
         let base_offset = log.len() as u64;
         if topic == Topic::Executions {
             for message in messages {
-                log.push(message.payload.clone());
+                log.push(message.payload.to_vec());
             }
         }
         drop(log);

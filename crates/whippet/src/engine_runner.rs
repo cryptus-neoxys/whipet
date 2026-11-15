@@ -60,9 +60,40 @@ pub const SHARD_RING_CAPACITY: usize = 2;
 const POLL_FAILURE_BUDGET: u32 = 40;
 
 /// Minimum spacing between engine-state snapshots. The snapshot is bounded by
-/// the dedup window, but it still costs hash + serialize + fsync, so 15 s keeps
-/// the tail spikes rare without making the replay window large.
-const SNAPSHOT_MIN_INTERVAL: Duration = Duration::from_secs(15);
+/// the dedup window, but building it still clones the book and the dedup vec on
+/// the match thread, so the interval trades tail spikes against the replay
+/// window. Defaults to 30 s and is configurable through
+/// [`SNAPSHOT_MIN_INTERVAL_ENV`], clamped to
+/// [`SNAPSHOT_MIN_INTERVAL_FLOOR_SECS`] .. [`SNAPSHOT_MIN_INTERVAL_CEILING_SECS`].
+const SNAPSHOT_MIN_INTERVAL_DEFAULT_SECS: u64 = 30;
+const SNAPSHOT_MIN_INTERVAL_FLOOR_SECS: u64 = 5;
+const SNAPSHOT_MIN_INTERVAL_CEILING_SECS: u64 = 300;
+
+/// Environment override for [`SNAPSHOT_MIN_INTERVAL_DEFAULT_SECS`].
+#[doc(hidden)]
+pub const SNAPSHOT_MIN_INTERVAL_ENV: &str = "WHIPPET_SNAPSHOT_MIN_INTERVAL_SECS";
+
+/// The configured period between periodic engine-state snapshots.
+///
+/// Read once per shard at startup. A value outside the floor/ceiling is
+/// clamped rather than rejected: the interval changes how often the tail is
+/// paid, not whether the node is correct, and a deployment should not fail to
+/// boot over it.
+fn snapshot_min_interval() -> Duration {
+    snapshot_min_interval_from(
+        std::env::var(SNAPSHOT_MIN_INTERVAL_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok()),
+    )
+}
+
+/// Pure form of [`snapshot_min_interval`], testable without the environment.
+fn snapshot_min_interval_from(secs: Option<u64>) -> Duration {
+    Duration::from_secs(secs.unwrap_or(SNAPSHOT_MIN_INTERVAL_DEFAULT_SECS).clamp(
+        SNAPSHOT_MIN_INTERVAL_FLOOR_SECS,
+        SNAPSHOT_MIN_INTERVAL_CEILING_SECS,
+    ))
+}
 
 /// The node gives each shard task five seconds to stop; the final snapshot flush
 /// has to fit inside that budget.
@@ -388,6 +419,9 @@ pub struct InputBatch {
 pub struct SnapshotJob {
     pub request: SequencedSnapshot,
     pub verify: bool,
+    /// When the matcher built and queued this snapshot. The writer reports the
+    /// handoff delay so a queue backlog is not mistaken for write cost.
+    pub queued_at: Instant,
 }
 
 /// One batch of matcher output, handed to the async writer.
@@ -513,6 +547,12 @@ pub fn run_matcher(
     let mut snapshot_sequence: u64 = 0;
     let mut last_snapshot_at = Instant::now();
     let mut last_offset = start_last_offset;
+    let snapshot_interval = snapshot_min_interval();
+    info!(
+        shard = shard_id,
+        interval_secs = snapshot_interval.as_secs(),
+        "engine-state snapshot cadence"
+    );
     // A snapshot that came due while the writer was behind. It is taken at the
     // next batch boundary where every output up to `last_offset` is appended.
     let mut snapshot_pending = false;
@@ -528,15 +568,17 @@ pub fn run_matcher(
         let mut snapshot = if snapshot_pending
             && durable != u64::MAX
             && durable >= last_offset
-            && last_snapshot_at.elapsed() >= SNAPSHOT_MIN_INTERVAL
+            && last_snapshot_at.elapsed() >= snapshot_interval
         {
             snapshot_pending = false;
             last_snapshot_at = Instant::now();
             snapshot_sequence += 1;
-            Some(SequencedSnapshot {
-                sequence: snapshot_sequence,
-                snapshot: engine.snapshot_state(),
-            })
+            Some(build_snapshot(
+                shard_id,
+                &engine,
+                snapshot_sequence,
+                "deferred",
+            ))
         } else {
             None
         };
@@ -590,14 +632,16 @@ pub fn run_matcher(
             let durable = appended_offset.load(Ordering::Acquire);
             if durable != u64::MAX
                 && durable >= last_offset
-                && last_snapshot_at.elapsed() >= SNAPSHOT_MIN_INTERVAL
+                && last_snapshot_at.elapsed() >= snapshot_interval
             {
                 last_snapshot_at = Instant::now();
                 snapshot_sequence += 1;
-                snapshot = Some(SequencedSnapshot {
-                    sequence: snapshot_sequence,
-                    snapshot: engine.snapshot_state(),
-                });
+                snapshot = Some(build_snapshot(
+                    shard_id,
+                    &engine,
+                    snapshot_sequence,
+                    "cadence",
+                ));
             } else {
                 snapshot_pending = true;
             }
@@ -632,12 +676,34 @@ pub fn run_matcher(
     shard_metrics.merge_into(&ctx.metrics);
 
     // Input closed: shutdown. Build the final snapshot here, where the engine
-    // lives, and let the writer persist it inside the shutdown budget.
+    // lives, and let the writer persist it inside the shutdown budget. The
+    // writer fills the hashes and rebuilds the shard to verify them before the
+    // rename, so a bad off-loop hash can never become the resume point.
     snapshot_sequence += 1;
+    let started = Instant::now();
     let final_state = engine.snapshot_state_without_hash();
+    let build_us = started.elapsed().as_micros() as u64;
     // A shard that never applied a command has no resume point; persisting an
     // empty snapshot would make the next boot start after offset 0.
     let has_commands = final_state.symbols.iter().any(|symbol| symbol.commands > 0);
+    if has_commands {
+        info!(
+            shard = shard_id,
+            sequence = snapshot_sequence,
+            build_us,
+            book_orders = final_state
+                .symbols
+                .iter()
+                .map(|s| s.book.orders.len())
+                .sum::<usize>(),
+            dedup_entries = final_state
+                .symbols
+                .iter()
+                .map(|s| s.dedup.len())
+                .sum::<usize>(),
+            "final snapshot state cloned for the writer"
+        );
+    }
     let final_snapshot = has_commands.then_some(SequencedSnapshot {
         sequence: snapshot_sequence,
         snapshot: final_state,
@@ -649,6 +715,44 @@ pub fn run_matcher(
         snapshot: final_snapshot,
         final_batch: true,
     });
+}
+
+/// Clone the engine state for the snapshot writer and log what it cost the
+/// match thread.
+///
+/// The hashes are deliberately **not** computed here: the writer fills them
+/// with `SnapshotWriter::fill_hashes`, so the shard thread pays only the clone
+/// (book walk + dedup vec) and the writer pays hash + serialize + fsync. The
+/// final snapshot is rebuilt and verified by the writer before it is persisted.
+fn build_snapshot(
+    shard_id: u32,
+    engine: &ShardEngine,
+    sequence: u64,
+    trigger: &'static str,
+) -> SequencedSnapshot {
+    let started = Instant::now();
+    let snapshot = engine.snapshot_state_without_hash();
+    let build_us = started.elapsed().as_micros() as u64;
+    let book_orders: usize = snapshot
+        .symbols
+        .iter()
+        .map(|symbol| symbol.book.orders.len())
+        .sum();
+    let dedup_entries: usize = snapshot
+        .symbols
+        .iter()
+        .map(|symbol| symbol.dedup.len())
+        .sum();
+    info!(
+        shard = shard_id,
+        sequence,
+        trigger,
+        build_us,
+        book_orders,
+        dedup_entries,
+        "snapshot state cloned for the writer"
+    );
+    SequencedSnapshot { sequence, snapshot }
 }
 
 /// Drain matcher output, publish executions and MD, commit the watermark, and
@@ -766,6 +870,7 @@ pub async fn run_writer<J: JournalOps + ?Sized>(
             match snapshot_tx.try_send(SnapshotJob {
                 request: snapshot,
                 verify: false,
+                queued_at: Instant::now(),
             }) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => warn!(
@@ -789,6 +894,7 @@ pub async fn run_writer<J: JournalOps + ?Sized>(
             snapshot_tx.send(SnapshotJob {
                 request: snapshot,
                 verify: true,
+                queued_at: Instant::now(),
             }),
         )
         .await
@@ -1171,6 +1277,11 @@ async fn commit_once<J: JournalOps + ?Sized>(
 /// Owns the snapshot file. `save` is blocking, so the whole writer runs on a
 /// blocking thread and the shard loop only ever hands over an owned
 /// `ShardSnapshot`.
+///
+/// The stage split is logged per snapshot (`queue_us`, `hash_us`, `write_us`,
+/// `total_us`) because the periodic p99 was previously attributed to the wrong
+/// stage: the shard thread's clone, the off-loop hash, and the serialize+fsync
+/// are three different costs on three different threads.
 fn spawn_snapshot_writer(
     ctx: Arc<NodeContext>,
     shard_id: u32,
@@ -1182,39 +1293,70 @@ fn spawn_snapshot_writer(
         let mut writer =
             SnapshotWriter::with_exchange(ctx.snapshots.clone(), ctx.exchange().clone());
         while let Some(job) = pending.blocking_recv() {
-            let SnapshotJob { request, verify } = job;
+            let SnapshotJob {
+                mut request,
+                verify,
+                queued_at,
+            } = job;
             let sequence = request.sequence;
-            // The shard only cloned the state; the writer fills and (for the
-            // final snapshot) verifies the hash, so the match loop pays neither.
-            // Diagnostics are built here, off the shard loop.
+            let received = Instant::now();
+            let queue_us = received.saturating_duration_since(queued_at).as_micros() as u64;
+
+            // The shard only cloned the state; the hash is filled here, off the
+            // match loop, and a supplied hash that disagrees is rejected rather
+            // than silently repaired.
+            let hash_started = Instant::now();
+            let filled = writer.fill_hashes(&mut request.snapshot);
+            let hash_us = hash_started.elapsed().as_micros() as u64;
+            if let Err(error) = filled {
+                warn!(
+                    shard = shard_id,
+                    sequence,
+                    error = %error,
+                    queue_us, hash_us,
+                    "snapshot hash fill failed; matching continues, the log is still canonical"
+                );
+                continue;
+            }
+            // Diagnostics are built here, off the shard loop, and only after the
+            // fill so the log shows the hashes that will be persisted.
             let hashes: Vec<String> = request
                 .snapshot
                 .symbols
                 .iter()
                 .map(|symbol| hex(&symbol.state_hash))
                 .collect();
-            let started = Instant::now();
+            let write_started = Instant::now();
             let result = if verify {
                 writer.write(request)
             } else {
                 writer.write_unverified(request)
             };
+            let write_us = write_started.elapsed().as_micros() as u64;
+            let total_us = received.elapsed().as_micros() as u64;
             // `Metrics` has no snapshot-duration recorder and `context.rs` is
-            // owned elsewhere, so the duration is logged rather than recorded.
+            // owned elsewhere, so the split is logged rather than recorded.
             // TODO(lead): add a `snapshot_duration_us` histogram to `Metrics`.
-            let duration_us = started.elapsed().as_micros() as u64;
             match result {
                 Ok(Some(path)) => info!(
                     shard = shard_id,
                     sequence,
                     path = %path.display(),
                     hashes = ?hashes,
-                    duration_us,
+                    queue_us,
+                    hash_us,
+                    write_us,
+                    total_us,
                     "snapshot written"
                 ),
                 Ok(None) => warn!(
                     shard = shard_id,
-                    sequence, "snapshot is older than the last one written; skipped"
+                    sequence,
+                    queue_us,
+                    hash_us,
+                    write_us,
+                    total_us,
+                    "snapshot is older than the last one written; skipped"
                 ),
                 Err(error) => {
                     // A failed snapshot costs a resume point, not matching:
@@ -1225,7 +1367,10 @@ fn spawn_snapshot_writer(
                         shard = shard_id,
                         sequence,
                         error = %error,
-                        duration_us,
+                        queue_us,
+                        hash_us,
+                        write_us,
+                        total_us,
                         "snapshot write failed; matching continues, the log is still canonical"
                     );
                 }
@@ -1357,6 +1502,53 @@ mod tests {
             symbol.last_offset = 42;
         }
         assert_eq!(resume_offset(&snapshot), Some(42));
+    }
+
+    #[test]
+    fn snapshot_cadence_defaults_to_thirty_seconds() {
+        assert_eq!(snapshot_min_interval_from(None), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn snapshot_cadence_is_clamped_to_the_supported_range() {
+        // Below the floor and above the ceiling clamp; inside the range is
+        // honoured exactly, including the old 15 s.
+        assert_eq!(snapshot_min_interval_from(Some(0)), Duration::from_secs(5));
+        assert_eq!(snapshot_min_interval_from(Some(1)), Duration::from_secs(5));
+        assert_eq!(
+            snapshot_min_interval_from(Some(15)),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            snapshot_min_interval_from(Some(30)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            snapshot_min_interval_from(Some(300)),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            snapshot_min_interval_from(Some(10_000)),
+            Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn the_matcher_hands_the_writer_an_unhashed_snapshot() {
+        // The shard thread pays the clone only; `SnapshotWriter::fill_hashes`
+        // computes the hash off the match loop and the final snapshot is
+        // rebuilt and verified before the rename.
+        let exchange = whippet_core::config::ExchangeConfig::default();
+        let engine = ShardEngine::new(1, &exchange);
+        let job = build_snapshot(1, &engine, 1, "test");
+        assert_eq!(job.sequence, 1);
+        assert!(
+            job.snapshot
+                .symbols
+                .iter()
+                .all(|symbol| symbol.state_hash == [0u8; 32]),
+            "the matcher must not hash on the shard thread"
+        );
     }
 
     const INTERVAL: u64 = COMMIT_INTERVAL_RECORDS;

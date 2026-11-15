@@ -6,13 +6,14 @@ use std::path::{Path, PathBuf};
 
 use whippet_core::config::ExchangeConfig;
 use whippet_core::ids::Symbol;
-use whippet_engine::{ShardEngine, ShardSnapshot};
+use whippet_engine::{ShardEngine, ShardSnapshot, fill_symbol_hashes};
 
 const MAGIC: &[u8; 8] = b"WHIPSNP1";
-/// Version 2 added the per-symbol config and the book's `min_price_ticks` so
-/// the state hash can be computed from the snapshot off the shard thread.
-/// Version 1 files are rejected rather than misread.
-const VERSION: u32 = 2;
+/// Version 3 adds the dedup terminal-eviction order so a restored table
+/// evicts at the same point as a continuous replay. Version 2 added the
+/// per-symbol config and the book's `min_price_ticks`; version 1 is rejected
+/// rather than misread.
+const VERSION: u32 = 3;
 const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -57,16 +58,26 @@ impl SnapshotStore {
     }
 
     /// Write atomically: temp file, fsync, rename.
+    ///
+    /// The payload is streamed through a `BufWriter` rather than built as one
+    /// `Vec` first. A snapshot at the dedup window is >10 MB, so buffering it
+    /// whole bought nothing but a second full-size allocation and copy on the
+    /// writer thread; the bytes on disk are identical either way.
     pub fn save(&self, snapshot: &ShardSnapshot) -> Result<PathBuf, SnapshotError> {
+        use std::io::BufWriter;
+
         fs::create_dir_all(&self.dir)?;
         let path = self.path(snapshot.shard_id);
         let temp = path.with_extension("snapshot.tmp");
-        let payload = bincode::serialize(snapshot)?;
         {
             let mut file = fs::File::create(&temp)?;
             file.write_all(MAGIC)?;
             file.write_all(&VERSION.to_le_bytes())?;
-            file.write_all(&payload)?;
+            {
+                let mut buffered = BufWriter::with_capacity(1 << 20, &mut file);
+                bincode::serialize_into(&mut buffered, snapshot)?;
+                buffered.flush()?;
+            }
             file.sync_all()?;
         }
         fs::rename(&temp, &path)?;
@@ -198,6 +209,39 @@ impl SnapshotWriter {
         self.write_inner(request, false)
     }
 
+    /// Fill each symbol's `state_hash` off the shard thread.
+    ///
+    /// The matcher hands over a snapshot built by
+    /// `ShardEngine::snapshot_state_without_hash`; this recomputes the hashes
+    /// with [`hash_symbol_snapshot`] and refuses a snapshot whose supplied
+    /// (non-zero) hash disagrees with the recomputed one. A zero hash is the
+    /// expected "not hashed yet" sentinel.
+    ///
+    /// Recomputing unconditionally would silently repair a corrupted stored
+    /// hash, so a mismatch is an error, not a quiet overwrite.
+    pub fn fill_hashes(&self, snapshot: &mut ShardSnapshot) -> Result<(), SnapshotError> {
+        let provided: Vec<[u8; 32]> = snapshot
+            .symbols
+            .iter()
+            .map(|symbol| symbol.state_hash)
+            .collect();
+        fill_symbol_hashes(snapshot);
+        for (symbol, provided) in snapshot.symbols.iter().zip(&provided) {
+            if *provided != [0u8; 32] && *provided != symbol.state_hash {
+                return Err(SnapshotError::HashMismatch {
+                    shard: snapshot.shard_id,
+                    detail: format!(
+                        "symbol {} stored hash {} does not match recomputed {}",
+                        symbol.symbol,
+                        hex(provided),
+                        hex(&symbol.state_hash)
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn write_inner(
         &mut self,
         request: SequencedSnapshot,
@@ -206,11 +250,10 @@ impl SnapshotWriter {
         if !is_newer(self.last_written, request.sequence) {
             return Ok(None);
         }
-        // The matcher computes the live state hash with the engine; the
-        // writer must not recompute it from the snapshot. An off-loop hash was
-        // tried and reverted: at ~170k orders it disagreed with the restored
-        // engine hash on one shard, which would have persisted an unusable
-        // resume point. The final snapshot is still rebuilt and verified here.
+        // The matcher only clones the state; the writer fills the hashes with
+        // `fill_hashes` before reaching this point, so the match loop never
+        // pays the hash. A snapshot that arrives here unhashed is a bug and is
+        // rejected by `verify`/`UnhashedSymbol` below rather than persisted.
         if verify {
             self.verify(&request.snapshot)?;
         }
@@ -392,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn unhashed_snapshot_is_rejected() {
+    fn unhashed_snapshot_is_rejected_without_an_off_loop_fill() {
         let exchange = test_exchange();
         let shard_id = test_shard(&exchange);
         let engine = ShardEngine::new(shard_id, &exchange);
@@ -409,6 +452,78 @@ mod tests {
             snapshot: unhashed,
         });
         assert!(matches!(result, Err(SnapshotError::UnhashedSymbol { .. })));
+    }
+
+    #[test]
+    fn fill_hashes_makes_an_unhashed_snapshot_writable() {
+        let exchange = test_exchange();
+        let shard_id = test_shard(&exchange);
+        let mut engine = ShardEngine::new(shard_id, &exchange);
+        let mut out = whippet_engine::EngineOutput::with_capacity(8, 8);
+        let symbol = Symbol::new("BTC-USD").unwrap();
+        let mut id = 0u128;
+        for offset in 0..2_000u64 {
+            id += 1;
+            let command = whippet_core::protocol::Command::new_order(
+                symbol,
+                whippet_core::protocol::Side::Buy,
+                whippet_core::protocol::OrderType::Limit,
+                whippet_core::ids::Price(40_000 + (offset as i64 % 200)),
+                whippet_core::ids::Qty(1),
+                whippet_core::ids::OrderId(id),
+                whippet_core::ids::ParticipantId(1),
+                offset,
+            );
+            engine.process(&command, offset, &mut out).unwrap();
+            out.clear();
+        }
+        let live = engine.state_hash();
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path());
+        let mut writer = SnapshotWriter::with_exchange(store.clone(), exchange.clone());
+        let mut snapshot = engine.snapshot_state_without_hash();
+        assert!(
+            snapshot
+                .symbols
+                .iter()
+                .all(|symbol| symbol.state_hash == [0u8; 32])
+        );
+        writer
+            .fill_hashes(&mut snapshot)
+            .expect("zero hashes are filled, not rejected");
+        let path = writer
+            .write(SequencedSnapshot {
+                sequence: 1,
+                snapshot,
+            })
+            .unwrap()
+            .expect("the filled snapshot is persisted");
+
+        let loaded = store.load(shard_id).unwrap().unwrap();
+        let restored = ShardEngine::from_snapshot(&exchange, loaded).unwrap();
+        assert_eq!(restored.state_hash(), live);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn fill_hashes_rejects_a_supplied_hash_that_disagrees() {
+        // Recomputing must not silently repair a corrupted stored hash: that
+        // would turn a hashing bug into a persisted resume point.
+        let exchange = test_exchange();
+        let engine = ShardEngine::new(test_shard(&exchange), &exchange);
+        let dir = tempfile::tempdir().unwrap();
+        let writer = SnapshotWriter::with_exchange(SnapshotStore::new(dir.path()), exchange);
+
+        let mut snapshot = engine.snapshot_state_without_hash();
+        snapshot.symbols[0].state_hash[0] ^= 0xff;
+        match writer.fill_hashes(&mut snapshot) {
+            Err(SnapshotError::HashMismatch { shard, detail }) => {
+                assert_eq!(shard, snapshot.shard_id);
+                assert!(detail.contains("does not match recomputed"), "{detail}");
+            }
+            other => panic!("expected HashMismatch, got {other:?}"),
+        }
     }
 
     #[test]

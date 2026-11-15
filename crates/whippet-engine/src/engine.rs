@@ -107,6 +107,9 @@ pub struct SymbolSnapshot {
     pub config: SymbolConfigSnapshot,
     pub book: BookSnapshot,
     pub dedup: Vec<(OrderId, DedupEntry)>,
+    /// Terminal ids in eviction order, snapshotted so a restored table evicts
+    /// at the same point as a continuous replay. Not part of the state hash.
+    pub dedup_terminal: Vec<OrderId>,
     pub exec_seq: Seq,
     pub md_seq: Seq,
     pub last_offset: u64,
@@ -769,6 +772,7 @@ impl SymbolEngine {
             config: SymbolConfigSnapshot::from_config(&self.config),
             book: self.book.snapshot(),
             dedup: self.dedup.entries_in_order(),
+            dedup_terminal: self.dedup.terminal_order(),
             exec_seq: self.exec_seq,
             md_seq: self.md_seq,
             last_offset: self.last_offset,
@@ -788,7 +792,11 @@ impl SymbolEngine {
         let mut engine = Self {
             config,
             book,
-            dedup: DedupTable::from_entries(dedup_capacity, snapshot.dedup),
+            dedup: DedupTable::from_entries(
+                dedup_capacity,
+                snapshot.dedup,
+                snapshot.dedup_terminal,
+            ),
             exec_seq: snapshot.exec_seq,
             md_seq: snapshot.md_seq,
             last_offset: snapshot.last_offset,

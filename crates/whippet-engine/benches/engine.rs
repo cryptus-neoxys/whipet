@@ -422,11 +422,118 @@ fn bench_snapshot_hash_off_thread(c: &mut Criterion) {
     group.finish();
 }
 
+/// The periodic snapshot, measured stage by stage at soak size.
+///
+/// The 60 s soak at 5,000 orders/s on shard 1 (~170k commands) showed a p50 of
+/// ~1.1 ms against a p99 of ~0.5 s, and the spike lined up with snapshots. That
+/// number was one lump; these stages are what it is made of:
+///
+/// - `matcher_clone_with_hash`: the old shard-thread cost (live hash + clone),
+/// - `matcher_clone_only`: what the shard thread pays now (clone only),
+/// - `writer_hash`: the off-loop `hash_symbol_snapshot`,
+/// - `writer_serialize`: the snapshot bytes, before fsync,
+/// - and, from the recovery test that writes a real file,
+///   `crates/whippet/tests/recovery.rs::off_loop_snapshot_stage_split_at_scale`,
+///   which also covers fsync + rename (the part a bench in this crate cannot
+///   reach).
+///
+/// The engine here is sized to a soak: dedup at its 100k window cap and a book
+/// deep enough that the clone is not trivially small.
+fn bench_snapshot_stages(c: &mut Criterion) {
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+    }
+
+    /// Commands applied before the measurement: a 60 s soak at 5k/s on one
+    /// shard is ~300k, and 170k is where the old off-loop hash diverged.
+    const COMMANDS: u64 = 170_000;
+    /// Ids are drawn from a pool larger than the dedup window (100k for this
+    /// config), so the window turns over during the run.
+    const ID_POOL: u64 = 120_000;
+
+    let mut config = InstrumentConfig::new("BTC-USD", 100, 40_000, 90_000).expect("static config");
+    config.max_orders = 250_000;
+    config.snapshot_depth = 20;
+    let mut engine = SymbolEngine::new(config);
+    let symbol = engine.config().symbol;
+    let mut out = EngineOutput::with_capacity(64, 64);
+    let mut rng = Rng(0x5ca1_ab1e_5eed_0001);
+    for offset in 0..COMMANDS {
+        let order_id = OrderId(u128::from(rng.next() % ID_POOL) + 1);
+        let command = if rng.next() % 100 < 60 {
+            Command::new_order(
+                symbol,
+                if rng.next().is_multiple_of(2) {
+                    Side::Buy
+                } else {
+                    Side::Sell
+                },
+                if rng.next().is_multiple_of(3) {
+                    OrderType::Ioc
+                } else {
+                    OrderType::Limit
+                },
+                Price(40_000 + (rng.next() % 500) as i64 * 100),
+                Qty(rng.next() % 20 + 1),
+                order_id,
+                ParticipantId(rng.next() % 4 + 1),
+                offset,
+            )
+        } else {
+            Command::cancel(symbol, order_id, ParticipantId(rng.next() % 4 + 1), offset)
+        };
+        engine.process(&command, offset, &mut out);
+        out.clear();
+    }
+    let snapshot = engine.snapshot_state_without_hash();
+    let book_orders = snapshot.book.orders.len();
+    let dedup_entries = snapshot.dedup.len();
+    let bytes = bincode::serialize(&snapshot)
+        .expect("snapshot serializes")
+        .len();
+    eprintln!(
+        "snapshot_stages: commands={COMMANDS} book_orders={book_orders} \
+         dedup_walk={dedup_entries} dedup_map={} bytes={bytes}",
+        engine.dedup().len()
+    );
+
+    let mut group = c.benchmark_group("snapshot_stages");
+    group.sample_size(10);
+    group.bench_function("matcher_clone_with_hash", |b| {
+        b.iter(|| black_box(engine.snapshot_state()));
+    });
+    group.bench_function("matcher_clone_only", |b| {
+        b.iter(|| black_box(engine.snapshot_state_without_hash()));
+    });
+    group.bench_function("writer_hash", |b| {
+        b.iter(|| black_box(hash_symbol_snapshot(&snapshot)));
+    });
+    // Serializer cost into a reused buffer. The writer streams the same bytes
+    // through a `BufWriter` into the temp file; fsync is only reachable from
+    // the recovery test named above.
+    let mut buffer = Vec::with_capacity(bytes);
+    group.bench_function("writer_serialize", |b| {
+        b.iter(|| {
+            buffer.clear();
+            bincode::serialize_into(&mut buffer, &snapshot).expect("snapshot serializes");
+            black_box(buffer.len())
+        });
+    });
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(2))
         .measurement_time(Duration::from_secs(5));
-    targets = bench_insert_cancel, bench_best_price, bench_aggressive_burst, bench_fok_burst, bench_snapshot_hash, bench_engine_state_hash, bench_snapshot_hash_off_thread
+    targets = bench_insert_cancel, bench_best_price, bench_aggressive_burst, bench_fok_burst, bench_snapshot_hash, bench_engine_state_hash, bench_snapshot_hash_off_thread, bench_snapshot_stages
 }
 criterion_main!(benches);

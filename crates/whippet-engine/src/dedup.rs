@@ -56,6 +56,10 @@ impl DedupTable {
         self.map.len()
     }
 
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
@@ -146,24 +150,56 @@ impl DedupTable {
 
     /// Entries in insertion order. Eviction depends on this order, so the
     /// snapshot and the state hash must preserve it, not sort it.
+    ///
+    /// A re-admitted id appears once per admission, so `insertion_order` is the
+    /// exact upper bound and the buffer is sized for it: `collect` over a
+    /// lazy filter grows and copies a multi-megabyte Vec, which is paid on the
+    /// shard thread every time it clones the state for the snapshot writer.
     pub fn entries_in_order(&self) -> Vec<(OrderId, DedupEntry)> {
-        self.insertion_order
-            .iter()
-            .filter_map(|order_id| self.map.get(order_id).map(|entry| (*order_id, *entry)))
-            .collect()
+        let mut entries = Vec::with_capacity(self.insertion_order.len());
+        for order_id in &self.insertion_order {
+            if let Some(entry) = self.map.get(order_id) {
+                entries.push((*order_id, *entry));
+            }
+        }
+        entries
     }
 
-    pub fn from_entries(capacity: usize, entries: Vec<(OrderId, DedupEntry)>) -> Self {
-        let mut table = Self::new(capacity.max(entries.len()));
+    /// The terminal ids in eviction order. Not part of the state hash, but
+    /// snapshotted so a restored table evicts at the same point as a
+    /// continuous replay.
+    pub fn terminal_order(&self) -> Vec<OrderId> {
+        self.terminal_order.iter().copied().collect()
+    }
+
+    pub fn from_entries(
+        capacity: usize,
+        entries: Vec<(OrderId, DedupEntry)>,
+        terminal: Vec<OrderId>,
+    ) -> Self {
+        // Use the configured capacity, not the insertion-walk length: an id
+        // that was evicted and re-admitted appears more than once in `entries`,
+        // so `entries.len()` can exceed the live map size. Inflating the
+        // capacity would make the restored table evict later than a continuous
+        // replay, and the two states diverge once the tail is long enough.
+        let mut table = Self::new(capacity);
         for (order_id, entry) in entries {
             table.insertion_order.push_back(order_id);
-            if matches!(
-                entry.status,
-                DedupStatus::Filled | DedupStatus::Cancelled | DedupStatus::Rejected
-            ) {
+            table.map.insert(order_id, entry);
+        }
+        // Rebuild the eviction queue in its original transition order. An id
+        // that was evicted and re-admitted appears once in the queue, so this
+        // cannot be reconstructed from the insertion walk alone.
+        for order_id in terminal {
+            let terminal = table.map.get(&order_id).is_some_and(|entry| {
+                matches!(
+                    entry.status,
+                    DedupStatus::Filled | DedupStatus::Cancelled | DedupStatus::Rejected
+                )
+            });
+            if terminal {
                 table.terminal_order.push_back(order_id);
             }
-            table.map.insert(order_id, entry);
         }
         table
     }
@@ -188,11 +224,16 @@ impl DedupTable {
 
 /// Reproduce [`DedupTable::hash_into`] over the snapshot form of the table: the
 /// entries in insertion order, as returned by [`DedupTable::entries_in_order`].
-/// The table hashes `map.len()` then walks that exact sequence, so the two are
-/// byte-identical.
+///
+/// The count is the number of **distinct** order ids, not the length of the
+/// slice, because that is what [`DedupTable::hash_into`] writes (`map.len()`).
+/// The two differ once the idempotency window turns over: an id that is evicted
+/// and later re-admitted is walked once per admission but occupies one map
+/// slot. A 200k-command run reaches that state routinely, which is why this
+/// function must not simply hash `entries.len()`.
 pub fn hash_dedup_entries(entries: &[(OrderId, DedupEntry)], hasher: &mut blake3::Hasher) {
     hasher.update(b"dedup");
-    hasher.update(&(entries.len() as u64).to_le_bytes());
+    hasher.update(&(distinct_order_ids(entries) as u64).to_le_bytes());
     for (order_id, entry) in entries {
         hasher.update(&order_id.0.to_le_bytes());
         hasher.update(&[entry.status as u8]);
@@ -200,6 +241,22 @@ pub fn hash_dedup_entries(entries: &[(OrderId, DedupEntry)], hasher: &mut blake3
         hasher.update(&entry.timestamp_ns.to_le_bytes());
         hasher.update(&entry.seq.0.to_le_bytes());
     }
+}
+
+/// Number of distinct order ids in an insertion-order walk.
+///
+/// `entries_in_order` yields one item per admission, so a re-admitted id
+/// appears more than once. This runs on the snapshot writer thread, once per
+/// persistence interval, so a sort is cheaper and far more predictable than a
+/// set of a hundred thousand ids.
+fn distinct_order_ids(entries: &[(OrderId, DedupEntry)]) -> usize {
+    if entries.len() < 2 {
+        return entries.len();
+    }
+    let mut ids: Vec<OrderId> = entries.iter().map(|(order_id, _)| *order_id).collect();
+    ids.sort_unstable_by_key(|order_id| order_id.0);
+    ids.dedup();
+    ids.len()
 }
 
 #[cfg(test)]
@@ -302,13 +359,47 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_restore_preserves_capacity_and_eviction() {
+        let mut table = DedupTable::new(4);
+        for id in 1..=4u64 {
+            table.insert(OrderId(u128::from(id)), entry(id));
+            table.update(OrderId(u128::from(id)), DedupStatus::Filled);
+        }
+        // Evict id 1, then re-admit it: the insertion walk is now longer than
+        // the map, which is the case that used to inflate the restored capacity.
+        table.insert(OrderId(5), entry(5));
+        table.update(OrderId(5), DedupStatus::Filled);
+        table.insert(OrderId(1), entry(1));
+        table.update(OrderId(1), DedupStatus::Filled);
+
+        let walk = table.entries_in_order();
+        assert!(walk.len() > table.len(), "test precondition: re-admission");
+
+        let mut restored = DedupTable::from_entries(4, walk, table.terminal_order());
+        assert_eq!(restored.capacity(), 4, "restored capacity must not inflate");
+        assert_eq!(restored.len(), table.len());
+
+        // Both tables now evict the same id under the same insert.
+        table.insert(OrderId(6), entry(6));
+        restored.insert(OrderId(6), entry(6));
+        for id in 1..=6u64 {
+            assert_eq!(
+                table.contains(OrderId(u128::from(id))),
+                restored.contains(OrderId(u128::from(id))),
+                "id {id} must be present in both tables"
+            );
+        }
+    }
+
+    #[test]
     fn snapshot_restore_preserves_eviction_order() {
         let mut table = DedupTable::new(2);
         table.insert(OrderId(5), entry(5));
         table.update(OrderId(5), DedupStatus::Filled);
         table.insert(OrderId(1), entry(1));
         table.update(OrderId(1), DedupStatus::Filled);
-        let mut restored = DedupTable::from_entries(2, table.entries_in_order());
+        let mut restored =
+            DedupTable::from_entries(2, table.entries_in_order(), table.terminal_order());
         table.insert(OrderId(9), entry(9));
         restored.insert(OrderId(9), entry(9));
         assert_eq!(table.contains(OrderId(5)), restored.contains(OrderId(5)));
@@ -340,5 +431,65 @@ mod tests {
         let mut actual = blake3::Hasher::new();
         table.hash_into(&mut actual);
         assert_eq!(actual.finalize(), expected.finalize());
+    }
+
+    /// Hash the table the way the snapshot writer does: over the insertion-order
+    /// walk, with no access to the map.
+    fn snapshot_hash(table: &DedupTable) -> blake3::Hash {
+        let mut hasher = blake3::Hasher::new();
+        hash_dedup_entries(&table.entries_in_order(), &mut hasher);
+        hasher.finalize()
+    }
+
+    fn live_hash(table: &DedupTable) -> blake3::Hash {
+        let mut hasher = blake3::Hasher::new();
+        table.hash_into(&mut hasher);
+        hasher.finalize()
+    }
+
+    #[test]
+    fn snapshot_hash_matches_after_an_evicted_id_is_readmitted() {
+        // An id that leaves the window and comes back is walked twice by
+        // `hash_into` but occupies one map slot. Hashing the walk's length
+        // instead of the distinct ids made the off-loop hash disagree with the
+        // live one at ~170k orders, so pin it.
+        let mut table = DedupTable::new(2);
+        table.insert(OrderId(1), entry(1));
+        table.update(OrderId(1), DedupStatus::Filled);
+        table.insert(OrderId(2), entry(2));
+        table.update(OrderId(2), DedupStatus::Filled);
+        table.insert(OrderId(3), entry(3));
+        assert!(!table.contains(OrderId(1)), "id 1 should have been evicted");
+
+        table.insert(OrderId(1), entry(9));
+        assert_eq!(table.len(), 2, "admitting id 1 evicted another terminal id");
+        assert!(table.contains(OrderId(1)));
+        let walk = table.entries_in_order();
+        assert_eq!(
+            walk.iter()
+                .filter(|(order_id, _)| *order_id == OrderId(1))
+                .count(),
+            2,
+            "the re-admitted id should appear twice in the walk"
+        );
+        assert!(walk.len() > table.len(), "the walk is longer than the map");
+        assert_eq!(snapshot_hash(&table), live_hash(&table));
+    }
+
+    #[test]
+    fn snapshot_hash_matches_over_a_full_window_turnover() {
+        // Keep re-admitting a rotating id while evicting terminal entries, so
+        // the walk stays longer than the map.
+        let mut table = DedupTable::new(8);
+        for round in 0..200u64 {
+            let order_id = OrderId(u128::from(round % 12) + 1);
+            table.insert(order_id, entry(round));
+            table.update(order_id, DedupStatus::Filled);
+            if round % 3 == 0 {
+                table.insert(OrderId(u128::from(round) + 100), entry(round));
+            }
+        }
+        assert!(table.entries_in_order().len() > table.len());
+        assert_eq!(snapshot_hash(&table), live_hash(&table));
     }
 }
