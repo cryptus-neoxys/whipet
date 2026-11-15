@@ -15,11 +15,12 @@ use futures_util::{SinkExt, StreamExt};
 use hdrhistogram::Histogram;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-use whippet_core::api::{WsClientMessage, WsServerMessage};
-use whippet_core::ids::Symbol;
+use whippet_core::api::{BatchOrderAck, WsClientMessage, WsServerMessage};
+use whippet_core::ids::{Seq, Symbol};
 use whippet_core::manifest::{HostInfo, LatencySummary, MANIFEST_SCHEMA_VERSION};
 
 use crate::{
@@ -32,9 +33,52 @@ pub const STALL_THRESHOLD_US: u64 = 1_000_000;
 const STALL_THRESHOLD: Duration = Duration::from_micros(STALL_THRESHOLD_US);
 const HISTOGRAM_MAX_US: u64 = 60_000_000;
 
+/// How strictly each subscriber validates a frame. `Envelope` (the default) is
+/// the server-bound shape: it deserializes only `"type"` plus the small
+/// identifying fields (`sequence` for state, `level`/`message` for notice,
+/// `symbol`/`seq` for trade, `orders_ingressed` for metrics) and never builds
+/// a `StateView`. `Full` keeps the complete `WsServerMessage` decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ParseMode {
+    #[default]
+    Envelope,
+    Full,
+}
+
+impl FromStr for ParseMode {
+    type Err = String;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "envelope" => Ok(ParseMode::Envelope),
+            "full" => Ok(ParseMode::Full),
+            other => Err(format!(
+                "parse mode must be envelope or full, got {other:?}"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for ParseMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseMode::Envelope => write!(f, "envelope"),
+            ParseMode::Full => write!(f, "full"),
+        }
+    }
+}
+
+fn default_ingress_batch() -> usize {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FanoutConfig {
     pub gateway: String,
+    /// Concurrent WebSocket subscribers. No upper cap: the sweep scales to
+    /// 1,000. Each subscriber is one lightweight task; per-frame allocation
+    /// is bounded by the parse mode (see [`ParseMode`]).
     pub subscribers: usize,
     pub duration_secs: u64,
     pub warmup_secs: u64,
@@ -42,11 +86,21 @@ pub struct FanoutConfig {
     pub symbols: Vec<String>,
     pub output_dir: PathBuf,
     pub label: String,
-    /// Real ingress load posted at `POST /api/orders` while subscribers run.
+    /// Frame validation strictness. `Envelope` (default) decodes only the
+    /// type tag plus identifying fields; `Full` decodes the whole message.
+    #[serde(default)]
+    pub parse_mode: ParseMode,
+    /// Real ingress load posted while subscribers run.
     /// `0` (default) disables the driver and preserves the old quiet-book
     /// measurement.
     #[serde(default)]
     pub ingress_rate: u64,
+    /// Orders per ingress request. `1` (default) posts one order per
+    /// `POST /api/orders`; `N > 1` posts `N` orders per
+    /// `POST /api/orders/batch` with the `{"orders": [...]}` shape, paced so
+    /// the offered order rate is unchanged.
+    #[serde(default = "default_ingress_batch")]
+    pub ingress_batch: usize,
     /// No-subscriber baseline for the comparison mode. Loaded by the example
     /// from `--baseline-metrics PATH`; echoed in the manifest with a note that
     /// compares the `/metrics` deltas with and without subscribers.
@@ -65,7 +119,9 @@ impl Default for FanoutConfig {
             symbols: Vec::new(),
             output_dir: PathBuf::from("artifacts/bench"),
             label: "fanout".into(),
+            parse_mode: ParseMode::default(),
             ingress_rate: 0,
+            ingress_batch: default_ingress_batch(),
             baseline: None,
         }
     }
@@ -112,6 +168,92 @@ pub fn parse_server_frame(text: &str) -> Result<ParsedFrame> {
             orders_ingressed: metrics.orders_ingressed,
         },
     })
+}
+
+/// Minimal envelope over a server frame: only the `"type"` tag plus the small
+/// identifying fields. `serde` ignores every other field, so a state frame
+/// never builds its books, trades, or metrics views. Lifetimes borrow from the
+/// frame text, so a state frame allocates nothing at all.
+#[derive(Debug, Deserialize)]
+struct FrameEnvelope<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: &'a str,
+    #[serde(default)]
+    state: Option<StateSequence>,
+    #[serde(default)]
+    trade: Option<TradeIdentity>,
+    #[serde(default)]
+    metrics: Option<MetricsIdentity>,
+    #[serde(default, borrow)]
+    level: Option<&'a str>,
+    #[serde(default, borrow)]
+    message: Option<&'a str>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StateSequence {
+    #[serde(default)]
+    sequence: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct TradeIdentity {
+    symbol: Symbol,
+    seq: Seq,
+}
+
+#[derive(Debug, Deserialize)]
+struct MetricsIdentity {
+    #[serde(default)]
+    orders_ingressed: u64,
+}
+
+/// Parse only the envelope of a frame: the `"type"` tag plus identifying
+/// fields. The returned [`ParsedFrame`] carries the same variant and key ids
+/// as [`parse_server_frame`], except `State.symbols`/`State.trades` are 0
+/// because the envelope never counts books or tape entries. Byte counting is
+/// left to the caller via `text.len()`.
+pub fn parse_envelope_frame(text: &str) -> Result<ParsedFrame> {
+    let envelope: FrameEnvelope<'_> = serde_json::from_str(text)?;
+    match envelope.kind {
+        "state" => {
+            let state = envelope.state.ok_or_else(|| {
+                BenchError::Config("envelope: state frame is missing its state object".into())
+            })?;
+            Ok(ParsedFrame::State {
+                sequence: state.sequence,
+                symbols: 0,
+                trades: 0,
+            })
+        }
+        "notice" => Ok(ParsedFrame::Notice {
+            level: envelope.level.unwrap_or_default().to_string(),
+            message: envelope.message.unwrap_or_default().to_string(),
+        }),
+        "trade" => {
+            let trade = envelope.trade.ok_or_else(|| {
+                BenchError::Config("envelope: trade frame is missing its trade object".into())
+            })?;
+            Ok(ParsedFrame::Trade {
+                symbol: trade.symbol,
+                seq: trade.seq.0,
+            })
+        }
+        "metrics" => Ok(ParsedFrame::Metrics {
+            orders_ingressed: envelope.metrics.map_or(0, |m| m.orders_ingressed),
+        }),
+        other => Err(BenchError::Config(format!(
+            "envelope: unknown frame type {other:?}"
+        ))),
+    }
+}
+
+/// Parse one frame under the configured [`ParseMode`].
+pub fn parse_server_frame_with_mode(text: &str, mode: ParseMode) -> Result<ParsedFrame> {
+    match mode {
+        ParseMode::Envelope => parse_envelope_frame(text),
+        ParseMode::Full => parse_server_frame(text),
+    }
 }
 
 /// Tracks inter-frame gaps in microseconds and detects stalls (> 1 s without a
@@ -225,6 +367,10 @@ pub struct FanoutMetricsScrape {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct IngressSummary {
     pub target_rate_per_sec: u64,
+    /// Orders per ingress request (`--ingress-batch N`). `1` is single-order
+    /// `POST /api/orders`; `N > 1` is `POST /api/orders/batch`.
+    #[serde(default = "default_ingress_batch")]
+    pub batch_size: usize,
     pub sent: u64,
     pub ok: u64,
     pub errors: u64,
@@ -273,6 +419,8 @@ pub struct FanoutManifest {
     pub subscribers: usize,
     pub trades: usize,
     pub symbols: Vec<String>,
+    /// Frame validation strictness used by every subscriber.
+    pub parse_mode: ParseMode,
     pub warmup_secs: u64,
     pub duration_secs: u64,
     pub measured_secs: f64,
@@ -399,6 +547,45 @@ pub struct IngressPlan {
     pub period_ns: u64,
 }
 
+/// Absolute-deadline pacing plan for the ingress batch driver. Pure so the
+/// pacing math is unit-testable: `total_orders` orders in `total_batches`
+/// batch slots spaced `batch_period_ns` apart, so the offered order rate is
+/// unchanged by the batch size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngressBatchPlan {
+    pub total_orders: u64,
+    pub total_batches: u64,
+    pub batch_period_ns: u64,
+    pub batch_size: usize,
+}
+
+/// Batch pacing for `--ingress-batch N`: `total_orders` stays
+/// `rate_per_sec * total_secs`; the driver issues
+/// `ceil(total_orders / N)` batch slots at `N / rate_per_sec` intervals.
+pub fn plan_ingress_batch(
+    rate_per_sec: u64,
+    total_secs: u64,
+    batch_size: usize,
+) -> IngressBatchPlan {
+    let batch = batch_size.clamp(1, whippet_core::api::MAX_BATCH_ORDERS);
+    if rate_per_sec == 0 || total_secs == 0 {
+        return IngressBatchPlan {
+            total_orders: 0,
+            total_batches: 0,
+            batch_period_ns: 0,
+            batch_size: batch,
+        };
+    }
+    let total_orders = rate_per_sec.saturating_mul(total_secs);
+    let batch_u64 = batch as u64;
+    IngressBatchPlan {
+        total_orders,
+        total_batches: total_orders.div_ceil(batch_u64),
+        batch_period_ns: (1_000_000_000u64.saturating_mul(batch_u64) / rate_per_sec).max(1),
+        batch_size: batch,
+    }
+}
+
 pub fn plan_ingress(rate_per_sec: u64, total_secs: u64) -> IngressPlan {
     if rate_per_sec == 0 || total_secs == 0 {
         return IngressPlan {
@@ -466,63 +653,128 @@ pub fn baseline_note(
     }
 }
 
-/// POST `POST /api/orders` at `rate_per_sec` for `total_secs` seconds on an
+/// POST ingress load at `rate_per_sec` orders/s for `total_secs` seconds on an
 /// absolute-deadline schedule. A `rate_per_sec` of 0 disables the driver and
-/// returns a zero summary. Requests run with bounded concurrency; every
-/// issued request is counted as `ok` (2xx) or `errors`.
+/// returns a zero summary. With `batch_size == 1` each order goes to
+/// `POST /api/orders`; with `batch_size == N` each slot posts `N` orders to
+/// `POST /api/orders/batch` with the `{"orders": [...]}` shape, paced at
+/// `rate_per_sec / N` slots/s so the offered order rate is unchanged. A batch
+/// whose ack does not confirm exactly `N` orders counts `N` errors, mirroring
+/// the main harness. Requests run with bounded concurrency; every issued
+/// order is counted as `ok` (2xx, ack-confirmed) or `errors`.
 async fn run_ingress_driver(
     client: &Client,
     gateway: &str,
     rate_per_sec: u64,
     total_secs: u64,
     symbol: &str,
+    batch_size: usize,
 ) -> IngressSummary {
-    let plan = plan_ingress(rate_per_sec, total_secs);
+    use whippet_core::api::MAX_BATCH_ORDERS;
+    let batch = batch_size.clamp(1, MAX_BATCH_ORDERS);
+    let plan = plan_ingress_batch(rate_per_sec, total_secs, batch);
     if plan.total_orders == 0 {
-        return IngressSummary::default();
+        return IngressSummary {
+            batch_size: batch,
+            ..IngressSummary::default()
+        };
     }
-    let url = format!("{}/api/orders", gateway.trim_end_matches('/'));
+    let base = gateway.trim_end_matches('/');
+    let single_url = format!("{base}/api/orders");
+    let batch_url = format!("{base}/api/orders/batch");
     let started = Instant::now();
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(512));
-    let mut tasks = tokio::task::JoinSet::new();
-    for seq in 0..plan.total_orders {
-        let deadline = started + Duration::from_nanos(plan.period_ns.saturating_mul(seq));
+    // Each task reports `(ok_orders, error_orders)`.
+    let mut tasks = tokio::task::JoinSet::<(u64, u64)>::new();
+    for slot in 0..plan.total_batches {
+        let deadline = started + Duration::from_nanos(plan.batch_period_ns.saturating_mul(slot));
         let now = Instant::now();
         if deadline > now {
             tokio::time::sleep_until(deadline.into()).await;
         }
+        let start_seq = slot.saturating_mul(batch as u64);
+        let end_seq = (start_seq + batch as u64).min(plan.total_orders);
+        let count = (end_seq.saturating_sub(start_seq)) as usize;
+        if count == 0 {
+            continue;
+        }
         let Ok(permit) = semaphore.clone().try_acquire_owned() else {
-            // Saturated driver: count the unsent slot as an error rather than
+            // Saturated driver: count the unsent slot as errors rather than
             // silently lowering the offered rate.
-            tasks.spawn(async move { false });
+            tasks.spawn(async move { (0u64, count as u64) });
             continue;
         };
-        let body = ingress_order_body(seq, symbol);
-        let request = client.post(&url).json(&body).build();
-        let Ok(request) = request else {
-            drop(permit);
-            tasks.spawn(async move { false });
-            continue;
-        };
-        let owned = client.clone();
-        tasks.spawn(async move {
-            let _permit = permit;
-            let response = owned.execute(request).await;
-            matches!(response, Ok(response) if response.status().is_success())
-        });
+        if batch == 1 {
+            let body = ingress_order_body(start_seq, symbol);
+            let request = client.post(&single_url).json(&body).build();
+            let Ok(request) = request else {
+                drop(permit);
+                tasks.spawn(async move { (0u64, 1u64) });
+                continue;
+            };
+            let owned = client.clone();
+            tasks.spawn(async move {
+                let _permit = permit;
+                let response = owned.execute(request).await;
+                if matches!(response, Ok(response) if response.status().is_success()) {
+                    (1u64, 0u64)
+                } else {
+                    (0u64, 1u64)
+                }
+            });
+        } else {
+            let orders: Vec<serde_json::Value> = (start_seq..end_seq)
+                .map(|seq| ingress_order_body(seq, symbol))
+                .collect();
+            let request = client
+                .post(&batch_url)
+                .json(&serde_json::json!({
+                    "orders": orders,
+                }))
+                .build();
+            let Ok(request) = request else {
+                drop(permit);
+                let n = count as u64;
+                tasks.spawn(async move { (0u64, n) });
+                continue;
+            };
+            let owned = client.clone();
+            let expected = count;
+            tasks.spawn(async move {
+                let _permit = permit;
+                let response = owned.execute(request).await;
+                let confirmed = match response {
+                    Ok(response) if response.status().is_success() => response
+                        .json::<BatchOrderAck>()
+                        .await
+                        .map(|ack| ack.count as usize == expected && ack.orders.len() == expected)
+                        .unwrap_or(false),
+                    _ => false,
+                };
+                if confirmed {
+                    (expected as u64, 0u64)
+                } else {
+                    (0u64, expected as u64)
+                }
+            });
+        }
     }
     let mut ok = 0u64;
     let mut errors = 0u64;
     while let Some(outcome) = tasks.join_next().await {
         match outcome {
-            Ok(true) => ok += 1,
-            _ => errors += 1,
+            Ok((ok_orders, error_orders)) => {
+                ok += ok_orders;
+                errors += error_orders;
+            }
+            _ => errors += batch as u64,
         }
     }
     let elapsed_secs = started.elapsed().as_secs_f64();
     let sent = ok + errors;
     IngressSummary {
         target_rate_per_sec: rate_per_sec,
+        batch_size: batch,
         sent,
         ok,
         errors,
@@ -535,10 +787,19 @@ fn validate_config(config: &FanoutConfig) -> Result<Vec<Symbol>> {
     if config.subscribers == 0 {
         return Err(BenchError::Config("subscribers must be at least 1".into()));
     }
+    // No upper cap: the sweep scales to 1,000 subscribers. Each subscriber is
+    // one lightweight task with no retained payload, so the client stays
+    // server-bound.
     if config.duration_secs == 0 {
         return Err(BenchError::Config(
             "duration_secs must be at least 1".into(),
         ));
+    }
+    if config.ingress_batch == 0 || config.ingress_batch > whippet_core::api::MAX_BATCH_ORDERS {
+        return Err(BenchError::Config(format!(
+            "ingress_batch must be 1..={} (one batch is one Iggy append)",
+            whippet_core::api::MAX_BATCH_ORDERS
+        )));
     }
     let _ = ws_url(&config.gateway, config.trades)?;
     let _ = metrics_url(&config.gateway)?;
@@ -591,6 +852,7 @@ async fn run_subscriber(
     mut socket: WsStream,
     measure_start: Instant,
     measure_end: Instant,
+    parse_mode: ParseMode,
 ) -> ClientRun {
     let mut frames = 0u64;
     let mut bytes = 0u64;
@@ -613,7 +875,7 @@ async fn run_subscriber(
                 let measured = received >= measure_start;
                 let frame_str: &str = text.as_ref();
                 let frame_len = frame_str.len() as u64;
-                if parse_server_frame(frame_str).is_err() {
+                if parse_server_frame_with_mode(frame_str, parse_mode).is_err() {
                     if measured {
                         parse_errors += 1;
                     }
@@ -634,7 +896,7 @@ async fn run_subscriber(
                 let frame_len = bin.len() as u64;
                 match std::str::from_utf8(&bin)
                     .ok()
-                    .and_then(|text| parse_server_frame(text).ok())
+                    .and_then(|text| parse_server_frame_with_mode(text, parse_mode).ok())
                 {
                     Some(_) => {
                         tracker.observe_frame(received, measured, measure_start);
@@ -742,6 +1004,7 @@ pub async fn run_fanout(config: FanoutConfig) -> Result<FanoutManifest> {
     let ingress_gateway = config.gateway.clone();
     let ingress_rate = config.ingress_rate;
     let ingress_secs = config.warmup_secs + config.duration_secs;
+    let ingress_batch = config.ingress_batch;
     let ingress_task = tokio::spawn(async move {
         run_ingress_driver(
             &ingress_client,
@@ -749,17 +1012,20 @@ pub async fn run_fanout(config: FanoutConfig) -> Result<FanoutManifest> {
             ingress_rate,
             ingress_secs,
             &ingress_symbol,
+            ingress_batch,
         )
         .await
     });
 
     let mut tasks = Vec::with_capacity(sockets.len());
+    let parse_mode = config.parse_mode;
     for (client_id, socket) in sockets.into_iter().enumerate() {
         tasks.push(tokio::spawn(run_subscriber(
             client_id,
             socket,
             measure_start,
             measure_end,
+            parse_mode,
         )));
     }
 
@@ -831,13 +1097,25 @@ pub async fn run_fanout(config: FanoutConfig) -> Result<FanoutManifest> {
         ),
         "Frames are decoded and discarded immediately; payloads are never stored in the harness."
             .into(),
+        match config.parse_mode {
+            ParseMode::Envelope => "Parse mode: envelope (only the \"type\" tag plus identifying fields \
+             are decoded; state symbol/trade counts are not decoded; bytes are still counted)."
+                .into(),
+            ParseMode::Full => "Parse mode: full (every frame is decoded as a complete WsServerMessage)."
+                .into(),
+        },
         "A client with no frame for >1 s (1,000,000 µs) during the measured window is flagged as stalled."
             .into(),
     ];
     if ingress.sent > 0 {
+        let endpoint = if ingress.batch_size > 1 {
+            format!("POST /api/orders/batch (batch {})", ingress.batch_size)
+        } else {
+            "POST /api/orders".into()
+        };
         notes.push(format!(
             "Ingress driver: target {} orders/s for {} s (warmup + measured), sent {} (ok {}, errors {}), \
-             achieved {:.0} orders/s over {:.1} s via POST /api/orders.",
+             achieved {:.0} orders/s over {:.1} s via {endpoint}.",
             ingress.target_rate_per_sec,
             ingress_secs,
             ingress.sent,
@@ -897,6 +1175,7 @@ pub async fn run_fanout(config: FanoutConfig) -> Result<FanoutManifest> {
         subscribers: config.subscribers,
         trades: config.trades,
         symbols: config.symbols.clone(),
+        parse_mode: config.parse_mode,
         warmup_secs: config.warmup_secs,
         duration_secs: config.duration_secs,
         measured_secs,
@@ -1011,6 +1290,128 @@ mod tests {
     }
 
     #[test]
+    fn envelope_parse_matches_full_parse_for_state_and_notice_frames() {
+        let state_json = serde_json::to_string(&WsServerMessage::State {
+            state: sample_state_view(),
+        })
+        .unwrap();
+        let full = parse_server_frame(&state_json).unwrap();
+        let envelope = parse_envelope_frame(&state_json).unwrap();
+        match (&full, &envelope) {
+            (
+                ParsedFrame::State {
+                    sequence: full_seq, ..
+                },
+                ParsedFrame::State {
+                    sequence: env_seq, ..
+                },
+            ) => assert_eq!(full_seq, env_seq),
+            _ => panic!("envelope changed the frame variant: {full:?} vs {envelope:?}"),
+        }
+        // The envelope skips book/tape counts; the caller still counts bytes.
+        assert_eq!(
+            envelope,
+            ParsedFrame::State {
+                sequence: 42,
+                symbols: 0,
+                trades: 0,
+            }
+        );
+        assert!(u64::try_from(state_json.len()).is_ok());
+        assert_eq!(
+            parse_server_frame_with_mode(&state_json, ParseMode::Envelope).unwrap(),
+            envelope
+        );
+        assert_eq!(
+            parse_server_frame_with_mode(&state_json, ParseMode::Full).unwrap(),
+            full
+        );
+
+        let notice_json = serde_json::to_string(&WsServerMessage::Notice {
+            level: "pong".into(),
+            message: "1700000000000000000".into(),
+        })
+        .unwrap();
+        let full_notice = parse_server_frame(&notice_json).unwrap();
+        let envelope_notice = parse_envelope_frame(&notice_json).unwrap();
+        assert_eq!(full_notice, envelope_notice);
+
+        let bogus = r#"{"type":"nope","sequence":1}"#;
+        assert!(parse_envelope_frame(bogus).is_err());
+        let stateless = r#"{"type":"state"}"#;
+        assert!(parse_envelope_frame(stateless).is_err());
+    }
+
+    #[test]
+    fn parse_mode_flag_round_trips_with_envelope_default() {
+        assert_eq!(ParseMode::default(), ParseMode::Envelope);
+        assert_eq!(
+            "envelope".parse::<ParseMode>().unwrap(),
+            ParseMode::Envelope
+        );
+        assert_eq!("full".parse::<ParseMode>().unwrap(), ParseMode::Full);
+        assert!("json".parse::<ParseMode>().is_err());
+        assert_eq!(ParseMode::Envelope.to_string(), "envelope");
+        assert_eq!(ParseMode::Full.to_string(), "full");
+    }
+
+    #[test]
+    fn ingress_batch_pacing_keeps_the_offered_order_rate() {
+        let off = plan_ingress_batch(0, 35, 10);
+        assert_eq!(off.total_orders, 0);
+        assert_eq!(off.total_batches, 0);
+        assert_eq!(off.batch_period_ns, 0);
+
+        // 10k orders/s in batches of 10: one batch slot per millisecond.
+        let batch10 = plan_ingress_batch(10_000, 35, 10);
+        assert_eq!(batch10.total_orders, 350_000);
+        assert_eq!(batch10.total_batches, 35_000);
+        assert_eq!(batch10.batch_period_ns, 1_000_000);
+        assert_eq!(batch10.batch_size, 10);
+
+        // Batch 1 matches the single-order plan exactly.
+        let single = plan_ingress(10_000, 35);
+        let batch1 = plan_ingress_batch(10_000, 35, 1);
+        assert_eq!(batch1.total_orders, single.total_orders);
+        assert_eq!(batch1.total_batches, single.total_orders);
+        assert_eq!(batch1.batch_period_ns, single.period_ns);
+
+        // A remainder forms a short final batch instead of dropping orders.
+        let partial = plan_ingress_batch(1_005, 1, 10);
+        assert_eq!(partial.total_orders, 1_005);
+        assert_eq!(partial.total_batches, 101);
+
+        // Batch sizes clamp into the gateway's 1..=256 range.
+        assert_eq!(plan_ingress_batch(1_000, 10, 0).batch_size, 1);
+        assert_eq!(
+            plan_ingress_batch(1_000, 10, 999).batch_size,
+            whippet_core::api::MAX_BATCH_ORDERS
+        );
+    }
+
+    #[test]
+    fn thousand_subscriber_plan_has_no_per_subscriber_payload() {
+        let config = FanoutConfig {
+            subscribers: 1000,
+            ..FanoutConfig::default()
+        };
+        assert!(validate_config(&config).is_ok());
+        // One task slot per subscriber; each run record holds only counters
+        // and a fixed-size gap histogram, never a frame payload.
+        assert!(
+            std::mem::size_of::<ClientRun>() <= 4096,
+            "ClientRun grew to {} bytes",
+            std::mem::size_of::<ClientRun>()
+        );
+        // The parsed frame itself carries no vectors or maps.
+        assert!(
+            std::mem::size_of::<ParsedFrame>() <= 128,
+            "ParsedFrame grew to {} bytes",
+            std::mem::size_of::<ParsedFrame>()
+        );
+    }
+
+    #[test]
     fn fanout_manifest_json_shape_contains_required_fields() {
         let (gap_us, _) = summarize_gaps_us(&[50_000, 50_100, 51_000]);
         let host = HostInfo {
@@ -1043,6 +1444,7 @@ mod tests {
             subscribers: 10,
             trades: 0,
             symbols: vec!["BTC-USD".into()],
+            parse_mode: ParseMode::Envelope,
             warmup_secs: 5,
             duration_secs: 30,
             measured_secs: 30.0,
@@ -1080,6 +1482,7 @@ mod tests {
             ),
             ingress: IngressSummary {
                 target_rate_per_sec: 10_000,
+                batch_size: 10,
                 sent: 300_000,
                 ok: 299_900,
                 errors: 100,
@@ -1107,6 +1510,7 @@ mod tests {
         assert_eq!(value["gateway"], "http://127.0.0.1:8080");
         assert_eq!(value["subscribers"], 10);
         assert_eq!(value["trades"], 0);
+        assert_eq!(value["parse_mode"], "envelope");
         assert_eq!(value["symbols"][0], "BTC-USD");
         assert_eq!(value["duration_secs"], 30);
         assert_eq!(value["frames_per_sec"], 200.0);
@@ -1119,6 +1523,7 @@ mod tests {
         assert_eq!(value["metrics"]["md_sequence_delta"], 600);
         assert!(value["metrics"]["process_cpu_seconds_delta"].is_null());
         assert_eq!(value["ingress"]["target_rate_per_sec"], 10_000);
+        assert_eq!(value["ingress"]["batch_size"], 10);
         assert_eq!(value["ingress"]["sent"], 300_000);
         assert_eq!(value["ingress"]["errors"], 100);
         assert_eq!(value["baseline"]["orders_ingressed_delta"], 300_000);
@@ -1317,7 +1722,9 @@ whippet_md_sequence 6789
             symbols: Vec::new(),
             output_dir: output_dir.clone(),
             label: "dev-loop-fanout".into(),
+            parse_mode: ParseMode::Envelope,
             ingress_rate: 0,
+            ingress_batch: 1,
             baseline: None,
         };
         let manifest = run_fanout(config).await.unwrap();

@@ -22,7 +22,7 @@
 use std::path::PathBuf;
 
 use whippet_bench::BenchError;
-use whippet_bench::fanout::{BaselineSnapshot, FanoutConfig, run_fanout};
+use whippet_bench::fanout::{BaselineSnapshot, FanoutConfig, ParseMode, run_fanout};
 
 fn take(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, BenchError> {
     args.next()
@@ -43,7 +43,14 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<FanoutCon
             "--duration" => config.duration_secs = parse(&flag, &take(&mut args, &flag)?)?,
             "--warmup" => config.warmup_secs = parse(&flag, &take(&mut args, &flag)?)?,
             "--trades" => config.trades = parse(&flag, &take(&mut args, &flag)?)?,
+            "--parse" => {
+                let raw = take(&mut args, &flag)?;
+                config.parse_mode = raw.parse::<ParseMode>().map_err(BenchError::Config)?;
+            }
             "--ingress-rate" => config.ingress_rate = parse(&flag, &take(&mut args, &flag)?)?,
+            "--ingress-batch" => {
+                config.ingress_batch = parse(&flag, &take(&mut args, &flag)?)?;
+            }
             "--baseline-metrics" => {
                 config.baseline = Some(load_baseline(&take(&mut args, &flag)?)?);
             }
@@ -60,8 +67,8 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<FanoutCon
             "-h" | "--help" => {
                 println!(
                     "usage: fanout [--gateway URL] [--subscribers N] [--duration S] [--warmup S]\n\
-                     \x20      [--trades N] [--ingress-rate R] [--baseline-metrics PATH]\n\
-                     \x20      [--symbols A,B] [--output-dir DIR] [--label NAME]"
+                     \x20      [--trades N] [--parse envelope|full] [--ingress-rate R] [--ingress-batch N]\n\
+                     \x20      [--baseline-metrics PATH] [--symbols A,B] [--output-dir DIR] [--label NAME]"
                 );
                 return Ok(None);
             }
@@ -101,9 +108,10 @@ fn main() -> Result<(), BenchError> {
     let manifest = runtime.block_on(run_fanout(config))?;
 
     println!(
-        "{}  subs={}  frames/s={:.1} ({:.1}/client)  bytes/s/client={:.0}  agg_bytes/s={:.0}  gap_p50={:.0}µs  gap_p99={:.0}µs  stalled={}  scope={}",
+        "{}  subs={}  parse={}  frames/s={:.1} ({:.1}/client)  bytes/s/client={:.0}  agg_bytes/s={:.0}  gap_p50={:.0}µs  gap_p99={:.0}µs  stalled={}  scope={}",
         manifest.label,
         manifest.subscribers,
+        manifest.parse_mode,
         manifest.frames_per_sec,
         manifest.frames_per_sec_per_client,
         manifest.bytes_per_sec_per_client,
@@ -133,8 +141,9 @@ fn main() -> Result<(), BenchError> {
     }
     if manifest.ingress.sent > 0 {
         println!(
-            "ingress: target={}/s  sent={}  ok={}  errors={}  achieved={:.0}/s",
+            "ingress: target={}/s  batch={}  sent={}  ok={}  errors={}  achieved={:.0}/s",
             manifest.ingress.target_rate_per_sec,
+            manifest.ingress.batch_size,
             manifest.ingress.sent,
             manifest.ingress.ok,
             manifest.ingress.errors,
@@ -161,7 +170,9 @@ mod tests {
         assert_eq!(defaults.duration_secs, 30);
         assert_eq!(defaults.warmup_secs, 5);
         assert_eq!(defaults.trades, 0);
+        assert_eq!(defaults.parse_mode, ParseMode::Envelope);
         assert_eq!(defaults.ingress_rate, 0);
+        assert_eq!(defaults.ingress_batch, 1);
         assert!(defaults.baseline.is_none());
         assert!(defaults.symbols.is_empty());
         assert_eq!(defaults.output_dir, PathBuf::from("artifacts/bench"));
@@ -178,8 +189,12 @@ mod tests {
             "3",
             "--trades",
             "25",
+            "--parse",
+            "full",
             "--ingress-rate",
             "10000",
+            "--ingress-batch",
+            "10",
             "--symbols",
             "BTC-USD,ETH-USD",
             "--output-dir",
@@ -195,7 +210,9 @@ mod tests {
         assert_eq!(custom.duration_secs, 15);
         assert_eq!(custom.warmup_secs, 3);
         assert_eq!(custom.trades, 25);
+        assert_eq!(custom.parse_mode, ParseMode::Full);
         assert_eq!(custom.ingress_rate, 10_000);
+        assert_eq!(custom.ingress_batch, 10);
         assert_eq!(custom.symbols, vec!["BTC-USD", "ETH-USD"]);
         assert_eq!(custom.output_dir, PathBuf::from("/tmp/out"));
         assert_eq!(custom.label, "dev-loop-fanout");
@@ -220,5 +237,20 @@ mod tests {
         assert_eq!(baseline.orders_ingressed_delta, Some(300_000));
         assert_eq!(baseline.md_sequence_delta, Some(600));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn thousand_subscribers_parse_without_a_cap() {
+        let args = ["--subscribers", "1000"].into_iter().map(String::from);
+        let config = parse_args(args).unwrap().unwrap();
+        assert_eq!(config.subscribers, 1000);
+    }
+
+    #[test]
+    fn parse_and_ingress_batch_flags_reject_bad_values() {
+        let bad_mode = ["--parse", "json"].into_iter().map(String::from);
+        assert!(parse_args(bad_mode).is_err());
+        let bad_batch = ["--ingress-batch", "nope"].into_iter().map(String::from);
+        assert!(parse_args(bad_batch).is_err());
     }
 }

@@ -321,7 +321,7 @@ is the honest status of this harness.
 |---|---|---|---|---|
 | L1 | 64 B orders, 1 symbol | 1k / 5k / 10k / 25k / 50k / 100k orders/s | 5 min x 5 | Partial. HTTP JSON by default, binary TCP with `--transport tcp`, mixed limit/IOC/cancel flow, optional batching, TCP stage timestamps. Payload size is not 64 B on the wire. |
 | L2 | 256 B, 10 symbols | 10k / 50k orders/s | 5 min x 5 | Partial. Only three instruments exist; the runner labels the row `L2-3sym`. |
-| F1 | 10k orders/s | 1 / 10 / 100 / 1000 subscribers | 5 min x 5 | Partial. `examples/fanout.rs` (`scripts/bench-fanout.sh`) measures `/ws` fanout across `N` subscribers and can add real ingress with `--ingress-rate` (`WHIPPET_FANOUT_INGRESS_RATE`); a 10k/s comparison pair has not been recorded yet. |
+| F1 | 10k orders/s | 1 / 10 / 100 / 1000 subscribers | 5 min x 5 | Partial. `examples/fanout.rs` (`scripts/bench-fanout.sh`) measures `/ws` fanout across `N` subscribers (scales to 1,000) with batched `--ingress-rate` ingress (`--ingress-batch`, `WHIPPET_FANOUT_INGRESS_BATCH`) and envelope-or-full `--parse` validation; a 10k/s comparison pair has not been recorded yet. |
 | F2 | Fixed 100k egress/s | 10 / 100 subscribers | 5 min x 5 | No. |
 | R1 | 10M replay | 0 / mid / tail; 1 / 10 / 100 consumers | drain x 5 | No. `whippet replay` exists for correctness, not replay throughput. |
 | R2 | Replay + live 10k/s | 1 config | 5 min x 5 | No. |
@@ -637,13 +637,29 @@ the 100-subscriber one (59.6 ms); this is scheduler noise on a shared laptop,
 not a scaling trend. These are `dev-loop`, one-run numbers, not headline
 results.
 
+With the ingress driver batched (`--ingress-batch 10`, 10,000 orders/s) and
+envelope parsing, 500 subscribers delivered 20 fps and ~245 KB/s/client with
+0 ingress errors and 0 stalled clients. A 1,000-subscriber run fails through
+Docker Desktop's host port proxy with a socket reset before the node's 2,048
+WebSocket cap is reached; the node itself is not the limit. Treat 1,000 as a
+native-Linux/direct-network target, not a Docker Desktop result.
+
 ### Method
 
 - **Connection and subscription.** The harness opens `--subscribers N`
   concurrent WebSocket connections (`tokio-tungstenite`, `TCP_NODELAY`) to
-  `/ws?trades=T` before starting the measurement clock. When `--symbols` is
-  supplied, each subscriber immediately sends
-  `{"type":"subscribe","symbols":[...]}` (`WsClientMessage::Subscribe`).
+  `/ws?trades=T` before starting the measurement clock. There is no upper
+  cap; the sweep scales to 1,000 subscribers. Each subscriber is one
+  lightweight task that retains no frame payload, so the measurement stays
+  server-bound. When `--symbols` is supplied, each subscriber immediately
+  sends `{"type":"subscribe","symbols":[...]}` (`WsClientMessage::Subscribe`).
+- **Frame validation (`--parse`).** `envelope` (default) decodes only the
+  `"type"` tag plus identifying fields (`sequence` for state,
+  `level`/`message` for notice, `symbol`/`seq` for trade, `orders_ingressed`
+  for metrics) and never builds a `StateView`; state symbol/trade counts are
+  left at zero and bytes are still counted per frame. `full` keeps the
+  complete `WsServerMessage` decode. The mode is recorded in the manifest
+  (`parse_mode`) and in the notes.
 - **Warmup and measured window.** Every subscriber drains frames for
   `--warmup S` seconds and then records measurements for `--duration S`
   seconds. Each incoming text or binary frame is parsed as `WsServerMessage`
@@ -656,13 +672,19 @@ results.
   flagged as `stalled = true`, `stalled_clients` is incremented, and the
   manifest adds the `stalled-subscriber` label.
 - **Ingress driver.** With `--ingress-rate R` (`WHIPPET_FANOUT_INGRESS_RATE`
-  in `scripts/bench-fanout.sh`) the harness also posts `R` same-symbol ladder
-  limit orders/s at `POST /api/orders` for the whole run (warmup + measured)
-  while the subscribers listen. Every order carries a unique client id and
-  participant, so repeated runs never collide. The manifest records the target
-  rate, achieved rate, sent/ok/error counts, and the `/metrics` deltas across
-  the run in a new `ingress` field. With `R = 0` (default) the driver is off
-  and the manifest says so; use that shape as the no-subscriber baseline.
+  in `scripts/bench-fanout.sh`) the harness posts `R` same-symbol ladder
+  limit orders/s for the whole run (warmup + measured) while the subscribers
+  listen. With `--ingress-batch N` (`WHIPPET_FANOUT_INGRESS_BATCH`, default
+  1) each slot posts `N` orders to `POST /api/orders/batch` with the
+  `{"orders": [...]}` shape, paced at `R / N` slots/s so the offered order
+  rate is unchanged; a batch whose ack does not confirm exactly `N` orders
+  counts `N` errors. The single-order 10k/s shape is past the durable knee and
+  produced ~27% errors; batch 10 is the valid 10k/s shape. Every order carries
+  a unique client id and participant, so repeated runs never collide. The
+  manifest records the target rate, batch size, achieved rate, sent/ok/error
+  counts, and the `/metrics` deltas across the run in a new `ingress` field.
+  With `R = 0` (default) the driver is off and the manifest says so; use that
+  shape as the no-subscriber baseline.
 - **Server `/metrics` scrape.** Immediately before warmup and after the
   measured window, the harness scrapes `GET /metrics` on the gateway and
   records `whippet_orders_ingressed_total`, `whippet_md_sequence`, and
@@ -679,21 +701,29 @@ results.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--gateway` | `http://127.0.0.1:8080` | Gateway HTTP or WebSocket base URL |
-| `--subscribers` | `10` | Concurrent WebSocket subscribers (`N >= 1`) |
+| `--subscribers` | `10` | Concurrent WebSocket subscribers (`N >= 1`, no upper cap; scales to 1,000) |
 | `--duration` | `30` | Measured window in seconds |
 | `--warmup` | `5` | Warmup window in seconds (excluded from counts/histograms) |
 | `--trades` | `0` | Trade tape limit passed as `/ws?trades=N` (`0` = full tape) |
-| `--ingress-rate` | `0` | Real ingress load in orders/s via `POST /api/orders` for warmup + measured (`0` = off) |
+| `--ingress-rate` | `0` | Real ingress load in orders/s for warmup + measured (`0` = off) |
+| `--ingress-batch` | `1` | Orders per ingress request: `1` = `POST /api/orders`, `N > 1` = `POST /api/orders/batch` paced at `R / N` slots/s |
+| `--parse` | `envelope` | Frame validation: `envelope` (type tag + identifying fields) or `full` (`WsServerMessage` decode) |
 | `--baseline-metrics` | *(none)* | Path to a no-subscriber baseline manifest; the manifest echoes its `/metrics` deltas with a comparison note |
 | `--symbols` | *(all)* | Optional comma-separated symbol filter sent as `Subscribe` |
 | `--output-dir` | `artifacts/bench` | Directory for `<run-id>.json` |
 | `--label` | `fanout` | Workload label recorded in the manifest |
 
-Sweep 1 / 10 / 100 subscribers for 30 s each (simulator stopped, label
-`dev-loop-fanout`):
+Sweep 1 / 10 / 100 / 1,000 subscribers for 30 s each (simulator stopped,
+label `dev-loop-fanout`, 10k orders/s ingress in batches of 10, envelope
+parse), writing to `artifacts/bench`:
 
 ```sh
 scripts/bench-fanout.sh
+# equivalent defaults:
+# WHIPPET_FANOUT_SUBSCRIBERS=1,10,100,1000 WHIPPET_FANOUT_INGRESS_RATE=10000 \
+# WHIPPET_FANOUT_INGRESS_BATCH=10 WHIPPET_FANOUT_PARSE=envelope \
+# WHIPPET_FANOUT_LABEL=dev-loop-fanout \
+# WHIPPET_FANOUT_OUTPUT_DIR=./artifacts/bench scripts/bench-fanout.sh
 ```
 
 Manual single runs:
@@ -705,6 +735,9 @@ cargo run --release -p whippet-bench --example fanout -- \
   --duration 30 \
   --warmup 5 \
   --trades 0 \
+  --parse envelope \
+  --ingress-rate 10000 \
+  --ingress-batch 10 \
   --label dev-loop-fanout \
   --output-dir artifacts/bench
 
@@ -715,19 +748,34 @@ cargo run --release -p whippet-bench --example fanout -- \
   --duration 30 \
   --warmup 5 \
   --trades 25 \
+  --parse envelope \
   --symbols BTC-USD \
+  --label dev-loop-fanout \
+  --output-dir artifacts/bench
+
+# 1,000-subscriber server-bound shape (envelope parse, batched 10k/s ingress):
+cargo run --release -p whippet-bench --example fanout -- \
+  --gateway http://127.0.0.1:8080 \
+  --subscribers 1000 \
+  --duration 30 \
+  --warmup 5 \
+  --trades 0 \
+  --parse envelope \
+  --ingress-rate 10000 \
+  --ingress-batch 10 \
   --label dev-loop-fanout \
   --output-dir artifacts/bench
 ```
 
-Comparison mode (quiet book vs 10k/s ingress, same subscriber count):
+Comparison mode (quiet book vs batched 10k/s ingress, same subscriber count):
 
 ```sh
 # 1. Quiet-book baseline: driver off. This manifest is the baseline.
 WHIPPET_FANOUT_SUBSCRIBERS=1 WHIPPET_FANOUT_INGRESS_RATE=0 \
   scripts/bench-fanout.sh
-# 2. Loaded run: same subscribers, driver on, baseline attached.
+# 2. Loaded run: same subscribers, batched driver on, baseline attached.
 WHIPPET_FANOUT_SUBSCRIBERS=1 WHIPPET_FANOUT_INGRESS_RATE=10000 \
+  WHIPPET_FANOUT_INGRESS_BATCH=10 \
   WHIPPET_FANOUT_BASELINE_METRICS=artifacts/bench/<baseline-run-id>.json \
   scripts/bench-fanout.sh
 ```
@@ -742,7 +790,9 @@ cargo run --release -p whippet-bench --example fanout -- \
   --subscribers 1 \
   --duration 30 \
   --warmup 5 \
+  --parse envelope \
   --ingress-rate 10000 \
+  --ingress-batch 10 \
   --baseline-metrics artifacts/bench/<baseline-run-id>.json \
   --label dev-loop-fanout-ingress \
   --output-dir artifacts/bench
@@ -771,6 +821,7 @@ ingress `BenchManifest` schema:
   "subscribers": 10,
   "trades": 0,
   "symbols": ["BTC-USD"],
+  "parse_mode": "envelope",
   "warmup_secs": 5,
   "duration_secs": 30,
   "measured_secs": 30.0,
@@ -825,6 +876,7 @@ ingress `BenchManifest` schema:
   },
   "ingress": {
     "target_rate_per_sec": 0,
+    "batch_size": 1,
     "sent": 0,
     "ok": 0,
     "errors": 0,
@@ -843,11 +895,23 @@ and the notes carry the subscriber-overhead comparison.
 
 ### Results
 
-**Status: pending.** Neither the `dev-loop-fanout` sweep (1 / 10 / 100
-subscribers), the `--ingress-rate 10000` comparison pair, nor a native Linux
-fanout run has been recorded yet. Run `scripts/bench-fanout.sh` and link the
-resulting manifests from
-`artifacts/bench/` before quoting any fanout numbers.
+**Status: pending.** No `dev-loop-fanout` numbers have been recorded with
+the server-bound shape yet (envelope parse, `--ingress-rate 10000`
+`--ingress-batch 10`). The sweep matrix is 1 / 10 / 100 / 1,000
+subscribers, 30 s measured each; run `scripts/bench-fanout.sh` and link the
+resulting manifests from `artifacts/bench/` before quoting any fanout
+numbers. The 1,000-subscriber row is new: it must show zero stalls with the
+envelope parser before the client is called server-bound at that scale.
+
+| Subscribers | Frames/s | Aggregate MB/s | Gap p50 | Gap p99 | Stalled |
+|---:|---:|---:|---:|---:|---:|
+| 1 | pending | pending | pending | pending | pending |
+| 10 | pending | pending | pending | pending | pending |
+| 100 | pending | pending | pending | pending | pending |
+| 1,000 | pending | pending | pending | pending | pending |
+
+Neither the `--ingress-rate 10000 --ingress-batch 10` comparison pair nor a
+native Linux fanout run has been recorded yet either.
 
 ## Soak (constant-rate proof — dev-loop measured)
 
