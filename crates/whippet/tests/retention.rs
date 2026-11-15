@@ -90,8 +90,17 @@ fn plan_args(dir: &Path, safety_margin_records: u64, json: bool) -> RetentionPla
     }
 }
 
+/// One synthetic MD record per unit. Retention reads only the committed
+/// offset, so the payload is intentionally meaningless; the record exists so
+/// the consumer commits a real offset on a non-empty topic.
+fn md_messages(count: u64) -> Vec<JournalMessage> {
+    (0..count)
+        .map(|_| JournalMessage::new(vec![0], Vec::new()))
+        .collect()
+}
+
 /// Seed a memory journal on the orders partition, commit the engine consumer
-/// through `committed`, and record the MD topic offset as a diagnostic.
+/// through `committed`, and record a valid MD topic offset as a diagnostic.
 fn seeded_journal(partition: u32, records: usize, committed: u64) -> Journal {
     let memory = MemoryJournal::new();
     let messages: Vec<JournalMessage> = orders(btc(), records as u64)
@@ -104,6 +113,11 @@ fn seeded_journal(partition: u32, records: usize, committed: u64) -> Journal {
         partition,
         &format!("whippet-engine-p{partition}"),
         committed,
+    );
+    memory.append(
+        Topic::Md,
+        partition,
+        &md_messages(committed.saturating_add(1)),
     );
     memory.commit(
         Topic::Md,
@@ -346,6 +360,7 @@ async fn an_md_offset_behind_the_engine_does_not_block_deletion() {
         &format!("whippet-engine-p{partition}"),
         19,
     );
+    memory.append(Topic::Md, partition, &md_messages(1));
     memory.commit(Topic::Md, partition, &format!("whippet-md-p{partition}"), 0);
     let journal = Journal::Memory(memory);
 
@@ -373,6 +388,7 @@ async fn a_missing_engine_commit_blocks_even_when_md_has_committed() {
         .map(|command| JournalMessage::new(command.encode(), Vec::new()))
         .collect();
     memory.append(Topic::Orders, partition, &messages);
+    memory.append(Topic::Md, partition, &md_messages(20));
     memory.commit(
         Topic::Md,
         partition,

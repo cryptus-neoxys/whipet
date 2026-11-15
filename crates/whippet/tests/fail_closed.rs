@@ -156,12 +156,16 @@ fn memory_journal(partition: u32, commands: &[Command], committed: u64) -> Journ
         .map(|command| JournalMessage::new(command.encode(), Vec::new()))
         .collect();
     memory.append(Topic::Orders, partition, &messages);
-    memory.commit(
-        Topic::Orders,
-        partition,
-        &format!("whippet-engine-p{partition}"),
-        committed,
-    );
+    // A commit is the last applied record, so an empty log has no offset to
+    // commit. Skip it rather than hand the journal an impossible resume point.
+    if !commands.is_empty() {
+        memory.commit(
+            Topic::Orders,
+            partition,
+            &format!("whippet-engine-p{partition}"),
+            committed,
+        );
+    }
     Journal::Memory(memory)
 }
 

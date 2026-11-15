@@ -49,12 +49,15 @@ fn partitions_have_independent_offsets_and_watermarks() {
     );
     assert!(journal.read(Topic::Orders, 0, 99, 10).is_empty());
     assert!(journal.read(Topic::Orders, 7, 0, 10).is_empty());
+    journal
+        .check_invariants()
+        .expect("per-partition offsets and watermarks");
 }
 
 #[test]
 fn commits_are_scoped_to_consumer_and_partition() {
     let journal = MemoryJournal::new();
-    journal.append(Topic::Orders, 0, &[message(1)]);
+    journal.append(Topic::Orders, 0, &[message(1), message(2), message(3)]);
     journal.append(Topic::Orders, 1, &[message(2)]);
 
     journal.commit(Topic::Orders, 0, "engine-p0", 0);
@@ -62,12 +65,16 @@ fn commits_are_scoped_to_consumer_and_partition() {
     assert_eq!(journal.committed(Topic::Orders, 1, "engine-p0"), None);
     assert_eq!(journal.committed(Topic::Orders, 0, "other"), None);
 
-    // Manual commits are explicit writes; the last one wins.
-    journal.commit(Topic::Orders, 0, "engine-p0", 5);
-    assert_eq!(journal.committed(Topic::Orders, 0, "engine-p0"), Some(5));
-    journal.commit(Topic::Orders, 0, "other", 3);
-    assert_eq!(journal.committed(Topic::Orders, 0, "other"), Some(3));
-    assert_eq!(journal.committed(Topic::Orders, 0, "engine-p0"), Some(5));
+    // Manual commits are explicit writes; a forward commit replaces the stored
+    // offset, and the partitions stay independent.
+    journal.commit(Topic::Orders, 0, "engine-p0", 2);
+    assert_eq!(journal.committed(Topic::Orders, 0, "engine-p0"), Some(2));
+    journal.commit(Topic::Orders, 0, "other", 1);
+    assert_eq!(journal.committed(Topic::Orders, 0, "other"), Some(1));
+    assert_eq!(journal.committed(Topic::Orders, 0, "engine-p0"), Some(2));
+    journal
+        .check_invariants()
+        .expect("commits stay within their partition heads");
 }
 
 #[test]
@@ -84,6 +91,9 @@ fn topics_are_separate_logs() {
     journal.commit(Topic::Orders, 3, "consumer", 0);
     assert_eq!(journal.committed(Topic::Orders, 3, "consumer"), Some(0));
     assert_eq!(journal.committed(Topic::Md, 3, "consumer"), None);
+    journal
+        .check_invariants()
+        .expect("a commit on one topic does not leak into another");
 }
 
 #[tokio::test]
@@ -237,12 +247,13 @@ async fn journal_memory_wrapper_matches_the_sync_api() {
         Some(1)
     );
 
-    // An empty append is a no-op with zero count.
+    // An empty append is a no-op with zero count that reports the length.
     let empty = journal
         .append(Topic::Orders, 2, &[])
         .await
         .expect("empty append");
     assert_eq!(empty.count, 0);
+    assert_eq!(empty.base_offset, 2, "an empty append reports the length");
     assert_eq!(
         journal
             .read(Topic::Orders, 2, "engine-p2", 0, 10, 0)

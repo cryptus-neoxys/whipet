@@ -8,7 +8,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::str::FromStr;
@@ -1006,6 +1006,16 @@ fn topic_create_options(topic: Topic, exchange: &ExchangeConfig) -> TopicCreateO
     }
 }
 
+/// The result of an empty append on the Iggy backend.
+///
+/// Iggy reports no send confirmation for a zero-message batch, so learning the
+/// current head would cost an extra `get_topic` round trip on every empty
+/// append. The Iggy path therefore reports `base_offset == 0`; the memory
+/// backend reports the current length (`log.len()`, so a fresh partition also
+/// reports 0). `count == 0` marks the result as empty on both backends, so no
+/// caller may read `base_offset` without checking `count`. The contract test
+/// `empty_append_reports_the_length_and_stores_nothing` in `tests/contract.rs`
+/// pins the memory side and records this divergence.
 fn empty_append(partition: u32) -> AppendResult {
     AppendResult {
         partition,
@@ -1019,14 +1029,40 @@ fn empty_append(partition: u32) -> AppendResult {
 /// This exists for unit tests, `cargo test` in CI without a broker, and an
 /// explicit `WHIPPET_JOURNAL=memory` developer escape hatch. The demo and the
 /// published benchmarks always use `Journal::Iggy`.
+///
+/// # Offset contract
+///
+/// For every `(topic, partition)` the log is a contiguous sequence starting at
+/// offset 0: record `i` has offset `i`, [`MemoryJournal::high_watermark`] is
+/// `len` (the next offset to append, `0` when empty), and the head — the last
+/// appended offset — is `high_watermark - 1`. Timestamps are non-decreasing
+/// across appends. Reads return the contiguous slice from the requested
+/// offset, capped by the requested count, and an empty slice at or past the
+/// head. Offsets are `u64`, so a negative offset is unrepresentable.
+///
+/// # Commit contract
+///
+/// A consumer commit is the offset of the **last record the consumer fully
+/// applied** (inclusive), never the next offset to read. Therefore
+/// `0 <= committed <= head`, commits are monotonic per
+/// `(topic, partition, consumer)`, and a partition with no records has no valid
+/// commit. [`MemoryJournal::commit`] enforces this fail-closed; see its docs
+/// for the debug and release behaviour. [`MemoryJournal::check_invariants`]
+/// verifies the whole store.
+///
+/// These are the semantics the Iggy backend is measured against; both are
+/// documented and pinned by the `contract` integration test.
 pub struct MemoryJournal {
     state: Mutex<MemoryState>,
 }
 
+/// A consumer key: `(topic, partition, consumer name)`.
+type CommitKey = (Topic, u32, String);
+
 #[derive(Default)]
 struct MemoryState {
     logs: BTreeMap<(Topic, u32), Vec<MemoryRecord>>,
-    committed: BTreeMap<(Topic, u32, String), u64>,
+    committed: BTreeMap<CommitKey, u64>,
 }
 
 #[derive(Clone)]
@@ -1035,6 +1071,97 @@ struct MemoryRecord {
     timestamp_ns: u64,
     payload: Vec<u8>,
     headers: Vec<(String, String)>,
+}
+
+/// Store a header set with unique keys, the last value for a key winning.
+///
+/// Iggy frames user headers in a `BTreeMap<HeaderKey, HeaderValue>`, so a
+/// repeated key already overwrites the earlier value on the wire. Normalising
+/// here gives the memory backend the same result and lets
+/// [`MemoryJournal::check_invariants`] require unique keys. The position of a
+/// key's first occurrence is kept, so the pair order still round-trips.
+fn normalized_headers(pairs: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut unique: Vec<(String, String)> = Vec::with_capacity(pairs.len());
+    for (key, value) in pairs {
+        match unique.iter_mut().find(|(existing, _)| existing == &key) {
+            Some(slot) => slot.1 = value,
+            None => unique.push((key, value)),
+        }
+    }
+    unique
+}
+
+/// The offset of the last record in a log, if it has one.
+fn head_of(log: &[MemoryRecord]) -> Option<u64> {
+    log.last().map(|record| record.offset)
+}
+
+/// Why a commit request violates the contract, if it does.
+///
+/// Pure so both the debug assertion and the release warning report the same
+/// reason, and so tests can construct each violation without depending on the
+/// panic path.
+fn commit_violation(state: &MemoryState, key: &CommitKey, offset: u64) -> Option<String> {
+    let (topic, partition, consumer) = key;
+    if consumer.is_empty() {
+        return Some("the consumer name is empty".to_string());
+    }
+    let Some(log) = state.logs.get(&(*topic, *partition)) else {
+        return Some(format!(
+            "{topic} partition {partition} has no log; nothing has been appended"
+        ));
+    };
+    let Some(head) = head_of(log) else {
+        return Some(format!(
+            "{topic} partition {partition} is empty; there is no offset for {consumer} to commit"
+        ));
+    };
+    if offset > head {
+        return Some(format!(
+            "offset {offset} is ahead of the {topic} partition {partition} head {head} \
+             for consumer {consumer}"
+        ));
+    }
+    if let Some(previous) = state.committed.get(key)
+        && offset < *previous
+    {
+        return Some(format!(
+            "offset {offset} rewinds consumer {consumer} on {topic} partition {partition} \
+             from {previous}"
+        ));
+    }
+    None
+}
+
+/// Apply a commit once it has been validated, never storing an impossible
+/// resume point.
+///
+/// - an empty consumer name, an unknown/empty partition, a backwards commit,
+///   or an offset ahead of the head stores nothing and returns `None`.
+///
+/// An ahead-of-head offset is **ignored**, never clamped to the head. The
+/// caller claimed it applied a record that does not exist, so its claim says
+/// nothing reliable about any record that does; storing the head would mark an
+/// unapplied record as done and skip it on the next restart. Ignoring replays
+/// more, which the dedup table and MD sequence make idempotent.
+fn apply_commit(state: &mut MemoryState, key: CommitKey, offset: u64) -> Option<u64> {
+    if key.2.is_empty() {
+        return None;
+    }
+    let head = state
+        .logs
+        .get(&(key.0, key.1))
+        .and_then(|log| head_of(log))?;
+    if offset > head {
+        return None;
+    }
+    if let Some(previous) = state.committed.get(&key)
+        && offset < *previous
+    {
+        return None;
+    }
+    state.committed.insert(key, offset);
+    Some(offset)
 }
 
 impl Default for MemoryJournal {
@@ -1050,6 +1177,13 @@ impl MemoryJournal {
         }
     }
 
+    /// Append a borrowed batch. Offsets continue the partition's log, so the
+    /// returned [`AppendResult::base_offset`] is the previous length and the
+    /// batch occupies `base_offset..base_offset + count` with no holes.
+    ///
+    /// An empty batch stores nothing and reports `base_offset == len`,
+    /// `count == 0`. Record timestamps are non-decreasing: a clock that steps
+    /// backwards is clamped to the last stored timestamp.
     pub fn append(
         &self,
         topic: Topic,
@@ -1059,20 +1193,19 @@ impl MemoryJournal {
         let mut state = self.state.lock().expect("memory journal poisoned");
         let log = state.logs.entry((topic, partition)).or_default();
         let base_offset = log.len() as u64;
-        log.extend(
-            messages
-                .iter()
-                .enumerate()
-                .map(|(index, message)| MemoryRecord {
-                    offset: base_offset + index as u64,
-                    timestamp_ns: now_ns(),
-                    // Dev path: convert to the owned storage format at the
-                    // storage boundary; the Iggy path hands the `Bytes` on
-                    // without a copy.
-                    payload: message.payload.to_vec(),
-                    headers: message.headers.to_pairs(),
-                }),
-        );
+        let mut timestamp_ns = log.last().map_or(0, |record| record.timestamp_ns);
+        for (index, message) in messages.iter().enumerate() {
+            timestamp_ns = now_ns().max(timestamp_ns);
+            log.push(MemoryRecord {
+                offset: base_offset + index as u64,
+                timestamp_ns,
+                // Dev path: convert to the owned storage format at the
+                // storage boundary; the Iggy path hands the `Bytes` on
+                // without a copy.
+                payload: message.payload.to_vec(),
+                headers: normalized_headers(message.headers.to_pairs()),
+            });
+        }
         AppendResult {
             partition,
             base_offset,
@@ -1081,6 +1214,9 @@ impl MemoryJournal {
     }
 
     /// Consume the messages instead of cloning their payloads.
+    ///
+    /// Offset, empty-append, and timestamp semantics match
+    /// [`MemoryJournal::append`].
     pub fn append_owned(
         &self,
         topic: Topic,
@@ -1092,16 +1228,18 @@ impl MemoryJournal {
         let base_offset = log.len() as u64;
         let count = messages.len() as u32;
         log.reserve(messages.len());
+        let mut timestamp_ns = log.last().map_or(0, |record| record.timestamp_ns);
         for (index, message) in messages.into_iter().enumerate() {
             let JournalMessage { payload, headers } = message;
+            timestamp_ns = now_ns().max(timestamp_ns);
             log.push(MemoryRecord {
                 offset: base_offset + index as u64,
-                timestamp_ns: now_ns(),
+                timestamp_ns,
                 // Dev path: convert to the owned storage format. Zero-copy
                 // when the `Bytes` is uniquely held, which append_owned's
                 // move guarantees.
                 payload: payload.into(),
-                headers: headers.into_pairs(),
+                headers: normalized_headers(headers.into_pairs()),
             });
         }
         AppendResult {
@@ -1111,6 +1249,10 @@ impl MemoryJournal {
         }
     }
 
+    /// Read records from `offset` in offset order, at most `count`.
+    ///
+    /// The result is exactly the contiguous slice that starts at `offset`; a
+    /// read at or past the head, or `count == 0`, returns an empty vector.
     pub fn read(
         &self,
         topic: Topic,
@@ -1119,22 +1261,22 @@ impl MemoryJournal {
         count: u32,
     ) -> Vec<JournalRecord> {
         let state = self.state.lock().expect("memory journal poisoned");
-        state
-            .logs
-            .get(&(topic, partition))
-            .map(|log| {
-                log.iter()
-                    .filter(|record| record.offset >= offset)
-                    .take(count as usize)
-                    .map(|record| JournalRecord {
-                        offset: record.offset,
-                        timestamp_ns: record.timestamp_ns,
-                        payload: record.payload.clone(),
-                        headers: record.headers.clone(),
-                    })
-                    .collect()
+        let Some(log) = state.logs.get(&(topic, partition)) else {
+            return Vec::new();
+        };
+        // Offsets are append-ordered and contiguous, so the slice bound is a
+        // binary search and the slice itself cannot have a hole.
+        let start = log.partition_point(|record| record.offset < offset);
+        let take = log.len().saturating_sub(start).min(count as usize);
+        log[start..start + take]
+            .iter()
+            .map(|record| JournalRecord {
+                offset: record.offset,
+                timestamp_ns: record.timestamp_ns,
+                payload: record.payload.clone(),
+                headers: record.headers.clone(),
             })
-            .unwrap_or_default()
+            .collect()
     }
 
     pub fn read_payloads(
@@ -1151,8 +1293,10 @@ impl MemoryJournal {
 
     /// Read payloads into a caller-owned buffer.
     ///
-    /// `out` is cleared and then filled with the matching records; the number
-    /// appended is returned. A reused buffer pays no per-read allocation.
+    /// `out` is cleared and then filled with exactly the contiguous slice from
+    /// `offset`, capped by `count`; the number appended is returned. A reused
+    /// buffer pays no per-read allocation. A read at or past the head, or
+    /// `count == 0`, leaves `out` empty and returns `0`.
     pub fn read_payloads_into(
         &self,
         topic: Topic,
@@ -1170,13 +1314,9 @@ impl MemoryJournal {
         // search. The reserve is then exact: an empty poll allocates nothing,
         // and a full batch allocates once.
         let start = log.partition_point(|record| record.offset < offset);
-        out.reserve(log.len().saturating_sub(start).min(count as usize));
-        for record in log
-            .iter()
-            .skip(start)
-            .filter(|record| record.offset >= offset)
-            .take(count as usize)
-        {
+        let take = log.len().saturating_sub(start).min(count as usize);
+        out.reserve(take);
+        for record in &log[start..start + take] {
             out.push(PayloadRecord {
                 offset: record.offset,
                 timestamp_ns: record.timestamp_ns,
@@ -1186,13 +1326,61 @@ impl MemoryJournal {
         out.len()
     }
 
+    /// Record the offset of the last record the consumer fully applied.
+    ///
+    /// The contract for one `(topic, partition, consumer)`:
+    ///
+    /// - `offset` is inclusive: the last applied record, not the next offset to
+    ///   read;
+    /// - `0 <= offset <= head`, where `head` is the last appended offset, so a
+    ///   partition with no records has no valid commit;
+    /// - commits never rewind (a later commit is `>=` the stored one);
+    /// - `committed()` is `None` until the first valid commit.
+    ///
+    /// Fail closed. A commit ahead of the head, a commit for an empty or
+    /// unknown partition, an empty consumer name, or a backwards commit is a
+    /// caller bug:
+    ///
+    /// - debug builds panic with the reason (`debug_assert!`);
+    /// - release builds never store an impossible resume point. An
+    ///   ahead-of-head commit is ignored, a backwards commit is ignored, and a
+    ///   commit for an empty/unknown partition or an empty consumer name is
+    ///   dropped. Every one of these replays more, never less.
+    ///
+    /// Dropping is the safe release behaviour for the last two cases: the
+    /// consumer's stored offset stays `None` (or unchanged), so a restart
+    /// replays from the start of a log that has no applied records yet. That is
+    /// at-least-once and can duplicate, but it can never skip records the way a
+    /// fabricated offset would.
+    ///
+    /// The choice of ignoring over storing a guessed head keeps a restart
+    /// correct: the
+    /// store is a resume hint, and the caller that lost the race with the
+    /// appended log still resumes at a record that exists. A hard error would
+    /// force the caller to distinguish "my offset is stale" from "the broker
+    /// failed", which the commit signature (and the Iggy commit path) does not
+    /// carry.
     pub fn commit(&self, topic: Topic, partition: u32, consumer: &str, offset: u64) {
         let mut state = self.state.lock().expect("memory journal poisoned");
-        state
-            .committed
-            .insert((topic, partition, consumer.to_string()), offset);
+        let key = (topic, partition, consumer.to_string());
+        if let Some(violation) = commit_violation(&state, &key, offset) {
+            debug_assert!(false, "invalid journal commit: {violation}");
+            tracing::warn!(
+                topic = %topic,
+                partition,
+                consumer,
+                offset,
+                violation,
+                "dropping an invalid journal commit"
+            );
+        }
+        apply_commit(&mut state, key, offset);
     }
 
+    /// The stored commit for `(topic, partition, consumer)`.
+    ///
+    /// `None` before the first valid commit; otherwise the offset of the last
+    /// record the consumer fully applied.
     pub fn committed(&self, topic: Topic, partition: u32, consumer: &str) -> Option<u64> {
         let state = self.state.lock().expect("memory journal poisoned");
         state
@@ -1223,12 +1411,90 @@ impl MemoryJournal {
         (bytes, messages)
     }
 
+    /// Number of records in `(topic, partition)`.
+    ///
+    /// This is the next offset to append: `0` for an unknown or empty
+    /// partition, and `head + 1` otherwise. It is not the head; use
+    /// [`MemoryJournal::read`] or `lag` for records.
     pub fn high_watermark(&self, topic: Topic, partition: u32) -> u64 {
         let state = self.state.lock().expect("memory journal poisoned");
         state
             .logs
             .get(&(topic, partition))
             .map_or(0, |log| log.len() as u64)
+    }
+
+    /// Verify the stored state obeys the journal contract.
+    ///
+    /// Checks every log and every commit, including invariants that the current
+    /// code maintains implicitly and future changes could break:
+    ///
+    /// - each log's offsets are exactly `0..len`, contiguous and increasing;
+    /// - each log's timestamps are non-decreasing;
+    /// - each record's header keys are unique (the pair representation allows
+    ///   duplicates; [`normalized_headers`] removes them on append);
+    /// - every commit has a non-empty consumer name, a partition with at least
+    ///   one record, and an offset at or below that partition's head.
+    ///
+    /// Payloads are allowed to be empty: audit and command records may carry no
+    /// bytes, and the contract does not require one. BTreeMap ordering is
+    /// inherent, so it is not re-checked.
+    pub fn check_invariants(&self) -> std::result::Result<(), String> {
+        let state = self.state.lock().expect("memory journal poisoned");
+        for ((topic, partition), log) in &state.logs {
+            let mut previous_timestamp = 0u64;
+            for (index, record) in log.iter().enumerate() {
+                if record.offset != index as u64 {
+                    return Err(format!(
+                        "{topic} partition {partition}: record {index} has offset {}; \
+                         offsets must be contiguous from 0",
+                        record.offset
+                    ));
+                }
+                if record.timestamp_ns < previous_timestamp {
+                    return Err(format!(
+                        "{topic} partition {partition}: record {index} has timestamp {} \
+                         after {previous_timestamp}; timestamps must be non-decreasing",
+                        record.timestamp_ns
+                    ));
+                }
+                previous_timestamp = record.timestamp_ns;
+                let mut keys = HashSet::with_capacity(record.headers.len());
+                for (key, _) in &record.headers {
+                    if !keys.insert(key.as_str()) {
+                        return Err(format!(
+                            "{topic} partition {partition}: record {index} has header key \
+                             {key:?} more than once"
+                        ));
+                    }
+                }
+            }
+        }
+        for ((topic, partition, consumer), offset) in &state.committed {
+            if consumer.is_empty() {
+                return Err(format!(
+                    "commit on {topic} partition {partition} has an empty consumer name"
+                ));
+            }
+            let Some(log) = state.logs.get(&(*topic, *partition)) else {
+                return Err(format!(
+                    "commit for {consumer} on {topic} partition {partition} has no log"
+                ));
+            };
+            let Some(head) = head_of(log) else {
+                return Err(format!(
+                    "commit for {consumer} on {topic} partition {partition} exists but the \
+                     partition has no records"
+                ));
+            };
+            if *offset > head {
+                return Err(format!(
+                    "commit for {consumer} on {topic} partition {partition} is {offset}, \
+                     ahead of the head {head}"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1344,6 +1610,16 @@ impl Journal {
         }
     }
 
+    /// Record the offset of the last record the consumer fully applied.
+    ///
+    /// Same contract on both backends: the offset is inclusive (last applied,
+    /// not next to read), `0 <= offset <= head`, commits are monotonic per
+    /// `(topic, partition, consumer)`, and `committed()` is `None` until the
+    /// first commit. The Iggy backend stores exactly what the broker accepts;
+    /// the memory backend (the test backend those semantics are measured
+    /// against) asserts on a violation in debug and ignores it in release,
+    /// never storing an impossible resume point. See
+    /// [`MemoryJournal::commit`].
     pub async fn commit(
         &self,
         topic: Topic,
@@ -1397,9 +1673,19 @@ impl Journal {
         }
     }
 
+    /// Records between the committed offset and the partition head.
+    ///
+    /// The committed offset is the last applied record (inclusive), so the
+    /// result is `head - committed` with both ends saturating: a consumer
+    /// committed through the head has zero lag. On both backends
+    /// `committed + lag == head`, except that an empty or unknown partition
+    /// reports `0` for both. `crates/whippet/src/cli.rs` relies on that
+    /// identity to report the head.
     pub async fn lag(&self, topic: Topic, partition: u32, committed: u64) -> Result<u64> {
         match self {
             Self::Iggy(journal) => journal.lag(topic, partition, committed).await,
+            // The memory log's length is `head + 1`, so subtract the inclusive
+            // committed record to match Iggy's `current_offset - committed`.
             Self::Memory(journal) => Ok(journal
                 .high_watermark(topic, partition)
                 .saturating_sub(committed.saturating_add(1))),
@@ -1443,6 +1729,533 @@ mod tests {
         journal.commit(Topic::Orders, 3, "engine-p3", 1);
         assert_eq!(journal.committed(Topic::Orders, 3, "engine-p3"), Some(1));
         assert_eq!(journal.high_watermark(Topic::Orders, 3), 3);
+        journal
+            .check_invariants()
+            .expect("offsets and the commit obey the contract");
+    }
+
+    /// The offsets a log exposes: contiguous from zero, read in order, with the
+    /// advertised base offset and head.
+    #[test]
+    fn memory_offsets_are_contiguous_and_read_in_order() {
+        let journal = MemoryJournal::new();
+        let first = journal.append(
+            Topic::Md,
+            1,
+            &[
+                JournalMessage::new(vec![0], vec![("n".to_string(), "0".to_string())]),
+                JournalMessage::new(vec![1], vec![("n".to_string(), "1".to_string())]),
+                JournalMessage::new(vec![2], vec![]),
+            ],
+        );
+        assert_eq!(first.base_offset, 0);
+        assert_eq!(first.count, 3);
+        let second = journal.append_owned(Topic::Md, 1, vec![JournalMessage::new(vec![3], vec![])]);
+        assert_eq!(
+            second.base_offset, 3,
+            "the next append starts at the head + 1"
+        );
+        assert_eq!(journal.high_watermark(Topic::Md, 1), 4);
+
+        let records = journal.read(Topic::Md, 1, 0, 100);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.offset)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.payload.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![0], vec![1], vec![2], vec![3]]
+        );
+        assert_eq!(records[1].header("n"), Some("1"), "headers round-trip");
+        assert!(
+            records
+                .windows(2)
+                .all(|pair| pair[0].timestamp_ns <= pair[1].timestamp_ns),
+            "timestamps are non-decreasing within a log"
+        );
+        journal.check_invariants().expect("contiguous log");
+    }
+
+    /// Reads are exactly the contiguous slice from the requested offset, capped
+    /// by the count, and empty at or past the head even through the facade.
+    #[test]
+    fn memory_read_is_the_contiguous_slice_from_the_offset() {
+        let journal = MemoryJournal::new();
+        journal.append(
+            Topic::Orders,
+            2,
+            &[
+                JournalMessage::new(vec![0], vec![]),
+                JournalMessage::new(vec![1], vec![]),
+                JournalMessage::new(vec![2], vec![]),
+                JournalMessage::new(vec![3], vec![]),
+            ],
+        );
+
+        let slice = journal.read(Topic::Orders, 2, 1, 2);
+        assert_eq!(
+            slice.iter().map(|record| record.offset).collect::<Vec<_>>(),
+            vec![1, 2],
+            "a mid-log read starts at the requested offset and stops at the count"
+        );
+        assert_eq!(
+            journal
+                .read(Topic::Orders, 2, 1, 2)
+                .iter()
+                .map(|record| record.payload.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![1], vec![2]],
+            "no hole between the requested offset and the slice end"
+        );
+        // The head itself is readable; one past it is not.
+        assert_eq!(
+            journal
+                .read(Topic::Orders, 2, 3, 1)
+                .iter()
+                .map(|record| record.offset)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert!(journal.read(Topic::Orders, 2, 4, 10).is_empty());
+        assert!(journal.read(Topic::Orders, 2, u64::MAX, 10).is_empty());
+        assert!(
+            journal.read(Topic::Orders, 2, 0, 0).is_empty(),
+            "count zero reads nothing"
+        );
+
+        // The payload path has the identical slice bound and buffer contract.
+        let payloads = journal.read_payloads(Topic::Orders, 2, 2, 5);
+        assert_eq!(
+            payloads
+                .iter()
+                .map(|record| record.offset)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        let mut out = vec![PayloadRecord {
+            offset: 99,
+            timestamp_ns: 99,
+            payload: Bytes::from_static(b"stale"),
+        }];
+        assert_eq!(
+            journal.read_payloads_into(Topic::Orders, 2, 2, 0, &mut out),
+            0
+        );
+        assert!(out.is_empty(), "a zero count clears the buffer");
+        assert_eq!(
+            journal.read_payloads_into(Topic::Orders, 2, 2, 1, &mut out),
+            1
+        );
+        assert_eq!(out[0].offset, 2, "the reused buffer holds only the slice");
+    }
+
+    /// An empty append is a no-op that reports the length as its base offset.
+    #[test]
+    fn memory_empty_append_reports_the_length_and_stores_nothing() {
+        let journal = MemoryJournal::new();
+
+        let empty = journal.append(Topic::Alerts, 0, &[]);
+        assert_eq!(empty.partition, 0);
+        assert_eq!(empty.base_offset, 0, "an unknown partition is empty");
+        assert_eq!(empty.count, 0);
+
+        journal.append(Topic::Alerts, 0, &[JournalMessage::new(vec![1], vec![])]);
+        let empty = journal.append_owned(Topic::Alerts, 0, Vec::new());
+        assert_eq!(empty.base_offset, 1, "an empty append reports the length");
+        assert_eq!(empty.count, 0);
+        assert_eq!(journal.high_watermark(Topic::Alerts, 0), 1);
+        assert_eq!(journal.read(Topic::Alerts, 0, 0, 10).len(), 1);
+        journal.check_invariants().expect("empty append is a no-op");
+    }
+
+    /// A commit is the last applied offset, and lag counts what is left.
+    #[tokio::test]
+    async fn memory_commit_is_the_last_applied_offset_and_lag_starts_after_it() {
+        let journal = MemoryJournal::new();
+        journal.append(
+            Topic::Orders,
+            5,
+            &[
+                JournalMessage::new(vec![0], vec![]),
+                JournalMessage::new(vec![1], vec![]),
+                JournalMessage::new(vec![2], vec![]),
+            ],
+        );
+
+        assert_eq!(
+            journal.committed(Topic::Orders, 5, "engine-p5"),
+            None,
+            "no commit before the first one"
+        );
+        journal.commit(Topic::Orders, 5, "engine-p5", 1);
+        assert_eq!(journal.committed(Topic::Orders, 5, "engine-p5"), Some(1));
+
+        // `1` is the last applied record, so offset `2` is still unread.
+        let next = journal.committed(Topic::Orders, 5, "engine-p5").unwrap() + 1;
+        assert_eq!(
+            journal
+                .read(Topic::Orders, 5, next, 10)
+                .iter()
+                .map(|record| record.offset)
+                .collect::<Vec<_>>(),
+            vec![2],
+            "a resume after the commit replays no applied record"
+        );
+        journal
+            .check_invariants()
+            .expect("commit at the last applied offset");
+
+        // Through the facade, lag is head - committed: one record remains.
+        let journal = Journal::Memory(journal);
+        let committed = journal
+            .committed(Topic::Orders, 5, "engine-p5")
+            .await
+            .expect("committed through the facade")
+            .expect("a commit exists");
+        assert_eq!(committed, 1, "committed is last-applied, not next");
+        assert_eq!(
+            journal.lag(Topic::Orders, 5, committed).await.expect("lag"),
+            1
+        );
+    }
+
+    /// The commit normaliser drops or ignores instead of storing an impossible
+    /// resume point. This is the release-mode path; the debug path asserts and
+    /// is covered by `commit_contract_asserts_in_debug`.
+    #[test]
+    fn commit_normalisation_ignores_and_drops() {
+        let mut state = MemoryState::default();
+        state.logs.insert(
+            (Topic::Orders, 0),
+            (0..3)
+                .map(|offset| MemoryRecord {
+                    offset,
+                    timestamp_ns: 0,
+                    payload: vec![offset as u8],
+                    headers: Vec::new(),
+                })
+                .collect(),
+        );
+
+        // An ahead-of-head claim says nothing reliable about the head, so it
+        // stores nothing: clamping would mark an unapplied record as done.
+        assert_eq!(
+            apply_commit(&mut state, (Topic::Orders, 0, "c".to_string()), 99),
+            None,
+            "an ahead-of-head commit is ignored, never clamped"
+        );
+        assert_eq!(
+            state.committed.get(&(Topic::Orders, 0, "c".to_string())),
+            None
+        );
+
+        // A valid commit stores.
+        assert_eq!(
+            apply_commit(&mut state, (Topic::Orders, 0, "c".to_string()), 1),
+            Some(1)
+        );
+
+        // A backwards commit is ignored, not stored.
+        assert_eq!(
+            apply_commit(&mut state, (Topic::Orders, 0, "c".to_string()), 0),
+            None,
+            "a backwards commit does not rewind"
+        );
+        assert_eq!(
+            state.committed.get(&(Topic::Orders, 0, "c".to_string())),
+            Some(&1)
+        );
+
+        // Unknown and empty partitions have no valid offset.
+        assert_eq!(
+            apply_commit(&mut state, (Topic::Md, 0, "c".to_string()), 0),
+            None
+        );
+        state.logs.insert((Topic::Md, 0), Vec::new());
+        assert_eq!(
+            apply_commit(&mut state, (Topic::Md, 0, "c".to_string()), 0),
+            None,
+            "an empty partition has no offset to commit"
+        );
+        assert_eq!(
+            apply_commit(&mut state, (Topic::Orders, 0, String::new()), 0),
+            None,
+            "an empty consumer name is dropped"
+        );
+        assert_eq!(state.committed.len(), 1, "only the valid commit was stored");
+    }
+
+    /// Every constructed violation is a debug assertion with a clear message.
+    ///
+    /// A fresh journal per case keeps the deliberate panic from poisoning the
+    /// state mutex of the next case.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn commit_contract_asserts_in_debug() {
+        fn one_record() -> MemoryJournal {
+            let journal = MemoryJournal::new();
+            journal.append(Topic::Orders, 0, &[JournalMessage::new(vec![1], vec![])]);
+            journal
+        }
+
+        fn assert_panics(
+            journal: &MemoryJournal,
+            topic: Topic,
+            partition: u32,
+            consumer: &str,
+            offset: u64,
+            expected: &str,
+        ) {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                journal.commit(topic, partition, consumer, offset);
+            }));
+            let payload = result.expect_err("an invalid commit must assert in debug");
+            let message = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|text| text.to_string()))
+                .unwrap_or_default();
+            assert!(
+                message.contains(expected) && message.contains("invalid journal commit"),
+                "unexpected assertion message: {message}"
+            );
+        }
+
+        assert_panics(
+            &one_record(),
+            Topic::Orders,
+            0,
+            "engine-p0",
+            9,
+            "ahead of the",
+        );
+        assert_panics(
+            &one_record(),
+            Topic::Orders,
+            9,
+            "engine-p9",
+            0,
+            "has no log",
+        );
+        assert_panics(
+            &MemoryJournal::new(),
+            Topic::Md,
+            0,
+            "engine-p0",
+            0,
+            "has no log",
+        );
+        assert_panics(
+            &one_record(),
+            Topic::Orders,
+            0,
+            "",
+            0,
+            "consumer name is empty",
+        );
+
+        // An equal commit is forward progress, not a rewind; a smaller one is a
+        // bug.
+        let journal = one_record();
+        journal.commit(Topic::Orders, 0, "engine-p0", 0);
+        journal.commit(Topic::Orders, 0, "engine-p0", 0);
+        journal.append(Topic::Orders, 0, &[JournalMessage::new(vec![2], vec![])]);
+        journal.commit(Topic::Orders, 0, "engine-p0", 1);
+        assert_panics(&journal, Topic::Orders, 0, "engine-p0", 0, "rewinds");
+    }
+
+    /// Release builds never store an impossible resume point; this is the
+    /// end-to-end proof of the release half of the contract, run with
+    /// `cargo test -p whippet-journal --release`.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn commit_ignores_ahead_and_drops_in_release() {
+        let journal = MemoryJournal::new();
+        journal.append(Topic::Orders, 0, &[JournalMessage::new(vec![1], vec![])]);
+
+        journal.commit(Topic::Orders, 0, "engine-p0", 9);
+        assert_eq!(
+            journal.committed(Topic::Orders, 0, "engine-p0"),
+            None,
+            "an ahead-of-head commit stores nothing"
+        );
+
+        journal.commit(Topic::Orders, 0, "engine-p0", 0);
+        assert_eq!(journal.committed(Topic::Orders, 0, "engine-p0"), Some(0));
+
+        // A backwards commit does not rewind.
+        journal.commit(Topic::Orders, 0, "engine-p0", 0);
+        assert_eq!(journal.committed(Topic::Orders, 0, "engine-p0"), Some(0));
+
+        // Partitions with no records and empty consumer names store nothing.
+        journal.commit(Topic::Md, 0, "whippet-md-p0", 0);
+        assert_eq!(journal.committed(Topic::Md, 0, "whippet-md-p0"), None);
+        journal.commit(Topic::Orders, 0, "", 0);
+        assert_eq!(journal.committed(Topic::Orders, 0, ""), None);
+
+        journal
+            .check_invariants()
+            .expect("the release path keeps the store valid");
+    }
+
+    /// `check_invariants` accepts what the API produces.
+    #[test]
+    fn memory_check_invariants_accepts_a_valid_store() {
+        let journal = MemoryJournal::new();
+        journal.append(
+            Topic::Orders,
+            0,
+            &[
+                JournalMessage::new(vec![1], vec![("n".to_string(), "0".to_string())]),
+                JournalMessage::new(vec![], vec![]),
+            ],
+        );
+        journal.append_owned(Topic::Orders, 0, vec![JournalMessage::new(vec![3], vec![])]);
+        journal.commit(Topic::Orders, 0, "engine-p0", 0);
+        journal.commit(Topic::Orders, 0, "engine-p0", 2);
+        assert!(
+            journal.check_invariants().is_ok(),
+            "an empty payload is allowed and a full-length commit is in range"
+        );
+    }
+
+    /// Each invariant reports the exact violation when the state is corrupted
+    /// directly, so a future writer that skips the enforcing API is caught.
+    #[test]
+    fn memory_check_invariants_rejects_constructed_violations() {
+        fn seeded() -> MemoryJournal {
+            let journal = MemoryJournal::new();
+            journal.append(
+                Topic::Orders,
+                0,
+                &[JournalMessage::new(
+                    vec![1],
+                    vec![("n".to_string(), "0".to_string())],
+                )],
+            );
+            journal
+        }
+
+        let journal = seeded();
+        {
+            let mut state = journal.state.lock().expect("memory journal");
+            state
+                .committed
+                .insert((Topic::Orders, 0, "engine".to_string()), 9);
+        }
+        let error = journal
+            .check_invariants()
+            .expect_err("commit ahead of head");
+        assert!(error.contains("ahead of the head 0"), "{error}");
+
+        let journal = seeded();
+        {
+            let mut state = journal.state.lock().expect("memory journal");
+            state
+                .committed
+                .insert((Topic::Md, 0, "engine".to_string()), 0);
+        }
+        let error = journal.check_invariants().expect_err("commit with no log");
+        assert!(error.contains("has no log"), "{error}");
+
+        let journal = seeded();
+        journal.append(Topic::Md, 0, &[]);
+        {
+            let mut state = journal.state.lock().expect("memory journal");
+            state
+                .committed
+                .insert((Topic::Md, 0, "engine".to_string()), 0);
+        }
+        let error = journal
+            .check_invariants()
+            .expect_err("commit on an empty partition");
+        assert!(error.contains("has no records"), "{error}");
+
+        let journal = seeded();
+        {
+            let mut state = journal.state.lock().expect("memory journal");
+            state.committed.insert((Topic::Orders, 0, String::new()), 0);
+        }
+        let error = journal
+            .check_invariants()
+            .expect_err("commit with an empty consumer");
+        assert!(error.contains("empty consumer"), "{error}");
+
+        let journal = seeded();
+        {
+            let mut state = journal.state.lock().expect("memory journal");
+            state
+                .logs
+                .get_mut(&(Topic::Orders, 0))
+                .expect("log")
+                .push(MemoryRecord {
+                    offset: 5,
+                    timestamp_ns: 0,
+                    payload: vec![2],
+                    headers: Vec::new(),
+                });
+        }
+        let error = journal.check_invariants().expect_err("offset hole");
+        assert!(error.contains("contiguous"), "{error}");
+
+        let journal = seeded();
+        {
+            let mut state = journal.state.lock().expect("memory journal");
+            state
+                .logs
+                .get_mut(&(Topic::Orders, 0))
+                .expect("log")
+                .push(MemoryRecord {
+                    offset: 1,
+                    timestamp_ns: 0,
+                    payload: vec![2],
+                    headers: Vec::new(),
+                });
+            state.logs.get_mut(&(Topic::Orders, 0)).expect("log")[0].timestamp_ns = 5;
+        }
+        let error = journal.check_invariants().expect_err("timestamp rewind");
+        assert!(error.contains("non-decreasing"), "{error}");
+
+        let journal = seeded();
+        {
+            let mut state = journal.state.lock().expect("memory journal");
+            state.logs.get_mut(&(Topic::Orders, 0)).expect("log")[0]
+                .headers
+                .push(("n".to_string(), "1".to_string()));
+        }
+        let error = journal
+            .check_invariants()
+            .expect_err("duplicate header key");
+        assert!(error.contains("more than once"), "{error}");
+    }
+
+    /// Duplicate header keys keep the last value, matching Iggy's header map.
+    #[test]
+    fn memory_duplicate_header_keys_keep_the_last_value() {
+        let journal = MemoryJournal::new();
+        journal.append(
+            Topic::Orders,
+            0,
+            &[JournalMessage::new(
+                vec![1],
+                vec![
+                    ("n".to_string(), "0".to_string()),
+                    ("n".to_string(), "1".to_string()),
+                    ("other".to_string(), "x".to_string()),
+                ],
+            )],
+        );
+        let record = &journal.read(Topic::Orders, 0, 0, 1)[0];
+        assert_eq!(record.headers.len(), 2, "the duplicate key is collapsed");
+        assert_eq!(record.header("n"), Some("1"), "the last value wins");
+        assert_eq!(record.header("other"), Some("x"));
+        journal.check_invariants().expect("unique header keys");
     }
 
     #[test]
@@ -1807,6 +2620,9 @@ mod tests {
         );
         assert_eq!(empty.count, 0);
         assert_eq!(journal.high_watermark(Topic::Orders, 0), 4);
+        journal
+            .check_invariants()
+            .expect("the owned and borrowed appends form one contiguous log");
     }
 
     #[test]
@@ -1848,6 +2664,9 @@ mod tests {
                 "the owned append stores the same payload bytes at its own offset"
             );
         }
+        journal
+            .check_invariants()
+            .expect("the two append paths target one contiguous log");
     }
 
     #[test]
@@ -1902,6 +2721,9 @@ mod tests {
 
         assert!(journal.read_payloads(Topic::Orders, 1, 2, 10).is_empty());
         assert!(journal.read_payloads(Topic::Orders, 9, 0, 10).is_empty());
+        journal
+            .check_invariants()
+            .expect("the read paths do not mutate the log");
     }
 
     #[test]
@@ -2018,6 +2840,9 @@ mod tests {
         let appended = journal.read_payloads_into(Topic::Md, 9, 0, 10, &mut out);
         assert_eq!(appended, 0);
         assert!(out.is_empty());
+        journal
+            .check_invariants()
+            .expect("buffer reuse does not mutate the log");
     }
 
     #[test]
