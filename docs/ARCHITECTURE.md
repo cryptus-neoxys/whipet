@@ -496,7 +496,10 @@ duplicate. See [FAILURE-MODES.md](FAILURE-MODES.md).
   rebalancing.
 - **Full-state frames at 20 Hz.** No per-client delta protocol, no conflation
   policy knobs, no sequence-gap recovery in the browser.
-- **No authentication or transport security.** Bootstrap credentials only.
+- **Scoped bearer tokens, no transport security.** `WHIPPET_API_TOKENS`
+  binds each token to one participant, and `WHIPPET_METRICS_TOKEN` can protect
+  `/metrics`. TLS, stream encryption, and Iggy scoped users/PATs are still
+  Phase 2; the node uses the bootstrap Iggy account today.
 - **Single node.** `persisted` means the local disk; there is no replica and
   no failover.
 - **One market-data path.** The dashboard consumes `md`; the node has no

@@ -18,8 +18,8 @@ credentials explicitly.
 | `WHIPPET_IGGY_USER` | `iggy` | Iggy username. Compose must pass a non-default account. |
 | `WHIPPET_IGGY_PASSWORD` | `iggy` | Iggy password. Compose must pass a non-default secret. |
 | `WHIPPET_IGGY_PASSWORD_FILE` | unset | Read the Iggy password from a file instead of the environment. Compose points this at `/run/secrets/iggy_root_password`; the container entrypoint also exports the value. |
-| `WHIPPET_API_TOKEN` | unset | Optional bearer token for `/api/orders`, `/api/orders/batch`, and `/api/cancel`. |
-| `WHIPPET_API_PARTICIPANT` | `api` | Participant identity used when a bearer token is configured. |
+| `WHIPPET_API_TOKEN` | unset | Optional legacy bearer token for `/api/orders`, `/api/orders/batch`, and `/api/cancel`, bound to `WHIPPET_API_PARTICIPANT`. Prefer `WHIPPET_API_TOKENS` when more than one desk submits orders. |
+| `WHIPPET_API_PARTICIPANT` | `api` | Participant identity bound to the legacy single token. A request naming a different participant is rejected with 403. |
 | `WHIPPET_RATE_LIMIT_PER_SEC` | `0` | Optional per-IP ingress limit; `0` disables. Shared by HTTP and TCP, charged per order before validation: a batch reserves `N` tokens for its `N` orders up front, and a batch larger than the per-second budget is rejected. A rejected request returns HTTP 429 `rate_limited` with a `Retry-After: 1` header (TCP returns the `RateLimited` error code). |
 | `WHIPPET_MAX_WS_CONNECTIONS` | `2048` | Concurrent WebSocket subscriber cap. |
 | `WHIPPET_WS_PER_IP` | `0` | Per-IP WebSocket subscriber sub-limit; `0` disables it. The fanout benchmark leaves it off because all subscribers share one host. |
@@ -33,6 +33,8 @@ credentials explicitly.
 | `WHIPPET_ENGINE_JOURNAL_PENDING_MIB` | `256` | Total client-side pending-operations budget for the engine pool, in MiB, clamped to 16–4096. Split as `max(16 MiB, total / pool_size)` per client and passed to `IggyJournal::connect_with_pending`. A large pool can therefore exceed the configured total rather than starve a client. The ingress client keeps its own 256 MiB budget via `IggyJournal::connect`. Unused in `memory` journal mode, where every pool entry is the ingress `Arc`. |
 | `WHIPPET_TURBO_WINDOW_COMMANDS` | `10000` | Turbo only: commands allowed in one shard's uncommitted window. Validated at startup (1–1,000,000); a zero or oversized value is a startup error. |
 | `WHIPPET_TURBO_WINDOW_MS` | `50` | Turbo only: maximum age of the oldest unjournaled command in one shard's window, in ms (1–60,000). The binding limit is whichever of count or age is hit first. |
+| `WHIPPET_API_TOKENS` | unset | Scoped tokens as `token:participant` pairs, comma separated (for example `tok-a:alice,tok-b:bob`). Each token authorizes only its participant: the gateway derives the participant id from the name, so self-trade prevention and attribution see distinct desks. Tokens cannot contain `:`. Merged with `WHIPPET_API_TOKEN`. |
+| `WHIPPET_METRICS_TOKEN` | unset | Optional bearer token for `GET /metrics`. Health and readiness stay unauthenticated for probes. |
 | `WHIPPET_HTTP_TRACE` | unset | Set to `1` to enable per-request `tower-http` trace spans; off by default for throughput. |
 
 Concurrent single-order submissions on one partition are coalesced into one

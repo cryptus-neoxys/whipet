@@ -859,11 +859,6 @@ pub(crate) fn journal_message_for_command(command: &Command) -> JournalMessage {
     JournalMessage::new_named(command.encode(), meta.named_pairs(HeaderMode::Full))
 }
 
-/// Constant-time bearer comparison shared by the HTTP and TCP ingress paths.
-pub(crate) fn token_matches(expected: &str, presented: &str) -> bool {
-    crate::auth::constant_time_eq(expected.as_bytes(), presented.as_bytes())
-}
-
 async fn cancel_order(
     State(ctx): State<Arc<NodeContext>>,
     Extension(participants): Extension<Arc<ParticipantCache>>,
@@ -977,8 +972,6 @@ fn bearer_token(value: &str) -> Option<&str> {
     let token = token.trim();
     (!token.is_empty()).then_some(token)
 }
-
-use crate::auth::constant_time_eq;
 
 /// Shared participant check for the HTTP ingress paths. Returns the name
 /// borrowed from the caller config, the request, or the anonymous fallback:

@@ -1668,6 +1668,123 @@ fn ctx_with_engine_pool(
 }
 
 #[tokio::test]
+async fn scoped_tokens_attribute_orders_to_distinct_participants() {
+    let node = TestNode::new();
+    let ctx = node_with(&node, |config| {
+        config.api_token = None;
+        config.api_tokens = vec![
+            whippet::auth::ApiToken {
+                token: "tok-alice".into(),
+                participant: "alice".into(),
+            },
+            whippet::auth::ApiToken {
+                token: "tok-bob".into(),
+                participant: "bob".into(),
+            },
+        ];
+    });
+    let app = gateway::router(ctx);
+
+    for (token, id) in [("tok-alice", "scoped-1"), ("tok-bob", "scoped-2")] {
+        let (status, _, body) = send(
+            &app,
+            Method::POST,
+            "/api/orders",
+            Some(json!({
+                "symbol": "BTC-USD",
+                "side": "buy",
+                "order_type": "limit",
+                "price_cents": 6_000_000,
+                "qty": 1,
+                "client_order_id": id,
+            })),
+            Ingress {
+                token: Some(token),
+                peer: None,
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "order with {token}: {body}");
+    }
+
+    let commands = node.commands(symbol());
+    assert_eq!(commands.len(), 2);
+    assert_eq!(
+        commands[0].participant,
+        ParticipantId::derive("alice"),
+        "the first token must not be attributed to the shared 'api' identity"
+    );
+    assert_eq!(commands[1].participant, ParticipantId::derive("bob"));
+    assert_ne!(commands[0].participant, commands[1].participant);
+
+    // A token cannot claim another participant by naming it in the body.
+    let (status, _, body) = send(
+        &app,
+        Method::POST,
+        "/api/orders",
+        Some(json!({
+            "symbol": "BTC-USD",
+            "side": "buy",
+            "order_type": "limit",
+            "price_cents": 6_000_000,
+            "qty": 1,
+            "client_order_id": "scoped-3",
+            "participant": "bob",
+        })),
+        Ingress {
+            token: Some("tok-alice"),
+            peer: None,
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "participant_mismatch");
+}
+
+#[tokio::test]
+async fn metrics_requires_a_token_when_one_is_configured() {
+    let node = TestNode::new();
+    let ctx = node_with(&node, |config| {
+        config.metrics_token = Some("metrics-secret".into());
+    });
+    let app = gateway::router(ctx);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/metrics")
+                .body(Body::empty())
+                .expect("valid request"),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/metrics")
+                .header(header::AUTHORIZATION, "Bearer metrics-secret")
+                .body(Body::empty())
+                .expect("valid request"),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body collects")
+        .to_bytes();
+    let text = String::from_utf8(bytes.to_vec()).expect("utf-8 metrics");
+    assert!(text.contains("whippet_orders_ingressed_total"));
+}
+
+#[tokio::test]
 async fn engine_journal_for_selects_distinct_entries_when_the_pool_has_them() {
     // Memory mode shares one Arc (`memory_mode_pool_shares_one_journal_arc`),
     // so distinct handles only exist in iggy mode. This test wires two

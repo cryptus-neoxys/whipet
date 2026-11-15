@@ -49,6 +49,11 @@ Whippet is pre-1.0; minor releases may change internal APIs.
 
 ### Added
 
+- Scoped ingress tokens (`WHIPPET_API_TOKENS=token:participant,...`). Each
+  token authorizes only its participant; the HTTP and TCP paths derive the
+  participant id from the bound name and reject a request that claims another
+  identity. `WHIPPET_METRICS_TOKEN` optionally protects `GET /metrics`; health
+  and readiness stay open for probes. The legacy single token still works.
 - Turbo mode (`WHIPPET_MODE=turbo`, requires the Iggy journal). Ingress
   acknowledges after `ShardEngine::process` returns with
   `guarantee: "matched_unjournaled"`; a per-shard bounded window

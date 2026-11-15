@@ -35,7 +35,7 @@ use whippet_core::tcp::{TCP_BATCH_MAX, TcpErrorCode, TcpRequest, TcpResponse, bo
 use whippet_journal::{GroupCommit, Topic};
 
 use crate::context::NodeContext;
-use crate::gateway::{journal_message_for_command, token_matches};
+use crate::gateway::journal_message_for_command;
 use crate::ratelimit::RateLimiter;
 use crate::turbo::EnqueueError;
 
@@ -303,12 +303,15 @@ async fn handle_submit(
     }
 
     // A token authorizes one participant, not just "some valid client". A
-    // token holder cannot submit an order attributed to another desk.
-    if let Some(participant) = &state.participant
-        && commands.iter().any(|command| {
-            command.participant.0 != 0 && command.participant.as_str() != participant
-        })
-    {
+    // token holder cannot submit an order attributed to another desk. HTTP
+    // derives the id from the token's participant name; TCP clients send the
+    // numeric id, so compare against the same derivation.
+    if let Some(participant) = &state.participant {
+        let expected = whippet_core::ids::ParticipantId::derive(participant);
+        if commands
+            .iter()
+            .any(|command| command.participant != expected)
+        {
             return (
                 error_response(
                     TcpErrorCode::Unauthorized,
@@ -573,6 +576,8 @@ mod tests {
             build: "test".into(),
             api_token: api_token.map(str::to_string),
             api_participant: "api".into(),
+            api_tokens: Vec::new(),
+            metrics_token: None,
             rate_limit_per_sec: per_sec,
             ws_per_ip: 0,
             turbo: crate::turbo::TurboConfig::default(),
@@ -635,6 +640,14 @@ mod tests {
         }
     }
 
+    /// A command attributed to the legacy token's participant, the way a
+    /// token-bound TCP client must attribute every order.
+    fn authed_command(symbol: &str, client_id: u8) -> Command {
+        let mut command = command(symbol, client_id);
+        command.participant = ParticipantId::derive("api");
+        command
+    }
+
     fn error_code(response: &TcpResponse) -> Option<u16> {
         match response {
             TcpResponse::Error { code, .. } => Some(*code),
@@ -680,6 +693,68 @@ mod tests {
                 .read(Topic::Orders, partition, 0, 10)
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn a_bound_token_rejects_another_participants_command() {
+        let node = test_node(Some("s3cret"));
+        let mut state = ConnectionState::new(&node.ctx);
+        let (response, close) = handle_request(
+            &node.ctx,
+            &node.ctx.group_commit,
+            &mut state,
+            TcpRequest::Hello {
+                token: "s3cret".into(),
+            },
+        )
+        .await;
+        assert_eq!(
+            response,
+            TcpResponse::HelloAck {
+                ok: true,
+                message: "ok".into(),
+            }
+        );
+        assert!(!close);
+        assert_eq!(state.participant.as_deref(), Some("api"));
+
+        // A different participant id is refused before anything is journaled.
+        let (response, close) = handle_request(
+            &node.ctx,
+            &node.ctx.group_commit,
+            &mut state,
+            TcpRequest::Submit {
+                commands: vec![command("BTC-USD", 1)],
+            },
+        )
+        .await;
+        assert_eq!(
+            error_code(&response),
+            Some(TcpErrorCode::Unauthorized.as_u16())
+        );
+        assert!(!close);
+        let partition = Symbol::new("BTC-USD")
+            .unwrap()
+            .partition(node.ctx.exchange().partitions);
+        assert!(
+            node.memory()
+                .read(Topic::Orders, partition, 0, 10)
+                .is_empty()
+        );
+
+        // The same client with the token's participant id is accepted.
+        let (response, close) = handle_request(
+            &node.ctx,
+            &node.ctx.group_commit,
+            &mut state,
+            TcpRequest::Submit {
+                commands: vec![authed_command("BTC-USD", 2)],
+            },
+        )
+        .await;
+        assert!(!close);
+        assert_eq!(submit_ack(response).1, 0);
+        assert_eq!(node.memory().read(Topic::Orders, partition, 0, 10).len(), 1);
     }
 
     #[tokio::test]
@@ -1144,7 +1219,7 @@ mod tests {
             &node.ctx.group_commit,
             &mut state,
             TcpRequest::Submit {
-                commands: vec![command("BTC-USD", 3)],
+                commands: vec![authed_command("BTC-USD", 3)],
             },
         )
         .await;
@@ -1216,13 +1291,13 @@ mod tests {
         );
         out.extend_from_slice(
             &TcpRequest::Submit {
-                commands: vec![command("BTC-USD", 1), command("BTC-USD", 2)],
+                commands: vec![authed_command("BTC-USD", 1), authed_command("BTC-USD", 2)],
             }
             .encode(),
         );
         out.extend_from_slice(
             &TcpRequest::Submit {
-                commands: vec![command("BTC-USD", 3)],
+                commands: vec![authed_command("BTC-USD", 3)],
             }
             .encode(),
         );

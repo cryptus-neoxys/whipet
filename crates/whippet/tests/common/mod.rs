@@ -57,6 +57,8 @@ impl TestNode {
             build: "test".into(),
             api_token: None,
             api_participant: "api".into(),
+            api_tokens: Vec::new(),
+            metrics_token: None,
             rate_limit_per_sec: 0,
             ws_per_ip: 0,
             turbo: whippet::turbo::TurboConfig::default(),
