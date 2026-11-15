@@ -117,10 +117,12 @@ impl TcpRequest {
         match self {
             TcpRequest::Hello { token } => {
                 body.push(KIND_HELLO);
-                let token = token.as_bytes();
-                let len = token.len().min(TCP_TOKEN_MAX) as u16;
+                // Never split a multi-byte character: a truncated token must
+                // still be valid UTF-8 or the decoder rejects our own frame.
+                let token = truncate_utf8(token, TCP_TOKEN_MAX).as_bytes();
+                let len = token.len() as u16;
                 body.extend_from_slice(&len.to_le_bytes());
-                body.extend_from_slice(&token[..len as usize]);
+                body.extend_from_slice(token);
             }
             TcpRequest::Submit { commands } => {
                 body.push(KIND_SUBMIT);
@@ -148,10 +150,20 @@ impl TcpRequest {
                     return Err(CoreError::InvalidValue("short hello frame".into()));
                 }
                 let len = u16::from_le_bytes([rest[0], rest[1]]) as usize;
-                if len > TCP_TOKEN_MAX || rest.len() < 2 + len {
-                    return Err(CoreError::InvalidValue("hello token length".into()));
+                if len > TCP_TOKEN_MAX {
+                    return Err(CoreError::InvalidValue(format!(
+                        "hello token of {len} bytes exceeds the {TCP_TOKEN_MAX}-byte limit"
+                    )));
                 }
-                let token = std::str::from_utf8(&rest[2..2 + len])
+                // Exact, not `>=`: a frame with bytes after the token is a
+                // desynchronised or crafted frame, not a partial decode.
+                if rest.len() != 2 + len {
+                    return Err(CoreError::InvalidValue(format!(
+                        "hello frame carries {} bytes after the token length prefix, expected {len}",
+                        rest.len() - 2
+                    )));
+                }
+                let token = std::str::from_utf8(&rest[2..])
                     .map_err(|_| CoreError::InvalidValue("hello token is not UTF-8".into()))?;
                 Ok(TcpRequest::Hello {
                     token: token.to_string(),
@@ -168,8 +180,11 @@ impl TcpRequest {
                     )));
                 }
                 let expected = count * COMMAND_ENCODED_LEN;
-                if rest.len() < 2 + expected {
-                    return Err(CoreError::InvalidValue("truncated submit frame".into()));
+                if rest.len() != 2 + expected {
+                    return Err(CoreError::InvalidValue(format!(
+                        "submit frame of {} bytes does not match {count} fixed {COMMAND_ENCODED_LEN}-byte commands",
+                        rest.len() - 2
+                    )));
                 }
                 let mut commands = Vec::with_capacity(count);
                 for index in 0..count {
@@ -180,10 +195,13 @@ impl TcpRequest {
                 Ok(TcpRequest::Submit { commands })
             }
             KIND_PING => {
-                if rest.len() < 8 {
-                    return Err(CoreError::InvalidValue("short ping frame".into()));
+                if rest.len() != 8 {
+                    return Err(CoreError::InvalidValue(format!(
+                        "ping frame carries {} bytes, expected 8",
+                        rest.len()
+                    )));
                 }
-                let client_ns = u64::from_le_bytes(rest[..8].try_into().expect("8 bytes"));
+                let client_ns = u64::from_le_bytes(rest.try_into().expect("8 bytes"));
                 Ok(TcpRequest::Ping { client_ns })
             }
             other => Err(CoreError::InvalidValue(format!(
@@ -242,14 +260,28 @@ impl TcpResponse {
                 let (&ok, rest) = rest
                     .split_first()
                     .ok_or_else(|| CoreError::InvalidValue("short hello ack".into()))?;
+                // The encoder emits exactly 0 or 1. Accepting any other byte
+                // would make the decode/re-encode cycle non-canonical.
+                let ok = match ok {
+                    0 => false,
+                    1 => true,
+                    other => {
+                        return Err(CoreError::InvalidValue(format!(
+                            "hello ack boolean must be 0 or 1, got {other}"
+                        )));
+                    }
+                };
                 Ok(TcpResponse::HelloAck {
-                    ok: ok != 0,
+                    ok,
                     message: read_string(rest)?,
                 })
             }
             KIND_SUBMIT_ACK => {
-                if rest.len() < 24 {
-                    return Err(CoreError::InvalidValue("short submit ack".into()));
+                if rest.len() != 24 {
+                    return Err(CoreError::InvalidValue(format!(
+                        "submit ack carries {} bytes, expected 24",
+                        rest.len()
+                    )));
                 }
                 Ok(TcpResponse::SubmitAck {
                     partition: u32::from_le_bytes(rest[0..4].try_into().expect("4 bytes")),
@@ -259,8 +291,11 @@ impl TcpResponse {
                 })
             }
             KIND_PONG => {
-                if rest.len() < 16 {
-                    return Err(CoreError::InvalidValue("short pong".into()));
+                if rest.len() != 16 {
+                    return Err(CoreError::InvalidValue(format!(
+                        "pong carries {} bytes, expected 16",
+                        rest.len()
+                    )));
                 }
                 Ok(TcpResponse::Pong {
                     client_ns: u64::from_le_bytes(rest[..8].try_into().expect("8 bytes")),
@@ -303,10 +338,26 @@ pub fn body_len(prefix: [u8; 4]) -> Result<usize> {
 }
 
 fn push_string(out: &mut Vec<u8>, value: &str) {
-    let bytes = value.as_bytes();
-    let len = bytes.len().min(u16::MAX as usize) as u16;
+    // Cap on a UTF-8 boundary so a truncated message still decodes. The format
+    // length is a `u16`; anything longer is truncated by contract.
+    let value = truncate_utf8(value, u16::MAX as usize);
+    let len = value.len() as u16;
     out.extend_from_slice(&len.to_le_bytes());
-    out.extend_from_slice(&bytes[..len as usize]);
+    out.extend_from_slice(value.as_bytes());
+}
+
+/// The longest prefix of `value` that is at most `max` bytes and ends on a
+/// UTF-8 character boundary. A truncated frame must never contain a split
+/// character, because the decoder rejects invalid UTF-8.
+fn truncate_utf8(value: &str, max: usize) -> &str {
+    if value.len() <= max {
+        return value;
+    }
+    let mut end = max;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 fn read_string(bytes: &[u8]) -> Result<String> {
@@ -314,10 +365,14 @@ fn read_string(bytes: &[u8]) -> Result<String> {
         return Err(CoreError::InvalidValue("short string field".into()));
     }
     let len = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
-    if bytes.len() < 2 + len {
-        return Err(CoreError::InvalidValue("truncated string field".into()));
+    // Exact, not `>=`: trailing bytes after the string are a malformed frame.
+    if bytes.len() != 2 + len {
+        return Err(CoreError::InvalidValue(format!(
+            "string field carries {} bytes, expected {len}",
+            bytes.len() - 2
+        )));
     }
-    std::str::from_utf8(&bytes[2..2 + len])
+    std::str::from_utf8(&bytes[2..])
         .map(str::to_string)
         .map_err(|_| CoreError::InvalidValue("string field is not UTF-8".into()))
 }
@@ -416,6 +471,93 @@ mod tests {
         let mut body = vec![KIND_SUBMIT];
         body.extend_from_slice(&1u16.to_le_bytes());
         body.extend_from_slice(&[0u8; 10]);
+        assert!(TcpRequest::decode_body(&body).is_err());
+    }
+
+    #[test]
+    fn decoders_reject_trailing_bytes() {
+        let requests = [
+            TcpRequest::Hello {
+                token: "secret".into(),
+            },
+            TcpRequest::Ping { client_ns: 7 },
+            TcpRequest::Submit {
+                commands: vec![command(1)],
+            },
+        ];
+        for request in requests {
+            let mut body = request.encode()[4..].to_vec();
+            body.push(0);
+            assert!(
+                TcpRequest::decode_body(&body).is_err(),
+                "trailing byte accepted for {request:?}"
+            );
+        }
+
+        let responses = [
+            TcpResponse::HelloAck {
+                ok: true,
+                message: "ok".into(),
+            },
+            TcpResponse::SubmitAck {
+                partition: 1,
+                base_offset: 2,
+                count: 3,
+                server_ns: 4,
+            },
+            TcpResponse::Pong {
+                client_ns: 5,
+                server_ns: 6,
+            },
+            TcpResponse::Error {
+                code: TcpErrorCode::BadFrame.as_u16(),
+                message: "bad".into(),
+            },
+        ];
+        for response in responses {
+            let mut body = response.encode()[4..].to_vec();
+            body.push(0);
+            assert!(
+                TcpResponse::decode_body(&body).is_err(),
+                "trailing byte accepted for {response:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hello_ack_rejects_a_non_canonical_boolean() {
+        let body = [KIND_HELLO_ACK, 2, 0, 0];
+        assert!(TcpResponse::decode_body(&body).is_err());
+    }
+
+    #[test]
+    fn oversized_hello_token_is_not_split_mid_character() {
+        // 511 ASCII bytes then a three-byte character straddles the 512-byte
+        // truncation point. Encoding must cut on a boundary, not emit invalid
+        // UTF-8 that its own decoder rejects.
+        let token = format!("{}€", "a".repeat(TCP_TOKEN_MAX - 1));
+        let frame = TcpRequest::Hello { token }.encode();
+        let len = body_len(frame[..4].try_into().unwrap()).unwrap();
+        let decoded = TcpRequest::decode_body(&frame[4..]).unwrap();
+        assert_eq!(
+            decoded,
+            TcpRequest::Hello {
+                token: "a".repeat(TCP_TOKEN_MAX - 1)
+            },
+            "frame body of {len} bytes must decode"
+        );
+    }
+
+    #[test]
+    fn declared_counts_are_rejected_before_reading_the_payload() {
+        // Maximum batch count with no commands behind it.
+        let mut body = vec![KIND_SUBMIT];
+        body.extend_from_slice(&u16::MAX.to_le_bytes());
+        assert!(TcpRequest::decode_body(&body).is_err());
+
+        // Maximum hello token length with no token behind it.
+        let mut body = vec![KIND_HELLO];
+        body.extend_from_slice(&u16::MAX.to_le_bytes());
         assert!(TcpRequest::decode_body(&body).is_err());
     }
 }

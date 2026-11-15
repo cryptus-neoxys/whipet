@@ -792,6 +792,14 @@ impl MdLevel {
 
 pub const MD_SNAPSHOT_HEADER_LEN: usize = 1 + 1 + 16 + 8 + 8 + 8 + 8 + 8 + 2 + 2 + 4;
 
+/// Encoded size of one [`MdLevel`]: `i64 price + u64 qty + u32 orders`.
+pub const MD_LEVEL_ENCODED_LEN: usize = 8 + 8 + 4;
+
+/// Encoded size of one [`MdOrder`]: `u128 id + u8 side + i64 price + u64 qty +
+/// u64 participant`. The snapshot decoder uses this to reject an order count
+/// that cannot fit before reserving memory for it.
+pub const MD_ORDER_ENCODED_LEN: usize = 16 + 1 + 8 + 8 + 8;
+
 /// One resting order in a full snapshot. The MD hub needs this to apply
 /// subsequent reduce/remove deltas after a recovery; the top-N levels alone are
 /// not enough.
@@ -849,8 +857,8 @@ impl MdSnapshot {
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = Writer::with_capacity(
             MD_SNAPSHOT_HEADER_LEN
-                + (self.bids.len() + self.asks.len()) * 20
-                + self.orders.len() * 37
+                + (self.bids.len() + self.asks.len()) * MD_LEVEL_ENCODED_LEN
+                + self.orders.len() * MD_ORDER_ENCODED_LEN
                 + 1,
         );
         writer
@@ -902,15 +910,30 @@ impl MdSnapshot {
         let bid_count = reader.u16()? as usize;
         let ask_count = reader.u16()? as usize;
         let order_count = reader.u32()? as usize;
+        // Validate each count against the bytes that actually remain before
+        // reserving: a 66-byte header can otherwise advertise 65,535 levels
+        // and force a multi-megabyte allocation for a frame that cannot exist.
+        if bid_count > reader.remaining() / MD_LEVEL_ENCODED_LEN {
+            return Err(CoreError::InvalidValue(format!(
+                "snapshot claims {bid_count} bid levels but only {} bytes remain",
+                reader.remaining()
+            )));
+        }
         let mut bids = Vec::with_capacity(bid_count);
         for _ in 0..bid_count {
             bids.push(MdLevel::decode(&mut reader)?);
+        }
+        if ask_count > reader.remaining() / MD_LEVEL_ENCODED_LEN {
+            return Err(CoreError::InvalidValue(format!(
+                "snapshot claims {ask_count} ask levels but only {} bytes remain",
+                reader.remaining()
+            )));
         }
         let mut asks = Vec::with_capacity(ask_count);
         for _ in 0..ask_count {
             asks.push(MdLevel::decode(&mut reader)?);
         }
-        if order_count > reader.remaining() / 37 {
+        if order_count > reader.remaining() / MD_ORDER_ENCODED_LEN {
             return Err(CoreError::InvalidValue(format!(
                 "snapshot claims {order_count} orders but only {} bytes remain",
                 reader.remaining()
