@@ -1448,8 +1448,11 @@ async fn read_topic_from_start(
     partition: u32,
     consumer: &str,
 ) -> Result<Vec<PayloadRecord>> {
-    const BATCH: u32 = 1_000;
-    const MAX_WAIT_MS: u64 = 100;
+    // Offline scan: the broker's batch cap is 256, and a zero wait returns
+    // whatever is already available instead of holding each poll open. A
+    // non-zero wait here made a 100k-record topic take minutes.
+    const BATCH: u32 = 256;
+    const MAX_WAIT_MS: u64 = 0;
     const EMPTY_POLL_LIMIT: u32 = 5;
 
     let mut records = Vec::new();
@@ -1476,7 +1479,7 @@ async fn read_topic_from_start(
                 break;
             }
             empty_polls += 1;
-            tokio::time::sleep(Duration::from_millis(MAX_WAIT_MS)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
             continue;
         }
         empty_polls = 0;
