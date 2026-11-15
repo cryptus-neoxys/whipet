@@ -10,7 +10,7 @@
 use whippet_core::api::BookView;
 use whippet_core::config::ExchangeConfig;
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Seq, Symbol};
-use whippet_core::protocol::{MdEvent, MdKind, Side};
+use whippet_core::protocol::{MdEvent, MdKind, MdSnapshot, Side};
 use whippet_marketdata::MdHub;
 
 fn btc() -> Symbol {
@@ -40,6 +40,24 @@ fn event(
     }
 }
 
+/// The producer's startup image: an empty book at sequence zero. The hub
+/// refuses book-state deltas until it has seen one, because a delta cannot
+/// establish depth by itself.
+fn seed(hub: &MdHub) {
+    hub.apply_snapshot(&MdSnapshot {
+        symbol: btc(),
+        seq: Seq(0),
+        cause_offset: 0,
+        timestamp_ns: 0,
+        last_trade_price: Price(0),
+        last_trade_qty: Qty(0),
+        bids: Vec::new(),
+        asks: Vec::new(),
+        orders: Vec::new(),
+        flags: 0,
+    });
+}
+
 fn book(hub: &MdHub) -> BookView {
     hub.state()
         .symbols
@@ -57,6 +75,7 @@ fn duplicate_md_delta_is_idempotent_and_later_seq_applies() {
         None,
     );
 
+    seed(&hub);
     let first = event(MdKind::Add, Side::Buy, 65_000, 10, 1, 1);
     hub.apply(&first);
     hub.apply(&first);
@@ -99,16 +118,42 @@ fn duplicate_md_delta_is_idempotent_and_later_seq_applies() {
 }
 
 #[test]
-fn first_event_always_applies() {
+fn the_first_event_after_the_image_applies() {
     let hub = MdHub::new(
         ExchangeConfig::default(),
         "test".into(),
         "memory".into(),
         None,
     );
-    // Sequence zero is the initial state; a real event must still apply.
-    hub.apply(&event(MdKind::Add, Side::Sell, 65_100, 7, 9, 0));
+    seed(&hub);
+    // Sequence zero is the image; the first real event must still apply.
+    hub.apply(&event(MdKind::Add, Side::Sell, 65_100, 7, 9, 1));
     let state = book(&hub);
+    assert_eq!(state.seq, Seq(1));
     assert_eq!(state.asks[0].qty, 7);
     assert_eq!(state.asks[0].orders, 1);
+}
+
+#[test]
+fn a_book_state_delta_without_an_image_is_refused() {
+    let hub = MdHub::new(
+        ExchangeConfig::default(),
+        "test".into(),
+        "memory".into(),
+        None,
+    );
+    hub.apply(&event(MdKind::Add, Side::Sell, 65_100, 7, 9, 1));
+    let state = book(&hub);
+    assert_eq!(state.seq, Seq(0), "a refused delta must not advance seq");
+    assert!(state.asks.is_empty(), "no depth can be built from a delta");
+    assert_eq!(hub.events_without_baseline(), 1);
+    assert_eq!(
+        hub.book_phase(btc()),
+        Some(whippet_marketdata::BookPhase::AwaitingSnapshot)
+    );
+
+    // The image seeds the book, and the retried delta then applies.
+    seed(&hub);
+    hub.apply(&event(MdKind::Add, Side::Sell, 65_100, 7, 9, 1));
+    assert_eq!(book(&hub).asks[0].qty, 7);
 }

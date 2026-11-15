@@ -14,6 +14,27 @@
 //! `Arc`, paired with [`MdHub::feed_snapshot`] for a full depth-unlimited
 //! image at a known sequence. Conflation is the dashboard's policy; it is not
 //! the external feed's contract.
+//!
+//! ## Book lifecycle
+//!
+//! Each symbol's book has a baseline phase. The engine publishes a full image
+//! before it publishes any delta, so a hub starts in
+//! [`BookPhase::AwaitingSnapshot`], and an accepted snapshot moves the symbol
+//! to [`BookPhase::Seeded`] for the rest of the process:
+//!
+//! ```text
+//! AwaitingSnapshot --snapshot seq >= book.seq--> Seeded   (baseline image)
+//! Seeded           --snapshot seq >  book.seq--> Seeded   (image replaces)
+//! any              --snapshot seq <  book.seq--> any      (stale, refused)
+//! AwaitingSnapshot --Status / Snapshot delta---> AwaitingSnapshot (seq advances)
+//! AwaitingSnapshot --Add/Reduce/Remove/Trade/Bbo-> AwaitingSnapshot (refused, counted)
+//! ```
+//!
+//! A delta advances the per-symbol sequence only when the book applied it, so
+//! `seq` means "applied through" on both the book and the hub. A book-state
+//! delta that arrives without a baseline is refused and counted
+//! ([`MdHub::events_without_baseline`]) instead of inventing depth: the image
+//! that follows covers it, because sequences only increase within a symbol.
 
 #![forbid(unsafe_code)]
 
@@ -79,6 +100,72 @@ struct LevelState {
     orders: u32,
 }
 
+/// Lifecycle phase of one symbol's book.
+///
+/// The producer publishes a full image before it publishes any delta, because
+/// a delta names one price level and cannot reconstruct the resting orders
+/// behind the rest of the book. A book that has never accepted an image is
+/// therefore [`BookPhase::AwaitingSnapshot`], and book-state deltas are refused
+/// (and counted) rather than inventing depth.
+///
+/// The phase is monotonic within a process: an accepted snapshot seeds the
+/// book and nothing unsets it. A snapshot cannot be "unseen", and a stale one
+/// is rejected before it can touch the phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BookPhase {
+    /// No full image has been accepted yet. Only events that carry no book
+    /// state (`Status`, `Snapshot`) apply.
+    AwaitingSnapshot,
+    /// A full image has been accepted; deltas apply from here on.
+    Seeded,
+}
+
+impl BookPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AwaitingSnapshot => "awaiting_snapshot",
+            Self::Seeded => "seeded",
+        }
+    }
+}
+
+/// Result of offering one delta to a book.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyOutcome {
+    /// The event mutated the book (or was an accepted no-op) and advanced the
+    /// per-symbol sequence.
+    Applied,
+    /// Duplicate or stale: already covered by the book's sequence.
+    Stale,
+    /// A book-state delta arrived before any full image. Ignored and counted;
+    /// the sequence did not advance.
+    NoBaseline,
+    /// The event cannot be represented against the current book (an
+    /// over-reduce or an aggregate overflow). Ignored; the sequence did not
+    /// advance, so the book never claims state it did not take.
+    Refused,
+}
+
+impl ApplyOutcome {
+    const fn is_applied(self) -> bool {
+        matches!(self, Self::Applied)
+    }
+}
+
+/// Whether a delta kind needs a baseline image to be meaningful.
+///
+/// `Status` mutates only the halt/session flags and an `MdKind::Snapshot`
+/// delta carries no depth at all, so both are safe before a baseline. Every
+/// other kind describes book state for a symbol: a resting order, a trade, or
+/// a best bid/offer. Applying one of those without an image is what invents
+/// depth, so the gate covers them all.
+const fn carries_book_state(kind: MdKind) -> bool {
+    matches!(
+        kind,
+        MdKind::Add | MdKind::Reduce | MdKind::Remove | MdKind::Trade | MdKind::Bbo
+    )
+}
+
 #[derive(Debug)]
 struct BookState {
     symbol: Symbol,
@@ -89,6 +176,15 @@ struct BookState {
     last_trade_price_cents: Option<i64>,
     last_trade_qty: u64,
     last_trade_side: Option<Side>,
+    /// Baseline lifecycle. Monotonic; see [`BookPhase`].
+    phase: BookPhase,
+    /// `true` while `orders` is the complete resting-order set, so every level
+    /// aggregate equals the refs at that level. A level-only snapshot
+    /// (aggregates, no refs) clears this until a full image arrives.
+    refs_complete: bool,
+    /// Book-state deltas refused because the book had no baseline image.
+    /// Nonzero means the producer's startup order was violated.
+    events_without_baseline: u64,
     seq: Seq,
     /// Instrument halt state from the latest `MdKind::Status` event. A halt
     /// carries no book change; this flag is the only thing a status event
@@ -120,6 +216,9 @@ impl BookState {
             last_trade_price_cents: None,
             last_trade_qty: 0,
             last_trade_side: None,
+            phase: BookPhase::AwaitingSnapshot,
+            refs_complete: true,
+            events_without_baseline: 0,
             seq: Seq(0),
             halted: false,
             session: SessionState::default(),
@@ -133,10 +232,24 @@ impl BookState {
         price.0 * self.tick_size_cents
     }
 
+    fn side_levels(&self, side: Side) -> &BTreeMap<i64, LevelState> {
+        match side {
+            Side::Buy => &self.bids,
+            Side::Sell => &self.asks,
+        }
+    }
+
     fn side_levels_mut(&mut self, side: Side) -> &mut BTreeMap<i64, LevelState> {
         match side {
             Side::Buy => &mut self.bids,
             Side::Sell => &mut self.asks,
+        }
+    }
+
+    fn depth(&self, side: Side) -> u64 {
+        match side {
+            Side::Buy => self.depth_bid_qty,
+            Side::Sell => self.depth_ask_qty,
         }
     }
 
@@ -154,100 +267,35 @@ impl BookState {
         self.depth_ask_qty = total_depth(&self.asks);
     }
 
-    fn apply(&mut self, event: &MdEvent) -> bool {
+    /// Apply one delta.
+    ///
+    /// The sequence advances if and only if the event was applied. A stale
+    /// duplicate, a baseline-less delta, and an event the book cannot represent
+    /// all leave `seq` where it was; that is what keeps the hub sequence equal
+    /// to the maximum book sequence and stops an ignored event from making
+    /// every later one look stale.
+    fn apply(&mut self, event: &MdEvent) -> ApplyOutcome {
         // At-least-once delivery: a crash between apply and commit replays the
         // batch. The per-symbol sequence makes deltas idempotent.
         if self.seq.0 != 0 && event.seq.0 <= self.seq.0 {
-            return false;
+            return ApplyOutcome::Stale;
         }
-        self.seq = event.seq;
-        self.last_cause_offset = event.cause_offset;
-        match event.kind {
-            MdKind::Add => {
-                let price_cents = self.price_cents(event.price);
-                let added = {
-                    let level = self
-                        .side_levels_mut(event.side)
-                        .entry(price_cents)
-                        .or_default();
-                    let before = level.qty;
-                    level.qty = level.qty.saturating_add(event.qty.0);
-                    level.orders = level.orders.saturating_add(1);
-                    // Saturating arithmetic can absorb part of the add; track
-                    // the change the map actually took, not the requested qty.
-                    level.qty - before
-                };
-                let depth = self.depth_mut(event.side);
-                *depth = depth.saturating_add(added);
-                self.orders.insert(
-                    event.order_id,
-                    OrderRef {
-                        side: event.side,
-                        price_cents,
-                        qty: event.qty.0,
-                    },
-                );
-            }
-            MdKind::Reduce => {
-                if let Some(order) = self.orders.get(&event.order_id).copied() {
-                    let new_qty = event.qty.0;
-                    if new_qty > order.qty {
-                        return false;
-                    }
-                    let delta = order.qty.saturating_sub(new_qty);
-                    if delta > 0 {
-                        let removed =
-                            match self.side_levels_mut(order.side).get_mut(&order.price_cents) {
-                                Some(level) => {
-                                    let before = level.qty;
-                                    level.qty = level.qty.saturating_sub(delta);
-                                    before - level.qty
-                                }
-                                None => 0,
-                            };
-                        if removed > 0 {
-                            let depth = self.depth_mut(order.side);
-                            *depth = depth.saturating_sub(removed);
-                        }
-                    }
-                    if let Some(order) = self.orders.get_mut(&event.order_id) {
-                        order.qty = new_qty;
-                    }
-                }
-            }
-            MdKind::Remove => {
-                if let Some(order) = self.orders.remove(&event.order_id) {
-                    let (removed, remove_level, leftover) = {
-                        let levels = self.side_levels_mut(order.side);
-                        if let Some(level) = levels.get_mut(&order.price_cents) {
-                            let before = level.qty;
-                            level.qty = level.qty.saturating_sub(order.qty);
-                            level.orders = level.orders.saturating_sub(1);
-                            (before - level.qty, level.orders == 0, level.qty)
-                        } else {
-                            (0, false, 0)
-                        }
-                    };
-                    if remove_level {
-                        self.side_levels_mut(order.side).remove(&order.price_cents);
-                    }
-                    // Removing the level also drops any quantity left behind by
-                    // an inconsistent order set, so subtract that too.
-                    let removed = if remove_level {
-                        removed.saturating_add(leftover)
-                    } else {
-                        removed
-                    };
-                    if removed > 0 {
-                        let depth = self.depth_mut(order.side);
-                        *depth = depth.saturating_sub(removed);
-                    }
-                }
-            }
+        // Fail closed on book state without a baseline image. `Status` and
+        // `Snapshot` deltas carry no depth, so they still apply and advance the
+        // sequence exactly as before.
+        if self.phase == BookPhase::AwaitingSnapshot && carries_book_state(event.kind) {
+            self.events_without_baseline = self.events_without_baseline.saturating_add(1);
+            return ApplyOutcome::NoBaseline;
+        }
+        let outcome = match event.kind {
+            MdKind::Add => self.apply_add(event),
+            MdKind::Reduce => self.apply_reduce(event),
+            MdKind::Remove => self.apply_remove(event),
             MdKind::Trade => {
                 self.last_trade_price_cents = Some(self.price_cents(event.price));
                 self.last_trade_qty = event.qty.0;
                 self.last_trade_side = Some(event.side);
+                ApplyOutcome::Applied
             }
             MdKind::Status => {
                 // One decoder for the halt + session combination. An
@@ -260,16 +308,142 @@ impl BookState {
                 } else {
                     self.halted = event.flags & MD_FLAG_HALTED != 0;
                 }
+                ApplyOutcome::Applied
             }
-            MdKind::Bbo | MdKind::Snapshot => {}
+            MdKind::Bbo | MdKind::Snapshot => ApplyOutcome::Applied,
+        };
+        if outcome.is_applied() {
+            self.seq = event.seq;
+            self.last_cause_offset = event.cause_offset;
         }
-        true
+        outcome
+    }
+
+    /// Apply an add. Overflow in a level or in the cached depth refuses the
+    /// event instead of saturating: a saturated aggregate can never equal the
+    /// sum of its order refs again, and saturating silently is exactly the
+    /// corruption this book is trying to avoid.
+    fn apply_add(&mut self, event: &MdEvent) -> ApplyOutcome {
+        let price_cents = self.price_cents(event.price);
+        let before = self
+            .side_levels(event.side)
+            .get(&price_cents)
+            .copied()
+            .unwrap_or_default();
+        let Some(qty) = before.qty.checked_add(event.qty.0) else {
+            return ApplyOutcome::Refused;
+        };
+        let Some(orders) = before.orders.checked_add(1) else {
+            return ApplyOutcome::Refused;
+        };
+        let Some(depth) = self.depth(event.side).checked_add(event.qty.0) else {
+            return ApplyOutcome::Refused;
+        };
+        self.side_levels_mut(event.side)
+            .insert(price_cents, LevelState { qty, orders });
+        *self.depth_mut(event.side) = depth;
+        self.orders.insert(
+            event.order_id,
+            OrderRef {
+                side: event.side,
+                price_cents,
+                qty: event.qty.0,
+            },
+        );
+        ApplyOutcome::Applied
+    }
+
+    /// Apply a reduce, which names the order's new remaining quantity.
+    ///
+    /// An unknown order ref is accepted as a no-op: a level-only snapshot has
+    /// aggregates but no refs, so an order-level reduce cannot be matched
+    /// against it. A reduce to zero is a cancel and removes the ref, the level
+    /// quantity and the level's order count, so no zero-quantity level survives.
+    fn apply_reduce(&mut self, event: &MdEvent) -> ApplyOutcome {
+        let Some(order) = self.orders.get(&event.order_id).copied() else {
+            return ApplyOutcome::Applied;
+        };
+        let new_qty = event.qty.0;
+        if new_qty > order.qty {
+            return ApplyOutcome::Refused;
+        }
+        if new_qty == 0 {
+            self.orders.remove(&event.order_id);
+            self.drop_order_from_levels(order);
+            return ApplyOutcome::Applied;
+        }
+        let removed = {
+            let levels = self.side_levels_mut(order.side);
+            match levels.get_mut(&order.price_cents) {
+                Some(level) => {
+                    let before = level.qty;
+                    level.qty = level.qty.saturating_sub(order.qty - new_qty);
+                    before - level.qty
+                }
+                None => 0,
+            }
+        };
+        if removed > 0 {
+            let depth = self.depth_mut(order.side);
+            *depth = depth.saturating_sub(removed);
+        }
+        if let Some(order) = self.orders.get_mut(&event.order_id) {
+            order.qty = new_qty;
+        }
+        ApplyOutcome::Applied
+    }
+
+    /// Apply a remove. An unknown order (already removed, or a level-only
+    /// snapshot with no refs) is an accepted no-op that still advances `seq`.
+    fn apply_remove(&mut self, event: &MdEvent) -> ApplyOutcome {
+        if let Some(order) = self.orders.remove(&event.order_id) {
+            self.drop_order_from_levels(order);
+        }
+        ApplyOutcome::Applied
+    }
+
+    /// Subtract a removed order's remaining quantity from its level, drop the
+    /// level when its last order leaves, and keep the cached depth in step.
+    fn drop_order_from_levels(&mut self, order: OrderRef) {
+        let (removed, empty, leftover) = {
+            let levels = self.side_levels_mut(order.side);
+            let Some(level) = levels.get_mut(&order.price_cents) else {
+                return;
+            };
+            let before = level.qty;
+            level.qty = level.qty.saturating_sub(order.qty);
+            level.orders = level.orders.saturating_sub(1);
+            (before - level.qty, level.orders == 0, level.qty)
+        };
+        if empty {
+            self.side_levels_mut(order.side).remove(&order.price_cents);
+        }
+        // Removing the level also drops any quantity left behind by an
+        // inconsistent order set, so subtract that too.
+        let removed = if empty {
+            removed.saturating_add(leftover)
+        } else {
+            removed
+        };
+        if removed > 0 {
+            let depth = self.depth_mut(order.side);
+            *depth = depth.saturating_sub(removed);
+        }
     }
 
     fn apply_snapshot(&mut self, snapshot: &MdSnapshot) -> bool {
-        // A retried append can deliver an older snapshot after newer deltas.
-        // Never regress a symbol that already has state.
-        if self.seq.0 != 0 && snapshot.seq.0 <= self.seq.0 {
+        // A retried append can deliver an older snapshot after newer deltas:
+        // never regress a symbol that already has real state. While the book is
+        // still awaiting a baseline it holds no depth, so an image at the
+        // book's current sequence is exactly right (a replayed status advanced
+        // `seq` without carrying book state) and a strictly older image is
+        // still refused.
+        let stale = if self.phase == BookPhase::Seeded {
+            self.seq.0 != 0 && snapshot.seq.0 <= self.seq.0
+        } else {
+            snapshot.seq.0 < self.seq.0
+        };
+        if stale {
             return false;
         }
         self.seq = snapshot.seq;
@@ -286,6 +460,12 @@ impl BookState {
         self.bids.clear();
         self.asks.clear();
         self.orders.clear();
+        // A level-only image carries aggregates but no order refs, so the
+        // per-level ref equality is unprovable until a full image arrives. An
+        // empty image is complete: it has no levels and no refs.
+        self.refs_complete =
+            !snapshot.orders.is_empty() || (snapshot.bids.is_empty() && snapshot.asks.is_empty());
+        self.phase = BookPhase::Seeded;
         if snapshot.orders.is_empty() {
             // Compatibility with a level-only snapshot: keep the aggregates
             // but accept that later order-level deltas cannot be applied.
@@ -339,6 +519,145 @@ impl BookState {
             self.last_trade_qty = 0;
         }
         true
+    }
+
+    /// Executable book invariants. Test-only: it walks every level and order,
+    /// so it never belongs on a production path.
+    ///
+    /// ```text
+    /// sequence      seq > 0 as soon as the book holds any state; a book at
+    ///               seq 0 has cause offset 0 and no levels/orders
+    /// phase         a book without a baseline image holds no depth
+    /// levels        every level has qty > 0 and orders > 0; prices are
+    ///               positive tick multiples; best bid < best ask
+    /// depth         depth_bid_qty == sum(bids.qty), likewise asks, with
+    ///               checked addition (an overflow is reported, not wrapped)
+    /// order refs    every ref has positive qty, a level on its own side and
+    ///               a positive tick-multiple price; while the ref set is
+    ///               complete, each level's qty/orders equals the sum/count of
+    ///               the refs at that level, and every level has refs
+    /// last trade    last_trade_qty == 0 iff last_trade_price_cents is None;
+    ///               a present price is positive and a tick multiple. The side
+    ///               is unknown (None) after a snapshot: qty and price are not
+    /// ```
+    #[cfg(test)]
+    fn check_invariants(&self) -> Result<(), String> {
+        if self.tick_size_cents <= 0 {
+            return Err(format!(
+                "tick size {} is not positive",
+                self.tick_size_cents
+            ));
+        }
+        if self.seq.0 == 0 && self.last_cause_offset != 0 {
+            return Err(format!(
+                "sequence 0 carries cause offset {}",
+                self.last_cause_offset
+            ));
+        }
+        let holds_state = !self.bids.is_empty() || !self.asks.is_empty() || !self.orders.is_empty();
+        if self.seq.0 == 0 && holds_state {
+            return Err("book holds state at sequence 0".into());
+        }
+        if self.phase == BookPhase::AwaitingSnapshot && holds_state {
+            return Err("a book without a baseline image holds depth".into());
+        }
+        let bid_sum = check_levels(&self.bids, self.tick_size_cents, "bid")?;
+        let ask_sum = check_levels(&self.asks, self.tick_size_cents, "ask")?;
+        if self.depth_bid_qty != bid_sum {
+            return Err(format!(
+                "cached bid depth {} != level sum {bid_sum}",
+                self.depth_bid_qty
+            ));
+        }
+        if self.depth_ask_qty != ask_sum {
+            return Err(format!(
+                "cached ask depth {} != level sum {ask_sum}",
+                self.depth_ask_qty
+            ));
+        }
+        if let (Some((best_bid, _)), Some((best_ask, _))) =
+            (self.bids.last_key_value(), self.asks.first_key_value())
+            && best_bid >= best_ask
+        {
+            return Err(format!(
+                "crossed book: best bid {best_bid} >= best ask {best_ask}"
+            ));
+        }
+        match (self.last_trade_price_cents, self.last_trade_qty) {
+            (None, 0) => {}
+            (Some(price_cents), qty) => {
+                if qty == 0 {
+                    return Err(format!("last trade price {price_cents} without a quantity"));
+                }
+                if price_cents <= 0 || price_cents % self.tick_size_cents != 0 {
+                    return Err(format!(
+                        "last trade price {price_cents} is not a positive tick multiple"
+                    ));
+                }
+            }
+            (None, qty) => return Err(format!("last trade quantity {qty} without a price")),
+        }
+        if self.orders.is_empty() {
+            // A level-only image has aggregates but no refs: the per-level
+            // equality cannot be proven, everything above still is.
+            return Ok(());
+        }
+        if !self.refs_complete {
+            return Ok(());
+        }
+        let mut aggregates: HashMap<(Side, i64), (u64, u32)> = HashMap::new();
+        for (order_id, order) in &self.orders {
+            if order.qty == 0 {
+                return Err(format!("order {order_id} has zero quantity"));
+            }
+            if order.price_cents <= 0 || order.price_cents % self.tick_size_cents != 0 {
+                return Err(format!(
+                    "order {order_id} prices at {} which is not a positive tick multiple",
+                    order.price_cents
+                ));
+            }
+            let level = self
+                .side_levels(order.side)
+                .get(&order.price_cents)
+                .ok_or_else(|| {
+                    format!(
+                        "order {order_id} rests at {} with no {:?} level",
+                        order.price_cents, order.side
+                    )
+                })?;
+            if level.orders == 0 {
+                return Err(format!("order {order_id} rests in a level with no orders"));
+            }
+            let entry = aggregates
+                .entry((order.side, order.price_cents))
+                .or_insert((0, 0));
+            entry.0 = entry
+                .0
+                .checked_add(order.qty)
+                .ok_or_else(|| format!("order refs overflow at {}", order.price_cents))?;
+            entry.1 += 1;
+        }
+        for (side, levels) in [(Side::Buy, &self.bids), (Side::Sell, &self.asks)] {
+            for (price_cents, level) in levels {
+                let (qty, count) = aggregates
+                    .get(&(side, *price_cents))
+                    .copied()
+                    .unwrap_or_default();
+                if level.qty != qty {
+                    return Err(format!(
+                        "{side:?} level {price_cents}: level qty {} != order refs {qty}",
+                        level.qty
+                    ));
+                }
+                if level.orders != count {
+                    return Err(format!(
+                        "{side:?} level {price_cents}: level orders {} != order refs {count}",
+                        level.orders
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn view(&self) -> BookView {
@@ -433,6 +752,42 @@ fn total_depth(levels: &BTreeMap<i64, LevelState>) -> u64 {
     levels
         .values()
         .fold(0u64, |total, level| total.saturating_add(level.qty))
+}
+
+/// Validate one side's level map and return its checked quantity total.
+///
+/// A zero-quantity level is a real defect, not a rounding artefact: it renders
+/// an empty rung in the ladder, it can only come from an inconsistent order
+/// set, and it makes "best bid < best ask" meaningless.
+#[cfg(test)]
+fn check_levels(
+    levels: &BTreeMap<i64, LevelState>,
+    tick_size_cents: i64,
+    side: &str,
+) -> Result<u64, String> {
+    let mut total = 0u64;
+    for (price_cents, level) in levels {
+        if *price_cents <= 0 {
+            return Err(format!(
+                "{side} level {price_cents} is not a positive price"
+            ));
+        }
+        if price_cents % tick_size_cents != 0 {
+            return Err(format!(
+                "{side} level {price_cents} is not a multiple of the tick {tick_size_cents}"
+            ));
+        }
+        if level.qty == 0 {
+            return Err(format!("{side} level {price_cents} has zero quantity"));
+        }
+        if level.orders == 0 {
+            return Err(format!("{side} level {price_cents} has no orders"));
+        }
+        total = total
+            .checked_add(level.qty)
+            .ok_or_else(|| format!("{side} quantity overflows u64 at level {price_cents}"))?;
+    }
+    Ok(total)
 }
 
 struct HubState {
@@ -1343,11 +1698,19 @@ pub struct MdHub {
     /// Frames handed to the feed buffer since process start. Stays `0` while
     /// no subscriber is attached: the no-subscriber path encodes nothing.
     feed_sent: AtomicU64,
+    /// Set by the first [`MdHub::subscribe_feed`] call. Distinguishes "no
+    /// subscriber ever" from "the last subscriber left", which `feed_sent`
+    /// alone cannot.
+    feed_subscribed: AtomicBool,
     /// `Lagged` results reported by subscribers through
     /// [`MdHub::record_feed_lagged`].
     feed_lagged: AtomicU64,
     /// Resnapshots triggered through [`MdHub::record_feed_resync`].
     feed_resyncs: AtomicU64,
+    /// Book-state deltas refused because the symbol had no baseline image.
+    /// Nonzero means the producer published a delta before its snapshot, or
+    /// the startup snapshot never landed.
+    events_without_baseline: AtomicU64,
     metrics: Arc<Metrics>,
     iggy_addr: String,
     journal: String,
@@ -1429,8 +1792,10 @@ impl MdHub {
             watch,
             feed,
             feed_sent: AtomicU64::new(0),
+            feed_subscribed: AtomicBool::new(false),
             feed_lagged: AtomicU64::new(0),
             feed_resyncs: AtomicU64::new(0),
+            events_without_baseline: AtomicU64::new(0),
             metrics,
             iggy_addr,
             journal,
@@ -1454,6 +1819,7 @@ impl MdHub {
     /// received frames with [`Self::feed_snapshot`]: the snapshot carries the
     /// sequence, and the consumer drops deltas at or below it.
     pub fn subscribe_feed(&self) -> broadcast::Receiver<Arc<MdFeedEvent>> {
+        self.feed_subscribed.store(true, Ordering::Relaxed);
         self.feed.subscribe()
     }
 
@@ -1461,6 +1827,22 @@ impl MdHub {
     /// feed work at all: it neither builds nor serializes a delta.
     pub fn feed_receiver_count(&self) -> usize {
         self.feed.receiver_count()
+    }
+
+    /// Book-state deltas refused because the symbol had no baseline image.
+    ///
+    /// A well-behaved producer publishes its initial snapshot before any
+    /// delta, so this stays `0`. A nonzero value means the hub received a
+    /// delta first and refused it rather than building depth from nothing;
+    /// the book stays empty until an image arrives.
+    pub fn events_without_baseline(&self) -> u64 {
+        self.events_without_baseline.load(Ordering::Relaxed)
+    }
+
+    /// Baseline phase of one symbol's book. `None` for an untracked symbol.
+    pub fn book_phase(&self, symbol: Symbol) -> Option<BookPhase> {
+        let state = self.state.lock().expect("md state poisoned");
+        state.books.get(&symbol).map(|book| book.phase)
     }
 
     /// Full price-level snapshot of `symbol` at its current sequence.
@@ -1520,6 +1902,7 @@ impl MdHub {
         let mut state = self.state.lock().expect("md state poisoned");
         let mut applied = 0u64;
         let mut trades_applied = 0u64;
+        let mut no_baseline = 0u64;
         let mut max_seq = 0u64;
         for event in events {
             // Unknown symbols are skipped exactly as `apply` skips them. The
@@ -1535,8 +1918,13 @@ impl MdHub {
             };
             #[cfg(debug_assertions)]
             debug_assert_eq!(book.tick_size_cents, instrument.tick_size_cents);
-            if !book.apply(event) {
-                continue;
+            match book.apply(event) {
+                ApplyOutcome::Applied => {}
+                ApplyOutcome::NoBaseline => {
+                    no_baseline += 1;
+                    continue;
+                }
+                ApplyOutcome::Stale | ApplyOutcome::Refused => continue,
             }
             // Read the price scale before touching `state.trades` so the book
             // borrow ends here (the two fields are disjoint, but NLL needs the
@@ -1545,8 +1933,8 @@ impl MdHub {
             applied += 1;
             max_seq = max_seq.max(event.seq.0);
             if broadcasting {
-                // A duplicate or stale record never reaches this point, so
-                // the feed cannot publish a frame the book rejected.
+                // A duplicate, stale, or refused record never reaches this
+                // point, so the feed cannot publish a frame the book rejected.
                 accepted.push((event, price_cents));
             }
             if event.kind == MdKind::Trade {
@@ -1564,6 +1952,12 @@ impl MdHub {
                     seq: event.seq,
                 });
             }
+        }
+        // Counted while the hub lock is held so the hub counter and the
+        // per-book counters can be compared by `check_invariants`.
+        if no_baseline > 0 {
+            self.events_without_baseline
+                .fetch_add(no_baseline, Ordering::Relaxed);
         }
         if applied == 0 {
             // A batch of duplicates still did work; record it before returning.
@@ -1597,10 +1991,11 @@ impl MdHub {
     /// advance the symbol's sequence, and skipping them would show the
     /// consumer a hole it cannot distinguish from a lost frame.
     ///
-    /// One asymmetry is inherited from [`BookState::apply`]: an over-reduce
-    /// advances the sequence and *then* rejects the event, so it is not
-    /// broadcast. The consumer sees a gap and resnapshots, which is the honest
-    /// outcome for a producer bug rather than inventing a frame for it.
+    /// A refused event (an over-reduce, an aggregate overflow, or a delta that
+    /// arrived before the symbol's baseline image) advances nothing and is not
+    /// broadcast, so the frame stream is exactly the applied-event stream: the
+    /// consumer's own sequence check covers the gap, and a baseline-less delta
+    /// is dropped on both sides rather than published as book state.
     fn publish_feed(&self, accepted: &[(&MdEvent, i64)]) {
         let mut sent = 0u64;
         for (event, price_cents) in accepted {
@@ -1651,6 +2046,143 @@ impl MdHub {
         state.last_update_ns = now_ns();
         state.sequence = state.sequence.max(snapshot.seq.0);
         state.dirty = true;
+    }
+
+    /// Executable hub invariants, covering the books, the tape, the sequence
+    /// watermark, and the feed counters. Test-only: it walks every book.
+    ///
+    /// ```text
+    /// books       keys == the configured instruments, each with its own tick
+    ///             size, and every book passes `BookState::check_invariants`
+    /// sequence    state.sequence == max(book.seq), 0 when no book has state
+    /// counters    trades_count <= md_events (a trade is an applied event) and
+    ///             the tape holds at most TRADE_TAPE_LEN entries, never more
+    ///             than the trades counted
+    /// tape        per symbol, seq strictly increases in tape order (the seq
+    ///             domain is per symbol, so two symbols may interleave); every
+    ///             entry has positive qty and price; the newest entry for a
+    ///             symbol is that symbol's highest trade seq and never runs
+    ///             past the book's sequence
+    /// feed        no subscriber ever => feed_sent == 0; the lag and resync
+    ///             counters are monotonic fetch_adds, so only the no-subscriber
+    ///             rule needs state here
+    /// baseline    the hub counter equals the sum of the per-book counters
+    /// ```
+    #[cfg(test)]
+    pub fn check_invariants(&self) -> Result<(), String> {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return Err("md state mutex is poisoned".into()),
+        };
+        if state.books.len() != self.config.instruments.len() {
+            return Err(format!(
+                "{} books for {} configured instruments",
+                state.books.len(),
+                self.config.instruments.len()
+            ));
+        }
+        let mut no_baseline = 0u64;
+        for instrument in &self.config.instruments {
+            let book = state
+                .books
+                .get(&instrument.symbol)
+                .ok_or_else(|| format!("configured symbol {} has no book", instrument.symbol))?;
+            if book.tick_size_cents != instrument.tick_size_cents {
+                return Err(format!(
+                    "{}: book tick {} != instrument tick {}",
+                    instrument.symbol, book.tick_size_cents, instrument.tick_size_cents
+                ));
+            }
+            book.check_invariants()
+                .map_err(|error| format!("{}: {error}", instrument.symbol))?;
+            no_baseline = no_baseline.saturating_add(book.events_without_baseline);
+        }
+        for symbol in state.books.keys() {
+            if self.config.instrument(*symbol).is_none() {
+                return Err(format!("book {symbol} is not a configured instrument"));
+            }
+        }
+        if self.events_without_baseline.load(Ordering::Relaxed) != no_baseline {
+            return Err(format!(
+                "hub counted {} baseline-less events, books counted {no_baseline}",
+                self.events_without_baseline.load(Ordering::Relaxed)
+            ));
+        }
+        let max_seq = state
+            .books
+            .values()
+            .map(|book| book.seq.0)
+            .max()
+            .unwrap_or(0);
+        if state.sequence != max_seq {
+            return Err(format!(
+                "hub sequence {} != max book sequence {max_seq}",
+                state.sequence
+            ));
+        }
+        if state.trades.len() > TRADE_TAPE_LEN {
+            return Err(format!(
+                "trade tape holds {} entries, over the {TRADE_TAPE_LEN} bound",
+                state.trades.len()
+            ));
+        }
+        if state.trades.len() as u64 > state.trades_count {
+            return Err(format!(
+                "trade tape holds {} entries but only {} trades were applied",
+                state.trades.len(),
+                state.trades_count
+            ));
+        }
+        if state.trades_count > state.md_events {
+            return Err(format!(
+                "{} trades recorded from {} applied events",
+                state.trades_count, state.md_events
+            ));
+        }
+        let mut newest: HashMap<Symbol, u64> = HashMap::new();
+        for trade in &state.trades {
+            if trade.qty == 0 {
+                return Err(format!(
+                    "tape entry for {} has zero quantity at seq {}",
+                    trade.symbol, trade.seq.0
+                ));
+            }
+            if trade.price_cents <= 0 {
+                return Err(format!(
+                    "tape entry for {} has non-positive price {} at seq {}",
+                    trade.symbol, trade.price_cents, trade.seq.0
+                ));
+            }
+            if let Some(previous) = newest.insert(trade.symbol, trade.seq.0)
+                && trade.seq.0 <= previous
+            {
+                return Err(format!(
+                    "{}: tape seq {} does not increase past {previous}",
+                    trade.symbol, trade.seq.0
+                ));
+            }
+        }
+        for (symbol, seq) in newest {
+            let book = state
+                .books
+                .get(&symbol)
+                .ok_or_else(|| format!("tape holds a trade for untracked {symbol}"))?;
+            if seq > book.seq.0 {
+                return Err(format!(
+                    "{}: newest tape seq {seq} is ahead of the book sequence {}",
+                    symbol, book.seq.0
+                ));
+            }
+        }
+        if !self.feed_subscribed.load(Ordering::Relaxed)
+            && self.feed_sent.load(Ordering::Relaxed) != 0
+        {
+            return Err(format!(
+                "{} frames were sent with no feed subscriber ever attached",
+                self.feed_sent.load(Ordering::Relaxed)
+            ));
+        }
+        Ok(())
     }
 
     /// Most recently published frame. This is an `Arc` clone, not a rebuild:
@@ -1839,6 +2371,79 @@ mod tests {
         ExchangeConfig::default()
     }
 
+    /// The producer's startup image: an empty full snapshot for one symbol at
+    /// sequence 0, carrying the open, running status a fresh engine reports.
+    ///
+    /// A hub refuses book-state deltas until a symbol has a baseline, exactly
+    /// as the engine's initial MD snapshot provides one before any delta. A
+    /// test that applies deltas has to seed first, or it is modelling a
+    /// producer order that cannot happen.
+    fn seed_symbol(hub: &MdHub, symbol: Symbol) {
+        hub.apply_snapshot(&MdSnapshot {
+            symbol,
+            seq: Seq(0),
+            cause_offset: 0,
+            timestamp_ns: 0,
+            last_trade_price: Price::ZERO,
+            last_trade_qty: Qty::ZERO,
+            bids: Vec::new(),
+            asks: Vec::new(),
+            orders: Vec::new(),
+            flags: SessionState::Open.to_md_flags(),
+        });
+    }
+
+    /// Seed every configured symbol with an empty image at sequence 0.
+    fn seed(hub: &MdHub) {
+        for instrument in &hub.config.instruments {
+            seed_symbol(hub, instrument.symbol);
+        }
+    }
+
+    /// Full snapshot of one symbol's book, built from `(order_id, side,
+    /// price_ticks, qty)` tuples. The seq is the image's own sequence.
+    fn full_snapshot(symbol: Symbol, seq: u64, orders: &[(u128, Side, i64, u64)]) -> MdSnapshot {
+        MdSnapshot {
+            symbol,
+            seq: Seq(seq),
+            cause_offset: seq,
+            timestamp_ns: seq,
+            last_trade_price: Price::ZERO,
+            last_trade_qty: Qty::ZERO,
+            bids: Vec::new(),
+            asks: Vec::new(),
+            orders: orders
+                .iter()
+                .map(|&(order_id, side, price, qty)| MdOrder {
+                    order_id: OrderId(order_id),
+                    side,
+                    price: Price(price),
+                    qty: Qty(qty),
+                    participant: ParticipantId(1),
+                })
+                .collect(),
+            flags: SessionState::Open.to_md_flags(),
+        }
+    }
+
+    /// Deltas applied since the hub started, i.e. `HubState::md_events`
+    /// (snapshots are counted in `Metrics`, not here).
+    fn applied_deltas(hub: &MdHub) -> u64 {
+        hub.state.lock().expect("md state").md_events
+    }
+
+    fn hub_sequence(hub: &MdHub) -> u64 {
+        hub.state.lock().expect("md state").sequence
+    }
+
+    fn btc() -> Symbol {
+        Symbol::new("BTC-USD").unwrap()
+    }
+
+    fn eth() -> Symbol {
+        Symbol::new("ETH-USD").unwrap()
+    }
+
     fn event(kind: MdKind, side: Side, price: i64, qty: u64, order_id: u128) -> MdEvent {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(1);
@@ -1860,6 +2465,7 @@ mod tests {
     #[test]
     fn add_reduce_remove_updates_levels() {
         let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        seed_symbol(&hub, btc());
         hub.apply(&event(MdKind::Add, Side::Buy, 65_000, 10, 1));
         hub.apply(&event(MdKind::Add, Side::Buy, 65_000, 5, 2));
         let state = hub.state();
@@ -1894,6 +2500,7 @@ mod tests {
     #[test]
     fn duplicate_delta_is_ignored() {
         let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        seed_symbol(&hub, btc());
         let add = event(MdKind::Add, Side::Buy, 65_000, 10, 1);
         hub.apply(&add);
         hub.apply(&add);
@@ -1910,6 +2517,7 @@ mod tests {
     #[test]
     fn trade_updates_last_trade_and_tape() {
         let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        seed_symbol(&hub, btc());
         hub.apply(&event(MdKind::Add, Side::Sell, 65_100, 10, 1));
         hub.apply(&event(MdKind::Trade, Side::Buy, 65_100, 4, 2));
         let state = hub.state();
@@ -2093,6 +2701,7 @@ mod tests {
     #[test]
     fn status_leaves_the_book_and_tape_untouched() {
         let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        seed_symbol(&hub, btc());
         let mut add = event(MdKind::Add, Side::Sell, 65_100, 10, 1);
         add.seq = Seq(1);
         hub.apply(&add);
@@ -2126,13 +2735,17 @@ mod tests {
         let state = hub.state();
         assert_eq!(state.sequence, 3);
         assert_eq!(state.trades.len(), 1);
-        assert_eq!(state.metrics.md_events, 3);
+        assert_eq!(
+            state.metrics.md_events, 4,
+            "one seed image plus three deltas"
+        );
         assert_eq!(state.metrics.trades, 1);
     }
 
     #[test]
     fn duplicate_trade_is_not_added_to_the_tape_or_metrics_twice() {
         let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        seed_symbol(&hub, btc());
         let mut add = event(MdKind::Add, Side::Sell, 65_100, 10, 1);
         add.seq = Seq(1);
         hub.apply(&add);
@@ -2143,7 +2756,10 @@ mod tests {
         let state = hub.state();
         assert_eq!(state.trades.len(), 1);
         assert_eq!(state.metrics.trades, 1);
-        assert_eq!(state.metrics.md_events, 2);
+        assert_eq!(
+            state.metrics.md_events, 3,
+            "one seed image, the add, and the first trade"
+        );
     }
 
     #[test]
@@ -2186,6 +2802,7 @@ mod tests {
     #[test]
     fn snapshot_replaces_levels() {
         let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        seed_symbol(&hub, Symbol::new("BTC-USD").unwrap());
         hub.apply(&event(MdKind::Add, Side::Buy, 65_000, 10, 1));
         let snapshot = MdSnapshot {
             symbol: Symbol::new("BTC-USD").unwrap(),
@@ -2224,6 +2841,7 @@ mod tests {
     #[test]
     fn latest_returns_the_last_published_frame() {
         let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        seed(&hub);
 
         // The watch channel is seeded with the configured symbols, so a read
         // before the first publish is still a valid frame.
@@ -2264,11 +2882,12 @@ mod tests {
     #[test]
     fn metrics_snapshot_does_not_rebuild_the_published_frame() {
         let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        seed_symbol(&hub, btc());
         let before = hub.latest();
 
         hub.apply(&event(MdKind::Trade, Side::Buy, 65_000, 4, 1));
         let metrics = hub.metrics_snapshot();
-        assert_eq!(metrics.md_events, 1);
+        assert_eq!(metrics.md_events, 2, "the seed snapshot plus one delta");
         assert_eq!(metrics.trades, 1);
         // The read path did not build or publish a new state frame.
         assert!(Arc::ptr_eq(&before, &hub.latest()));
@@ -2343,6 +2962,7 @@ mod tests {
     #[test]
     fn apply_batch_records_one_md_apply_sample_per_batch() {
         let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        seed(&hub);
         let metrics = hub.metrics();
         let md_apply = |metrics: &Metrics| {
             metrics
@@ -2369,6 +2989,7 @@ mod tests {
     #[test]
     fn duplicate_and_stale_events_leave_the_published_frame_correct() {
         let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        seed_symbol(&hub, btc());
         let add = event(MdKind::Add, Side::Buy, 65_000, 10, 1);
         hub.apply(&add);
         let trade = event(MdKind::Trade, Side::Buy, 65_000, 4, 2);
@@ -2394,7 +3015,10 @@ mod tests {
         assert_eq!(btc.bids[0].qty, 10);
         assert_eq!(btc.bids[0].orders, 1);
         assert_eq!(after.trades.len(), 1);
-        assert_eq!(after.metrics.md_events, 2);
+        assert_eq!(
+            after.metrics.md_events, 3,
+            "one seed image, the add, and the trade"
+        );
         assert_eq!(after.metrics.trades, 1);
         assert_eq!(after.sequence, baseline.sequence);
     }
@@ -2547,7 +3171,7 @@ mod tests {
             event_at(MdKind::Add, btc, 6, Side::Buy, 65_001, 8, 6),
             // No-op reduce (same quantity) still counts as applied.
             event_at(MdKind::Reduce, eth, 3, Side::Sell, 15_000, 7, 3),
-            // Over-reduce: rejected after the book advances its sequence.
+            // Over-reduce: refused whole, so the sequence does not advance.
             event_at(MdKind::Reduce, btc, 7, Side::Buy, 65_000, 99, 1),
             event_at(MdKind::Add, btc, 8, Side::Buy, 65_002, 2, 7),
             event_at(MdKind::Trade, btc, 9, Side::Sell, 65_002, 1, 7),
@@ -2561,6 +3185,7 @@ mod tests {
         let stream = mixed_stream();
 
         let single = MdHub::new(config(), "test".into(), "memory".into(), None);
+        seed(&single);
         for event in &stream {
             single.apply(event);
         }
@@ -2568,13 +3193,19 @@ mod tests {
         // Batch boundaries must not change the result, including when a chunk
         // splits a duplicate from the event it replays.
         let chunked = MdHub::new(config(), "test".into(), "memory".into(), None);
+        seed(&chunked);
         for chunk in stream.chunks(3) {
             chunked.apply_batch(chunk);
         }
 
         let once = MdHub::new(config(), "test".into(), "memory".into(), None);
+        seed(&once);
         once.apply_batch(&stream);
 
+        for hub in [&single, &chunked, &once] {
+            hub.check_invariants()
+                .expect("batch shaping is invariant-free");
+        }
         let single = single.state();
         let chunked = chunked.state();
         let once = once.state();
@@ -2588,6 +3219,10 @@ mod tests {
     fn incremental_depth_matches_full_fold() {
         let btc = Symbol::new("BTC-USD").unwrap();
         let mut book = BookState::new(btc, 100);
+        // A baseline image first: without one, the book refuses deltas by
+        // design and this test would be measuring nothing.
+        assert!(book.apply_snapshot(&full_snapshot(btc, 0, &[])));
+        assert_eq!(book.phase, BookPhase::Seeded);
         // Deterministic xorshift so a failure is reproducible.
         let mut rng = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = move || {
@@ -2701,6 +3336,7 @@ mod tests {
     #[test]
     fn latest_for_clones_only_requested_symbols_and_trades() {
         let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        seed(&hub);
         let btc = Symbol::new("BTC-USD").unwrap();
         let eth = Symbol::new("ETH-USD").unwrap();
         let sol = Symbol::new("SOL-USD").unwrap();
@@ -2762,6 +3398,8 @@ mod tests {
         let latest = hub.latest();
         assert_eq!(latest.symbols.len(), 3);
         assert_eq!(latest.trades.len(), 70);
+        hub.check_invariants()
+            .expect("a filtered read cannot hurt the hub");
     }
 
     fn decode_feed(frame: &[u8]) -> MdFeedMessage {
@@ -2772,6 +3410,7 @@ mod tests {
     fn feed_snapshot_reflects_levels_seq_and_halt_state() {
         let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
         let btc = Symbol::new("BTC-USD").unwrap();
+        seed_symbol(&hub, btc);
         let bid = event_at(MdKind::Add, btc, 1, Side::Buy, 65_000, 10, 1);
         hub.apply(&bid);
         hub.apply(&event_at(MdKind::Add, btc, 2, Side::Buy, 65_000, 5, 2));
@@ -2804,12 +3443,20 @@ mod tests {
         assert_eq!(empty.cause_offset, 0);
         assert!(empty.bids.is_empty() && empty.asks.is_empty());
         assert!(!empty.halted);
+        assert_eq!(
+            hub.book_phase(eth),
+            Some(BookPhase::AwaitingSnapshot),
+            "a symbol with no image is still awaiting its baseline"
+        );
+        assert_eq!(hub.book_phase(btc), Some(BookPhase::Seeded));
+        hub.check_invariants().expect("invariants hold");
     }
 
     #[test]
     fn feed_snapshot_is_not_capped_at_the_dashboard_depth() {
         let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
         let btc = Symbol::new("BTC-USD").unwrap();
+        seed_symbol(&hub, btc);
         // 25 distinct bid levels and 25 ask levels: more than BOOK_DEPTH.
         for level in 0..25i64 {
             hub.apply(&event_at(
@@ -2863,6 +3510,7 @@ mod tests {
     #[test]
     fn feed_is_silent_without_subscribers() {
         let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        seed(&hub);
         assert_eq!(hub.feed_receiver_count(), 0);
 
         hub.apply_batch(&mixed_stream());
@@ -2871,12 +3519,17 @@ mod tests {
         assert_eq!(hub.feed_receiver_count(), 0);
         // No frame was built, so nothing was counted and nothing panicked.
         assert_eq!(hub.feed_stats(), (0, 0, 0));
+        // The state still applies: the feed is an output, not the apply path.
+        assert!(applied_deltas(&hub) > 0);
+        assert!(btc_book(&hub.state()).bids.len() >= 2);
+        hub.check_invariants().expect("invariants hold");
     }
 
     #[test]
     fn subscribed_feed_delivers_every_applied_event_in_sequence() {
         let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
         let btc = Symbol::new("BTC-USD").unwrap();
+        seed_symbol(&hub, btc);
         let mut receiver = hub.subscribe_feed();
         assert_eq!(hub.feed_receiver_count(), 1);
 
@@ -2922,12 +3575,103 @@ mod tests {
             other => panic!("expected a delta frame, got {other:?}"),
         }
         assert_eq!(hub.feed_stats(), (3, 0, 0));
+        hub.check_invariants().expect("invariants hold");
+    }
+
+    /// Every accepted event gets exactly one frame, in apply order, per symbol
+    /// strictly increasing; rejected events get none. The tape and the feed
+    /// are outputs of the same apply decision, so a frame must never exist for
+    /// an event the book ignored.
+    #[test]
+    fn feed_frames_track_accepted_events_across_symbols() {
+        let hub = MdHub::with_feed_capacity(config(), "test".into(), "memory".into(), None, 16);
+        let btc = Symbol::new("BTC-USD").unwrap();
+        let eth = Symbol::new("ETH-USD").unwrap();
+        seed(&hub);
+        let mut receiver = hub.subscribe_feed();
+
+        let stream = vec![
+            event_at(MdKind::Add, btc, 1, Side::Buy, 65_000, 10, 1),
+            event_at(MdKind::Add, eth, 1, Side::Sell, 15_000, 7, 2),
+            // A duplicate of the first add: accepted once, no second frame.
+            event_at(MdKind::Add, btc, 1, Side::Buy, 65_000, 10, 1),
+            event_at(MdKind::Add, btc, 2, Side::Buy, 65_001, 5, 3),
+            event_at(MdKind::Reduce, eth, 2, Side::Sell, 15_000, 3, 2),
+            // A stale event below the applied sequence: silent.
+            event_at(MdKind::Add, eth, 1, Side::Sell, 15_000, 7, 9),
+            event_at(MdKind::Trade, btc, 3, Side::Buy, 65_001, 2, 3),
+        ];
+        hub.apply_batch(&stream);
+
+        let mut frames = Vec::new();
+        while let Ok(frame) = receiver.try_recv() {
+            frames.push(frame);
+        }
+        let applied: Vec<(Symbol, u64)> = vec![(btc, 1), (eth, 1), (btc, 2), (eth, 2), (btc, 3)];
+        let got: Vec<(Symbol, u64)> = frames
+            .iter()
+            .map(|frame| (frame.symbol, frame.seq))
+            .collect();
+        assert_eq!(got, applied, "one frame per accepted event, in apply order");
+        assert_eq!(
+            hub.feed_stats(),
+            (applied.len() as u64, 0, 0),
+            "feed_sent counts exactly the frames a drained receiver got"
+        );
+        assert_eq!(hub.feed_receiver_count(), 1);
+        hub.check_invariants().expect("invariants hold");
+    }
+
+    /// The lag path at the smallest buffer: a `Lagged` notice, the hub's two
+    /// counters, and a fresh image at or past the last applied sequence.
+    #[test]
+    fn feed_lag_at_capacity_one_resyncs_from_a_current_image() {
+        let hub = MdHub::with_feed_capacity(config(), "test".into(), "memory".into(), None, 1);
+        let btc = Symbol::new("BTC-USD").unwrap();
+        seed_symbol(&hub, btc);
+        let mut receiver = hub.subscribe_feed();
+
+        for seq in 1..=3u64 {
+            hub.apply(&event_at(
+                MdKind::Add,
+                btc,
+                seq,
+                Side::Buy,
+                65_000 + seq as i64,
+                1,
+                seq as u128,
+            ));
+        }
+        match receiver.try_recv() {
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(dropped)) => {
+                assert_eq!(dropped, 2, "capacity 1 retains only the newest frame");
+            }
+            other => panic!("expected a lag report, got {other:?}"),
+        }
+        hub.record_feed_lagged();
+        hub.record_feed_resync();
+        assert_eq!(hub.feed_stats(), (3, 1, 1));
+
+        let snapshot = hub.feed_snapshot(btc).expect("BTC-USD snapshot");
+        let state = btc_book(&hub.state());
+        assert_eq!(snapshot.seq, state.seq.0);
+        assert_eq!(snapshot.seq, 3, "the image is at the last applied seq");
+        // Everything the lagging receiver missed is in the image it adopts.
+        assert_eq!(snapshot.bids.len(), 3);
+        assert_eq!(snapshot.bids.iter().map(|level| level.qty).sum::<u64>(), 3);
+
+        // The oldest retained frame is still queued; drain it before the next
+        // apply, or the receiver lags again on the way.
+        assert_eq!(receiver.try_recv().expect("retained frame").seq, 3);
+        hub.apply(&event_at(MdKind::Add, btc, 4, Side::Buy, 65_004, 1, 4));
+        assert_eq!(receiver.try_recv().expect("post-lag frame").seq, 4);
     }
 
     #[test]
     fn feed_skips_duplicate_and_stale_events() {
         let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
         let btc = Symbol::new("BTC-USD").unwrap();
+        seed_symbol(&hub, btc);
         let mut receiver = hub.subscribe_feed();
         let add = event_at(MdKind::Add, btc, 1, Side::Buy, 65_000, 10, 1);
         hub.apply(&add);
@@ -2946,6 +3690,7 @@ mod tests {
         // Capacity 2: five published frames overwrite the receiver's view.
         let hub = MdHub::with_feed_capacity(config(), "test".into(), "memory".into(), None, 2);
         let btc = Symbol::new("BTC-USD").unwrap();
+        seed_symbol(&hub, btc);
         let mut receiver = hub.subscribe_feed();
         for seq in 1..=5u64 {
             hub.apply(&event_at(
@@ -2985,6 +3730,555 @@ mod tests {
         hub.apply(&event_at(MdKind::Add, btc, 6, Side::Buy, 65_100, 1, 6));
         let frame = receiver.try_recv().expect("post-lag frame");
         assert_eq!(frame.seq, 6);
+    }
+
+    /// The book's own invariants across a hand-written lifecycle, including
+    /// the shapes the randomized run produces: partial reduces, a reduce to
+    /// zero, a remove, a trade, and a snapshot that clears the last trade side.
+    #[test]
+    fn book_invariants_hold_across_the_delta_lifecycle() {
+        let btc = btc();
+        let mut book = BookState::new(btc, 100);
+        assert_eq!(book.phase, BookPhase::AwaitingSnapshot);
+        book.check_invariants()
+            .expect("an empty book is consistent");
+
+        assert!(book.apply_snapshot(&full_snapshot(
+            btc,
+            1,
+            &[(1, Side::Buy, 65_000, 10), (2, Side::Sell, 65_100, 7)]
+        )));
+        assert_eq!(book.phase, BookPhase::Seeded);
+        book.check_invariants()
+            .expect("a seeded book is consistent");
+
+        assert_eq!(
+            book.apply(&event_at(MdKind::Add, btc, 2, Side::Buy, 65_000, 5, 3)),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            book.apply(&event_at(MdKind::Reduce, btc, 3, Side::Buy, 65_000, 4, 3)),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(book.depth_bid_qty, 14);
+        book.check_invariants()
+            .expect("adds and partial reduces hold");
+
+        // A reduce to zero is a cancel: the ref, the level quantity and the
+        // level's order count all leave, so no zero-quantity level survives.
+        assert_eq!(
+            book.apply(&event_at(MdKind::Reduce, btc, 4, Side::Buy, 65_000, 0, 3)),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(book.bids.get(&6_500_000).map(|level| level.qty), Some(10));
+        assert_eq!(book.depth_bid_qty, 10);
+        book.check_invariants()
+            .expect("a reduce to zero is a cancel");
+
+        assert_eq!(
+            book.apply(&event_at(MdKind::Remove, btc, 5, Side::Buy, 65_000, 0, 1)),
+            ApplyOutcome::Applied
+        );
+        assert!(
+            book.bids.is_empty(),
+            "the last bid level leaves with its order"
+        );
+        assert_eq!(book.depth_bid_qty, 0);
+        book.check_invariants().expect("a remove holds");
+
+        assert_eq!(
+            book.apply(&event_at(MdKind::Trade, btc, 6, Side::Sell, 65_100, 3, 2)),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(book.last_trade_price_cents, Some(6_510_000));
+        assert_eq!(book.last_trade_side, Some(Side::Sell));
+        book.check_invariants().expect("a trade holds");
+
+        // A snapshot keeps qty and price but drops the side: the image says
+        // what traded, not who aggressed.
+        assert!(book.apply_snapshot(&full_snapshot(btc, 7, &[(4, Side::Sell, 65_100, 7)])));
+        assert_eq!(book.last_trade_side, None);
+        assert_eq!(book.last_trade_qty, 0);
+        assert_eq!(book.last_trade_price_cents, None);
+        book.check_invariants().expect("a snapshot image holds");
+    }
+
+    #[test]
+    fn check_invariants_detects_a_depth_drift() {
+        let btc = btc();
+        let mut book = BookState::new(btc, 100);
+        assert!(book.apply_snapshot(&full_snapshot(btc, 1, &[(1, Side::Buy, 65_000, 10)])));
+        book.depth_bid_qty += 1;
+        let error = book
+            .check_invariants()
+            .expect_err("depth drift is detected");
+        assert!(error.contains("cached bid depth"), "{error}");
+    }
+
+    #[test]
+    fn check_invariants_detects_a_zero_quantity_level() {
+        let btc = btc();
+        let mut book = BookState::new(btc, 100);
+        assert!(book.apply_snapshot(&full_snapshot(btc, 1, &[(1, Side::Buy, 65_000, 10)])));
+        book.bids
+            .insert(6_500_000, LevelState { qty: 0, orders: 1 });
+        let error = book
+            .check_invariants()
+            .expect_err("a zero-qty level is detected");
+        assert!(error.contains("zero quantity"), "{error}");
+    }
+
+    #[test]
+    fn check_invariants_detects_a_crossed_book() {
+        let btc = btc();
+        let mut book = BookState::new(btc, 100);
+        assert!(book.apply_snapshot(&full_snapshot(
+            btc,
+            1,
+            &[(1, Side::Buy, 65_100, 10), (2, Side::Sell, 65_000, 7)]
+        )));
+        let error = book.check_invariants().expect_err("a cross is detected");
+        assert!(error.contains("crossed book"), "{error}");
+    }
+
+    #[test]
+    fn check_invariants_detects_a_zero_quantity_order_ref() {
+        let btc = btc();
+        let mut book = BookState::new(btc, 100);
+        assert!(book.apply_snapshot(&full_snapshot(btc, 1, &[(1, Side::Buy, 65_000, 10)])));
+        book.orders.get_mut(&OrderId(1)).expect("ref").qty = 0;
+        let error = book
+            .check_invariants()
+            .expect_err("a zero-quantity ref is detected");
+        assert!(error.contains("zero quantity"), "{error}");
+    }
+
+    #[test]
+    fn check_invariants_detects_a_level_aggregate_mismatch() {
+        let btc = btc();
+        let mut book = BookState::new(btc, 100);
+        assert!(book.apply_snapshot(&full_snapshot(btc, 1, &[(1, Side::Buy, 65_000, 10)])));
+        book.bids.get_mut(&6_500_000).expect("level").qty += 1;
+        book.depth_bid_qty += 1;
+        let error = book
+            .check_invariants()
+            .expect_err("a level that disagrees with its refs is detected");
+        assert!(error.contains("order refs"), "{error}");
+    }
+
+    /// A delta before any image is refused, counted, and does not advance the
+    /// sequence; the image that follows seeds the book and deltas resume.
+    #[test]
+    fn delta_before_a_snapshot_is_refused_and_the_image_seeds_the_book() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        let btc = btc();
+        hub.apply(&event_at(MdKind::Add, btc, 1, Side::Buy, 65_000, 10, 1));
+        hub.apply(&event_at(MdKind::Trade, btc, 2, Side::Buy, 65_000, 4, 1));
+
+        assert_eq!(hub.events_without_baseline(), 2);
+        assert_eq!(hub.book_phase(btc), Some(BookPhase::AwaitingSnapshot));
+        let book = btc_book(&hub.state());
+        assert!(book.bids.is_empty(), "no depth was invented from a delta");
+        assert_eq!(book.seq, Seq(0), "a refused delta does not advance seq");
+        assert_eq!(book.last_trade_price_cents, None);
+        assert_eq!(hub_sequence(&hub), 0);
+
+        // The image that follows covers the refused deltas: it is the state
+        // through a later sequence, so applying it loses nothing.
+        hub.apply_snapshot(&full_snapshot(btc, 5, &[(1, Side::Buy, 65_000, 10)]));
+        assert_eq!(hub.book_phase(btc), Some(BookPhase::Seeded));
+        let book = btc_book(&hub.state());
+        assert_eq!(book.seq, Seq(5));
+        assert_eq!(book.bids[0].qty, 10);
+
+        // Deltas apply on top of the image from here on.
+        hub.apply(&event_at(MdKind::Add, btc, 6, Side::Buy, 65_001, 3, 2));
+        let book = btc_book(&hub.state());
+        assert_eq!(book.seq, Seq(6));
+        assert_eq!(book.depth_bid_qty, 13);
+        assert_eq!(hub.events_without_baseline(), 2, "the seed reset nothing");
+        hub.check_invariants().expect("invariants hold");
+    }
+
+    /// A status event carries no depth, so it applies before a baseline and
+    /// advances the sequence exactly as it does today. An image at that same
+    /// sequence is still accepted: the replayed status left no book state to
+    /// be stale against.
+    #[test]
+    fn status_applies_before_a_snapshot_and_seeds_at_the_same_sequence() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        let btc = btc();
+        let mut halted = event_at(MdKind::Status, btc, 4, Side::Buy, 0, 0, 0);
+        halted.flags = MD_FLAG_HALTED;
+        hub.apply(&halted);
+
+        assert!(btc_book(&hub.state()).halted);
+        assert_eq!(btc_book(&hub.state()).seq, Seq(4));
+        assert_eq!(hub.book_phase(btc), Some(BookPhase::AwaitingSnapshot));
+        assert_eq!(hub.events_without_baseline(), 0);
+
+        hub.apply_snapshot(&full_snapshot(btc, 4, &[(1, Side::Buy, 65_000, 10)]));
+        assert_eq!(hub.book_phase(btc), Some(BookPhase::Seeded));
+        let book = btc_book(&hub.state());
+        // The image is authoritative for the status too.
+        assert!(!book.halted);
+        assert_eq!(book.bids[0].qty, 10);
+        hub.check_invariants().expect("invariants hold");
+    }
+
+    /// Once seeded, the phase never goes back: a newer image replaces the
+    /// book, and a stale image is refused without touching depth or phase.
+    #[test]
+    fn a_newer_snapshot_replaces_a_seeded_book_and_a_stale_one_does_not() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        let btc = btc();
+        seed_symbol(&hub, btc);
+        hub.apply(&event_at(MdKind::Add, btc, 1, Side::Buy, 65_000, 10, 1));
+        hub.apply(&event_at(MdKind::Add, btc, 2, Side::Buy, 65_002, 4, 2));
+        assert_eq!(btc_book(&hub.state()).bids.len(), 2);
+
+        // The image is authoritative: levels it omits are gone even though no
+        // delta removed them.
+        hub.apply_snapshot(&full_snapshot(btc, 3, &[(3, Side::Sell, 65_100, 6)]));
+        let book = btc_book(&hub.state());
+        assert!(book.bids.is_empty());
+        assert_eq!(book.asks[0].qty, 6);
+        assert_eq!(book.depth_bid_qty, 0);
+        assert_eq!(book.seq, Seq(3));
+
+        hub.apply_snapshot(&full_snapshot(btc, 2, &[(1, Side::Buy, 65_000, 10)]));
+        let book = btc_book(&hub.state());
+        assert!(book.bids.is_empty(), "the stale image was refused whole");
+        assert_eq!(book.seq, Seq(3));
+        assert_eq!(hub.book_phase(btc), Some(BookPhase::Seeded));
+        hub.check_invariants().expect("invariants hold");
+    }
+
+    #[test]
+    fn hub_invariants_detect_a_sequence_and_tick_drift() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        let btc = btc();
+        seed_symbol(&hub, btc);
+        hub.apply(&event_at(MdKind::Add, btc, 1, Side::Buy, 65_000, 10, 1));
+        hub.check_invariants().expect("invariants hold");
+
+        {
+            let mut state = hub.state.lock().expect("md state");
+            state.sequence += 1;
+        }
+        let error = hub
+            .check_invariants()
+            .expect_err("a sequence drift is detected");
+        assert!(error.contains("hub sequence"), "{error}");
+
+        {
+            let mut state = hub.state.lock().expect("md state");
+            state.sequence -= 1;
+            state.books.get_mut(&btc).expect("book").tick_size_cents = 1;
+        }
+        let error = hub
+            .check_invariants()
+            .expect_err("a tick drift is detected");
+        assert!(error.contains("book tick"), "{error}");
+    }
+
+    /// Deterministic SplitMix64. A fixed stream is what makes a failure
+    /// reproducible from the seed alone.
+    struct SplitMix64(u64);
+
+    impl SplitMix64 {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound
+        }
+    }
+
+    type MdModel = BTreeMap<(Symbol, u128), (Side, i64, u64)>;
+
+    fn live_order_ids(model: &MdModel, symbol: Symbol) -> Vec<u128> {
+        model
+            .keys()
+            .filter(|(modeled, _)| *modeled == symbol)
+            .map(|(_, order_id)| *order_id)
+            .collect()
+    }
+
+    /// A free id from the 32-id pool, or `None` when every id is resting.
+    fn free_order_id(model: &MdModel, symbol: Symbol, rng: &mut SplitMix64) -> Option<u128> {
+        for _ in 0..32 {
+            let candidate = u128::from(1 + rng.below(32));
+            if !model.contains_key(&(symbol, candidate)) {
+                return Some(candidate);
+            }
+        }
+        (1..=32u128).find(|order_id| !model.contains_key(&(symbol, *order_id)))
+    }
+
+    /// The full image of `symbol` at `seq`, built from the model. `level_only`
+    /// publishes the same state as aggregates without refs, the shape a
+    /// producer with no order-level history leaves behind.
+    fn model_snapshot(model: &MdModel, symbol: Symbol, seq: u64, level_only: bool) -> MdSnapshot {
+        let orders: Vec<(u128, Side, i64, u64)> = model
+            .iter()
+            .filter(|((modeled, _), _)| *modeled == symbol)
+            .map(|((_, order_id), (side, price, qty))| (*order_id, *side, *price, *qty))
+            .collect();
+        let mut snapshot = full_snapshot(symbol, seq, &orders);
+        if !level_only {
+            return snapshot;
+        }
+        let mut bids: BTreeMap<i64, (u64, u32)> = BTreeMap::new();
+        let mut asks: BTreeMap<i64, (u64, u32)> = BTreeMap::new();
+        for &(_, side, price, qty) in &orders {
+            let levels = if side == Side::Buy {
+                &mut bids
+            } else {
+                &mut asks
+            };
+            let entry = levels.entry(price).or_default();
+            entry.0 += qty;
+            entry.1 += 1;
+        }
+        let levels = |levels: BTreeMap<i64, (u64, u32)>| -> Vec<whippet_core::protocol::MdLevel> {
+            levels
+                .into_iter()
+                .map(|(price, (qty, orders))| whippet_core::protocol::MdLevel {
+                    price: Price(price),
+                    qty: Qty(qty),
+                    orders,
+                })
+                .collect()
+        };
+        snapshot.bids = levels(bids);
+        snapshot.asks = levels(asks);
+        snapshot.orders = Vec::new();
+        snapshot
+    }
+
+    /// 2,000 deterministic mixed events over two symbols, checked after every
+    /// apply. The price bands are disjoint per side, so nothing here can
+    /// produce a crossed book: a cross is what the invariant is for, not
+    /// something the generator is allowed to create.
+    #[test]
+    fn randomized_invariants_hold_over_a_mixed_stream() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        let btc = btc();
+        let eth = eth();
+        let symbols = [btc, eth];
+        let mids = [(btc, 65_000i64), (eth, 30_000i64)];
+        let mid_of = |symbol: Symbol| {
+            mids.iter()
+                .find(|(modeled, _)| *modeled == symbol)
+                .map(|(_, mid)| *mid)
+                .expect("configured symbol")
+        };
+
+        // Coverage pin: deltas before any baseline image are refused without
+        // building depth, while a status event still applies.
+        hub.apply(&event_at(MdKind::Add, btc, 1, Side::Buy, 64_990, 10, 100));
+        hub.apply(&event_at(MdKind::Reduce, btc, 2, Side::Buy, 64_990, 5, 100));
+        let mut halted = event_at(MdKind::Status, btc, 3, Side::Buy, 0, 0, 0);
+        halted.flags = MD_FLAG_HALTED;
+        hub.apply(&halted);
+        assert_eq!(hub.events_without_baseline(), 2);
+        assert!(btc_book(&hub.state()).bids.is_empty());
+
+        // The producer's startup image for each symbol, at the sequence the
+        // prelude left the book on.
+        hub.apply_snapshot(&full_snapshot(btc, 4, &[]));
+        hub.apply_snapshot(&full_snapshot(eth, 1, &[]));
+        assert_eq!(hub.book_phase(btc), Some(BookPhase::Seeded));
+        assert_eq!(hub.book_phase(eth), Some(BookPhase::Seeded));
+
+        let mut rng = SplitMix64(0x5eed_1234_9abc_def0);
+        let mut model: MdModel = BTreeMap::new();
+        let mut seqs: HashMap<Symbol, u64> = HashMap::from([(btc, 4), (eth, 1)]);
+        let mut history: Vec<Vec<MdEvent>> = Vec::new();
+        let mut both_books_non_empty = false;
+        let mut trades = 0u64;
+        let mut statuses = 0u64;
+        let mut accepted_snapshots = 0u64;
+        let mut level_only_snapshots = 0u64;
+        let mut stale_replays = 0u64;
+
+        for step in 0..2_000u32 {
+            let mut group: Vec<MdEvent> = Vec::new();
+            let len = 1 + rng.below(4);
+            for _ in 0..len {
+                let symbol = symbols[rng.below(2) as usize];
+                let mid = mid_of(symbol);
+                let seq = {
+                    let next = seqs.get_mut(&symbol).expect("configured symbol");
+                    *next += 1;
+                    *next
+                };
+                let live = live_order_ids(&model, symbol);
+                let action = rng.below(100);
+                let event = if action < 45 || live.is_empty() {
+                    if live.len() >= 24 {
+                        continue;
+                    }
+                    let Some(order_id) = free_order_id(&model, symbol, &mut rng) else {
+                        continue;
+                    };
+                    let side = if rng.below(2) == 0 {
+                        Side::Buy
+                    } else {
+                        Side::Sell
+                    };
+                    let offset = 1 + rng.below(10) as i64;
+                    let price = if side == Side::Buy {
+                        mid - offset
+                    } else {
+                        mid + offset
+                    };
+                    let qty = 1 + rng.below(20);
+                    model.insert((symbol, order_id), (side, price, qty));
+                    event_at(MdKind::Add, symbol, seq, side, price, qty, order_id)
+                } else if action < 65 {
+                    let order_id = live[rng.below(live.len() as u64) as usize];
+                    let &(side, price, qty) = model.get(&(symbol, order_id)).expect("live order");
+                    let new_qty = rng.below(qty + 1);
+                    if new_qty == 0 {
+                        model.remove(&(symbol, order_id));
+                    } else {
+                        model.insert((symbol, order_id), (side, price, new_qty));
+                    }
+                    event_at(MdKind::Reduce, symbol, seq, side, price, new_qty, order_id)
+                } else if action < 78 {
+                    let order_id = live[rng.below(live.len() as u64) as usize];
+                    let &(side, price, _) = model.get(&(symbol, order_id)).expect("live order");
+                    model.remove(&(symbol, order_id));
+                    event_at(MdKind::Remove, symbol, seq, side, price, 0, order_id)
+                } else if action < 88 {
+                    // A trade prices inside the instrument's band and never
+                    // touches depth, so it cannot cross the book.
+                    let side = if rng.below(2) == 0 {
+                        Side::Buy
+                    } else {
+                        Side::Sell
+                    };
+                    let offset = rng.below(10) as i64;
+                    let price = if side == Side::Buy {
+                        mid - offset
+                    } else {
+                        mid + offset
+                    };
+                    trades += 1;
+                    event_at(
+                        MdKind::Trade,
+                        symbol,
+                        seq,
+                        side,
+                        price,
+                        1 + rng.below(20),
+                        u128::from(1_000_000 + seq),
+                    )
+                } else {
+                    statuses += 1;
+                    let mut status = event_at(MdKind::Status, symbol, seq, Side::Buy, 0, 0, 0);
+                    status.flags = match rng.below(4) {
+                        0 => MD_FLAG_HALTED,
+                        1 => SessionState::PreOpen.to_md_flags(),
+                        2 => SessionState::Closed.to_md_flags() | MD_FLAG_HALTED,
+                        _ => SessionState::Open.to_md_flags(),
+                    };
+                    status
+                };
+                group.push(event);
+            }
+
+            for event in &group {
+                hub.apply(event);
+                // After every apply: the book must be self-consistent.
+                let state = hub.state.lock().expect("md state");
+                for book in state.books.values() {
+                    book.check_invariants()
+                        .unwrap_or_else(|error| panic!("step {step}: {error}"));
+                }
+            }
+            if !group.is_empty() {
+                history.push(group.clone());
+            }
+
+            // Occasionally publish a fresh image, half of them level-only.
+            if rng.below(100) < 7 {
+                let symbol = symbols[rng.below(2) as usize];
+                let seq = {
+                    let next = seqs.get_mut(&symbol).expect("configured symbol");
+                    *next += 1;
+                    *next
+                };
+                let level_only = rng.below(100) < 30;
+                hub.apply_snapshot(&model_snapshot(&model, symbol, seq, level_only));
+                accepted_snapshots += 1;
+                if level_only {
+                    level_only_snapshots += 1;
+                }
+            }
+
+            // Occasionally replay an earlier batch verbatim: every event in it
+            // is already covered, so nothing may be applied.
+            if step % 97 == 96 && !history.is_empty() {
+                let index = rng.below(history.len() as u64) as usize;
+                let before = applied_deltas(&hub);
+                hub.apply_batch(&history[index]);
+                assert_eq!(
+                    applied_deltas(&hub),
+                    before,
+                    "step {step}: a replayed batch must be entirely stale"
+                );
+                stale_replays += 1;
+            }
+
+            {
+                let state = hub.state.lock().expect("md state");
+                let non_empty = state
+                    .books
+                    .values()
+                    .filter(|book| !book.bids.is_empty() || !book.asks.is_empty())
+                    .count();
+                both_books_non_empty |= non_empty == 2;
+                assert!(
+                    state.trades.len() <= TRADE_TAPE_LEN,
+                    "step {step}: the tape outgrew its bound"
+                );
+            }
+            if step % 100 == 99 {
+                hub.check_invariants()
+                    .unwrap_or_else(|error| panic!("step {step}: {error}"));
+            }
+        }
+
+        hub.check_invariants()
+            .expect("hub invariants hold at the end");
+        // Coverage pins, so a generator change that stops exercising a path is
+        // a test failure instead of a silent hole.
+        assert!(both_books_non_empty, "both books held depth at some point");
+        assert!(trades > 0, "the stream generated trades");
+        assert!(statuses > 0, "the stream generated status events");
+        assert!(
+            accepted_snapshots >= 1,
+            "the stream generated snapshots: {accepted_snapshots}"
+        );
+        assert!(
+            level_only_snapshots >= 1,
+            "the stream generated level-only snapshots"
+        );
+        assert!(stale_replays >= 1, "the stream replayed a previous batch");
+        assert!(
+            hub.events_without_baseline() >= 2,
+            "the prelude exercised the no-baseline refusal"
+        );
+        // No subscriber was ever attached, so the feed encoded nothing.
+        assert_eq!(hub.feed_stats(), (0, 0, 0));
     }
 }
 

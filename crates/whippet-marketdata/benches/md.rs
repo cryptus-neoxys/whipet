@@ -21,7 +21,7 @@ use std::time::Duration;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use whippet_core::config::ExchangeConfig;
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Seq, Symbol};
-use whippet_core::protocol::{MdEvent, MdKind, Side};
+use whippet_core::protocol::{MdEvent, MdKind, MdSnapshot, Side};
 use whippet_marketdata::{MdHub, Metrics, ShardMetrics};
 
 fn hub() -> Arc<MdHub> {
@@ -35,6 +35,24 @@ fn hub() -> Arc<MdHub> {
 
 fn symbol(name: &str) -> Symbol {
     Symbol::new(name).expect("static symbol")
+}
+
+/// The producer's empty startup image. The hub refuses book-state deltas
+/// until it has seen one, so a benchmark that applies raw deltas must seed the
+/// symbol first or it measures refused events.
+fn seed(hub: &MdHub, symbol: Symbol) {
+    hub.apply_snapshot(&MdSnapshot {
+        symbol,
+        seq: Seq(0),
+        cause_offset: 0,
+        timestamp_ns: 0,
+        last_trade_price: Price(0),
+        last_trade_qty: Qty(0),
+        bids: Vec::new(),
+        asks: Vec::new(),
+        orders: Vec::new(),
+        flags: 0,
+    });
 }
 
 fn event(
@@ -71,6 +89,7 @@ fn apply_1m(c: &mut Criterion) {
         b.iter(|| {
             let hub = hub();
             let btc = symbol("BTC-USD");
+            seed(&hub, btc);
             let mut seq = 0u64;
             for order in 0..250_000u128 {
                 let price = 65_000 + (order % 1_000) as i64;
@@ -112,6 +131,7 @@ fn seeded_hub() -> Arc<MdHub> {
     let mut seq = 0u64;
     let mut order_id = 0u128;
     for instrument in &config.instruments {
+        seed(&hub, instrument.symbol);
         let mid = instrument.reference_price().0;
         for level in 0..20i64 {
             seq += 1;
@@ -176,6 +196,7 @@ fn apply_batch_1m(c: &mut Criterion) {
         b.iter(|| {
             let hub = hub();
             let btc = symbol("BTC-USD");
+            seed(&hub, btc);
             let mut batch: Vec<MdEvent> = Vec::with_capacity(BATCH);
             let mut seq = 0u64;
             for order in 0..250_000u128 {
@@ -239,9 +260,11 @@ fn duplicate_stale(c: &mut Criterion) {
     let add = event(MdKind::Add, btc, 1, Side::Buy, 65_000, 10, 1);
 
     let duplicate_hub = hub();
+    seed(&duplicate_hub, btc);
     duplicate_hub.apply(&add);
 
     let stale_hub = hub();
+    seed(&stale_hub, btc);
     let newer = event(MdKind::Add, btc, 2, Side::Buy, 65_001, 10, 2);
     stale_hub.apply(&newer);
 
@@ -297,6 +320,9 @@ fn contended_apply(c: &mut Criterion) {
         b.iter(|| {
             let hub = hub();
             let config = ExchangeConfig::default();
+            for instrument in &config.instruments {
+                seed(&hub, instrument.symbol);
+            }
             thread::scope(|scope| {
                 for instrument in &config.instruments {
                     let hub = Arc::clone(&hub);

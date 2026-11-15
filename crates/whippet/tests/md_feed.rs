@@ -26,7 +26,7 @@ use whippet::context::NodeContext;
 use whippet::gateway;
 use whippet_core::config::{ExchangeConfig, Mode};
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Seq, Symbol};
-use whippet_core::protocol::{MdEvent, MdKind, Side};
+use whippet_core::protocol::{MdEvent, MdKind, MdSnapshot, Side};
 use whippet_marketdata::MdHub;
 
 use common::TestNode;
@@ -51,6 +51,23 @@ fn add_event(seq: u64, price: i64, qty: u64, order: u128) -> MdEvent {
         order_id: OrderId(order),
         participant: ParticipantId(1),
     }
+}
+
+/// Seed the hub with the producer's empty startup image. Book-state deltas
+/// are refused until a baseline image exists.
+fn seed(hub: &whippet_marketdata::MdHub) {
+    hub.apply_snapshot(&MdSnapshot {
+        symbol: btc(),
+        seq: Seq(0),
+        cause_offset: 0,
+        timestamp_ns: 0,
+        last_trade_price: Price(0),
+        last_trade_qty: Qty(0),
+        bids: Vec::new(),
+        asks: Vec::new(),
+        orders: Vec::new(),
+        flags: 0,
+    });
 }
 
 /// Serve the router on a real loopback listener and return its address.
@@ -334,7 +351,9 @@ async fn md_feed_sends_a_snapshot_then_every_delta() {
     assert_eq!(snapshot["seq"], 0, "a fresh hub has applied no events");
 
     // Deltas are applied the way the engine's MD consumer would: straight
-    // into the hub, which sequences and broadcasts them.
+    // into the hub, which sequences and broadcasts them. The startup image
+    // must exist first; the initial WS frame above is not that image.
+    seed(&node.ctx.hub);
     node.ctx.hub.apply(&add_event(5, 65_000, 10, 1));
     let delta = client.read_frame().await;
     let delta: Value = serde_json::from_str(&delta).expect("delta frame");
@@ -436,6 +455,7 @@ async fn md_feed_resyncs_a_lagged_consumer() {
 
     // Apply twenty events synchronously: no runtime turn passes between them,
     // so the subscriber (capacity 4) is guaranteed to fall 16 frames behind.
+    seed(&ctx.hub);
     for seq in 1..=20u64 {
         ctx.hub
             .apply(&add_event(seq, 65_000 + seq as i64, 1, seq as u128));
@@ -498,6 +518,7 @@ async fn md_feed_ends_when_the_client_closes() {
     // end the serving task and hand the permit back; the event below also
     // wakes the loop into a failed send in case close detection is lazy.
     drop(client);
+    seed(&node.ctx.hub);
     node.ctx.hub.apply(&add_event(1, 65_000, 1, 1));
 
     let semaphore = Arc::clone(&node.ctx.ws_connections);
