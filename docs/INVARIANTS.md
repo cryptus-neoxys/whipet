@@ -102,17 +102,47 @@ failure paths that mark only the failing role.
 - The snapshot file is `WHIPSNP1` + version `5` + bincode; load rejects bad
   magic, an old version, the wrong shard id, a hash mismatch, oversized
   lengths, trailing bytes, and a snapshot ahead of the log head.
-- The writer only persists a final snapshot after rebuilding and verifying it;
-  `last_written` is monotonic; a write is temp-file + fsync + rename.
+- Before any file exists, `ShardSnapshot::check_invariants` requires: a
+  non-empty, strictly sorted symbol list; `book.symbol == symbol.symbol`; both
+  sequences at least 1; a zero-command symbol has offset 0 and no dedup; every
+  dedup offset/timestamp within `last_offset`/`last_ts_ns`; terminal indices in
+  range, terminal, unique, and covering every terminal entry; at least one
+  symbol with `commands > 0` (no resume point otherwise); and a non-zero
+  `state_hash` on every symbol. The check runs in `save` before the temp file
+  is opened, so a bad snapshot cannot exist on disk even transiently.
+- Both the verified (`write`) and periodic (`write_unverified`) paths require
+  filled hashes; `fill_hashes` is the only way to leave the unhashed phase, and
+  a supplied hash that disagrees with the recomputation is rejected rather
+  than repaired. The verified path additionally rebuilds the shard and compares
+  the state hash before the rename.
+- `last_written` advances only after a successful rename. A sequence at or
+  below `last_written` is a no-op with no filesystem work; a failed newer write
+  leaves the watermark and the previous file untouched. A failed write, flush,
+  sync, or rename removes the temp file.
+- A commandless snapshot written by an older node or by hand is still rejected
+  by the reader (`--require-snapshot` fails closed), even though the current
+  writer refuses to produce one.
 - The dedup terminal queue and session are part of the state hash; the
   terminal queue is validated on restore.
 - The engine consumer commits only after the orders, executions, and MD
-  appends land; the commit watermark never moves backwards and is flushed at
-  most 256 records / 100 ms behind.
+  appends land. `CommitWatermark` enforces `committed <= applied`, neither
+  offset moves backwards, a partial commit leaves the range and its onset
+  pending, and the delay bound is measured from the first uncommitted record
+  (256 records / 100 ms). `CommitRetry` retries with 100 ms–2 s backoff and a
+  30-attempt diagnostic budget; it never stops retrying, so a broker outage
+  costs commit lag, not availability. See ADR 0021.
 - The reader rejects a gap/overlap in a batch and fails the shard closed.
 - The turbo write-behind appends exactly one order record per seq in order;
   seq == broker offset is the startup/proof precondition; admissions are
-  released only after the orders append is durable.
+  released only after the orders append is durable. An admission is
+  `Queued -> Completed` (durable append) or `Queued -> Abandoned` (drop), and
+  exactly-once release is structural through its owned permit. The window
+  invariant is `in_flight == queued.len()`,
+  `available permits + in_flight == capacity`, strictly increasing unique ids,
+  non-decreasing timestamps, and `drops == count_drops + age_drops`.
+  `AdmitError::{CountFull, AgeFull}` is carried through
+  `EnqueueError::WindowFull(_)`; the HTTP/TCP wire answer stays `window_full`
+  and there is no durable fallback.
 
 ## 6. Ingress and configuration
 
@@ -135,6 +165,12 @@ failure paths that mark only the failing role.
 ## 7. What is not proven
 
 - Engine invariants are checked in tests, not on the release hot path.
+- Snapshot writer invariants are structural and verified by a rebuild on the
+  final path, but a periodic (`write_unverified`) snapshot is not rebuilt
+  before its rename; its hashes are filled from the same state and the next
+  verified snapshot or replay is the cross-check.
+- Commit state is in-process: a broker outage can extend commit lag up to the
+  retry cadence, and only a restart proves what was acknowledged.
 - The ingress risk guard is bypassable by a direct log producer; engine-level
   exposure/account state is not implemented.
 - Position reconstruction is not settlement: no balances, fees, margin, or

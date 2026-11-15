@@ -397,8 +397,13 @@ The engine's book/dedup and order lifecycle invariants are executable in
 `SymbolEngine::check_invariants`; the dedup lifecycle table is enforced by
 `DedupTable::update` (ADR 0019). Each active shard's engine and MD tasks move
 through `Starting -> Running -> Stopped` or `Failed` (terminal), and readiness
-requires every active role to be Running (ADR 0020). The full catalogue and
-what remains unproven is [INVARIANTS.md](INVARIANTS.md).
+requires every active role to be Running (ADR 0020). The durable path has three
+explicit state machines: the snapshot writer (save-time structural and hash
+invariants, rename-only advance), the commit watermark/retry (committed never
+ahead of applied, bounded drift, retries that never stop), and the turbo
+admission window (Queued to Completed/Abandoned, exactly-once permit release)
+(ADR 0021). The full catalogue and what remains unproven is
+[INVARIANTS.md](INVARIANTS.md).
 
 ## Observability
 

@@ -49,6 +49,18 @@ Whippet is pre-1.0; minor releases may change internal APIs.
 
 ### Added
 
+- Durable-path state machines (ADR 0021): a snapshot is structurally validated
+  and hashed before any temp file exists and `last_written` advances only after
+  the rename; `CommitWatermark`/`CommitRetry` enforce `committed <= applied`,
+  bounded drift, and retries that never stop; turbo admissions have an explicit
+  `Queued -> Completed|Abandoned` lifecycle with exactly-once permit release
+  and window invariants.
+- Snapshot writer invariants: a snapshot must have sorted unique symbols, at
+  least one applied command, consistent dedup/terminal state, and filled
+  hashes before `save` creates a temp file; both verified and periodic writes
+  enforce them, `last_written` advances only after the rename, and a failed
+  write removes the temp file. The reader still rejects commandless files that
+  pre-date the writer guard.
 - Executable engine invariants and an explicit dedup order lifecycle:
   `Book`/`DedupTable`/`SymbolEngine::check_invariants`, the
   `Accepted -> Resting -> Filled|Cancelled` transition table enforced by

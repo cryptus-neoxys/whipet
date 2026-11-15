@@ -26,6 +26,7 @@ supersedes an earlier one.
 | [0018](0018-instrument-session-state.md) | Instrument session state | Accepted (log-ordered `set_session`, snapshot v5, hub/dashboard visibility) |
 | [0019](0019-executable-engine-invariants.md) | Executable engine invariants and the order lifecycle | Accepted (book/dedup/engine checks, dedup transition table) |
 | [0020](0020-explicit-shard-lifecycle.md) | Explicit shard lifecycle and readiness | Accepted (per-role state machine, readiness = all engine+MD running) |
+| [0021](0021-durable-path-state-machines.md) | Durable-path state machines: snapshot, commit, turbo admission | Accepted (save-time snapshot invariants, commit watermark/retry, admission lifecycle) |
 
 Template:
 

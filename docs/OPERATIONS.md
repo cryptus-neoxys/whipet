@@ -239,7 +239,8 @@ See `docs/RUNBOOK.md` for the operator sequence.
 The executable invariant catalogue is [INVARIANTS.md](INVARIANTS.md): the
 book/dedup checks and order lifecycle ([ADR 0019](adr/0019-executable-engine-invariants.md)),
 the per-shard lifecycle/readiness rule ([ADR 0020](adr/0020-explicit-shard-lifecycle.md)),
-snapshot/journal gates, and ingress/config invariants. `Book::check_invariants`,
+snapshot writer, commit, turbo admission, journal gates, and ingress/config
+invariants (ADR 0021). `Book::check_invariants`,
 `DedupTable::check_invariants`, and `SymbolEngine::check_invariants` are
 test-only diagnostics; readiness is the per-shard rule above.
 
