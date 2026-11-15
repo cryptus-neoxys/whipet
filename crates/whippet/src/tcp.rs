@@ -480,6 +480,7 @@ mod tests {
             api_token: api_token.map(str::to_string),
             api_participant: "api".into(),
             rate_limit_per_sec: per_sec,
+            ws_per_ip: 0,
         };
         let journal = Arc::new(Journal::memory());
         let hub = MdHub::new(exchange, config.iggy_addr.clone(), "memory".into(), None);

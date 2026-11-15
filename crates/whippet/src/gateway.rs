@@ -1,7 +1,8 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -17,6 +18,7 @@ use axum::routing::{get, post};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde::Serialize;
+use tokio::sync::OwnedSemaphorePermit;
 use tower_http::compression::CompressionLayer;
 use tower_http::compression::predicate::NotForContentType;
 use tower_http::services::{ServeDir, ServeFile};
@@ -62,6 +64,7 @@ pub fn router(ctx: Arc<NodeContext>) -> Router {
     let limiter = Arc::clone(&ctx.rate_limiter);
     let frames = Arc::new(FrameCache::new(Arc::clone(&ctx.metrics)));
     let participants = Arc::new(ParticipantCache::default());
+    let ws_state = Arc::new(WsState::with_limit(ctx.config.ws_per_ip));
     let ingress = Router::new()
         .route("/api/orders", post(submit_order))
         .route("/api/orders/batch", post(submit_orders))
@@ -89,7 +92,8 @@ pub fn router(ctx: Arc<NodeContext>) -> Router {
     let api = api
         .layer(CompressionLayer::new().compress_when(NotForContentType::new("application/json")))
         .layer(Extension(frames))
-        .layer(Extension(participants));
+        .layer(Extension(participants))
+        .layer(Extension(ws_state));
     let api = if http_trace_enabled() {
         api.layer(TraceLayer::new_for_http())
     } else {
@@ -271,14 +275,16 @@ async fn submit_order(
     // `GatewayParse` to the body read and the JSON parse.
     let mut stage_at = Instant::now();
     let bytes = read_json_body(&headers, body).await?;
-    // Fast path: borrow the strings from the body. A body with a JSON escape
-    // cannot be borrowed, so fall back to the owned DTO rather than rejecting
-    // a request the old API accepted.
-    let validated = match serde_json::from_slice::<OrderRequestRef<'_>>(&bytes) {
-        Ok(request) => validate_order_ref(&ctx, &request, caller, &participants),
+    // The body parse and the field validation are separate stages, so a
+    // validation-heavy request does not blur into the parse. The owned DTO
+    // fallback must outlive the borrowed view it produces.
+    let owned;
+    let request = match serde_json::from_slice::<OrderRequestRef<'_>>(&bytes) {
+        Ok(request) => request,
         Err(borrow_error) => match serde_json::from_slice::<OrderRequest>(&bytes) {
-            Ok(owned) => {
-                let request = OrderRequestRef {
+            Ok(parsed) => {
+                owned = parsed;
+                OrderRequestRef {
                     symbol: owned.symbol.as_str(),
                     side: owned.side,
                     order_type: owned.order_type,
@@ -286,14 +292,21 @@ async fn submit_order(
                     qty: owned.qty,
                     client_order_id: owned.client_order_id.as_deref(),
                     participant: owned.participant.as_deref(),
-                };
-                validate_order_ref(&ctx, &request, caller, &participants)
+                }
             }
-            Err(_) => Err(invalid_json(borrow_error)),
+            Err(_) => {
+                // A body that cannot even be parsed is still parse time.
+                ctx.metrics
+                    .record_stage_us(Stage::GatewayParse, split_elapsed(&mut stage_at));
+                return Err(invalid_json(borrow_error));
+            }
         },
     };
     ctx.metrics
         .record_stage_us(Stage::GatewayParse, split_elapsed(&mut stage_at));
+    let validated = validate_order_ref(&ctx, &request, caller, &participants);
+    ctx.metrics
+        .record_stage_us(Stage::GatewayValidate, split_elapsed(&mut stage_at));
     let validated = validated?;
     let timestamp_ns = now_ns();
     let (order_id, message) = build_order(&validated, timestamp_ns);
@@ -350,10 +363,13 @@ async fn submit_orders(
     // below is a slice of this one clock, shared by the whole batch.
     let mut stage_at = Instant::now();
     let bytes = read_json_body(&headers, body).await?;
-    let validated = match serde_json::from_slice::<BatchOrderRequestRef<'_>>(&bytes) {
-        Ok(request) => validate_batch(&ctx, &request, caller, &participants),
+    // Same split as `submit_order`: parse first, then validate every order.
+    let owned;
+    let request = match serde_json::from_slice::<BatchOrderRequestRef<'_>>(&bytes) {
+        Ok(request) => request,
         Err(borrow_error) => match serde_json::from_slice::<BatchOrderRequest>(&bytes) {
-            Ok(owned) => {
+            Ok(parsed) => {
+                owned = parsed;
                 let orders: Vec<OrderRequestRef<'_>> = owned
                     .orders
                     .iter()
@@ -367,14 +383,21 @@ async fn submit_orders(
                         participant: order.participant.as_deref(),
                     })
                     .collect();
-                let request = BatchOrderRequestRef { orders };
-                validate_batch(&ctx, &request, caller, &participants)
+                BatchOrderRequestRef { orders }
             }
-            Err(_) => Err(invalid_json(borrow_error)),
+            Err(_) => {
+                // A body that cannot even be parsed is still parse time.
+                ctx.metrics
+                    .record_stage_us(Stage::GatewayParse, split_elapsed(&mut stage_at));
+                return Err(invalid_json(borrow_error));
+            }
         },
     };
     ctx.metrics
         .record_stage_us(Stage::GatewayParse, split_elapsed(&mut stage_at));
+    let validated = validate_batch(&ctx, &request, caller, &participants);
+    ctx.metrics
+        .record_stage_us(Stage::GatewayValidate, split_elapsed(&mut stage_at));
     let (partition, validated) = validated?;
     // The middleware charged one token for the request; charge the rest of the
     // batch so a 256-order request cannot bypass the per-second budget.
@@ -545,6 +568,24 @@ fn validate_order_ref(
     )
 }
 
+/// Cancel validation, split out so the request can record the validate stage
+/// before propagating a rejection. Same rules as before: the symbol must be
+/// configured and the participant must pass the auth/ownership check.
+fn validate_cancel(
+    ctx: &NodeContext,
+    request: &CancelRequest,
+    caller: Option<&str>,
+    participants: &ParticipantCache,
+) -> Result<ParticipantId, (StatusCode, Json<ApiError>)> {
+    ctx.exchange().instrument(request.symbol).ok_or_else(|| {
+        bad_request(
+            "unknown_symbol",
+            format!("unknown symbol {}", request.symbol),
+        )
+    })?;
+    resolve_participant_id(caller, request.participant.as_deref(), Some(participants))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_fields(
     ctx: &NodeContext,
@@ -659,19 +700,21 @@ async fn cancel_order(
 ) -> ApiResult<CancelAck> {
     ensure_shards_ready(&ctx)?;
     let caller = authenticate(&ctx, &headers)?;
+    // One clock for the whole cancel, the same shape as the order paths: no
+    // per-order stamps, just consecutive slices of this request.
+    let mut stage_at = Instant::now();
     // Use the same body contract as the order paths instead of axum's `Json`
     // extractor, whose syntax-error rejection is a bare 400. A malformed cancel
     // body must be the same 422 `invalid_json` an order body gets.
     let bytes = read_json_body(&headers, body).await?;
-    let request: CancelRequest = serde_json::from_slice(&bytes).map_err(invalid_json)?;
-    ctx.exchange().instrument(request.symbol).ok_or_else(|| {
-        bad_request(
-            "unknown_symbol",
-            format!("unknown symbol {}", request.symbol),
-        )
-    })?;
-    let participant =
-        resolve_participant_id(caller, request.participant.as_deref(), Some(&participants))?;
+    let parsed: Result<CancelRequest, _> = serde_json::from_slice(&bytes);
+    ctx.metrics
+        .record_stage_us(Stage::GatewayParse, split_elapsed(&mut stage_at));
+    let request = parsed.map_err(invalid_json)?;
+    let participant = validate_cancel(&ctx, &request, caller, &participants);
+    ctx.metrics
+        .record_stage_us(Stage::GatewayValidate, split_elapsed(&mut stage_at));
+    let participant = participant?;
     let timestamp_ns = now_ns();
     let command = Command::cancel(request.symbol, request.order_id, participant, timestamp_ns);
     let partition = request.symbol.partition(ctx.exchange().partitions);
@@ -683,11 +726,15 @@ async fn cancel_order(
         request.order_id.0,
     );
     let message = JournalMessage::new_named(command.encode(), meta.named_pairs(HeaderMode::Full));
+    ctx.metrics
+        .record_stage_us(Stage::GatewayEncode, split_elapsed(&mut stage_at));
     let append = ctx
         .group_commit
         .append(Topic::Orders, partition, vec![message])
-        .await
-        .map_err(journal_unavailable)?;
+        .await;
+    ctx.metrics
+        .record_stage_us(Stage::GatewayAppend, split_elapsed(&mut stage_at));
+    let append = append.map_err(journal_unavailable)?;
     Ok(Json(CancelAck {
         order_id: request.order_id,
         symbol: request.symbol,
@@ -876,11 +923,23 @@ async fn instruments(
     Json(ctx.exchange().clone())
 }
 
-async fn prometheus(State(ctx): State<Arc<NodeContext>>) -> impl IntoResponse {
+async fn prometheus(
+    State(ctx): State<Arc<NodeContext>>,
+    Extension(ws_state): Extension<Arc<WsState>>,
+) -> impl IntoResponse {
     let state = ctx.hub.latest();
     let stats = ctx.group_commit.stats();
     let stages = ctx.metrics.stage_snapshot();
     let mut body = prometheus_text(&state.metrics, state.freshness_ms, state.sequence, &stages);
+    let (ws_active, ws_rejected) = ws_state.snapshot();
+    body.push_str("# HELP whippet_ws_connections Active WebSocket subscribers.\n");
+    body.push_str("# TYPE whippet_ws_connections gauge\n");
+    body.push_str(&format!("whippet_ws_connections {ws_active}\n"));
+    body.push_str(
+        "# HELP whippet_ws_rejected_total WebSocket upgrades refused by a connection cap.\n",
+    );
+    body.push_str("# TYPE whippet_ws_rejected_total counter\n");
+    body.push_str(&format!("whippet_ws_rejected_total {ws_rejected}\n"));
     body.push_str("# HELP whippet_group_commit_batches_total Group-commit appends completed.\n");
     body.push_str("# TYPE whippet_group_commit_batches_total counter\n");
     body.push_str(&format!(
@@ -1205,29 +1264,165 @@ fn filtered_state(state: &StateView, symbols: &[Symbol], trade_limit: usize) -> 
     }
 }
 
+/// Per-peer cap on concurrent WebSocket subscribers. The global semaphore in
+/// [`NodeContext`] bounds the whole process; without a per-peer sub-limit one
+/// address can take every permit and lock out everybody else. Eight covers the
+/// dashboard's own fanout (a handful of tabs) with room to spare.
+pub const WS_PER_IP_LIMIT: usize = 8;
+
+/// One router's WebSocket budget accounting.
+///
+/// The global permit still lives in [`NodeContext::ws_connections`]; this only
+/// tracks the per-peer sub-limit plus the two gauge/counter series. It is
+/// created per router, so tests with their own router get their own counts.
+/// Peers are removed as soon as their count reaches zero, so the table is
+/// bounded by the number of live subscribers, not by every address ever seen.
+struct WsState {
+    per_ip_limit: usize,
+    per_ip: Mutex<HashMap<IpAddr, usize>>,
+    active: AtomicU64,
+    rejected: AtomicU64,
+}
+
+impl Default for WsState {
+    fn default() -> Self {
+        Self::with_limit(WS_PER_IP_LIMIT)
+    }
+}
+
+/// Everything an accepted upgrade owns: the global permit, the per-peer slot,
+/// and the active gauge. Dropping the lease releases all three, which happens
+/// when the socket loop ends or the upgrade is abandoned.
+struct WsLease {
+    state: Arc<WsState>,
+    ip: Option<IpAddr>,
+    _global: OwnedSemaphorePermit,
+}
+
+impl WsState {
+    fn with_limit(per_ip_limit: usize) -> Self {
+        Self {
+            per_ip_limit,
+            per_ip: Mutex::new(HashMap::new()),
+            active: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+        }
+    }
+
+    /// `(active, rejected)` for the metrics exposition.
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.active.load(Ordering::Relaxed),
+            self.rejected.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Count one refused upgrade and log it with the peer that caused it.
+    fn record_rejection(&self, ip: Option<IpAddr>, reason: &str) {
+        let total = self.rejected.fetch_add(1, Ordering::Relaxed) + 1;
+        warn!(
+            peer = ?ip,
+            reason,
+            rejected_total = total,
+            "websocket upgrade rejected"
+        );
+    }
+
+    /// Take the per-peer slot, or return the global permit so the caller can
+    /// answer 503. On success the lease owns the permit.
+    fn acquire(
+        self: &Arc<Self>,
+        global: OwnedSemaphorePermit,
+        ip: Option<IpAddr>,
+    ) -> Result<WsLease, ()> {
+        if let Some(ip) = ip {
+            let mut per_ip = self
+                .per_ip
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let count = per_ip.entry(ip).or_insert(0);
+            if self.per_ip_limit != 0 && *count >= self.per_ip_limit {
+                // Dropping `global` here releases the permit we just took.
+                return Err(());
+            }
+            *count += 1;
+        }
+        self.active.fetch_add(1, Ordering::Relaxed);
+        Ok(WsLease {
+            state: Arc::clone(self),
+            ip,
+            _global: global,
+        })
+    }
+}
+
+impl Drop for WsLease {
+    fn drop(&mut self) {
+        if let Some(ip) = self.ip {
+            let mut per_ip = self
+                .state
+                .per_ip
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(count) = per_ip.get_mut(&ip) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    // Do not let idle peers accumulate in the table.
+                    per_ip.remove(&ip);
+                }
+            }
+        }
+        self.state.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// One rejection contract for both the global cap and the per-peer sub-limit:
+/// a 503 with a JSON `ApiError` and a retry hint, never a bare text body.
+fn ws_capacity_response(state: &WsState, ip: Option<IpAddr>, reason: &str) -> Response {
+    state.record_rejection(ip, reason);
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiError::new(
+            "ws_capacity",
+            format!("websocket subscriber capacity is exhausted ({reason}); retry shortly"),
+        )),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response
+}
+
 async fn ws_upgrade(
     ws: WebSocketUpgrade,
     State(ctx): State<Arc<NodeContext>>,
     Extension(cache): Extension<Arc<FrameCache>>,
+    Extension(ws_state): Extension<Arc<WsState>>,
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
     Query(query): Query<WsQuery>,
 ) -> Response {
+    let ip = connect.map(|Extension(ConnectInfo(address))| address.ip());
     // Mirror the TCP connection cap: each subscriber holds a task and an
     // egress stream, so an unbounded upgrade path is a memory/bandwidth DoS.
     let permit = match Arc::clone(&ctx.ws_connections).try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "websocket connection cap reached",
-            )
-                .into_response();
+            return ws_capacity_response(ws_state.as_ref(), ip, "global connection cap reached");
+        }
+    };
+    // Then the per-peer cap, so a single address cannot hold the whole budget.
+    let lease = match ws_state.acquire(permit, ip) {
+        Ok(lease) => lease,
+        Err(()) => {
+            return ws_capacity_response(ws_state.as_ref(), ip, "per-peer connection cap reached");
         }
     };
     let trade_limit = query.trades.unwrap_or(0);
     ws.max_message_size(64 * 1024)
         .max_frame_size(64 * 1024)
         .on_upgrade(move |socket| async move {
-            let _permit = permit;
+            let _lease = lease;
             ws_loop(socket, ctx, cache, trade_limit).await;
         })
 }
@@ -1452,6 +1647,97 @@ mod tests {
         // A different filter is a miss and is measured.
         cache.frame(&state, &[Symbol::new("BTC-USD").unwrap()], 60);
         assert_eq!(ws_frame_samples(), 2);
+    }
+
+    #[tokio::test]
+    async fn ws_per_ip_leases_are_bounded_and_released() {
+        let state = Arc::new(WsState::default());
+        let global = Arc::new(tokio::sync::Semaphore::new(64));
+        let ip: IpAddr = "203.0.113.9".parse().expect("peer address");
+        let other: IpAddr = "203.0.113.10".parse().expect("peer address");
+
+        let mut leases = Vec::new();
+        for _ in 0..WS_PER_IP_LIMIT {
+            let permit = Arc::clone(&global)
+                .try_acquire_owned()
+                .expect("global permit");
+            leases.push(state.acquire(permit, Some(ip)).expect("under the cap"));
+        }
+        assert_eq!(state.snapshot(), (WS_PER_IP_LIMIT as u64, 0));
+        // The peer above the cap is refused, and the refused attempt gives the
+        // global permit back instead of leaking it.
+        let permit = Arc::clone(&global)
+            .try_acquire_owned()
+            .expect("global permit");
+        assert!(state.acquire(permit, Some(ip)).is_err());
+        assert_eq!(global.available_permits(), 64 - WS_PER_IP_LIMIT);
+
+        // Another peer still has the whole per-peer budget.
+        let permit = Arc::clone(&global)
+            .try_acquire_owned()
+            .expect("global permit");
+        let other_lease = state.acquire(permit, Some(other)).expect("other peer");
+        assert_eq!(state.snapshot(), (WS_PER_IP_LIMIT as u64 + 1, 0));
+
+        // Closing one socket frees both the slot and the global permit.
+        leases.pop();
+        assert_eq!(global.available_permits(), 64 - WS_PER_IP_LIMIT);
+        assert_eq!(state.snapshot().0, WS_PER_IP_LIMIT as u64);
+        let permit = Arc::clone(&global)
+            .try_acquire_owned()
+            .expect("global permit");
+        let replacement = state.acquire(permit, Some(ip)).expect("slot freed");
+        assert_eq!(state.snapshot().0, WS_PER_IP_LIMIT as u64 + 1);
+        drop(other_lease);
+        assert_eq!(state.snapshot().0, WS_PER_IP_LIMIT as u64);
+        drop(replacement);
+        assert_eq!(state.snapshot().0, WS_PER_IP_LIMIT as u64 - 1);
+        drop(leases);
+        assert_eq!(state.snapshot().0, 0);
+        assert_eq!(global.available_permits(), 64);
+    }
+
+    #[tokio::test]
+    async fn ws_without_a_peer_identity_has_no_per_ip_cap() {
+        // In-process callers and transports with no `ConnectInfo` skip the
+        // per-peer guard, matching the rate limiter, but the global permit and
+        // the active gauge still apply.
+        let state = Arc::new(WsState::default());
+        let global = Arc::new(tokio::sync::Semaphore::new(64));
+        let permits: Vec<_> = (0..WS_PER_IP_LIMIT + 4)
+            .map(|_| {
+                let permit = Arc::clone(&global)
+                    .try_acquire_owned()
+                    .expect("global permit");
+                state.acquire(permit, None).expect("no per-peer identity")
+            })
+            .collect();
+        assert_eq!(state.snapshot().0, (WS_PER_IP_LIMIT + 4) as u64);
+        drop(permits);
+        assert_eq!(state.snapshot().0, 0);
+        assert_eq!(global.available_permits(), 64);
+    }
+
+    #[tokio::test]
+    async fn ws_rejection_is_a_json_api_error_with_retry_after() {
+        let state = WsState::default();
+        let response =
+            ws_capacity_response(&state, Some("203.0.113.9".parse().unwrap()), "test cap");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 4_096)
+            .await
+            .expect("rejection body");
+        let error: ApiError = serde_json::from_slice(&body).expect("json api error");
+        assert_eq!(error.code, "ws_capacity");
+        assert!(error.error.contains("test cap"));
+        assert_eq!(state.snapshot().1, 1, "the rejection is counted");
     }
 
     #[test]

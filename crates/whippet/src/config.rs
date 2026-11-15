@@ -108,6 +108,11 @@ pub struct NodeArgs {
     /// limiter, which is the single-node demo default.
     #[arg(long, env = "WHIPPET_RATE_LIMIT_PER_SEC", default_value_t = 0)]
     pub rate_limit_per_sec: u32,
+    /// Per-IP WebSocket subscriber sub-limit. `0` disables it; the global cap
+    /// still applies. The fanout benchmark sets 0 because all subscribers come
+    /// from one host.
+    #[arg(long, env = "WHIPPET_WS_PER_IP", default_value_t = 0)]
+    pub ws_per_ip: usize,
 }
 
 #[derive(Clone)]
@@ -131,6 +136,8 @@ pub struct NodeConfig {
     pub api_participant: String,
     /// 0 disables per-IP ingress limiting.
     pub rate_limit_per_sec: u32,
+    /// 0 disables the per-IP WebSocket sub-limit.
+    pub ws_per_ip: usize,
 }
 
 impl NodeConfig {
@@ -184,6 +191,7 @@ impl NodeConfig {
             api_token,
             api_participant,
             rate_limit_per_sec: args.rate_limit_per_sec,
+            ws_per_ip: args.ws_per_ip,
         })
     }
 }

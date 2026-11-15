@@ -58,6 +58,7 @@ impl TestNode {
             api_token: None,
             api_participant: "api".into(),
             rate_limit_per_sec: 0,
+            ws_per_ip: 0,
         };
         let journal = Arc::new(Journal::memory());
         let group_commit = whippet_journal::group::GroupCommit::new(

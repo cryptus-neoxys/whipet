@@ -15,6 +15,7 @@ mod common;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -33,6 +34,7 @@ use whippet_core::api::{
 use whippet_core::config::Mode;
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Symbol};
 use whippet_core::protocol::{Command, CommandKind, ExecKind, MdKind, RejectReason, Side};
+use whippet_marketdata::Stage;
 
 use common::TestNode;
 
@@ -143,6 +145,62 @@ async fn get(app: &Router, uri: &str) -> (StatusCode, Value) {
     (status, value)
 }
 
+/// Plain-text GET for `/metrics`, whose body is not JSON.
+async fn get_text(app: &Router, uri: &str) -> (StatusCode, String) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .expect("valid request"),
+        )
+        .await
+        .expect("router responds");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body collects")
+        .to_bytes();
+    (
+        status,
+        String::from_utf8(bytes.to_vec()).expect("utf-8 metrics"),
+    )
+}
+
+/// Parse the last column of the first exposition line with `prefix`.
+fn metric_value(text: &str, prefix: &str) -> f64 {
+    text.lines()
+        .find(|line| line.starts_with(prefix))
+        .unwrap_or_else(|| panic!("missing metric {prefix}"))
+        .rsplit(' ')
+        .next()
+        .expect("value column")
+        .parse()
+        .expect("numeric metric value")
+}
+
+/// Test-only middleware: a real listener has one peer address (127.0.0.1), so
+/// the per-IP WebSocket test selects its peer with this header. The node never
+/// does this; production peer identity comes from `ConnectInfo`.
+async fn with_test_peer(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if let Some(peer) = request
+        .headers()
+        .get("x-test-peer")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<SocketAddr>().ok())
+    {
+        request.extensions_mut().insert(ConnectInfo(peer));
+    }
+    next.run(request).await
+}
+
 /// Send a raw body so tests can exercise the size and content-type checks the
 /// typed `send` helper cannot express.
 async fn post_raw(
@@ -182,14 +240,21 @@ async fn post_raw(
 /// Perform a raw WebSocket handshake against a live server. The returned socket
 /// must stay alive: dropping it frees the subscriber permit.
 async fn open_websocket(addr: SocketAddr) -> (tokio::net::TcpStream, u16) {
+    open_websocket_as(addr, None).await
+}
+
+/// Same as [`open_websocket`], with an optional synthetic peer selector for the
+/// per-IP test (see [`with_test_peer`]).
+async fn open_websocket_as(addr: SocketAddr, peer: Option<&str>) -> (tokio::net::TcpStream, u16) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut stream = tokio::net::TcpStream::connect(addr)
         .await
         .expect("connect to the test server");
+    let peer_header = peer.map_or_else(String::new, |peer| format!("x-test-peer: {peer}\r\n"));
     let request = format!(
         "GET /ws HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
-         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+         {peer_header}Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
     );
     stream
         .write_all(request.as_bytes())
@@ -848,6 +913,166 @@ async fn websocket_upgrades_are_capped() {
     assert_eq!(status, 503, "the upgrade above the cap must be refused");
     drop(overflow);
     assert_eq!(live.len(), cap);
+}
+
+#[tokio::test]
+async fn websocket_per_ip_cap_is_enforced_and_released() {
+    let node = TestNode::new();
+    // Keep the global cap out of the way: this test is about the per-peer cap.
+    let app = gateway::router(node_with_ws_cap(&node, 512, |config| {
+        config.ws_per_ip = gateway::WS_PER_IP_LIMIT;
+    }))
+    .layer(axum::middleware::from_fn(with_test_peer));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a test listener");
+    let addr = listener.local_addr().expect("local address");
+    let metrics_app = app.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let peer = "203.0.113.9:4000";
+    let other = "203.0.113.10:4000";
+    let cap = gateway::WS_PER_IP_LIMIT;
+
+    // One peer fills its sub-limit; the upgrade above it is refused.
+    let mut live = Vec::new();
+    for index in 0..cap {
+        let (stream, status) = open_websocket_as(addr, Some(peer)).await;
+        assert_eq!(
+            status, 101,
+            "upgrade {index} under the per-IP cap is accepted"
+        );
+        live.push(stream);
+    }
+    let (overflow, status) = open_websocket_as(addr, Some(peer)).await;
+    assert_eq!(
+        status, 503,
+        "the upgrade above the per-IP cap must be refused"
+    );
+    drop(overflow);
+
+    // A different peer still gets its own full budget.
+    let (other_stream, status) = open_websocket_as(addr, Some(other)).await;
+    assert_eq!(status, 101, "a second peer is not blocked by the first");
+
+    // Both the gauge and the rejection counter are exported.
+    let (status, text) = get_text(&metrics_app, "/metrics").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        metric_value(&text, "whippet_ws_connections "),
+        (cap + 1) as f64,
+        "only the accepted upgrades count as active"
+    );
+    assert_eq!(metric_value(&text, "whippet_ws_rejected_total "), 1.0);
+
+    // Closing a socket releases the per-peer slot (and the global permit), so
+    // the same peer can upgrade again.
+    live.pop();
+    let mut reconnected = None;
+    for _ in 0..50 {
+        let (stream, status) = open_websocket_as(addr, Some(peer)).await;
+        if status == 101 {
+            reconnected = Some(stream);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        reconnected.is_some(),
+        "dropping a socket must free its per-peer slot"
+    );
+    drop(reconnected);
+    drop(other_stream);
+    drop(live);
+}
+
+#[tokio::test]
+async fn metrics_expose_validate_and_cancel_stages() {
+    let node = TestNode::new();
+    let app = gateway::router(Arc::clone(&node.ctx));
+    let samples = |stage: Stage| {
+        node.ctx
+            .metrics
+            .stage_snapshot()
+            .into_iter()
+            .find(|(candidate, _)| *candidate == stage)
+            .map(|(_, summary)| summary.samples)
+            .expect("every stage is in the snapshot")
+    };
+
+    // Cancel-only traffic first: the four gateway stages must all be recorded
+    // by `/api/cancel`, not just by the order paths.
+    let (status, body) = post(
+        &app,
+        "/api/cancel",
+        json!({
+            "symbol": "BTC-USD",
+            "order_id": OrderId::derive(symbol(), "metrics-cancel").to_hex(),
+            "participant": "alice",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for stage in [
+        Stage::GatewayParse,
+        Stage::GatewayValidate,
+        Stage::GatewayEncode,
+        Stage::GatewayAppend,
+    ] {
+        assert_eq!(
+            samples(stage),
+            1,
+            "/api/cancel must record exactly one {} sample",
+            stage.as_str()
+        );
+    }
+
+    // The order paths record validate as their own stage too, once per
+    // request, not once per order.
+    assert_eq!(
+        samples(Stage::GatewayValidate),
+        1,
+        "the cancel walk above leaves one sample"
+    );
+    let (status, body) = post(&app, "/api/orders", limit_order("metrics-1", "alice")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(samples(Stage::GatewayValidate), 2);
+    let (status, body) = post(
+        &app,
+        "/api/orders/batch",
+        json!({ "orders": [limit_order("metrics-2", "alice"), limit_order("metrics-3", "alice")] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        samples(Stage::GatewayValidate),
+        3,
+        "a two-order batch is still one validate sample"
+    );
+
+    let (status, text) = get_text(&app, "/metrics").await;
+    assert_eq!(status, StatusCode::OK);
+    for stage in [
+        "gateway_parse",
+        "gateway_validate",
+        "gateway_encode",
+        "gateway_append",
+    ] {
+        for quantile in ["p50", "p99"] {
+            let prefix = format!("whippet_stage_{quantile}_us{{stage=\"{stage}\"}}");
+            let value = metric_value(&text, &prefix);
+            assert!(
+                value >= 0.0 && value.is_finite(),
+                "stage {stage} must expose a non-negative sample, got {value}"
+            );
+        }
+    }
+    assert_eq!(metric_value(&text, "whippet_ws_connections "), 0.0);
+    assert_eq!(metric_value(&text, "whippet_ws_rejected_total "), 0.0);
+    assert!(text.contains("# TYPE whippet_ws_connections gauge"));
+    assert!(text.contains("# TYPE whippet_ws_rejected_total counter"));
 }
 
 #[tokio::test]
