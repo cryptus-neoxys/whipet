@@ -3995,6 +3995,7 @@ dependencies = [
 name = "whippet-marketdata"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "criterion",
  "hdrhistogram",
  "serde",
