@@ -125,12 +125,15 @@ failure paths that mark only the failing role.
 - The dedup terminal queue and session are part of the state hash; the
   terminal queue is validated on restore.
 - The engine consumer commits only after the orders, executions, and MD
-  appends land. `CommitWatermark` enforces `committed <= applied`, neither
-  offset moves backwards, a partial commit leaves the range and its onset
-  pending, and the delay bound is measured from the first uncommitted record
-  (256 records / 100 ms). `CommitRetry` retries with 100 ms–2 s backoff and a
-  30-attempt diagnostic budget; it never stops retrying, so a broker outage
-  costs commit lag, not availability. See ADR 0021.
+  appends land, and only for a batch that actually consumed an input record:
+  the empty shutdown batch carries `applied = false`, so it cannot claim
+  offset 0 of an empty log as durable. The same rule gates cadence snapshots.
+  `CommitWatermark` enforces `committed <= applied`, neither offset moves
+  backwards, a partial commit leaves the range and its onset pending, and the
+  delay bound is measured from the first uncommitted record (256 records /
+  100 ms). `CommitRetry` retries with 100 ms–2 s backoff and a 30-attempt
+  diagnostic budget; it never stops retrying, so a broker outage costs commit
+  lag, not availability. See ADR 0021.
 - The journal offset contract is explicit on both backends: offsets are
   contiguous from zero per `(topic, partition)`, timestamps are non-decreasing,
   and a commit is the inclusive last-applied offset. Commits are monotonic and

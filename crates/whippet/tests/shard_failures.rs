@@ -280,6 +280,7 @@ fn output_batch(last_offset: u64, final_batch: bool) -> OutputBatch {
         md: Vec::new(),
         orders: Vec::new(),
         last_offset,
+        applied: true,
         snapshot: None,
         final_batch,
     }
@@ -634,6 +635,7 @@ async fn a_durable_order_record_releases_the_turbo_window_slot() {
                 admission,
             }],
             last_offset: 4,
+            applied: true,
             snapshot: None,
             final_batch: true,
         })
@@ -722,6 +724,7 @@ async fn a_failed_order_append_stops_the_shard_without_committing() {
                 admission,
             }],
             last_offset: 4,
+            applied: true,
             snapshot: None,
             final_batch: true,
         })

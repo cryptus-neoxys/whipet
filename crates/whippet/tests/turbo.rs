@@ -378,6 +378,7 @@ async fn the_ack_arrives_before_the_writer_drains_anything() {
             md: Vec::new(),
             orders: Vec::new(),
             last_offset: 0,
+            applied: false,
             snapshot: None,
             final_batch: false,
         })

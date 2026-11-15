@@ -703,7 +703,13 @@ pub struct OutputBatch {
     /// Turbo only: commands to append to `Topic::Orders`, in seq order, each
     /// holding its window permit until that append lands.
     pub orders: Vec<TurboJournalRecord>,
+    /// The last record this batch consumed. Only meaningful when `applied` is
+    /// true: the shutdown batch carries no records and must not claim offset 0
+    /// of an empty log as durable.
     pub last_offset: u64,
+    /// Whether this batch consumed at least one input record (durable or
+    /// turbo). The writer advances `applied`/commits only for such a batch.
+    pub applied: bool,
     pub snapshot: Option<SequencedSnapshot>,
     /// The matcher is exiting: flush the final snapshot and commit.
     pub final_batch: bool,
@@ -889,6 +895,7 @@ pub fn run_matcher(
         // Size to the input batch, not the maximum ring capacity: batch-10
         // ingress was allocating ~230 KB of output vectors per batch.
         let input_len = batch.records.len() + batch.turbo.len();
+        let applied = input_len > 0;
         let mut executions: Vec<JournalMessage> = Vec::with_capacity(input_len);
         let mut md_messages: Vec<JournalMessage> = Vec::with_capacity(input_len);
         let mut orders: Vec<TurboJournalRecord> = Vec::with_capacity(batch.turbo.len());
@@ -1076,6 +1083,7 @@ pub fn run_matcher(
                 md: md_messages,
                 orders,
                 last_offset,
+                applied,
                 snapshot,
                 final_batch: false,
             })
@@ -1134,6 +1142,7 @@ pub fn run_matcher(
             md: Vec::new(),
             orders: Vec::new(),
             last_offset,
+            applied: false,
             snapshot: final_snapshot,
             final_batch: true,
         })
@@ -1203,6 +1212,7 @@ fn merge_output_batch(into: &mut OutputBatch, next: OutputBatch) {
         into.snapshot = next.snapshot;
     }
     into.last_offset = next.last_offset;
+    into.applied |= next.applied;
     into.final_batch |= next.final_batch;
 }
 
@@ -1402,8 +1412,10 @@ pub async fn run_writer<J: JournalOps + ?Sized>(
             Stage::EngineAppend,
             append_started.elapsed().as_micros() as u64,
         );
-        appended_offset.store(batch.last_offset, Ordering::Release);
-        watermark.note_applied(batch.last_offset);
+        if batch.applied {
+            appended_offset.store(batch.last_offset, Ordering::Release);
+            watermark.note_applied(batch.last_offset);
+        }
         let commit_started = Instant::now();
         maybe_commit(
             journal,
