@@ -49,6 +49,12 @@ Whippet is pre-1.0; minor releases may change internal APIs.
 
 ### Added
 
+- Audited instrument halt/resume: operator-only `POST /api/admin/instruments/{symbol}/halt`
+  and `/resume` (`WHIPPET_OPERATOR_TOKENS`, separate from trading tokens),
+  log-ordered `CommandKind::Halt/Resume`, `Rejected/Halted` for new orders while
+  cancels stay allowed, a Status MD event and `BookView.halted`, a JSON audit
+  record in the `audit` topic, and replay-safe state (ADR 0015). TCP rejects
+  operator commands.
 - Scoped ingress tokens (`WHIPPET_API_TOKENS=token:participant,...`). Each
   token authorizes only its participant; the HTTP and TCP paths derive the
   participant id from the bound name and reject a request that claims another

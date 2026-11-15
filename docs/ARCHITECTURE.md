@@ -137,6 +137,23 @@ HTTP/TCP -> TurboIngress (one bounded lane + window per active shard)
   `whippet_turbo_window_drops_total`, and the
   `whippet_turbo_ack_latency_microseconds` summary.
 
+### Instrument control plane
+
+Halt and resume are `CommandKind::Halt`/`Resume` records in the **orders** log,
+not a side channel. The matcher processes them in log order, so a restore or a
+full replay reproduces the halted state and the state hash covers it. The
+engine rejects new orders with `Rejected/Halted` while halted, allows cancels,
+and emits a `MdKind::Status` event (`MD_FLAG_HALTED`) that the MD hub applies to
+`BookView.halted`. The engine's state snapshot carries `halted`; the MD
+snapshot carries the same bit in its optional trailing status byte, so the hub
+learns a restored halt from the startup append without an extra status record
+or an MD-sequence bump.
+
+The HTTP endpoints are operator-only (`WHIPPET_OPERATOR_TOKENS`, a namespace
+separate from trading tokens); the binary TCP channel rejects operator
+commands. One JSON audit record per accepted request lands in the `audit`
+topic; see [ADR 0015](adr/0015-audited-instrument-control-plane.md).
+
 ### Group commit
 
 A single-order client still sends one command per request. The gateway and the

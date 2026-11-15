@@ -152,6 +152,20 @@ Expected trade:
 ]
 ```
 
+Halt and resume an instrument with an operator token (set
+`WHIPPET_OPERATOR_TOKENS=op-secret:ops1` on the node):
+
+```sh
+curl -X POST http://127.0.0.1:8080/api/admin/instruments/BTC-USD/halt \
+  -H 'Authorization: Bearer op-secret' -d '{"reason":"demo"}'
+curl -X POST http://127.0.0.1:8080/api/admin/instruments/BTC-USD/resume \
+  -H 'Authorization: Bearer op-secret' -d '{}'
+```
+
+While halted, BTC-USD rejects new orders with `halted` and the dashboard shows
+a `HALTED` badge; cancels still work. The command and its audit record are in
+the orders and audit logs, so the state survives a restart.
+
 The trade is at the maker's price, 6,500,000 cents. `side` is the aggressor's
 side. `order_id` is the taker. The resting order keeps 6 units at the same
 price.

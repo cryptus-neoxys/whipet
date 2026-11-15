@@ -35,6 +35,7 @@ credentials explicitly.
 | `WHIPPET_TURBO_WINDOW_MS` | `50` | Turbo only: maximum age of the oldest unjournaled command in one shard's window, in ms (1–60,000). The binding limit is whichever of count or age is hit first. |
 | `WHIPPET_API_TOKENS` | unset | Scoped tokens as `token:participant` pairs, comma separated (for example `tok-a:alice,tok-b:bob`). Each token authorizes only its participant: the gateway derives the participant id from the name, so self-trade prevention and attribution see distinct desks. Tokens cannot contain `:`. Merged with `WHIPPET_API_TOKEN`. |
 | `WHIPPET_METRICS_TOKEN` | unset | Optional bearer token for `GET /metrics`. Health and readiness stay unauthenticated for probes. |
+| `WHIPPET_OPERATOR_TOKENS` | unset | Operator credentials for the instrument control plane, as `token:operator-name` pairs, comma separated. Separate from `WHIPPET_API_TOKENS`: operator tokens cannot submit orders, and trading tokens cannot halt/resume. With none configured, every admin request is 403 `operator_not_configured`. |
 | `WHIPPET_DATA_DIR` | `/data` | Directory on the node's own data volume; the storage monitor samples the filesystem that holds it. |
 | `WHIPPET_IGGY_DATA_DIR` | `/iggy-data` | Read-only mount of Iggy's data volume. Resolved once at startup; a missing path disables the Iggy sample instead of failing the node. |
 | `WHIPPET_DISK_WARN_PCT` | `70` | Volume usage percentage that raises the warning state. 1–99 and strictly below the critical value. |
@@ -169,6 +170,32 @@ These retention values are recorded at topic creation, but in Iggy 0.10 they
 are enforced only by the messages cleaner — and the default stack disables
 it, so nothing trims the log. See
 [Log growth and retention](#log-growth-and-retention) for the exact state.
+
+## Instrument control plane
+
+Halt and resume are operator-only HTTP endpoints:
+
+```sh
+curl -X POST http://127.0.0.1:8080/api/admin/instruments/BTC-USD/halt \
+  -H "Authorization: Bearer $WHIPPET_OPERATOR_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"reason":"maintenance"}'
+curl -X POST http://127.0.0.1:8080/api/admin/instruments/BTC-USD/resume \
+  -H "Authorization: Bearer $WHIPPET_OPERATOR_TOKEN" -d '{}'
+```
+
+The response is `AdminAck`: `symbol`, `action`, `halted`, `partition`,
+`offset` (orders log), `operator`, `audit_offset`. Authorization is a separate
+namespace (`WHIPPET_OPERATOR_TOKENS`), never a trading token; no operator
+tokens configured means 403, missing/invalid means 401. The command is appended
+to the same orders log as client commands, so a restarted engine replays the
+halt state. A halted instrument rejects new orders with `halted`, allows
+cancels, and shows `halted: true` in `/api/state` and the dashboard badge.
+Each accepted request appends a JSON audit record to the `audit` topic; if that
+append fails the endpoint returns 500 `audit_unavailable` because the command
+may already be applied. See [ADR 0015](adr/0015-audited-instrument-control-plane.md).
+
+TCP `Submit` rejects Halt/Resume commands; the control plane is HTTP-only.
 
 ## Disk capacity and admission
 
