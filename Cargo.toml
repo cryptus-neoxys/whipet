@@ -46,7 +46,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 crossbeam-channel = "0.5"
 futures-util = "0.3"
 hdrhistogram = "7.5"
-rand = "0.8"
+rand = "0.10"
 rand_chacha = "0.3"
 rustc-hash = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
