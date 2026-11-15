@@ -56,6 +56,8 @@ fn node_with(node: &TestNode, risk: RiskConfig) -> Arc<NodeContext> {
         started: node.ctx.started,
         shutdown: node.ctx.shutdown.clone(),
         shards_ok: Arc::clone(&node.ctx.shards_ok),
+        health: node.ctx.health.clone(),
+        active_shards: node.ctx.active_shards.clone(),
         rate_limiter,
         ws_connections: Arc::new(tokio::sync::Semaphore::new(512)),
         snapshot_lock: Arc::new(std::sync::Mutex::new(())),

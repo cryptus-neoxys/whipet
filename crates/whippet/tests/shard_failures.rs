@@ -19,6 +19,7 @@ use whippet::engine_runner::{
     APPEND_MAX_ATTEMPTS, InputBatch, JournalOps, OutputBatch, SHARD_RING_CAPACITY,
     TurboJournalRecord, join_matcher, read_orders, run_matcher, run_writer,
 };
+use whippet::health::{ShardRole, ShardState};
 use whippet::turbo::{TurboConfig, TurboWindow, now_ns};
 use whippet_core::config::ExchangeConfig;
 use whippet_engine::ShardEngine;
@@ -320,7 +321,7 @@ async fn output_append_retries_then_commits_without_a_gap() {
     .expect("the second append attempt succeeds");
 
     assert!(
-        ctx.shards_ok(),
+        ctx.shards_ready(),
         "a recovered append must not mark the shard failed"
     );
     assert_eq!(
@@ -387,7 +388,17 @@ async fn output_append_failure_forever_stops_without_committing() {
         error.to_string().contains("output append failed"),
         "unexpected error: {error}"
     );
-    assert!(!ctx.shards_ok(), "the shard is marked failed");
+    assert!(!ctx.shards_ready(), "the shard is marked failed");
+    assert_eq!(
+        ctx.shard_state(0, ShardRole::Engine),
+        ShardState::Failed,
+        "the engine role that stopped is the one reported failed"
+    );
+    assert_ne!(
+        ctx.shard_state(0, ShardRole::Md),
+        ShardState::Failed,
+        "a writer failure must not fail the MD role"
+    );
     assert_eq!(
         journal.attempts(),
         APPEND_MAX_ATTEMPTS as usize,
@@ -435,7 +446,8 @@ async fn matcher_panic_is_joined_and_fails_the_shard() {
         error.to_string().contains("panicked"),
         "unexpected error: {error}"
     );
-    assert!(!ctx.shards_ok(), "the shard is marked failed");
+    assert!(!ctx.shards_ready(), "the shard is marked failed");
+    assert_eq!(ctx.shard_state(0, ShardRole::Engine), ShardState::Failed);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -558,7 +570,11 @@ async fn reader_gap_or_overlap_fails_the_shard_and_stops_polling() {
         .await
         .unwrap_or_else(|_| panic!("the reader must stop on a non-contiguous batch {offsets:?}"));
 
-        assert!(!ctx.shards_ok(), "gap/overlap {offsets:?} fails the shard");
+        assert!(
+            !ctx.shards_ready(),
+            "gap/overlap {offsets:?} fails the shard"
+        );
+        assert_eq!(ctx.shard_state(0, ShardRole::Engine), ShardState::Failed);
         assert_eq!(
             journal.polls(),
             1,
@@ -569,6 +585,24 @@ async fn reader_gap_or_overlap_fails_the_shard_and_stops_polling() {
             "a bad batch is never forwarded to the matcher"
         );
     }
+}
+
+#[tokio::test]
+async fn a_failed_role_is_not_relabelled_stopped() {
+    // A reader can fail and exit while the rest of the shard winds down; the
+    // shard task then returns `Ok`. The lifecycle must keep `Failed` so the
+    // health view still names the real cause.
+    let node = TestNode::new();
+    let ctx = Arc::clone(&node.ctx);
+    ctx.mark_shard_failed(0, ShardRole::Engine);
+    ctx.mark_shard_stopped(0, ShardRole::Engine);
+    assert_eq!(ctx.shard_state(0, ShardRole::Engine), ShardState::Failed);
+    assert!(!ctx.shards_ready(), "a failed role never becomes ready");
+
+    // A role that was healthy does stop cleanly.
+    ctx.mark_shard_state(0, ShardRole::Md, ShardState::Running);
+    ctx.mark_shard_stopped(0, ShardRole::Md);
+    assert_eq!(ctx.shard_state(0, ShardRole::Md), ShardState::Stopped);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -714,7 +748,7 @@ async fn a_failed_order_append_stops_the_shard_without_committing() {
         error.to_string().contains("output append failed"),
         "unexpected error: {error}"
     );
-    assert!(!ctx.shards_ok(), "the shard is marked failed");
+    assert!(!ctx.shards_ready(), "the shard is marked failed");
     assert_eq!(
         appended.load(Ordering::SeqCst),
         0,

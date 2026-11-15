@@ -73,6 +73,8 @@ fn node_with(node: &TestNode, configure: impl FnOnce(&mut NodeConfig)) -> Arc<No
         started: node.ctx.started,
         shutdown: node.ctx.shutdown.clone(),
         shards_ok: Arc::clone(&node.ctx.shards_ok),
+        health: node.ctx.health.clone(),
+        active_shards: node.ctx.active_shards.clone(),
         rate_limiter,
         ws_connections: Arc::clone(&node.ctx.ws_connections),
         snapshot_lock: Arc::new(std::sync::Mutex::new(())),
@@ -544,6 +546,9 @@ async fn turbo_halt_matches_through_the_lane_and_audits() {
         started: std::time::Instant::now(),
         shutdown,
         shards_ok: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        // This test runs a turbo matcher directly, not the shard lifecycle.
+        health: whippet::health::ShardHealth::new(),
+        active_shards: Vec::new(),
         rate_limiter: Arc::new(whippet::ratelimit::RateLimiter::new(0)),
         ws_connections: Arc::new(tokio::sync::Semaphore::new(8)),
         snapshot_lock: Arc::new(std::sync::Mutex::new(())),

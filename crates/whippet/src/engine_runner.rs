@@ -20,6 +20,7 @@ use whippet_journal::{AppendResult, Journal, JournalMessage, PayloadRecord, Topi
 use whippet_marketdata::{ShardMetrics, Stage};
 
 use crate::context::NodeContext;
+use crate::health::{ShardRole, ShardState};
 use crate::snapshot::{SequencedSnapshot, SnapshotWriter};
 use crate::turbo::{TurboAck, TurboAdmission, TurboEntry};
 
@@ -242,7 +243,31 @@ impl JournalOps for Journal {
 /// the matcher applies decoded records. In turbo the matcher is fed from the
 /// lane and is the only sequencer; the writer appends the commands to the
 /// orders log behind the match.
+///
+/// This wrapper owns the shard's lifecycle: `Starting` before any setup,
+/// `Running` once the shard body has replayed and published its initial state,
+/// `Stopped` on a clean shutdown, and `Failed` on every error path.
 pub async fn run_engine_shard(
+    ctx: Arc<NodeContext>,
+    shard_id: u32,
+    turbo: Option<mpsc::Receiver<TurboEntry>>,
+) -> Result<()> {
+    ctx.mark_shard_state(shard_id, ShardRole::Engine, ShardState::Starting);
+    let result = engine_shard(Arc::clone(&ctx), shard_id, turbo).await;
+    match &result {
+        // Only shutdown returns `Ok` from the loop; a startup error is never a
+        // clean stop. A role that failed inside the loop (the reader's poll
+        // budget, a log gap) keeps its `Failed` state.
+        Ok(()) => ctx.mark_shard_stopped(shard_id, ShardRole::Engine),
+        Err(_) => ctx.mark_shard_failed(shard_id, ShardRole::Engine),
+    }
+    result
+}
+
+/// The engine shard body. Split from [`run_engine_shard`] so every early
+/// error return — a snapshot that will not load, a missing turbo lane, a
+/// broker offset read — is classified as `Failed` in one place.
+async fn engine_shard(
     ctx: Arc<NodeContext>,
     shard_id: u32,
     turbo: Option<mpsc::Receiver<TurboEntry>>,
@@ -422,6 +447,11 @@ pub async fn run_engine_shard(
         consumer,
         "engine shard running"
     );
+    // Replay is done and the initial MD snapshot is published, so this task is
+    // now the live matcher for the partition. Readiness opens here: the reader
+    // and matcher loops start next, and nothing before this point may report
+    // the shard as running.
+    ctx.mark_shard_state(shard_id, ShardRole::Engine, ShardState::Running);
     // --- Dedicated shard thread and bounded rings ---------------------------
     //
     // The matcher owns the engine on a plain OS thread. It never awaits and
@@ -535,7 +565,7 @@ pub fn join_matcher(
     matcher: std::thread::JoinHandle<()>,
 ) -> Result<()> {
     if matcher.join().is_err() {
-        ctx.mark_shard_failed();
+        ctx.mark_shard_failed(shard_id, ShardRole::Engine);
         anyhow::bail!("matcher thread for shard {shard_id} panicked");
     }
     Ok(())
@@ -735,7 +765,7 @@ pub async fn read_orders<J: JournalOps + 'static>(
                     "order poll failed; retrying"
                 );
                 if poll_failures >= POLL_FAILURE_BUDGET {
-                    ctx.mark_shard_failed();
+                    ctx.mark_shard_failed(shard_id, ShardRole::Engine);
                     error!(
                         shard = shard_id,
                         attempts = poll_failures,
@@ -760,7 +790,7 @@ pub async fn read_orders<J: JournalOps + 'static>(
         if let (Some(first), Some(last)) = (records.first(), records.last()) {
             let span = last.offset.saturating_sub(first.offset).saturating_add(1);
             if first.offset != next_offset || span != records.len() as u64 {
-                ctx.mark_shard_failed();
+                ctx.mark_shard_failed(shard_id, ShardRole::Engine);
                 error!(
                     shard = shard_id,
                     requested = next_offset,
@@ -1363,7 +1393,7 @@ pub async fn run_writer<J: JournalOps + ?Sized>(
         // the matched commands are not in the log at all, so the shard stops
         // rather than keep acking work whose write-behind can never drain.
         if orders_result.is_err() || execution_result.is_err() || md_result.is_err() {
-            ctx.mark_shard_failed();
+            ctx.mark_shard_failed(shard_id, ShardRole::Engine);
             if let Err(error) = orders_result {
                 error!(
                     shard = shard_id,
@@ -1428,7 +1458,7 @@ pub async fn run_writer<J: JournalOps + ?Sized>(
                         shard = shard_id,
                         "snapshot writer stopped; engine state is no longer being persisted"
                     );
-                    ctx.mark_shard_failed();
+                    ctx.mark_shard_failed(shard_id, ShardRole::Engine);
                 }
             }
         }
@@ -1484,7 +1514,22 @@ pub async fn run_writer<J: JournalOps + ?Sized>(
 }
 
 /// Consume the canonical market-data log and apply it to the dashboard cache.
+///
+/// Like [`run_engine_shard`], this wrapper owns the MD role's lifecycle:
+/// `Starting` before the committed-offset read, `Running` once that read is
+/// done and the poll loop is about to start, `Stopped` on shutdown, `Failed` on
+/// any error.
 pub async fn run_md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
+    ctx.mark_shard_state(shard_id, ShardRole::Md, ShardState::Starting);
+    let result = md_shard(Arc::clone(&ctx), shard_id).await;
+    match &result {
+        Ok(()) => ctx.mark_shard_stopped(shard_id, ShardRole::Md),
+        Err(_) => ctx.mark_shard_failed(shard_id, ShardRole::Md),
+    }
+    result
+}
+
+async fn md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
     let journal = ctx.engine_journal_for(shard_id);
     let consumer = format!("whippet-md-p{shard_id}");
     let committed_offset = match journal.committed(Topic::Md, shard_id, &consumer).await {
@@ -1504,6 +1549,7 @@ pub async fn run_md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
         start_offset = next_offset,
         "MD consumer running"
     );
+    ctx.mark_shard_state(shard_id, ShardRole::Md, ShardState::Running);
     let mut shutdown = ctx.shutdown.subscribe();
     let mut watermark = CommitWatermark::new(committed_offset);
     let mut commit_retry = CommitRetry::new();
@@ -1531,7 +1577,7 @@ pub async fn run_md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
                 poll_failures += 1;
                 warn!(shard = shard_id, attempt = poll_failures, error = %error, "MD poll failed; retrying");
                 if poll_failures >= POLL_FAILURE_BUDGET {
-                    ctx.mark_shard_failed();
+                    ctx.mark_shard_failed(shard_id, ShardRole::Md);
                     anyhow::bail!(
                         "MD poll failed {poll_failures} times on shard {shard_id}; the dashboard feed is stopped"
                     );
@@ -1576,7 +1622,7 @@ pub async fn run_md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
                     match MdSnapshot::decode(&record.payload) {
                         Ok(snapshot) => ctx.hub.apply_snapshot(&snapshot),
                         Err(error) => {
-                            ctx.mark_shard_failed();
+                            ctx.mark_shard_failed(shard_id, ShardRole::Md);
                             anyhow::bail!(
                                 "undecodable MD snapshot on shard {shard_id} at offset {}: {error}; refusing to advance past a lost recovery point",
                                 record.offset
@@ -1587,7 +1633,7 @@ pub async fn run_md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
                 _ => match MdEvent::decode(&record.payload) {
                     Ok(event) => events.push(event),
                     Err(error) => {
-                        ctx.mark_shard_failed();
+                        ctx.mark_shard_failed(shard_id, ShardRole::Md);
                         anyhow::bail!(
                             "undecodable MD event on shard {shard_id} at offset {}: {error}; refusing to desynchronise the book",
                             record.offset

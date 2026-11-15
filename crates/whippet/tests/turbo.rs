@@ -115,6 +115,9 @@ fn test_node_with(
         started: Instant::now(),
         shutdown,
         shards_ok: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        // The test drives `run_engine_shard` directly; readiness is not gated.
+        health: whippet::health::ShardHealth::new(),
+        active_shards: Vec::new(),
         rate_limiter,
         ws_connections,
         snapshot_lock: Arc::new(std::sync::Mutex::new(())),

@@ -307,6 +307,8 @@ fn feed_node(feed_capacity: usize) -> (Arc<NodeContext>, TempDir) {
         started: Instant::now(),
         shutdown,
         shards_ok: Arc::new(AtomicBool::new(true)),
+        health: whippet::health::ShardHealth::new(),
+        active_shards: Vec::new(),
         rate_limiter,
         ws_connections,
         snapshot_lock: Arc::new(std::sync::Mutex::new(())),

@@ -20,6 +20,7 @@ use crate::context::{
 };
 use crate::engine_runner::{run_engine_shard, run_md_shard};
 use crate::gateway;
+use crate::health::{ShardHealth, ShardRole};
 use crate::ratelimit::RateLimiter;
 use crate::snapshot::SnapshotStore;
 use crate::storage::{StorageMonitor, StorageSnapshot, StorageState};
@@ -152,6 +153,8 @@ pub async fn run(args: NodeArgs) -> Result<()> {
         started: Instant::now(),
         shutdown,
         shards_ok: Arc::new(AtomicBool::new(true)),
+        health: ShardHealth::new(),
+        active_shards: active_shards.clone(),
         rate_limiter,
         ws_connections,
         snapshot_lock: Arc::new(std::sync::Mutex::new(())),
@@ -163,14 +166,14 @@ pub async fn run(args: NodeArgs) -> Result<()> {
     spawn_storage_monitor(Arc::clone(&ctx));
 
     let mut handles = Vec::new();
-    for shard in ctx.active_shards() {
+    for &shard in ctx.active_shards() {
         let engine_ctx = Arc::clone(&ctx);
         let turbo_rx = turbo_receivers.remove(&shard);
         handles.push(tokio::spawn(async move {
             let result = run_engine_shard(Arc::clone(&engine_ctx), shard, turbo_rx).await;
             if let Err(error) = &result {
                 tracing::error!(shard, error = %error, "engine shard stopped unexpectedly");
-                engine_ctx.mark_shard_failed();
+                engine_ctx.mark_shard_failed(shard, ShardRole::Engine);
             }
             result
         }));
@@ -179,7 +182,7 @@ pub async fn run(args: NodeArgs) -> Result<()> {
             let result = run_md_shard(Arc::clone(&md_ctx), shard).await;
             if let Err(error) = &result {
                 tracing::error!(shard, error = %error, "MD shard stopped unexpectedly");
-                md_ctx.mark_shard_failed();
+                md_ctx.mark_shard_failed(shard, ShardRole::Md);
             }
             result
         }));
@@ -189,7 +192,7 @@ pub async fn run(args: NodeArgs) -> Result<()> {
         partitions = config.exchange.partitions,
         mode = %config.mode,
         journal = ?config.journal,
-        "Whippet node started"
+        "Whippet node started; readiness waits for every active shard's engine and MD task to run"
     );
 
     if let Some(tcp_addr) = config.tcp_addr {

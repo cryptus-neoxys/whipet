@@ -296,7 +296,7 @@ async fn handle_submit(
         );
     }
 
-    if !ctx.shards_ok() {
+    if !ctx.shards_ready() {
         return (
             error_response(
                 TcpErrorCode::JournalUnavailable,
@@ -668,6 +668,19 @@ mod tests {
         let rate_limiter = Arc::new(crate::ratelimit::RateLimiter::new(per_sec));
         let ws_connections = Arc::new(Semaphore::new(512));
         let storage = crate::storage::StorageMonitor::new(config.storage.clone());
+        // Tests drive the engine directly, so tell the context its shard tasks
+        // have reached their loops: ingress is open and readiness is true.
+        let active_shards = {
+            let mut shards: Vec<u32> = config
+                .exchange
+                .instruments
+                .iter()
+                .map(|instrument| instrument.symbol.partition(config.exchange.partitions))
+                .collect();
+            shards.sort_unstable();
+            shards.dedup();
+            shards
+        };
         let ctx = Arc::new(NodeContext {
             config,
             journal: Arc::clone(&journal),
@@ -681,11 +694,25 @@ mod tests {
             started: Instant::now(),
             shutdown,
             shards_ok: Arc::new(AtomicBool::new(true)),
+            health: crate::health::ShardHealth::new(),
+            active_shards,
             rate_limiter,
             ws_connections,
             snapshot_lock: Arc::new(std::sync::Mutex::new(())),
             turbo: None,
         });
+        for &shard in ctx.active_shards() {
+            ctx.mark_shard_state(
+                shard,
+                crate::health::ShardRole::Engine,
+                crate::health::ShardState::Running,
+            );
+            ctx.mark_shard_state(
+                shard,
+                crate::health::ShardRole::Md,
+                crate::health::ShardState::Running,
+            );
+        }
         TestNode { ctx, _dir: dir }
     }
 

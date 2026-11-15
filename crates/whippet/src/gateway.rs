@@ -29,7 +29,7 @@ use whippet_core::api::{
     AdminAck, AdminRequest, ApiError, BatchOrderAck, BatchOrderRequest, BatchOrderRequestRef,
     CancelAck, CancelRequest, GUARANTEE_DURABLE, GUARANTEE_TURBO, HealthView, MAX_BATCH_ORDERS,
     MdFeedMessage, MdFeedResync, OrderAck, OrderRequest, OrderRequestRef, SessionRequest,
-    StateView, TradeView, WsClientMessage, WsServerMessage,
+    ShardHealthView, StateView, TradeView, WsClientMessage, WsServerMessage,
 };
 use whippet_core::headers::{HeaderMode, MessageMeta, SCHEMA_ORDER};
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Seq, Symbol};
@@ -279,8 +279,13 @@ fn invalid_json(error: serde_json::Error) -> (StatusCode, Json<ApiError>) {
 
 /// Refuse new orders when no matcher is running. Without this the gateway
 /// acknowledges orders that will never be matched.
+///
+/// Readiness is the per-shard lifecycle: every active shard's engine and MD
+/// task must be `Running`. A fresh node is therefore not ready until its tasks
+/// reach their loops, and a failed shard is not ready until the process
+/// restarts.
 fn ensure_shards_ready(ctx: &NodeContext) -> Result<(), (StatusCode, Json<ApiError>)> {
-    if !ctx.shards_ok() {
+    if !ctx.shards_ready() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ApiError::new(
@@ -1467,7 +1472,7 @@ async fn health(State(ctx): State<Arc<NodeContext>>) -> Json<HealthView> {
     let metrics = ctx.metrics.snapshot();
     let journal_ready =
         ctx.config.journal == crate::config::JournalKind::Memory || metrics.iggy_connected;
-    let shards_ok = ctx.shards_ok();
+    let shards_ok = ctx.shards_ready();
     let storage = ctx.storage.snapshot();
     let storage_ok = storage.state != StorageState::Critical;
     Json(HealthView {
@@ -1481,6 +1486,7 @@ async fn health(State(ctx): State<Arc<NodeContext>>) -> Json<HealthView> {
         iggy_addr: ctx.config.iggy_addr.clone(),
         journal: ctx.config.journal.as_str().to_string(),
         shards_ok,
+        shards: ctx.shard_health_snapshot(),
         storage_ok,
         storage_state: storage.state.as_str().to_string(),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -1495,11 +1501,14 @@ struct ReadinessView {
     ready: bool,
     journal: bool,
     shards_ok: bool,
+    /// Which shard/role is keeping the node out of rotation.
+    shards: Vec<ShardHealthView>,
     storage: bool,
 }
 
-/// Machine readiness: 200 only when the journal answers and every shard is
-/// alive. `/api/health` stays the human-readable JSON view.
+/// Machine readiness: 200 only when the journal answers and every active
+/// shard's engine and MD task is running. `/api/health` stays the
+/// human-readable JSON view.
 async fn readyz(State(ctx): State<Arc<NodeContext>>) -> impl IntoResponse {
     // The node's health monitor pings the ingress client and every engine-pool
     // entry once per cycle and caches the aggregate. Probes do no journal I/O,
@@ -1509,7 +1518,7 @@ async fn readyz(State(ctx): State<Arc<NodeContext>>) -> impl IntoResponse {
     } else {
         true
     };
-    let shards_ok = ctx.shards_ok();
+    let shards_ok = ctx.shards_ready();
     let storage_ok = ctx.storage.state() != StorageState::Critical;
     let ready = journal && shards_ok && storage_ok;
     let status = if ready {
@@ -1523,6 +1532,7 @@ async fn readyz(State(ctx): State<Arc<NodeContext>>) -> impl IntoResponse {
             ready,
             journal,
             shards_ok,
+            shards: ctx.shard_health_snapshot(),
             storage: storage_ok,
         }),
     )

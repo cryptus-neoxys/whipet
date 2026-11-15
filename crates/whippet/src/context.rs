@@ -9,6 +9,7 @@ use whippet_journal::{GroupCommit, Journal};
 use whippet_marketdata::{MdHub, Metrics};
 
 use crate::config::NodeConfig;
+use crate::health::{ShardHealth, ShardRole, ShardState};
 use crate::ratelimit::RateLimiter;
 use crate::snapshot::SnapshotStore;
 use crate::storage::StorageMonitor;
@@ -111,7 +112,20 @@ pub struct NodeContext {
     pub snapshots: SnapshotStore,
     pub started: Instant,
     pub shutdown: watch::Sender<bool>,
+    /// Legacy hard-fail latch. Order ingress used to gate on this alone; it is
+    /// kept as the external `shards_ok` contract and as a second way for a
+    /// test to fail the node closed, but readiness is
+    /// [`NodeContext::shards_ready`]: the latch **and** the per-shard
+    /// lifecycle. The real node starts it `true` and every failure path
+    /// clears it through [`NodeContext::mark_shard_failed`].
     pub shards_ok: Arc<AtomicBool>,
+    /// Per-shard, per-role lifecycle. Readiness requires every active shard's
+    /// engine and MD role to be `Running`.
+    pub health: ShardHealth,
+    /// Distinct partitions that own a configured symbol, sorted once at
+    /// construction. Readiness is scoped to this set: an unused Iggy partition
+    /// has no local task and is never required to run.
+    pub active_shards: Vec<u32>,
     /// One per-IP bucket shared by HTTP and TCP.
     pub rate_limiter: Arc<RateLimiter>,
     /// Caps concurrent WebSocket subscribers.
@@ -136,12 +150,51 @@ impl NodeContext {
         &self.engine_journals[shard_id as usize % self.engine_journals.len()]
     }
 
-    pub fn mark_shard_failed(&self) {
+    pub fn mark_shard_failed(&self, shard: u32, role: ShardRole) {
+        self.health.set(shard, role, ShardState::Failed);
         self.shards_ok.store(false, Ordering::Relaxed);
     }
 
-    pub fn shards_ok(&self) -> bool {
-        self.shards_ok.load(Ordering::Relaxed)
+    /// Apply one lifecycle transition for `(shard, role)` and return the state
+    /// it came from. The transition table lives in
+    /// [`crate::health::ShardState::can_transition_to`]; a `Running` after
+    /// `Failed` is a bug and is rejected (and asserted in debug builds).
+    pub fn mark_shard_state(&self, shard: u32, role: ShardRole, state: ShardState) -> ShardState {
+        self.health.set(shard, role, state)
+    }
+
+    /// Record a clean stop, unless the role already reported a failure.
+    ///
+    /// A reader task can fail and exit while the rest of the shard winds down
+    /// normally; the shard's outer task then returns `Ok`. That must not
+    /// overwrite the `Failed` state, or a failed shard would report `Stopped`
+    /// (and the health view would lose the reason).
+    pub fn mark_shard_stopped(&self, shard: u32, role: ShardRole) {
+        if !self.shard_state(shard, role).is_terminal() {
+            self.mark_shard_state(shard, role, ShardState::Stopped);
+        }
+    }
+
+    /// The lifecycle state of one shard role.
+    pub fn shard_state(&self, shard: u32, role: ShardRole) -> ShardState {
+        self.health.get(shard, role)
+    }
+
+    /// True only when the local shard role is actually in its loop.
+    pub fn shard_running(&self, shard: u32, role: ShardRole) -> bool {
+        self.shard_state(shard, role) == ShardState::Running
+    }
+
+    /// The readiness invariant: the hard-fail latch is intact and every active
+    /// shard's engine and MD task is `Running`. A `Starting`, `Failed`, or
+    /// `Stopped` role keeps the node not-ready.
+    pub fn shards_ready(&self) -> bool {
+        self.shards_ok.load(Ordering::Relaxed) && self.health.all_running(&self.active_shards)
+    }
+
+    /// Per-shard lifecycle for `/api/health`, one entry per active shard.
+    pub fn shard_health_snapshot(&self) -> Vec<whippet_core::api::ShardHealthView> {
+        self.health.snapshot(&self.active_shards)
     }
 
     pub fn exchange(&self) -> &whippet_core::config::ExchangeConfig {
@@ -150,15 +203,9 @@ impl NodeContext {
 
     /// Partitions that actually own a configured symbol. The other partitions
     /// exist in Iggy for scale-out but have no local writer in this process.
-    pub fn active_shards(&self) -> Vec<u32> {
-        let mut shards: Vec<u32> = self
-            .exchange()
-            .instruments
-            .iter()
-            .map(|instrument| instrument.symbol.partition(self.exchange().partitions))
-            .collect();
-        shards.sort_unstable();
-        shards.dedup();
-        shards
+    /// Computed once at construction so readiness never allocates or walks the
+    /// instrument table on the ingress path.
+    pub fn active_shards(&self) -> &[u32] {
+        &self.active_shards
     }
 }

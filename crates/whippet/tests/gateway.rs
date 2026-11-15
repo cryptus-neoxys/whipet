@@ -27,6 +27,7 @@ use tower::ServiceExt;
 use whippet::config::NodeConfig;
 use whippet::context::NodeContext;
 use whippet::gateway;
+use whippet::health::{ShardRole, ShardState};
 use whippet_core::api::{
     BatchOrderAck, BatchOrderRequest, BatchOrderRequestRef, CancelAck, HealthView,
     MAX_BATCH_ORDERS, OrderAck, OrderRequest, OrderRequestRef, StateView,
@@ -82,6 +83,8 @@ fn node_with_ws_cap(
         started: node.ctx.started,
         shutdown: node.ctx.shutdown.clone(),
         shards_ok: Arc::clone(&node.ctx.shards_ok),
+        health: node.ctx.health.clone(),
+        active_shards: node.ctx.active_shards.clone(),
         rate_limiter,
         ws_connections: Arc::new(tokio::sync::Semaphore::new(ws_cap)),
         snapshot_lock: Arc::new(std::sync::Mutex::new(())),
@@ -1179,12 +1182,174 @@ async fn readyz_tracks_journal_and_shard_health() {
     assert_eq!(body["ready"], true);
     assert_eq!(body["journal"], true);
     assert_eq!(body["shards_ok"], true);
+    let shards = body["shards"].as_array().expect("per-shard lifecycle");
+    assert_eq!(
+        shards.len(),
+        node.ctx.active_shards().len(),
+        "one entry per active shard"
+    );
+    assert!(
+        shards
+            .iter()
+            .all(|shard| shard["engine"] == "running" && shard["md"] == "running")
+    );
 
-    node.ctx.mark_shard_failed();
+    // One failed engine role is enough to drop the node out of rotation, and
+    // the view names the shard and role that failed.
+    let shard = node.ctx.active_shards()[0];
+    node.ctx.mark_shard_failed(shard, ShardRole::Engine);
     let (status, body) = get(&app, "/readyz").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["ready"], false);
     assert_eq!(body["shards_ok"], false);
+    let failed = body["shards"]
+        .as_array()
+        .expect("per-shard lifecycle")
+        .iter()
+        .find(|entry| entry["partition"] == shard)
+        .expect("the failed shard is reported");
+    assert_eq!(failed["engine"], "failed");
+    assert_eq!(failed["md"], "running");
+}
+
+#[tokio::test]
+async fn a_starting_shard_keeps_the_node_out_of_rotation() {
+    // The regression this covers: readiness used to start `true`, so a node
+    // could accept orders before its engine or MD task had started.
+    let node = TestNode::new_with_shards_starting();
+    let app = gateway::router(Arc::clone(&node.ctx));
+
+    let (status, body) = get(&app, "/readyz").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["ready"], false);
+    assert_eq!(body["shards_ok"], false);
+    assert!(
+        body["shards"]
+            .as_array()
+            .expect("per-shard lifecycle")
+            .iter()
+            .all(|shard| shard["engine"] == "starting" && shard["md"] == "starting")
+    );
+
+    let order = json!({"symbol":"BTC-USD","side":"buy","price_cents":6500000,"qty":1});
+    let (status, body) = post(&app, "/api/orders", order.clone()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["code"], "shard_unavailable");
+    assert!(
+        node.orders(symbol()).is_empty(),
+        "a not-ready node appends nothing"
+    );
+
+    // Every active shard, both roles, reaches its loop.
+    for shard in node.ctx.active_shards().to_vec() {
+        node.ctx
+            .mark_shard_state(shard, ShardRole::Engine, ShardState::Running);
+        node.ctx
+            .mark_shard_state(shard, ShardRole::Md, ShardState::Running);
+    }
+
+    let (status, body) = get(&app, "/readyz").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ready"], true);
+    assert_eq!(body["shards_ok"], true);
+
+    let (status, body) = get(&app, "/api/health").await;
+    assert_eq!(status, StatusCode::OK);
+    let health: HealthView = serde_json::from_value(body).expect("health view");
+    assert!(health.shards_ok);
+    assert_eq!(health.shards.len(), node.ctx.active_shards().len());
+    assert!(
+        health
+            .shards
+            .iter()
+            .all(|shard| shard.engine == "running" && shard.md == "running")
+    );
+
+    let (status, body) = post(&app, "/api/orders", order).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn a_stopped_shard_is_not_ready() {
+    let node = TestNode::new();
+    let shard = node.ctx.active_shards()[0];
+    node.ctx
+        .mark_shard_state(shard, ShardRole::Md, ShardState::Stopped);
+    let app = gateway::router(Arc::clone(&node.ctx));
+
+    let (status, body) = get(&app, "/readyz").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["ready"], false);
+    assert_eq!(body["shards_ok"], false);
+    let entry = body["shards"]
+        .as_array()
+        .expect("per-shard lifecycle")
+        .iter()
+        .find(|entry| entry["partition"] == shard)
+        .expect("the stopped shard is reported");
+    assert_eq!(entry["engine"], "running");
+    assert_eq!(entry["md"], "stopped");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_real_shard_tasks_flip_readiness() {
+    // The production wiring: one engine task and one MD task per active shard
+    // over the memory journal. Readiness must stay closed until both reach
+    // their loops, open when they do, and close again after a clean stop.
+    let node = TestNode::new_with_shards_starting();
+    let app = gateway::router(Arc::clone(&node.ctx));
+    let (status, _) = get(&app, "/readyz").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+    let mut handles = Vec::new();
+    for &shard in node.ctx.active_shards() {
+        let engine_ctx = Arc::clone(&node.ctx);
+        handles.push(tokio::spawn(async move {
+            whippet::engine_runner::run_engine_shard(engine_ctx, shard, None).await
+        }));
+        let md_ctx = Arc::clone(&node.ctx);
+        handles.push(tokio::spawn(async move {
+            whippet::engine_runner::run_md_shard(md_ctx, shard).await
+        }));
+    }
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let (status, _) = get(&app, "/readyz").await;
+            if status == StatusCode::OK {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("readiness opens once every shard role is running");
+
+    let (_, body) = get(&app, "/api/health").await;
+    let health: HealthView = serde_json::from_value(body).expect("health view");
+    assert_eq!(health.status, "ok");
+    assert!(health.shards_ok);
+    assert!(
+        health
+            .shards
+            .iter()
+            .all(|shard| shard.engine == "running" && shard.md == "running")
+    );
+
+    let _ = node.ctx.shutdown.send(true);
+    for handle in handles {
+        tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("a shard task stops within the shutdown budget")
+            .expect("a shard task does not panic")
+            .expect("a shard task stops cleanly");
+    }
+    let (status, _) = get(&app, "/readyz").await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a stopped shard is not ready"
+    );
 }
 
 #[tokio::test]
@@ -1483,8 +1648,7 @@ async fn ingress_fails_closed_when_the_shard_is_down() {
     let symbol = whippet_core::ids::Symbol::new("BTC-USD").unwrap();
     let before = node.orders(symbol).len();
     node.ctx
-        .shards_ok
-        .store(false, std::sync::atomic::Ordering::Relaxed);
+        .mark_shard_failed(node.ctx.active_shards()[0], ShardRole::Engine);
     let app = gateway::router(Arc::clone(&node.ctx));
 
     let (status, body) = post(
@@ -1663,6 +1827,8 @@ fn ctx_with_engine_pool(
         started: node.ctx.started,
         shutdown: node.ctx.shutdown.clone(),
         shards_ok: Arc::clone(&node.ctx.shards_ok),
+        health: node.ctx.health.clone(),
+        active_shards: node.ctx.active_shards.clone(),
         rate_limiter: Arc::clone(&node.ctx.rate_limiter),
         ws_connections: Arc::clone(&node.ctx.ws_connections),
         snapshot_lock: Arc::clone(&node.ctx.snapshot_lock),

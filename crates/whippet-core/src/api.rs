@@ -310,7 +310,12 @@ pub struct HealthView {
     pub iggy_connected: bool,
     pub iggy_addr: String,
     pub journal: String,
+    /// True only when every active shard's engine **and** MD task is running.
     pub shards_ok: bool,
+    /// Per-shard lifecycle, one entry per active shard. Empty on a node that
+    /// runs no local shards; additive, so an older client can ignore it.
+    #[serde(default)]
+    pub shards: Vec<ShardHealthView>,
     /// False at the critical disk threshold: ingress is refused until space is
     /// reclaimed or the operator raises the limit deliberately.
     pub storage_ok: bool,
@@ -321,6 +326,15 @@ pub struct HealthView {
     /// True when ingress requires a bearer token. False means order submission
     /// and cancel are anonymous; that is a demo posture, not a safe default.
     pub auth_required: bool,
+}
+
+/// One active shard's engine and market-data lifecycle, as `starting`,
+/// `running`, `failed`, or `stopped`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShardHealthView {
+    pub partition: u32,
+    pub engine: String,
+    pub md: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

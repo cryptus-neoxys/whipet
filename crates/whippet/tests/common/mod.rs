@@ -25,6 +25,7 @@ use whippet_marketdata::MdHub;
 
 use whippet::config::{JournalKind, NodeConfig};
 use whippet::context::NodeContext;
+use whippet::health::{ShardHealth, ShardRole, ShardState};
 use whippet::snapshot::SnapshotStore;
 
 /// A node wired entirely in memory: memory journal, market-data hub, temp
@@ -37,8 +38,30 @@ pub struct TestNode {
     pub tempdir: TempDir,
 }
 
+/// Whether the harness models its shard tasks as already running.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shards {
+    /// Every active shard's engine and MD role is `Starting`, as on a node
+    /// whose tasks have been spawned but have not reached their loops.
+    Starting,
+    /// Every active shard role is `Running`, as on a node that has finished
+    /// startup. This is the default: most tests drive the engine directly and
+    /// only need ingress to be open.
+    Running,
+}
+
 impl TestNode {
     pub fn new() -> Self {
+        Self::build(Shards::Running)
+    }
+
+    /// A node whose shard lifecycle is untouched: every active shard role is
+    /// still `Starting`. Readiness tests drive the transitions from here.
+    pub fn new_with_shards_starting() -> Self {
+        Self::build(Shards::Starting)
+    }
+
+    fn build(shards: Shards) -> Self {
         let tempdir = tempfile::tempdir().expect("temp dir");
         let exchange = ExchangeConfig::default();
         let snapshot_dir = tempdir.path().join("snapshots");
@@ -93,6 +116,19 @@ impl TestNode {
         let rate_limiter = Arc::new(whippet::ratelimit::RateLimiter::new(0));
         let ws_connections = Arc::new(tokio::sync::Semaphore::new(512));
         let storage = whippet::storage::StorageMonitor::new(config.storage.clone());
+        // The same derivation the node uses: distinct partitions that own a
+        // configured symbol, sorted.
+        let active_shards = {
+            let mut shards: Vec<u32> = config
+                .exchange
+                .instruments
+                .iter()
+                .map(|instrument| instrument.symbol.partition(config.exchange.partitions))
+                .collect();
+            shards.sort_unstable();
+            shards.dedup();
+            shards
+        };
         let ctx = Arc::new(NodeContext {
             config,
             journal: Arc::clone(&journal),
@@ -106,11 +142,21 @@ impl TestNode {
             started: Instant::now(),
             shutdown,
             shards_ok: Arc::new(AtomicBool::new(true)),
+            health: ShardHealth::new(),
+            active_shards,
             rate_limiter,
             ws_connections,
             snapshot_lock: Arc::new(std::sync::Mutex::new(())),
             turbo: None,
         });
+        if shards == Shards::Running {
+            // No shard task runs in this harness, so the context is told the
+            // lifecycle it would reach: every active shard is serving.
+            for &shard in ctx.active_shards() {
+                ctx.mark_shard_state(shard, ShardRole::Engine, ShardState::Running);
+                ctx.mark_shard_state(shard, ShardRole::Md, ShardState::Running);
+            }
+        }
         Self { ctx, tempdir }
     }
 
