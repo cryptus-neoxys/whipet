@@ -314,9 +314,7 @@ impl NodeConfig {
     }
 
     pub fn from_args(args: NodeArgs) -> Result<Self, ConfigError> {
-        let http_addr: SocketAddr = args.http_addr.parse().map_err(|_| {
-            ConfigError::Invalid(format!("invalid HTTP address: {}", args.http_addr))
-        })?;
+        let http_addr = parse_bind_addr(&args.http_addr, "HTTP")?;
         let tcp_addr = parse_tcp_addr(&args.tcp_addr)?;
         let journal = JournalKind::parse(&args.journal)?;
         let iggy_password = read_password(&args.iggy_password, args.iggy_password_file.as_deref())?;
@@ -536,10 +534,31 @@ fn parse_tcp_addr(value: &str) -> Result<Option<SocketAddr>, ConfigError> {
     if value.is_empty() || value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("none") {
         return Ok(None);
     }
+    parse_bind_addr(value, "TCP").map(Some)
+}
+
+/// Parse a bind address.
+///
+/// A numeric `IP:port` is the normal and recommended form (`0.0.0.0:8081`
+/// for a container that publishes the port). A hostname is also accepted and
+/// resolved once at startup, because Compose/Mac users naturally write
+/// `node:8081` or `localhost:8081`; an unresolvable or malformed value fails
+/// startup with the value named.
+fn parse_bind_addr(value: &str, kind: &str) -> Result<SocketAddr, ConfigError> {
+    let value = value.trim();
+    if let Ok(address) = value.parse() {
+        return Ok(address);
+    }
+    use std::net::ToSocketAddrs;
     value
-        .parse()
-        .map(Some)
-        .map_err(|_| ConfigError::Invalid(format!("invalid TCP address: {value}")))
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addresses| addresses.next())
+        .ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "invalid {kind} address: {value} (use host:port, for example 0.0.0.0:8081)"
+            ))
+        })
 }
 
 /// Resolve the Iggy password the same way for the node and `whippet doctor`.
@@ -903,6 +922,30 @@ mod tests {
         let config = NodeConfig::from_args(cli.node).unwrap();
         assert_eq!(config.risk.max_order_qty, 100);
         assert_eq!(config.risk.max_notional_cents, 0);
+    }
+
+    #[test]
+    fn bind_addresses_accept_numeric_and_resolved_forms() {
+        let cli = Cli::parse_from([
+            "test",
+            "--http-addr",
+            "localhost:0",
+            "--tcp-addr",
+            "localhost:0",
+        ]);
+        let config = NodeConfig::from_args(cli.node).expect("localhost resolves");
+        assert_eq!(config.tcp_addr.expect("tcp is enabled").port(), 0);
+        assert_eq!(config.http_addr.port(), 0);
+
+        let cli = Cli::parse_from(["test", "--tcp-addr", "not a host:port"]);
+        let error = match NodeConfig::from_args(cli.node) {
+            Ok(_) => panic!("a malformed bind address must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("invalid TCP address"), "{error}");
+
+        let cli = Cli::parse_from(["test", "--tcp-addr", "off"]);
+        assert!(NodeConfig::from_args(cli.node).unwrap().tcp_addr.is_none());
     }
 
     #[test]
