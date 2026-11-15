@@ -11,6 +11,7 @@ pub mod engine_runner;
 pub mod gateway;
 pub mod health;
 pub mod inspect;
+pub mod ledger;
 pub mod node;
 pub mod positions;
 pub mod ratelimit;

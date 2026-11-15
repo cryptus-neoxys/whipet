@@ -23,6 +23,7 @@ use crate::inspect::{
     AUDIT_TOPIC_PARTITIONS, AuditFilter, AuditRecord, ExecRole, OrderTrace, build_order_trace,
     filter_audit, parse_order_id,
 };
+use crate::ledger::{LEDGER_NOTICE, LedgerReport, build_ledger};
 use crate::positions::{POSITIONS_NOTICE, PositionReport, build_positions};
 use crate::retention::{RetentionDecision, RetentionInput, evaluate, explain};
 use crate::snapshot::SnapshotStore;
@@ -1909,6 +1910,165 @@ fn print_positions(report: &PositionReport) {
          unresolved maker leg(s): {}, unattributable aggressor fill(s): {}; \
          read-only, nothing committed",
         report.participants.len(),
+        report.unresolved_maker_fills,
+        report.unresolved_aggressor_fills,
+    );
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct LedgerArgs {
+    #[arg(long, env = "WHIPPET_IGGY_ADDR", default_value = "127.0.0.1:8090")]
+    pub iggy_addr: String,
+    #[arg(long, env = "WHIPPET_IGGY_USER", default_value = "iggy")]
+    pub iggy_user: String,
+    #[arg(long, env = "WHIPPET_IGGY_PASSWORD", default_value = "iggy")]
+    pub iggy_password: String,
+    /// Read the Iggy password from a file, as the node does.
+    #[arg(long, env = "WHIPPET_IGGY_PASSWORD_FILE")]
+    pub iggy_password_file: Option<PathBuf>,
+    /// Partition that owns the symbols. BTC-USD is partition 1 with 16 partitions.
+    #[arg(long, default_value_t = 1)]
+    pub partition: u32,
+    /// Restrict the projection to these symbols. Omit to fold every symbol on
+    /// the partition.
+    #[arg(long, value_delimiter = ',')]
+    pub symbols: Vec<Symbol>,
+    /// Only this participant id, a u64. Participant names are derived by the
+    /// gateway from credentials and are never stored in the orders log, so a
+    /// name cannot be resolved offline; pass the numeric id the engine saw.
+    #[arg(long)]
+    pub participant: Option<u64>,
+    /// Print the report as one JSON document instead of a table.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Project the orders and executions logs into a double-entry cash/position
+/// ledger. Read-only: it reads both topics from offset 0 and never appends,
+/// commits, or writes.
+pub async fn run_ledger(args: LedgerArgs) -> Result<()> {
+    // Validate before connecting so a bad invocation is a usage error, not a
+    // connection attempt followed by an error.
+    if args.partition == 0 {
+        bail!("--partition must be at least 1");
+    }
+    let password = read_password(&args.iggy_password, args.iggy_password_file.as_deref())?;
+    let journal = Journal::Iggy(
+        IggyJournal::connect(&args.iggy_addr, &args.iggy_user, &password)
+            .await
+            .with_context(|| format!("connecting to Iggy at {}", args.iggy_addr))?,
+    );
+    ledger_with_journal(args, &journal).await.map(|_| ())
+}
+
+/// The ledger core, with the journal injected so the projection can be tested
+/// on the memory journal. `run_ledger` supplies the Iggy journal.
+///
+/// Both topics are read from offset 0 on one partition with
+/// [`read_topic_from_start`], decoded, and folded by [`build_ledger`]. The
+/// report must pass [`LedgerReport::check_invariants`] before it is printed:
+/// a projection that does not conserve cash and shares is a bug, not a
+/// report. This is a simulation ledger — T+0 posting, no fees, funding,
+/// deposits, withdrawals, or settlement dates — and participant attribution
+/// depends on the orders log. Malformed records are counted in one summary
+/// line, never logged per record. No fills is a valid empty report and exits
+/// zero.
+///
+/// Returns the report that was printed, so tests can assert on the accounts
+/// without scraping stdout.
+#[doc(hidden)]
+pub async fn ledger_with_journal(args: LedgerArgs, journal: &Journal) -> Result<LedgerReport> {
+    if args.partition == 0 {
+        bail!("--partition must be at least 1");
+    }
+
+    let orders_consumer = format!("whippet-ledger-orders-p{}", args.partition);
+    let order_payloads =
+        read_topic_from_start(journal, Topic::Orders, args.partition, &orders_consumer).await?;
+    let order_records = order_payloads.len() as u64;
+    let mut orders = Vec::with_capacity(order_payloads.len());
+    let mut skipped_orders = 0u64;
+    for payload in order_payloads {
+        match Command::decode(&payload.payload) {
+            Ok(command) => orders.push((payload.offset, command)),
+            Err(_) => skipped_orders += 1,
+        }
+    }
+
+    let executions_consumer = format!("whippet-ledger-executions-p{}", args.partition);
+    let execution_payloads = read_topic_from_start(
+        journal,
+        Topic::Executions,
+        args.partition,
+        &executions_consumer,
+    )
+    .await?;
+    let execution_records = execution_payloads.len() as u64;
+    let mut executions = Vec::with_capacity(execution_payloads.len());
+    let mut skipped_executions = 0u64;
+    for payload in execution_payloads {
+        match ExecutionReport::decode(&payload.payload) {
+            Ok(report) => executions.push(report),
+            Err(_) => skipped_executions += 1,
+        }
+    }
+
+    let symbols = (!args.symbols.is_empty()).then_some(args.symbols.as_slice());
+    let mut report = build_ledger(args.partition, &orders, &executions, symbols);
+    if let Some(participant) = args.participant {
+        report.retain_participant(ParticipantId(participant));
+    }
+    // Prove the projection before showing it. The filtered view keeps every
+    // entry whole, so this is meaningful with or without --participant.
+    report
+        .check_invariants()
+        .map_err(|error| anyhow::anyhow!("ledger invariants violated: {error}"))?;
+
+    // The notice and the read summary go to stderr so `--json` stdout stays a
+    // single parseable document.
+    eprintln!("{LEDGER_NOTICE}");
+    eprintln!(
+        "ledger: read {order_records} order record(s) and {execution_records} execution \
+         record(s) from offset 0 on partition {} ({skipped_orders} order, {skipped_executions} \
+         execution undecodable); read-only, nothing committed",
+        args.partition
+    );
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if report.accounts.is_empty() {
+        println!(
+            "no ledger accounts: no complete, attributed trade on partition {} matched the \
+             requested filters; read-only, nothing committed",
+            args.partition
+        );
+    } else {
+        print_ledger(&report);
+    }
+    Ok(report)
+}
+
+fn print_ledger(report: &LedgerReport) {
+    println!(
+        "whippet ledger  partition={}  {LEDGER_NOTICE}",
+        report.partition
+    );
+    println!(
+        "{:>12}  {:<16}  {:>18}  {:>8}",
+        "participant", "asset", "balance", "entries"
+    );
+    for account in &report.accounts {
+        println!(
+            "{:>12}  {:<16}  {:>18}  {:>8}",
+            account.participant.0, account.asset, account.balance, account.entries
+        );
+    }
+    println!(
+        "ledger: {} entr(ies) in the scan, {} account(s) shown, unresolved maker leg(s): {}, \
+         unattributable aggressor fill(s): {}; every entry balances per asset; \
+         read-only, nothing committed",
+        report.entries.len(),
+        report.accounts.len(),
         report.unresolved_maker_fills,
         report.unresolved_aggressor_fills,
     );

@@ -46,6 +46,8 @@ enum Commands {
     Surveillance(whippet::cli::SurveillanceArgs),
     /// Reconstruct per-participant positions and cash flow from the logs. Read-only.
     Positions(whippet::cli::PositionsArgs),
+    /// Project the logs into a double-entry cash/position ledger. Read-only.
+    Ledger(whippet::cli::LedgerArgs),
 }
 
 #[tokio::main]
@@ -75,5 +77,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::OrderTrace(args) => whippet::cli::run_order_trace(args).await,
         Commands::Surveillance(args) => whippet::cli::run_surveillance(args).await,
         Commands::Positions(args) => whippet::cli::run_positions(args).await,
+        Commands::Ledger(args) => whippet::cli::run_ledger(args).await,
     }
 }

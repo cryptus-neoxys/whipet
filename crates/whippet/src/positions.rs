@@ -122,9 +122,33 @@ impl PositionReport {
 /// trade's authority for the fill side and price, and the maker leg's side is
 /// the opposite of the aggressor's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct OrderInfo {
-    symbol: Symbol,
-    participant: ParticipantId,
+pub(crate) struct OrderInfo {
+    pub(crate) symbol: Symbol,
+    pub(crate) participant: ParticipantId,
+}
+
+/// Build the order-id → participant attribution map from the decoded orders.
+///
+/// Shared with the ledger projection so both tools attribute a trade the same
+/// way. The symbol is the filter authority (an order outside the requested
+/// symbol set never enters the map) and the participant is the attribution
+/// authority. **The first `NewOrder` per order id wins**, so a malformed log
+/// that re-uses an id keeps one deterministic answer instead of the last write.
+pub(crate) fn order_index(
+    orders: &[(u64, Command)],
+    allowed: impl Fn(Symbol) -> bool,
+) -> BTreeMap<OrderId, OrderInfo> {
+    let mut order_info: BTreeMap<OrderId, OrderInfo> = BTreeMap::new();
+    for (_, command) in orders {
+        if command.kind != CommandKind::NewOrder || !allowed(command.symbol) {
+            continue;
+        }
+        order_info.entry(command.order_id).or_insert(OrderInfo {
+            symbol: command.symbol,
+            participant: command.participant,
+        });
+    }
+    order_info
 }
 
 /// Per participant/symbol accumulation.
@@ -141,7 +165,10 @@ struct Accum {
 /// Trade value in cents. Saturating because a corrupt log could carry
 /// `i64::MAX` price against a `u64::MAX` quantity, which does not fit in
 /// `i128` after multiplication (the product exceeds `i128::MAX` by a hair).
-fn trade_cents(price: i64, qty: u64) -> i128 {
+///
+/// The ledger uses the same function so its cash postings and the positions
+/// cash flow agree exactly, including on saturated values.
+pub(crate) fn trade_cents(price: i64, qty: u64) -> i128 {
     i128::from(price).saturating_mul(i128::from(qty))
 }
 
@@ -200,17 +227,7 @@ pub fn build_positions(
     symbols: Option<&[Symbol]>,
 ) -> PositionReport {
     let allowed = |symbol: Symbol| symbols.is_none_or(|symbols| symbols.contains(&symbol));
-
-    let mut order_info: BTreeMap<OrderId, OrderInfo> = BTreeMap::new();
-    for (_, command) in orders {
-        if command.kind != CommandKind::NewOrder || !allowed(command.symbol) {
-            continue;
-        }
-        order_info.entry(command.order_id).or_insert(OrderInfo {
-            symbol: command.symbol,
-            participant: command.participant,
-        });
-    }
+    let order_info = order_index(orders, allowed);
 
     let mut rows: BTreeMap<(ParticipantId, Symbol), Accum> = BTreeMap::new();
     let mut unresolved_maker_fills = 0u64;
