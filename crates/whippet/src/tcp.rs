@@ -34,6 +34,7 @@ use whippet_core::ids::Symbol;
 use whippet_core::protocol::{Command, CommandKind};
 use whippet_core::tcp::{TCP_BATCH_MAX, TcpErrorCode, TcpRequest, TcpResponse, body_len};
 use whippet_journal::{GroupCommit, Topic};
+use whippet_marketdata::RiskRejection;
 
 use crate::context::NodeContext;
 use crate::gateway::journal_message_for_command;
@@ -467,12 +468,12 @@ fn validate_batch(ctx: &NodeContext, commands: &[Command]) -> Result<Symbol, Tcp
     }
 
     let symbol = commands[0].symbol;
-    if ctx.exchange().instrument(symbol).is_none() {
-        return Err(error_response(
+    let instrument = ctx.exchange().instrument(symbol).ok_or_else(|| {
+        error_response(
             TcpErrorCode::InvalidCommand,
             format!("unknown symbol {symbol}"),
-        ));
-    }
+        )
+    })?;
     for (index, command) in commands.iter().enumerate() {
         if command.symbol != symbol {
             return Err(error_response(
@@ -502,6 +503,43 @@ fn validate_batch(ctx: &NodeContext, commands: &[Command]) -> Result<Symbol, Tcp
                         "command {index}: operator commands are not accepted on the order channel"
                     ),
                 ));
+            }
+        }
+        // Ingress pre-trade risk guard: per-order quantity and notional
+        // limits from `RiskConfig`, enforced per command before the batch
+        // append. This is an admission guard, not engine-enforced risk: the
+        // matcher stays the authority for what executes, and a direct
+        // producer appending to the orders log bypasses it. `0` disables
+        // each check. Cancels carry no quantity and are never risk-checked.
+        if command.kind == CommandKind::NewOrder {
+            let risk = &ctx.config.risk;
+            if risk.max_order_qty > 0 && command.qty.0 > risk.max_order_qty {
+                ctx.metrics.record_risk_rejection(RiskRejection::OrderQty);
+                return Err(error_response(
+                    TcpErrorCode::RiskRejected,
+                    format!(
+                        "command {index}: qty {} exceeds the max_order_qty limit {}",
+                        command.qty.0, risk.max_order_qty
+                    ),
+                ));
+            }
+            // Notional is only checked when the command carries a positive
+            // price. Market commands (`price.0 <= 0`) are not notional-checked
+            // in this slice; an engine-side notional control would close that
+            // gap.
+            if risk.max_notional_cents > 0 && command.price.0 > 0 {
+                let notional = i128::from(instrument.cents_from_ticks(command.price))
+                    * i128::from(command.qty.0);
+                if notional > i128::from(risk.max_notional_cents) {
+                    ctx.metrics.record_risk_rejection(RiskRejection::Notional);
+                    return Err(error_response(
+                        TcpErrorCode::RiskRejected,
+                        format!(
+                            "command {index}: notional {notional} cents exceeds the max_notional_cents limit {}",
+                            risk.max_notional_cents
+                        ),
+                    ));
+                }
             }
         }
     }
@@ -608,6 +646,7 @@ mod tests {
             metrics_token: None,
             rate_limit_per_sec: per_sec,
             ws_per_ip: 0,
+            risk: crate::config::RiskConfig::default(),
             turbo: crate::turbo::TurboConfig::default(),
             storage: storage.unwrap_or_else(|| crate::storage::StorageConfig {
                 whippet_dir: dir.path().join("data"),

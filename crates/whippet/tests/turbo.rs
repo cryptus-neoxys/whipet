@@ -74,6 +74,7 @@ fn test_node_with(
         metrics_token: None,
         rate_limit_per_sec: 0,
         ws_per_ip: 0,
+        risk: whippet::config::RiskConfig::default(),
         turbo: TurboConfig::default(),
         storage: whippet::storage::StorageConfig {
             whippet_dir: tempdir.path().join("data"),

@@ -97,6 +97,11 @@ pub enum TcpErrorCode {
     /// A monitored volume is at the critical threshold; ingress is refused
     /// until space is reclaimed. Nothing was journaled.
     StoragePressure = 10,
+    /// The ingress pre-trade risk guard refused the batch (per-order quantity
+    /// or notional limit). Additive in the wire error set. Nothing was
+    /// journaled and the connection stays usable. This is an ingress guard,
+    /// not engine-enforced risk: a direct log producer bypasses it.
+    RiskRejected = 11,
 }
 
 impl TcpErrorCode {

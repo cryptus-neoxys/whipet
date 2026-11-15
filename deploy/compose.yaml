@@ -171,6 +171,10 @@ services:
       WHIPPET_OPERATOR_TOKENS: ${WHIPPET_OPERATOR_TOKENS:-}
       WHIPPET_METRICS_TOKEN: ${WHIPPET_METRICS_TOKEN:-}
       WHIPPET_RATE_LIMIT_PER_SEC: ${WHIPPET_RATE_LIMIT_PER_SEC:-0}
+      # Ingress pre-trade risk limits (an admission guard, not engine-enforced
+      # risk). 0 disables each check; see RiskConfig in crates/whippet/config.rs.
+      WHIPPET_RISK_MAX_ORDER_QTY: ${WHIPPET_RISK_MAX_ORDER_QTY:-0}
+      WHIPPET_RISK_MAX_NOTIONAL_CENTS: ${WHIPPET_RISK_MAX_NOTIONAL_CENTS:-0}
       WHIPPET_HTTP_TRACE: ${WHIPPET_HTTP_TRACE:-}
     secrets:
       - iggy_root_password

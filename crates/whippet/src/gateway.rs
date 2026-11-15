@@ -34,7 +34,7 @@ use whippet_core::headers::{HeaderMode, MessageMeta, SCHEMA_ORDER};
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Seq, Symbol};
 use whippet_core::protocol::{Command, OrderType, Side};
 use whippet_journal::{JournalMessage, Topic};
-use whippet_marketdata::{LatencySummary, Metrics, Stage};
+use whippet_marketdata::{LatencySummary, Metrics, RiskRejection, Stage};
 
 use crate::context::NodeContext;
 use crate::ratelimit::RateLimiter;
@@ -846,6 +846,36 @@ fn validate_fields(
     } else {
         Price::ZERO
     };
+    // Ingress pre-trade risk guard: per-order quantity and notional limits
+    // from `RiskConfig`. Enforced here, after the field checks and before any
+    // order id is minted or anything is journaled, so a rejected order
+    // consumes neither the dedup key nor a UUID. This is an admission guard,
+    // not engine-enforced risk: the matcher stays the authority for what
+    // executes, and a direct producer appending to the orders log bypasses
+    // these checks entirely. `0` disables each check.
+    let risk = &ctx.config.risk;
+    if risk.max_order_qty > 0 && qty > risk.max_order_qty {
+        ctx.metrics.record_risk_rejection(RiskRejection::OrderQty);
+        return Err(risk_limit(format!(
+            "qty {qty} exceeds the max_order_qty limit {}",
+            risk.max_order_qty
+        )));
+    }
+    // Notional is only checked when the order carries a price (Some and
+    // > 0). Market orders without a price are not notional-checked in this
+    // slice; an engine-side notional control would close that gap.
+    if risk.max_notional_cents > 0
+        && let Some(cents) = price_cents.filter(|cents| *cents > 0)
+    {
+        let notional = i128::from(cents) * i128::from(qty);
+        if notional > i128::from(risk.max_notional_cents) {
+            ctx.metrics.record_risk_rejection(RiskRejection::Notional);
+            return Err(risk_limit(format!(
+                "notional {notional} cents (price {cents} cents x qty {qty}) exceeds the max_notional_cents limit {}",
+                risk.max_notional_cents
+            )));
+        }
+    }
     // Derive from the borrowed key before any owned conversion: a supplied
     // idempotency key never touches the allocator. Only a missing key mints
     // (and owns) a fresh UUID.
@@ -1471,6 +1501,20 @@ async fn prometheus(
     body.push_str(&format!(
         "whippet_group_commit_partitions {}\n",
         ctx.group_commit.writer_count()
+    ));
+    // Ingress pre-trade risk guard: rejections by reason. An ingress guard,
+    // not engine-enforced risk, so the engine's own reject counter is
+    // unaffected by these.
+    let (risk_qty, risk_notional) = ctx.metrics.risk_rejections();
+    body.push_str(
+        "# HELP whippet_risk_rejected_total Orders refused by the ingress pre-trade risk guard, by reason.\n",
+    );
+    body.push_str("# TYPE whippet_risk_rejected_total counter\n");
+    body.push_str(&format!(
+        "whippet_risk_rejected_total{{reason=\"order_qty\"}} {risk_qty}\n"
+    ));
+    body.push_str(&format!(
+        "whippet_risk_rejected_total{{reason=\"notional\"}} {risk_notional}\n"
     ));
     let window = ctx.metrics.window_summary();
     body.push_str("# HELP whippet_latency_window_secs Rolling latency-window length.\n");
@@ -2332,6 +2376,16 @@ code{color:#7dd3fc}a{color:#a7f3d0}</style></head><body>
 
 fn bad_request(code: &str, message: impl Into<String>) -> (StatusCode, Json<ApiError>) {
     (StatusCode::BAD_REQUEST, Json(ApiError::new(code, message)))
+}
+
+/// The one HTTP risk-rejection shape: 422 with `code: "risk_limit"`. This is
+/// the ingress pre-trade risk guard, not engine-enforced risk: the command
+/// never reached the journal or the matcher.
+fn risk_limit(message: impl Into<String>) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(ApiError::new("risk_limit", message)),
+    )
 }
 
 fn journal_unavailable(error: whippet_journal::JournalError) -> (StatusCode, Json<ApiError>) {

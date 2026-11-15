@@ -499,6 +499,29 @@ impl Stage {
     }
 }
 
+/// Why the ingress pre-trade risk guard refused an order.
+///
+/// The guard sits at the HTTP/TCP admission boundary, before any journal
+/// append. It is an ingress guard, not engine-enforced risk; see the
+/// `RiskConfig` documentation in the `whippet` crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RiskRejection {
+    /// Quantity above `max_order_qty`.
+    OrderQty,
+    /// Notional above `max_notional_cents`.
+    Notional,
+}
+
+impl RiskRejection {
+    /// Stable snake_case name, used as the Prometheus `reason` label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OrderQty => "order_qty",
+            Self::Notional => "notional",
+        }
+    }
+}
+
 /// Latency percentiles for one [`Stage`], in microseconds.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LatencySummary {
@@ -583,6 +606,10 @@ pub struct Metrics {
     orders_ingressed: AtomicU64,
     orders_matched: AtomicU64,
     orders_rejected: AtomicU64,
+    /// Ingress pre-trade risk rejections, split by reason so the exposition
+    /// can label `whippet_risk_rejected_total{reason=...}`.
+    risk_rejected_qty: AtomicU64,
+    risk_rejected_notional: AtomicU64,
     executions: AtomicU64,
     trades: AtomicU64,
     md_events: AtomicU64,
@@ -635,6 +662,8 @@ impl Metrics {
             orders_ingressed: AtomicU64::new(0),
             orders_matched: AtomicU64::new(0),
             orders_rejected: AtomicU64::new(0),
+            risk_rejected_qty: AtomicU64::new(0),
+            risk_rejected_notional: AtomicU64::new(0),
             executions: AtomicU64::new(0),
             trades: AtomicU64::new(0),
             md_events: AtomicU64::new(0),
@@ -828,6 +857,27 @@ impl Metrics {
             .into_iter()
             .map(|stage| (stage, latency_summary(&self.stages[stage.index()])))
             .collect()
+    }
+
+    /// Record one ingress pre-trade risk rejection.
+    ///
+    /// Callers are the gateway and TCP admission paths, which run before any
+    /// journal append, so the counter never races with the matcher. Plain
+    /// `Relaxed` atomics: no lock on the ingress hot path.
+    pub fn record_risk_rejection(&self, reason: RiskRejection) {
+        let counter = match reason {
+            RiskRejection::OrderQty => &self.risk_rejected_qty,
+            RiskRejection::Notional => &self.risk_rejected_notional,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(order_qty, notional)` risk rejection totals for the exposition.
+    pub fn risk_rejections(&self) -> (u64, u64) {
+        (
+            self.risk_rejected_qty.load(Ordering::Relaxed),
+            self.risk_rejected_notional.load(Ordering::Relaxed),
+        )
     }
 
     pub fn record_execution(&self) {

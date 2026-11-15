@@ -37,6 +37,26 @@ impl JournalKind {
     }
 }
 
+/// Ingress pre-trade risk limits.
+///
+/// These are enforced at the HTTP and binary-TCP admission boundary, before
+/// any journal append. They are an **ingress guard, not engine-enforced
+/// risk**: the matcher remains the authority for what actually executes, and
+/// a direct producer that appends to the orders log (or a future engine-side
+/// path) bypasses them entirely.
+///
+/// Every limit is `u64` and `0` disables its check. Defaults are `0` so an
+/// unconfigured node behaves exactly as before.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RiskConfig {
+    /// Maximum quantity per new order. `0` disables the check.
+    pub max_order_qty: u64,
+    /// Maximum notional per new order that carries a price, in cents
+    /// (`price_cents * qty`). Market orders with no price are not
+    /// notional-checked in this slice. `0` disables the check.
+    pub max_notional_cents: u64,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("{0}")]
@@ -180,6 +200,15 @@ pub struct NodeArgs {
         default_value_t = crate::turbo::DEFAULT_WINDOW_MS
     )]
     pub turbo_window_ms: u64,
+    /// Pre-trade risk limit: maximum quantity per new order. `0` disables the
+    /// check. Enforced at ingress, before any journal append.
+    #[arg(long, env = "WHIPPET_RISK_MAX_ORDER_QTY", default_value_t = 0)]
+    pub risk_max_order_qty: u64,
+    /// Pre-trade risk limit: maximum notional per priced new order, in cents
+    /// (`price_cents * qty`). Market orders without a price are not
+    /// notional-checked. `0` disables the check.
+    #[arg(long, env = "WHIPPET_RISK_MAX_NOTIONAL_CENTS", default_value_t = 0)]
+    pub risk_max_notional_cents: u64,
 }
 
 #[derive(Clone)]
@@ -217,6 +246,9 @@ pub struct NodeConfig {
     pub turbo: TurboConfig,
     /// Disk thresholds and volume roots for the bounded-storage guard.
     pub storage: StorageConfig,
+    /// Ingress pre-trade risk limits. `0` on every field disables the checks;
+    /// see [`RiskConfig`] for the ingress-guard caveat.
+    pub risk: RiskConfig,
 }
 
 impl NodeConfig {
@@ -363,6 +395,10 @@ impl NodeConfig {
             ws_per_ip: args.ws_per_ip,
             turbo,
             storage,
+            risk: RiskConfig {
+                max_order_qty: args.risk_max_order_qty,
+                max_notional_cents: args.risk_max_notional_cents,
+            },
         })
     }
 }
@@ -718,6 +754,42 @@ mod tests {
         assert!(NodeConfig::from_args(cli.node).is_err());
         let cli = Cli::parse_from(["test", "--turbo-window-ms", "0"]);
         assert!(NodeConfig::from_args(cli.node).is_err());
+    }
+
+    #[test]
+    fn risk_defaults_are_zero_and_disable_every_check() {
+        let cli = Cli::parse_from(["test"]);
+        let config = NodeConfig::from_args(cli.node).unwrap();
+        assert_eq!(config.risk, RiskConfig::default());
+        assert_eq!(config.risk.max_order_qty, 0);
+        assert_eq!(config.risk.max_notional_cents, 0);
+    }
+
+    #[test]
+    fn risk_limits_parse_from_their_flags() {
+        let cli = Cli::parse_from([
+            "test",
+            "--risk-max-order-qty",
+            "1000",
+            "--risk-max-notional-cents",
+            "5000000",
+        ]);
+        let config = NodeConfig::from_args(cli.node).unwrap();
+        assert_eq!(
+            config.risk,
+            RiskConfig {
+                max_order_qty: 1000,
+                max_notional_cents: 5_000_000,
+            }
+        );
+    }
+
+    #[test]
+    fn a_zero_risk_flag_disables_only_its_own_check() {
+        let cli = Cli::parse_from(["test", "--risk-max-order-qty", "100"]);
+        let config = NodeConfig::from_args(cli.node).unwrap();
+        assert_eq!(config.risk.max_order_qty, 100);
+        assert_eq!(config.risk.max_notional_cents, 0);
     }
 
     #[test]

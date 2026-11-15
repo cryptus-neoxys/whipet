@@ -62,6 +62,7 @@ impl TestNode {
             metrics_token: None,
             rate_limit_per_sec: 0,
             ws_per_ip: 0,
+            risk: whippet::config::RiskConfig::default(),
             turbo: whippet::turbo::TurboConfig::default(),
             storage: whippet::storage::StorageConfig {
                 whippet_dir: tempdir.path().join("data"),
