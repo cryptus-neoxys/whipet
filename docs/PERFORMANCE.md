@@ -1014,6 +1014,31 @@ samples; it is a 2-minute dev-loop observation, not a sustained proof. Disk
 consumption was about 14 MB/s at this offered rate, which is why the
 bounded-storage guard and the retention design are Phase A work.
 
+## Phase A exit-gate attempt (dev-loop, 8 minutes)
+
+The improvement plan's Phase A exit gate asks for a 10-minute sustained run at
+5,000 accepted commands/s with no unexplained drops and bounded latency. On
+this Docker Desktop host the durable path does not pass; the measured knee is
+recorded here rather than hidden.
+
+| Metric | Value |
+|---|---|
+| Offered / accepted | 5,000/s, 2,398,780 orders, 0 errors |
+| Client-side p50 / p99 / p99.9 | 2,975 / 1,155,071 / 1,614,847 µs |
+| Server window p50 / p99 / p99.9 (median across 44 samples) | 2,254 / 256,703 / — µs |
+| Server window p99 max | 1,883,135 µs |
+| Drift, first vs last 10% of window p99 | +2,963% (fail) |
+| Iggy volume free, start → end | 13.86 GB → 12.50 GB |
+| Storage critical seen | no |
+
+The run is steady for the first minutes and then degrades; the matcher is not
+the bottleneck (`whippet_match_window_p99_us` stays in microseconds while the
+gateway append and log size grow). This is the documented Iggy
+append/log-growth knee on Docker Desktop, not a reason to lower the target or
+weaken the gate. A native Linux run and a replay-safe retention/archive path
+are required before this gate can pass. The window series, disk gauges, and
+log-size gauges introduced in this slice are what make the failure legible.
+
 ## Guardrails
 
 A performance change is admissible only if it preserves the correctness story:
