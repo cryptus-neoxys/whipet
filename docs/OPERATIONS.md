@@ -247,10 +247,13 @@ test-only diagnostics; readiness is the per-shard rule above.
 ## Ledger projection
 
 `whippet ledger --partition N [--symbols ...] [--participant ID] [--json]
-[--tick-size-cents N]` reads the orders and executions logs from offset 0 and
-prints double-entry cash/position accounts. The logs store tick indices, so the
-projection converts with the tick size: without the flag it uses the built-in
-default exchange config; a custom symbol needs `--tick-size-cents`. It is read-only, posts four legs per attributed fill,
+[--tick-size-cents SYMBOL=CENTS|CENTS]` reads the orders and executions logs
+from offset 0 and prints double-entry cash/position accounts. The logs store
+tick indices, so the projection converts with the tick size. The flag is
+repeatable: `SYMBOL=CENTS` sets one symbol and a plain `CENTS` is the fallback
+for every symbol without an override. Resolution is per-symbol override, then
+the plain fallback, then the built-in default exchange config; a symbol in
+neither is an error. A custom deployment should pass its own sizes. It is read-only, posts four legs per attributed fill,
 and excludes a trade whose aggressor or maker cannot be attributed (the
 unresolved counters say how many). It is T+0 simulation, not settlement: no
 fees, funding, margin, or clearing. Its cash/position balances reconcile with
