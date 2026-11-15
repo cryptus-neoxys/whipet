@@ -322,7 +322,7 @@ fn the_compact_terminal_queue_restores_eviction_parity_at_scale() {
     );
     drop(walk);
 
-    let mut snapshot = engine.snapshot_state_without_hash();
+    let mut snapshot = engine.snapshot_state_without_hash_compacted();
     assert_eq!(snapshot.dedup_terminal_idx.len(), live_queue.len());
     assert!(
         snapshot.dedup_terminal_idx.len() * 4 < live_queue.len() * 40,
@@ -336,13 +336,11 @@ fn the_compact_terminal_queue_restores_eviction_parity_at_scale() {
         live_queue,
         "the restored eviction queue diverged"
     );
-
     // Drive both engines through further evictions with the same commands and
-    // compare what is evicted. Membership and the queue are the parity the
-    // terminal payload has to preserve; the dedup hash walk is deliberately not
-    // compared here, because it also counts insertion-order entries for ids
-    // that were dead at snapshot time, which no snapshot form carries (see the
-    // note on `DedupTable::from_entries`).
+    // compare what is evicted. The snapshot is taken from the compacted table,
+    // so the restored insertion walk is identical to the live one and the
+    // post-tail state hash must match: a dead id re-admitted by the tail is
+    // the case that used to diverge.
     let tail = generate(1_003);
     let base = engine.commands();
     let mut out = EngineOutput::with_capacity(32, 32);
@@ -366,6 +364,11 @@ fn the_compact_terminal_queue_restores_eviction_parity_at_scale() {
         restored.dedup().terminal_order(),
         engine.dedup().terminal_order(),
         "the restored eviction queue diverged after the tail"
+    );
+    assert_eq!(
+        restored.state_hash(),
+        engine.state_hash(),
+        "the restored state hash diverged after the tail"
     );
 }
 

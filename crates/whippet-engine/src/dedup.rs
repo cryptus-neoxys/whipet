@@ -175,9 +175,6 @@ impl DedupTable {
         entries
     }
 
-    /// The terminal ids in eviction order. Not part of the state hash, but
-    /// snapshotted (as [`DedupTable::terminal_indices`]) so a restored table
-    /// evicts at the same point as a continuous replay.
     /// Drop ids that were evicted but are still sitting in the order deques.
     ///
     /// `hash_into` already skips them, so this does not change the state hash.
@@ -189,6 +186,9 @@ impl DedupTable {
         self.terminal_order.retain(|id| map.contains_key(id));
     }
 
+    /// The terminal ids in eviction order. Not part of the state hash, but
+    /// snapshotted (as [`DedupTable::terminal_indices`]) so a restored table
+    /// evicts at the same point as a continuous replay.
     pub fn terminal_order(&self) -> Vec<OrderId> {
         self.terminal_order.iter().copied().collect()
     }

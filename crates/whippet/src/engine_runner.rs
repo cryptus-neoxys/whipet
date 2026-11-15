@@ -586,7 +586,7 @@ pub fn run_matcher(
             snapshot_sequence += 1;
             Some(build_snapshot(
                 shard_id,
-                &engine,
+                &mut engine,
                 snapshot_sequence,
                 "deferred",
             ))
@@ -649,7 +649,7 @@ pub fn run_matcher(
                 snapshot_sequence += 1;
                 snapshot = Some(build_snapshot(
                     shard_id,
-                    &engine,
+                    &mut engine,
                     snapshot_sequence,
                     "cadence",
                 ));
@@ -692,7 +692,7 @@ pub fn run_matcher(
     // rename, so a bad off-loop hash can never become the resume point.
     snapshot_sequence += 1;
     let started = Instant::now();
-    let final_state = engine.snapshot_state_without_hash();
+    let final_state = engine.snapshot_state_without_hash_compacted();
     let build_us = started.elapsed().as_micros() as u64;
     // A shard that never applied a command has no resume point; persisting an
     // empty snapshot would make the next boot start after offset 0.
@@ -737,12 +737,15 @@ pub fn run_matcher(
 /// final snapshot is rebuilt and verified by the writer before it is persisted.
 fn build_snapshot(
     shard_id: u32,
-    engine: &ShardEngine,
+    engine: &mut ShardEngine,
     sequence: u64,
     trigger: &'static str,
 ) -> SequencedSnapshot {
     let started = Instant::now();
-    let snapshot = engine.snapshot_state_without_hash();
+    // Compact first: the saved walk must match the live one exactly, or a
+    // restored table diverges once an id that was dead at snapshot time is
+    // re-admitted after the tail. Compaction does not change the state hash.
+    let snapshot = engine.snapshot_state_without_hash_compacted();
     let build_us = started.elapsed().as_micros() as u64;
     let book_orders: usize = snapshot
         .symbols
@@ -1558,8 +1561,8 @@ mod tests {
         // computes the hash off the match loop and the final snapshot is
         // rebuilt and verified before the rename.
         let exchange = whippet_core::config::ExchangeConfig::default();
-        let engine = ShardEngine::new(1, &exchange);
-        let job = build_snapshot(1, &engine, 1, "test");
+        let mut engine = ShardEngine::new(1, &exchange);
+        let job = build_snapshot(1, &mut engine, 1, "test");
         assert_eq!(job.sequence, 1);
         assert!(
             job.snapshot

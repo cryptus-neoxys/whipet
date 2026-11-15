@@ -981,6 +981,18 @@ impl ShardEngine {
         }
     }
 
+    /// Snapshot after compacting every symbol's dedup queues.
+    ///
+    /// The node snapshots through this path: the saved insertion walk matches
+    /// the live walk, so a restored shard hashes identically even after the
+    /// tail re-admits an id that was dead at snapshot time.
+    pub fn snapshot_state_without_hash_compacted(&mut self) -> ShardSnapshot {
+        for engine in self.engines.values_mut() {
+            engine.dedup.compact();
+        }
+        self.snapshot_state_without_hash()
+    }
+
     pub fn from_snapshot(
         exchange: &ExchangeConfig,
         snapshot: ShardSnapshot,
