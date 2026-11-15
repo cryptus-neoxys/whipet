@@ -61,6 +61,15 @@ services:
       # the node dials `iggy:8090`.
       IGGY_NODE_ADVERTISED_ADDRESS: iggy
       IGGY_LOGGING_LEVEL: ${IGGY_LOGGING_LEVEL:-info}
+      # The message cleaner runs a full maintenance pass every minute; on this
+      # Docker Desktop volume it produced a periodic append-latency spike.
+      # Whippet topics do not use message expiry, so the pass has nothing to
+      # reclaim. Re-enable it if retention is configured.
+      IGGY_DATA_MAINTENANCE_MESSAGES_CLEANER_ENABLED: "false"
+      # Larger WAL and a short WAL group-commit window: fewer rotations and
+      # amortised WAL writes as the log grows. Re-measure on the target host.
+      IGGY_PARTITION_WAL_BYTES_MAX: 1GiB
+      IGGY_PARTITION_WAL_GROUP_COMMIT_DELAY_MICROS: "200"
     # Read the root password from a Compose secret instead of an environment
     # variable, then exec the stock server binary. The image entrypoint is
     # `iggy-server`; the wrapper only adds the secret and keeps PID 1 correct.

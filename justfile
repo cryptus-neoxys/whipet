@@ -25,6 +25,12 @@ bench-tcp:
 bench-fanout:
     make bench-fanout
 
+soak:
+    make soak
+
+crash-test:
+    make crash-test
+
 verify:
     make verify
 

@@ -67,7 +67,9 @@ tempfile = "3"
 [profile.release]
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# Unwind, not abort: a matcher-thread panic must be joinable so the shard can
+# be marked failed and the node can stay up (ADR 0010/0011).
+panic = "unwind"
 debug = 1
 
 [profile.bench]
