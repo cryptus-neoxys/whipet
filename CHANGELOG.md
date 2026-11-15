@@ -49,6 +49,20 @@ Whippet is pre-1.0; minor releases may change internal APIs.
 
 ### Added
 
+- Executable engine invariants and an explicit dedup order lifecycle:
+  `Book`/`DedupTable`/`SymbolEngine::check_invariants`, the
+  `Accepted -> Resting -> Filled|Cancelled` transition table enforced by
+  `DedupTable::update`, and randomized/golden coverage. Also fixes the
+  BookFull flow to store `Cancelled` (matching its report) instead of
+  `Rejected` (ADR 0019, `docs/INVARIANTS.md`).
+- Explicit per-shard/per-role lifecycle: `Starting -> Running -> Stopped` or
+  `Failed` (terminal), atomics only; readiness requires every active engine
+  and MD role to be Running, and `/api/health`/`/readyz` expose each shard's
+  states (ADR 0020).
+- Credential-role separation: a bearer token cannot be both a trading token
+  and an operator/metrics token; ambiguous roles fail startup.
+- `TradingStatus` as the single definition of the halt+session combination and
+  the MD flag encoding.
 - Instrument session state: operator-only `POST /api/admin/instruments/{symbol}/session`
   for `pre_open`/`open`/`closed`, log-ordered `CommandKind::SetSession`, only
   `open` admitting new orders while cancels stay allowed, session visibility on

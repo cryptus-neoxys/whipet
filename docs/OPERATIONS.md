@@ -234,6 +234,15 @@ wall clock is read. `--fail-on-findings` exits non-zero when any participant
 is flagged (for monitoring/CI), while an empty window is a successful exit.
 See `docs/RUNBOOK.md` for the operator sequence.
 
+## Invariants and state machines
+
+The executable invariant catalogue is [INVARIANTS.md](INVARIANTS.md): the
+book/dedup checks and order lifecycle ([ADR 0019](adr/0019-executable-engine-invariants.md)),
+the per-shard lifecycle/readiness rule ([ADR 0020](adr/0020-explicit-shard-lifecycle.md)),
+snapshot/journal gates, and ingress/config invariants. `Book::check_invariants`,
+`DedupTable::check_invariants`, and `SymbolEngine::check_invariants` are
+test-only diagnostics; readiness is the per-shard rule above.
+
 ## Instrument control plane
 
 Halt and resume are operator-only HTTP endpoints:
@@ -434,16 +443,19 @@ There are no per-order log lines on the hot path.
 
 ## Health and metrics
 
-`GET /readyz` returns 200 only when the journal is reachable, every shard task
-is alive, and no monitored volume is at the critical disk threshold; otherwise
-503. Use it for container readiness. It reads cached flags and performs no
+`GET /readyz` returns 200 only when the journal is reachable, **every active
+shard's engine and MD role is Running**, and no monitored volume is at the
+critical disk threshold; otherwise 503. A fresh node is `Starting` and is not
+ready until both roles have finished startup. Use it for container readiness. It reads cached flags and performs no
 journal I/O: every five seconds the health monitor pings the ingress client and
 every engine-pool client concurrently and caches the aggregate, refreshes the
 consumer-lag sweep, and the storage monitor samples both data volumes.
 `GET /api/health` returns HTTP 200 with `status: "ok"` or `"degraded"`; it is
 `ok` only when the journal is reachable (or the in-memory journal is selected),
 every shard task is alive, and storage is below critical. `shards_ok`,
-`storage_ok`, and `storage_state` report the components. A corrupt
+`storage_ok`, and `storage_state` report the components. `shards` lists each
+active partition's `engine`/`md` state (`starting`/`running`/`failed`/`stopped`)
+so a not-ready node names the failing role. A corrupt
 snapshot or a shard task panic therefore degrades health instead of leaving a
 silent "up but not matching" node. The health monitor pings all pool entries
 because every entry is its own Iggy connection: an ingress link that is up

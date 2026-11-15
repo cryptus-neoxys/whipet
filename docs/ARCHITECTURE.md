@@ -390,6 +390,16 @@ different contract:
 The feed mirrors the order book at price-level granularity; it is not an
 order-by-order feed. See [ADR 0016](adr/0016-sequenced-price-level-market-data-feed.md).
 
+## Invariants and state machines
+
+The engine's book/dedup and order lifecycle invariants are executable in
+`Book::check_invariants`, `DedupTable::check_invariants`, and
+`SymbolEngine::check_invariants`; the dedup lifecycle table is enforced by
+`DedupTable::update` (ADR 0019). Each active shard's engine and MD tasks move
+through `Starting -> Running -> Stopped` or `Failed` (terminal), and readiness
+requires every active role to be Running (ADR 0020). The full catalogue and
+what remains unproven is [INVARIANTS.md](INVARIANTS.md).
+
 ## Observability
 
 The node exposes `GET /metrics` in Prometheus text format. Counters cover
