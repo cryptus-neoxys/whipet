@@ -25,6 +25,7 @@ use crate::inspect::{
 };
 use crate::retention::{RetentionDecision, RetentionInput, evaluate, explain};
 use crate::snapshot::SnapshotStore;
+use crate::surveillance::{SurveillanceConfig, SurveillanceReport, analyze};
 
 #[derive(Args, Debug, Clone)]
 pub struct BenchArgs {
@@ -1490,4 +1491,230 @@ async fn read_topic_from_start(
         }
     }
     Ok(records)
+}
+
+/// Printed on every surveillance run, to stderr so `--json` output stays
+/// machine-readable and repeated in the table header.
+pub const SURVEILLANCE_NOTICE: &str = "educational indicators, not regulatory findings; read-only";
+
+#[derive(Args, Debug, Clone)]
+pub struct SurveillanceArgs {
+    #[arg(long, env = "WHIPPET_IGGY_ADDR", default_value = "127.0.0.1:8090")]
+    pub iggy_addr: String,
+    #[arg(long, env = "WHIPPET_IGGY_USER", default_value = "iggy")]
+    pub iggy_user: String,
+    #[arg(long, env = "WHIPPET_IGGY_PASSWORD", default_value = "iggy")]
+    pub iggy_password: String,
+    /// Read the Iggy password from a file, as the node does.
+    #[arg(long, env = "WHIPPET_IGGY_PASSWORD_FILE")]
+    pub iggy_password_file: Option<PathBuf>,
+    /// Partition to scan. BTC-USD is partition 1 with 16 partitions.
+    #[arg(long, default_value_t = 1)]
+    pub partition: u32,
+    /// Restrict the scan to these symbols. Omit to scan every symbol on the
+    /// partition.
+    #[arg(long, value_delimiter = ',')]
+    pub symbols: Vec<Symbol>,
+    /// Length of the analysis window in seconds, applied backwards from the
+    /// newest event in the scanned logs. An offline scan has no wall clock;
+    /// the log's newest event is the window's "now".
+    #[arg(long, default_value_t = 3_600)]
+    pub window_secs: u64,
+    /// Minimum windowed orders before a participant's cancel ratio is judged.
+    #[arg(long, default_value_t = 20)]
+    pub min_orders: u64,
+    /// Cancel ratio in basis points at and above which a participant with at
+    /// least `--min-orders` orders is flagged.
+    #[arg(long, default_value_t = 7_000)]
+    pub cancel_ratio_bps: u32,
+    /// Cancelled-order notional (price * qty, in cents) at and above which a
+    /// cancelled order counts as large.
+    #[arg(long, default_value_t = 10_000_000)]
+    pub large_notional_cents: u64,
+    /// Print the full report as one JSON document instead of a table.
+    #[arg(long)]
+    pub json: bool,
+    /// Exit non-zero when any participant has an indicator. For CI and
+    /// monitoring; an empty report with the flag set is still a success.
+    #[arg(long)]
+    pub fail_on_findings: bool,
+}
+
+/// Print educational surveillance indicators for one partition. Read-only:
+/// it reads the orders and executions topics from offset 0 and never appends
+/// or commits. The indicators are heuristics for teaching and exploration,
+/// never regulatory findings.
+pub async fn run_surveillance(args: SurveillanceArgs) -> Result<()> {
+    let password = read_password(&args.iggy_password, args.iggy_password_file.as_deref())?;
+    let journal = Journal::Iggy(
+        IggyJournal::connect(&args.iggy_addr, &args.iggy_user, &password)
+            .await
+            .with_context(|| format!("connecting to Iggy at {}", args.iggy_addr))?,
+    );
+    surveillance_with_journal(args, &journal).await.map(|_| ())
+}
+
+/// The surveillance core, with the journal injected so the read path and the
+/// indicator rules can be tested on the memory journal. `run_surveillance`
+/// supplies the Iggy journal.
+///
+/// Both topics are read from offset 0 on one partition with
+/// [`read_topic_from_start`], decoded, optionally filtered by symbol, and
+/// handed to [`analyze`]. Malformed records are counted in one summary line,
+/// never logged per record. "No windowed events" is a valid empty report and
+/// exits zero; `--fail-on-findings` turns any flagged indicator into a
+/// non-zero exit after printing the report.
+///
+/// Returns the report that was printed, so tests can assert on the counters
+/// without scraping stdout.
+#[doc(hidden)]
+pub async fn surveillance_with_journal(
+    args: SurveillanceArgs,
+    journal: &Journal,
+) -> Result<SurveillanceReport> {
+    // Validate before connecting so a bad invocation is a usage error, not a
+    // connection attempt followed by an error.
+    if args.partition == 0 {
+        bail!("--partition must be at least 1");
+    }
+    let config = SurveillanceConfig {
+        window_secs: args.window_secs,
+        min_orders: args.min_orders,
+        cancel_ratio_bps: args.cancel_ratio_bps,
+        large_notional_cents: args.large_notional_cents,
+    };
+    config
+        .validate()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    let orders_consumer = format!("whippet-surveillance-orders-p{}", args.partition);
+    let order_payloads =
+        read_topic_from_start(journal, Topic::Orders, args.partition, &orders_consumer).await?;
+    let order_records = order_payloads.len() as u64;
+    let mut orders = Vec::with_capacity(order_payloads.len());
+    let mut skipped_orders = 0u64;
+    for payload in order_payloads {
+        match Command::decode(&payload.payload) {
+            Ok(command) => orders.push((payload.offset, command)),
+            Err(_) => skipped_orders += 1,
+        }
+    }
+
+    let executions_consumer = format!("whippet-surveillance-executions-p{}", args.partition);
+    let execution_payloads = read_topic_from_start(
+        journal,
+        Topic::Executions,
+        args.partition,
+        &executions_consumer,
+    )
+    .await?;
+    let execution_records = execution_payloads.len() as u64;
+    let mut executions = Vec::with_capacity(execution_payloads.len());
+    let mut skipped_executions = 0u64;
+    for payload in execution_payloads {
+        match ExecutionReport::decode(&payload.payload) {
+            Ok(report) => executions.push(report),
+            Err(_) => skipped_executions += 1,
+        }
+    }
+
+    // Optional symbol filter, applied before the analysis so the report only
+    // ever speaks about the requested instruments.
+    if !args.symbols.is_empty() {
+        orders.retain(|(_, command)| args.symbols.contains(&command.symbol));
+        executions.retain(|report| args.symbols.contains(&report.symbol));
+    }
+
+    let report = analyze(args.partition, &orders, &executions, &config);
+
+    // The notice and the read summary go to stderr so `--json` stdout stays a
+    // single parseable document.
+    eprintln!("{SURVEILLANCE_NOTICE}");
+    eprintln!(
+        "surveillance: read {order_records} order record(s) and {execution_records} execution \
+         record(s) from offset 0 on partition {} ({skipped_orders} order, {skipped_executions} \
+         execution undecodable); read-only, nothing committed",
+        args.partition
+    );
+
+    let indicator_total: usize = report
+        .participants
+        .iter()
+        .map(|participant| participant.indicators.len())
+        .sum();
+    let flagged = report
+        .participants
+        .iter()
+        .filter(|participant| !participant.indicators.is_empty())
+        .count();
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if report.participants.is_empty() {
+        println!(
+            "no windowed orders or executions on partition {} in the {}-second window; \
+             nothing to report ({SURVEILLANCE_NOTICE})",
+            args.partition, config.window_secs
+        );
+    } else {
+        println!(
+            "whippet surveillance  partition={}  window={}s  window_ns=[{}, {}]  \
+             {SURVEILLANCE_NOTICE}",
+            args.partition, config.window_secs, report.window_start_ns, report.window_end_ns
+        );
+        println!(
+            "{:>12}  {:>7}  {:>8}  {:>6}  {:>8}  {:>4}  {:>4}  {:>11}  {:>18}  indicators",
+            "participant",
+            "orders",
+            "cancels",
+            "fills",
+            "rejects",
+            "stp",
+            "dup",
+            "cancel_bps",
+            "cancelled_notional"
+        );
+        for participant in &report.participants {
+            println!(
+                "{:>12}  {:>7}  {:>8}  {:>6}  {:>8}  {:>4}  {:>4}  {:>11}  {:>18}  {}",
+                participant.participant.0,
+                participant.orders,
+                participant.cancels,
+                participant.fills,
+                participant.rejected,
+                participant.stp_cancels,
+                participant.duplicate_rejects,
+                participant.cancel_ratio_bps,
+                participant.cancelled_notional_cents,
+                indicators_cell(&participant.indicators),
+            );
+        }
+        println!(
+            "surveillance: {} participant(s) in window, {flagged} with indicator(s), \
+             {indicator_total} indicator(s) total; read-only, nothing committed",
+            report.participants.len(),
+        );
+    }
+
+    if args.fail_on_findings && indicator_total > 0 {
+        bail!(
+            "--fail-on-findings: {indicator_total} indicator(s) across {flagged} participant(s) \
+             on partition {}",
+            args.partition
+        );
+    }
+    Ok(report)
+}
+
+/// Render one participant's indicator list for the table; no indicators is
+/// `-`, never an empty column.
+fn indicators_cell(indicators: &[crate::surveillance::Indicator]) -> String {
+    if indicators.is_empty() {
+        return "-".to_string();
+    }
+    indicators
+        .iter()
+        .map(|indicator| indicator.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
 }

@@ -15,5 +15,6 @@ pub mod retention;
 pub mod sim_runner;
 pub mod snapshot;
 pub mod storage;
+pub mod surveillance;
 pub mod tcp;
 pub mod turbo;

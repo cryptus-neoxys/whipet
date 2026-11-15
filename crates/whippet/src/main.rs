@@ -42,6 +42,8 @@ enum Commands {
     Audit(whippet::cli::AuditArgs),
     /// Reconstruct one order's timeline from the orders and executions logs. Read-only.
     OrderTrace(whippet::cli::OrderTraceArgs),
+    /// Print educational surveillance indicators per participant. Read-only.
+    Surveillance(whippet::cli::SurveillanceArgs),
 }
 
 #[tokio::main]
@@ -69,5 +71,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::RetentionPlan(args) => whippet::cli::run_retention_plan(args).await,
         Commands::Audit(args) => whippet::cli::run_audit(args).await,
         Commands::OrderTrace(args) => whippet::cli::run_order_trace(args).await,
+        Commands::Surveillance(args) => whippet::cli::run_surveillance(args).await,
     }
 }
