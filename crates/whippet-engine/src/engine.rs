@@ -860,6 +860,28 @@ impl SymbolEngine {
 /// writer, which calls this (or [`fill_symbol_hashes`]) instead of walking the
 /// live ladder. The field order and the `b"whippet-engine-v1"` domain prefix
 /// match [`SymbolEngine::state_hash`] exactly.
+/// Hash the dedup state carried by a snapshot.
+///
+/// The on-disk terminal queue is stored as indices into `snapshot.dedup`; the
+/// hash is over the resolved ids so it matches the live table's
+/// [`DedupTable::hash_into`] byte for byte. An out-of-range index is hashed as
+/// an impossible order id rather than panicking: the restore path rejects it,
+/// and a tampered snapshot's recomputed hash will not match the stored one.
+fn hash_dedup_snapshot(snapshot: &SymbolSnapshot, hasher: &mut blake3::Hasher) {
+    let terminal: Vec<OrderId> = snapshot
+        .dedup_terminal_idx
+        .iter()
+        .map(|index| {
+            snapshot
+                .dedup
+                .get(*index as usize)
+                .map(|(order_id, _)| *order_id)
+                .unwrap_or(OrderId(u128::MAX))
+        })
+        .collect();
+    hash_dedup_entries(&snapshot.dedup, &terminal, hasher);
+}
+
 pub fn hash_symbol_snapshot(snapshot: &SymbolSnapshot) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"whippet-engine-v1");
@@ -872,7 +894,7 @@ pub fn hash_symbol_snapshot(snapshot: &SymbolSnapshot) -> [u8; 32] {
     hasher.update(&u64::from(config.market_collar_bps).to_le_bytes());
     hasher.update(&snapshot.commands.to_le_bytes());
     hash_book_snapshot(&snapshot.book, &mut hasher);
-    hash_dedup_entries(&snapshot.dedup, &mut hasher);
+    hash_dedup_snapshot(snapshot, &mut hasher);
     hasher.update(&snapshot.exec_seq.0.to_le_bytes());
     hasher.update(&snapshot.md_seq.0.to_le_bytes());
     hasher.update(&snapshot.last_offset.to_le_bytes());
@@ -1354,6 +1376,41 @@ mod tests {
         let restored = SymbolEngine::from_snapshot(config(), snapshot).unwrap();
         assert_eq!(restored.state_hash(), engine.state_hash());
         assert_eq!(restored.book().best_ask(), engine.book().best_ask());
+    }
+
+    #[test]
+    fn a_reordered_terminal_queue_changes_the_snapshot_hash() {
+        // The terminal queue is not derivable from the map: it decides which
+        // id is evicted next. Two cancelled orders give a queue with a real
+        // order to reorder. If the queue were not hashed, a snapshot whose
+        // indices were shuffled at rest would verify and restore a table that
+        // evicts differently from a continuous replay.
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Buy, 90, 1, 1, 1), 0);
+        process(&mut engine, &limit(Side::Buy, 91, 1, 2, 2), 1);
+        for (offset, id) in [(2u64, 1u128), (3, 2)] {
+            let cancel = Command::cancel(symbol(), OrderId(id), ParticipantId(id as u64), offset);
+            process(&mut engine, &cancel, offset);
+        }
+        let snapshot = engine.snapshot_state_without_hash_compacted();
+        assert_eq!(snapshot.dedup_terminal_idx.len(), 2);
+        assert_eq!(hash_symbol_snapshot(&snapshot), engine.state_hash());
+
+        let mut reordered = snapshot.clone();
+        reordered.dedup_terminal_idx.reverse();
+        assert_ne!(
+            hash_symbol_snapshot(&reordered),
+            hash_symbol_snapshot(&snapshot),
+            "a reordered terminal queue must change the snapshot hash"
+        );
+        reordered.state_hash = hash_symbol_snapshot(&reordered);
+        let restored = SymbolEngine::from_snapshot(config(), reordered)
+            .expect("both orderings are internally valid");
+        assert_ne!(
+            restored.state_hash(),
+            engine.state_hash(),
+            "verify must be able to see the reordered queue"
+        );
     }
 
     #[test]

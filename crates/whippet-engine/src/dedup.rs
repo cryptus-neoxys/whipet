@@ -267,7 +267,14 @@ impl DedupTable {
         // that was evicted and re-admitted appears once per terminal transition
         // in the queue, so this cannot be reconstructed from the insertion walk
         // alone; `terminal_idx` is what carries it.
-        let mut seen = std::collections::HashSet::with_capacity(terminal_idx.len());
+        //
+        // A repeated index is harmless: the second occurrence is stale after
+        // the first eviction and is skipped by the eviction walk, exactly as a
+        // continuous table with the same queue would behave. It is therefore
+        // allowed, while an index outside the walk or one pointing at a
+        // non-terminal entry is a corrupt snapshot and fails closed.
+        let mut queued: std::collections::HashSet<OrderId> =
+            std::collections::HashSet::with_capacity(terminal_idx.len());
         for index in terminal_idx {
             let Some((order_id, entry)) = entries.get(index as usize) else {
                 return Err(format!("terminal index {index} is out of range"));
@@ -280,11 +287,7 @@ impl DedupTable {
                     "terminal index {index} points at a non-terminal entry"
                 ));
             }
-            if !seen.insert(*order_id) {
-                return Err(format!(
-                    "terminal index {index} repeats order id {order_id:?}"
-                ));
-            }
+            queued.insert(*order_id);
             table.terminal_order.push_back(*order_id);
         }
         // Every terminal id in the map must be in the queue, or the restored
@@ -299,10 +302,10 @@ impl DedupTable {
                 )
             })
             .count();
-        if table.terminal_order.len() != terminal_in_map {
+        if queued.len() != terminal_in_map {
             return Err(format!(
-                "terminal queue has {} entries but the map has {terminal_in_map} terminal ids",
-                table.terminal_order.len()
+                "terminal queue covers {} terminal ids but the map has {terminal_in_map}",
+                queued.len()
             ));
         }
         Ok(table)
@@ -323,6 +326,24 @@ impl DedupTable {
                 hasher.update(&entry.seq.0.to_le_bytes());
             }
         }
+        // The terminal queue decides which id is evicted next. It is not
+        // derivable from the map, so it must be in the hash: otherwise a
+        // snapshot whose (otherwise valid) indices were reordered restores a
+        // table that evicts differently while every hash still matches.
+        // Stale ids are skipped, matching the snapshot form, which can only
+        // resolve ids present in its walk.
+        let live = self
+            .terminal_order
+            .iter()
+            .filter(|order_id| self.map.contains_key(order_id))
+            .count();
+        hasher.update(b"terminal");
+        hasher.update(&(live as u64).to_le_bytes());
+        for order_id in &self.terminal_order {
+            if self.map.contains_key(order_id) {
+                hasher.update(&order_id.0.to_le_bytes());
+            }
+        }
     }
 }
 
@@ -335,7 +356,11 @@ impl DedupTable {
 /// and later re-admitted is walked once per admission but occupies one map
 /// slot. A 200k-command run reaches that state routinely, which is why this
 /// function must not simply hash `entries.len()`.
-pub fn hash_dedup_entries(entries: &[(OrderId, DedupEntry)], hasher: &mut blake3::Hasher) {
+pub fn hash_dedup_entries(
+    entries: &[(OrderId, DedupEntry)],
+    terminal: &[OrderId],
+    hasher: &mut blake3::Hasher,
+) {
     hasher.update(b"dedup");
     hasher.update(&(distinct_order_ids(entries) as u64).to_le_bytes());
     for (order_id, entry) in entries {
@@ -344,6 +369,11 @@ pub fn hash_dedup_entries(entries: &[(OrderId, DedupEntry)], hasher: &mut blake3
         hasher.update(&entry.input_offset.to_le_bytes());
         hasher.update(&entry.timestamp_ns.to_le_bytes());
         hasher.update(&entry.seq.0.to_le_bytes());
+    }
+    hasher.update(b"terminal");
+    hasher.update(&(terminal.len() as u64).to_le_bytes());
+    for order_id in terminal {
+        hasher.update(&order_id.0.to_le_bytes());
     }
 }
 
@@ -628,6 +658,12 @@ mod tests {
             expected.update(&entry.timestamp_ns.to_le_bytes());
             expected.update(&entry.seq.0.to_le_bytes());
         }
+        let terminal = table.terminal_order();
+        expected.update(b"terminal");
+        expected.update(&(terminal.len() as u64).to_le_bytes());
+        for order_id in &terminal {
+            expected.update(&order_id.0.to_le_bytes());
+        }
 
         let mut actual = blake3::Hasher::new();
         table.hash_into(&mut actual);
@@ -638,7 +674,8 @@ mod tests {
     /// walk, with no access to the map.
     fn snapshot_hash(table: &DedupTable) -> blake3::Hash {
         let mut hasher = blake3::Hasher::new();
-        hash_dedup_entries(&table.entries_in_order(), &mut hasher);
+        let terminal = table.terminal_order();
+        hash_dedup_entries(&table.entries_in_order(), &terminal, &mut hasher);
         hasher.finalize()
     }
 

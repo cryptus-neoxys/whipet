@@ -33,7 +33,7 @@ use crate::builders;
 ///
 /// Generated from the current code. Changing matching semantics requires
 /// updating this value deliberately (see the module docs).
-pub const GOLDEN_HASH: &str = "331a417f7124b27c0ecd090d56675c38b3f89b4a29d6796e8c8ed554d57b96d0";
+pub const GOLDEN_HASH: &str = "98e70d85d2c55bc4f52ad51facf92b92062ac21f43a0d25598b62931627f7f34";
 
 /// The instrument configuration used for the golden hash.
 ///
