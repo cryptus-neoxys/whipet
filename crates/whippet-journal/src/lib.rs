@@ -1054,6 +1054,14 @@ fn empty_append(partition: u32) -> AppendResult {
 /// documented and pinned by the `contract` integration test.
 pub struct MemoryJournal {
     state: Mutex<MemoryState>,
+    /// Pending stall for the next [`Journal::append_owned`] call.
+    ///
+    /// Test-only: a group-commit backpressure test needs the writer to stall
+    /// *without* blocking a runtime worker on a `std::sync::Mutex`, so the
+    /// stall has to be awaitable. The receiver is taken under the mutex and
+    /// awaited outside it; no real build ever installs one.
+    #[cfg(test)]
+    append_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
 /// A consumer key: `(topic, partition, consumer name)`.
@@ -1174,7 +1182,24 @@ impl MemoryJournal {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(MemoryState::default()),
+            #[cfg(test)]
+            append_gate: Mutex::new(None),
         }
+    }
+
+    /// A memory journal that stalls its next async append until `release`
+    /// sends.
+    ///
+    /// Test-only: lets a group-commit test fill the bounded queue against a
+    /// stalled writer without blocking a runtime worker.
+    #[cfg(test)]
+    pub fn with_append_gate() -> (Self, tokio::sync::oneshot::Sender<()>) {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let journal = Self {
+            append_gate: Mutex::new(Some(receiver)),
+            ..Self::new()
+        };
+        (journal, sender)
     }
 
     /// Append a borrowed batch. Offsets continue the partition's log, so the
@@ -1538,7 +1563,22 @@ impl Journal {
     ) -> Result<AppendResult> {
         match self {
             Self::Iggy(journal) => journal.append_owned(topic, partition, messages).await,
-            Self::Memory(journal) => Ok(journal.append_owned(topic, partition, messages)),
+            Self::Memory(journal) => {
+                #[cfg(test)]
+                {
+                    // A `std::sync::Mutex` held across an await would block a
+                    // runtime worker; take the receiver and await it unlocked.
+                    let gate = journal
+                        .append_gate
+                        .lock()
+                        .expect("memory journal gate poisoned")
+                        .take();
+                    if let Some(gate) = gate {
+                        let _ = gate.await;
+                    }
+                }
+                Ok(journal.append_owned(topic, partition, messages))
+            }
         }
     }
 
