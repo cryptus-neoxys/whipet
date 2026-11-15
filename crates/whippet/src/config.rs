@@ -318,6 +318,22 @@ impl NodeConfig {
         let tcp_addr = parse_tcp_addr(&args.tcp_addr)?;
         let journal = JournalKind::parse(&args.journal)?;
         let iggy_password = read_password(&args.iggy_password, args.iggy_password_file.as_deref())?;
+        // Resolve the Iggy address once at startup so a typo fails here, not
+        // on the first journal append. The memory journal never dials Iggy,
+        // so brokerless development does not depend on DNS for an address it
+        // will never use.
+        let iggy_addr = parse_iggy_addr(&args.iggy_addr, journal)?;
+        if journal == JournalKind::Iggy && iggy_password.is_empty() {
+            return Err(ConfigError::Invalid(
+                "Iggy password must not be empty (set WHIPPET_IGGY_PASSWORD or WHIPPET_IGGY_PASSWORD_FILE)"
+                    .into(),
+            ));
+        }
+        if journal == JournalKind::Iggy && args.iggy_user.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "Iggy username must not be empty (set WHIPPET_IGGY_USER)".into(),
+            ));
+        }
         let mode: Mode = args.mode.parse()?;
         let turbo = TurboConfig::new(args.turbo_window_commands, args.turbo_window_ms)
             .map_err(ConfigError::Invalid)?;
@@ -330,6 +346,11 @@ impl NodeConfig {
         if args.partitions == 0 || args.partitions > 256 {
             return Err(ConfigError::Invalid(
                 "partitions must be between 1 and 256".into(),
+            ));
+        }
+        if args.snapshot_every == 0 {
+            return Err(ConfigError::Invalid(
+                "snapshot cadence (WHIPPET_SNAPSHOT_EVERY) must be at least 1".into(),
             ));
         }
         // A missing Iggy mount is reported rather than fatal: the node can run
@@ -389,17 +410,17 @@ impl NodeConfig {
 
         let exchange = exchange_config(&args.venue, args.partitions, mode, &args.symbols)?;
 
-        Ok(Self {
+        let config = Self {
             http_addr,
             tcp_addr,
-            iggy_addr: args.iggy_addr,
+            iggy_addr,
             iggy_user: args.iggy_user,
             iggy_password,
             journal,
             mode,
             exchange,
             snapshot_dir: args.snapshot_dir,
-            snapshot_every: args.snapshot_every.max(1),
+            snapshot_every: args.snapshot_every,
             dashboard_dir: args.dashboard_dir,
             build: args.build,
             api_token,
@@ -415,7 +436,243 @@ impl NodeConfig {
                 max_order_qty: args.risk_max_order_qty,
                 max_notional_cents: args.risk_max_notional_cents,
             },
-        })
+        };
+        // Every construction path through flags/env ends here, so a bad
+        // combination fails before any network bind or journal write.
+        config.check_invariants()?;
+        Ok(config)
+    }
+
+    /// Validate the assembled node configuration without touching the network
+    /// or the filesystem: no DNS, no binds, no journal writes, no directory
+    /// probes. Hostname resolution and secret-file reads stay in
+    /// [`Self::from_args`], which runs before this check.
+    ///
+    /// Invariants enforced:
+    /// - mode/journal: turbo requires the Iggy journal; durable runs on either
+    ///   (memory is the test backend).
+    /// - credentials: every token string non-empty; scoped names non-empty;
+    ///   token strings pairwise disjoint across all roles (legacy trading,
+    ///   scoped trading, operator, metrics); duplicate tokens rejected within
+    ///   each scoped list; operator names unique; two trading tokens may share
+    ///   one participant (documented rotation: the old and new token overlap
+    ///   while clients roll over, and attribution sees one desk either way).
+    /// - symbols/exchange: partitions `1..=256`; instruments non-empty with
+    ///   unique symbols; each instrument re-validated through
+    ///   `InstrumentConfig::validate` (positive tick, ordered ladder, the
+    ///   5,000,000-level safety cap); each symbol's partition pins inside
+    ///   `partitions`.
+    /// - storage: `0 < warn_pct < crit_pct <= 99` via `StorageConfig::validate`;
+    ///   snapshot cadence `> 0`; rate limits are `u32`/`usize` where `0`
+    ///   disables the limiter (no rejection). Missing/unreadable data
+    ///   directories are NOT errors: a volume may simply not be mounted yet,
+    ///   and the monitor reports the gap as `Warn` at runtime.
+    /// - addresses: neither listener may be the degenerate `0.0.0.0:0` /
+    ///   `[::]:0` (unspecified address with port 0 binds nothing); port 0 is
+    ///   otherwise allowed so tests can take an ephemeral port; HTTP and TCP
+    ///   must not be the same `SocketAddr` with a real port (they cannot both
+    ///   bind it); a disabled TCP listener (`None`) is valid.
+    /// - iggy: for the Iggy journal the address must be `host:port` shaped
+    ///   with a non-zero port, and username/password non-empty. The memory
+    ///   journal never dials Iggy, so these are skipped there.
+    /// - risk: limits are `u64`, so non-negativity is by type; both zero
+    ///   disables the guard. No overflow check is needed at the config layer:
+    ///   ingress multiplies `price_cents * qty` in `i128` (see the TCP/HTTP
+    ///   risk guards), which cannot wrap for any `u64` limit.
+    pub fn check_invariants(&self) -> Result<(), ConfigError> {
+        if self.mode == Mode::Turbo && self.journal != JournalKind::Iggy {
+            return Err(ConfigError::Invalid(
+                "turbo mode requires the Iggy journal; the in-memory journal is a test backend, not a supported deployment"
+                    .into(),
+            ));
+        }
+        if self.exchange.partitions == 0 || self.exchange.partitions > 256 {
+            return Err(ConfigError::Invalid(
+                "partitions must be between 1 and 256".into(),
+            ));
+        }
+        self.storage.validate().map_err(ConfigError::Invalid)?;
+        if self.snapshot_every == 0 {
+            return Err(ConfigError::Invalid(
+                "snapshot cadence must be at least 1".into(),
+            ));
+        }
+        if self.api_participant.is_empty() || self.api_participant.len() > 64 {
+            return Err(ConfigError::Invalid(
+                "api participant must be between 1 and 64 bytes".into(),
+            ));
+        }
+        if let Some(legacy) = self.api_token.as_deref()
+            && legacy.is_empty()
+        {
+            return Err(ConfigError::Invalid(
+                "legacy API token must not be empty".into(),
+            ));
+        }
+        for entry in &self.api_tokens {
+            check_token_pair(entry, "WHIPPET_API_TOKENS", "participant")?;
+        }
+        for entry in &self.operator_tokens {
+            check_token_pair(entry, "WHIPPET_OPERATOR_TOKENS", "operator")?;
+        }
+        if let Some(metrics) = self.metrics_token.as_deref()
+            && metrics.is_empty()
+        {
+            return Err(ConfigError::Invalid(
+                "metrics token must not be empty".into(),
+            ));
+        }
+        reject_duplicate_tokens(&self.api_tokens, "WHIPPET_API_TOKENS", "participant")?;
+        reject_duplicate_tokens(&self.operator_tokens, "WHIPPET_OPERATOR_TOKENS", "operator")?;
+        // Operator names are unique: each operator token authorizes the admin
+        // endpoints as its own identity, so two tokens sharing one name would
+        // make audit attribution ambiguous. (Trading participants are the
+        // exception: duplicate names are allowed rotation, documented above.)
+        reject_duplicate_names(&self.operator_tokens)?;
+        if let Some(legacy) = self.api_token.as_deref()
+            && self.api_tokens.iter().any(|entry| entry.token == legacy)
+        {
+            return Err(ConfigError::Invalid(
+                "WHIPPET_API_TOKEN duplicates an entry in WHIPPET_API_TOKENS; a token must have one trading identity"
+                    .into(),
+            ));
+        }
+        validate_distinct_roles(
+            self.api_token.as_deref(),
+            &self.api_tokens,
+            &self.operator_tokens,
+            self.metrics_token.as_deref(),
+        )?;
+        check_bind_pair(self.http_addr, self.tcp_addr)?;
+        if self.journal == JournalKind::Iggy {
+            check_iggy_addr_shape(&self.iggy_addr)?;
+            if self.iggy_user.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "Iggy username must not be empty".into(),
+                ));
+            }
+            if self.iggy_password.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "Iggy password must not be empty".into(),
+                ));
+            }
+        }
+        if self.exchange.instruments.is_empty() {
+            return Err(ConfigError::Invalid(
+                "at least one symbol is required".into(),
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for instrument in &self.exchange.instruments {
+            instrument.validate()?;
+            if !seen.insert(instrument.symbol) {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate symbol in exchange config: {}",
+                    instrument.symbol
+                )));
+            }
+            if instrument.symbol.partition(self.exchange.partitions) >= self.exchange.partitions {
+                return Err(ConfigError::Invalid(format!(
+                    "symbol {} partitions outside 0..{}",
+                    instrument.symbol, self.exchange.partitions
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One parsed `token:name` pair, re-checked on the assembled config so direct
+/// struct construction gets the same bounds as flag parsing.
+fn check_token_pair(entry: &ApiToken, env: &str, role: &str) -> Result<(), ConfigError> {
+    if entry.token.is_empty() || entry.token.len() > 256 {
+        return Err(ConfigError::Invalid(
+            "an API token must be between 1 and 256 bytes".into(),
+        ));
+    }
+    if entry.token.contains(':') {
+        return Err(ConfigError::Invalid(format!(
+            "API tokens cannot contain ':' (use token:{role})"
+        )));
+    }
+    if entry.participant.is_empty() || entry.participant.len() > 64 {
+        return Err(ConfigError::Invalid(format!(
+            "a token {role} must be between 1 and 64 bytes ({env})"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject two operator tokens sharing one name. Trading participants may
+/// share a name (rotation); operator identities must stay attributable.
+fn reject_duplicate_names(operators: &[ApiToken]) -> Result<(), ConfigError> {
+    for (index, entry) in operators.iter().enumerate() {
+        if operators[..index]
+            .iter()
+            .any(|other| other.participant == entry.participant)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "duplicate operator name {} in WHIPPET_OPERATOR_TOKENS; each operator token needs its own identity",
+                entry.participant
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Pure bind-pair check: no DNS, no sockets. Port 0 is an ephemeral-port
+/// request for tests; the degenerate unspecified+0 pair binds nothing and is
+/// rejected, as is an HTTP/TCP collision on a real port.
+fn check_bind_pair(http_addr: SocketAddr, tcp_addr: Option<SocketAddr>) -> Result<(), ConfigError> {
+    for (kind, addr) in [("HTTP", Some(http_addr)), ("TCP", tcp_addr)]
+        .into_iter()
+        .filter_map(|(kind, addr)| addr.map(|addr| (kind, addr)))
+    {
+        if addr.port() == 0 && addr.ip().is_unspecified() {
+            return Err(ConfigError::Invalid(format!(
+                "invalid {kind} address: {addr} binds nothing (unspecified address with port 0)"
+            )));
+        }
+    }
+    if let Some(tcp) = tcp_addr
+        && tcp == http_addr
+        && http_addr.port() != 0
+    {
+        return Err(ConfigError::Invalid(format!(
+            "HTTP and TCP listeners cannot share {http_addr}; give each its own host:port"
+        )));
+    }
+    Ok(())
+}
+
+/// No-I/O shape check for the Iggy address: `host:port` with a non-zero
+/// port. Resolution happens once in [`NodeConfig::from_args`]; this only
+/// re-checks the shape so directly constructed configs get the same bound.
+fn check_iggy_addr_shape(value: &str) -> Result<(), ConfigError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ConfigError::Invalid(
+            "Iggy address must not be empty (use host:port, for example 127.0.0.1:8090)".into(),
+        ));
+    }
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        if addr.port() == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "invalid Iggy address: {value} (port must be non-zero)"
+            )));
+        }
+        return Ok(());
+    }
+    match value.rsplit_once(':') {
+        Some((host, port)) if !host.trim().is_empty() => match port.trim().parse::<u16>() {
+            Ok(port) if port != 0 => Ok(()),
+            _ => Err(ConfigError::Invalid(format!(
+                "invalid Iggy address: {value} (use host:port, for example iggy:8090)"
+            ))),
+        },
+        _ => Err(ConfigError::Invalid(format!(
+            "invalid Iggy address: {value} (use host:port, for example iggy:8090)"
+        ))),
     }
 }
 
@@ -537,6 +794,35 @@ fn parse_tcp_addr(value: &str) -> Result<Option<SocketAddr>, ConfigError> {
     parse_bind_addr(value, "TCP").map(Some)
 }
 
+/// Resolve the Iggy address once at startup.
+///
+/// A numeric `IP:port` resolves without I/O; a hostname is resolved here, at
+/// startup only, so an unresolvable value fails before any bind or journal
+/// write. The memory journal never dials Iggy, so its address is passed
+/// through unchecked and brokerless development never depends on DNS.
+fn parse_iggy_addr(value: &str, journal: JournalKind) -> Result<String, ConfigError> {
+    let value = value.trim();
+    if journal == JournalKind::Memory {
+        return Ok(value.to_string());
+    }
+    if value.is_empty() {
+        return Err(ConfigError::Invalid(
+            "invalid Iggy address: empty (use host:port, for example 127.0.0.1:8090)".into(),
+        ));
+    }
+    use std::net::ToSocketAddrs;
+    value
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addresses| addresses.next())
+        .ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "invalid Iggy address: {value} (use host:port, for example iggy:8090)"
+            ))
+        })?;
+    Ok(value.to_string())
+}
+
 /// Parse a bind address.
 ///
 /// A numeric `IP:port` is the normal and recommended form (`0.0.0.0:8081`
@@ -580,25 +866,40 @@ pub fn read_password(inline: &str, file: Option<&Path>) -> Result<String, Config
 
 /// Build the configured instrument set the same way for the node and
 /// `whippet doctor`, so snapshot verification uses the right symbols.
+///
+/// Duplicate symbols are rejected rather than deduplicated: a repeated symbol
+/// is almost always a copy-paste error in `WHIPPET_SYMBOLS`, and silently
+/// dropping it would hide the mistake while changing nothing else.
 pub fn exchange_config(
     venue: &str,
     partitions: u32,
     mode: Mode,
     symbols: &str,
 ) -> Result<ExchangeConfig, ConfigError> {
-    let mut requested: Vec<Symbol> = symbols
+    let raws: Vec<&str> = symbols
         .split(',')
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(Symbol::new)
-        .collect::<Result<_, _>>()?;
-    requested.sort_unstable();
-    requested.dedup();
-    if requested.is_empty() {
+        .collect();
+    if raws.is_empty() {
         return Err(ConfigError::Invalid(
             "at least one symbol is required".into(),
         ));
     }
+    let mut seen = std::collections::HashSet::new();
+    for raw in &raws {
+        if !seen.insert(*raw) {
+            return Err(ConfigError::Invalid(format!(
+                "duplicate symbol in {symbols:?}: {raw} appears more than once"
+            )));
+        }
+    }
+    let mut requested: Vec<Symbol> = raws
+        .iter()
+        .map(|raw| Symbol::new(raw))
+        .collect::<Result<_, _>>()?;
+    requested.sort_unstable();
+    requested.dedup();
     let mut instruments = Vec::new();
     for instrument in default_instruments() {
         if requested.contains(&instrument.symbol) {
@@ -1035,6 +1336,406 @@ mod tests {
         match NodeConfig::from_args(cli.node) {
             Ok(_) => panic!("a malformed TCP address must be rejected"),
             Err(error) => assert!(error.to_string().contains("invalid TCP address")),
+        }
+    }
+
+    /// A valid config for direct `check_invariants` construction. Mirrors the
+    /// demo defaults with loopback binds.
+    fn test_config() -> NodeConfig {
+        NodeConfig {
+            http_addr: "127.0.0.1:8080".parse().unwrap(),
+            tcp_addr: Some("127.0.0.1:8081".parse().unwrap()),
+            iggy_addr: "127.0.0.1:8090".into(),
+            iggy_user: "iggy".into(),
+            iggy_password: "iggy".into(),
+            journal: JournalKind::Iggy,
+            mode: Mode::Durable,
+            exchange: ExchangeConfig::default(),
+            snapshot_dir: PathBuf::from("data/snapshots"),
+            snapshot_every: 10_000,
+            dashboard_dir: PathBuf::from("apps/dashboard/dist"),
+            build: "test".into(),
+            api_token: None,
+            api_participant: "api".into(),
+            api_tokens: Vec::new(),
+            operator_tokens: Vec::new(),
+            metrics_token: None,
+            rate_limit_per_sec: 0,
+            ws_per_ip: 0,
+            turbo: crate::turbo::TurboConfig::default(),
+            storage: crate::storage::StorageConfig::default(),
+            risk: RiskConfig::default(),
+        }
+    }
+
+    fn token_pair(token: &str, participant: &str) -> ApiToken {
+        ApiToken {
+            token: token.into(),
+            participant: participant.into(),
+        }
+    }
+
+    #[test]
+    fn check_invariants_accepts_a_valid_config() {
+        test_config().check_invariants().expect("valid config");
+    }
+
+    #[test]
+    fn duplicate_symbols_are_rejected_not_deduplicated() {
+        for symbols in [
+            "BTC-USD,BTC-USD",
+            "BTC-USD, BTC-USD",
+            "ETH-USD,ETH-USD,ETH-USD",
+        ] {
+            let cli = Cli::parse_from(["test", "--symbols", symbols]);
+            let error = match NodeConfig::from_args(cli.node) {
+                Ok(_) => panic!("{symbols:?} must be rejected"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("duplicate symbol"), "{error}");
+        }
+        // Distinct symbols still parse.
+        let cli = Cli::parse_from(["test", "--symbols", "BTC-USD,ETH-USD"]);
+        let config = NodeConfig::from_args(cli.node).unwrap();
+        assert_eq!(config.exchange.instruments.len(), 2);
+    }
+
+    #[test]
+    fn empty_and_blank_symbol_lists_are_rejected() {
+        for symbols in ["", " , "] {
+            let cli = Cli::parse_from(["test", "--symbols", symbols]);
+            assert!(
+                NodeConfig::from_args(cli.node).is_err(),
+                "{symbols:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn partitions_stay_inside_1_to_256() {
+        for partitions in ["0", "257"] {
+            let cli = Cli::parse_from(["test", "--partitions", partitions]);
+            assert!(
+                NodeConfig::from_args(cli.node).is_err(),
+                "partitions={partitions} must be rejected"
+            );
+        }
+        for partitions in ["1", "256"] {
+            let cli = Cli::parse_from(["test", "--partitions", partitions]);
+            assert!(
+                NodeConfig::from_args(cli.node).is_ok(),
+                "partitions={partitions} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn http_and_tcp_cannot_share_one_socket() {
+        // Same host:port with a real port cannot bind twice.
+        let cli = Cli::parse_from([
+            "test",
+            "--http-addr",
+            "127.0.0.1:9999",
+            "--tcp-addr",
+            "127.0.0.1:9999",
+        ]);
+        let error = match NodeConfig::from_args(cli.node) {
+            Ok(_) => panic!("a shared HTTP/TCP socket must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("cannot share"), "{error}");
+
+        // Port 0 is an ephemeral-port request for tests, not a collision.
+        let mut config = test_config();
+        config.http_addr = "127.0.0.1:0".parse().unwrap();
+        config.tcp_addr = Some("127.0.0.1:0".parse().unwrap());
+        config.check_invariants().expect("port 0 is ephemeral");
+
+        // A disabled TCP listener never collides.
+        let mut config = test_config();
+        config.tcp_addr = None;
+        config.check_invariants().expect("disabled TCP is valid");
+
+        // The degenerate unspecified+0 pair binds nothing.
+        let mut config = test_config();
+        config.http_addr = "0.0.0.0:0".parse().unwrap();
+        config.tcp_addr = None;
+        assert!(config.check_invariants().is_err());
+    }
+
+    #[test]
+    fn duplicate_operator_names_are_rejected() {
+        let cli = Cli::parse_from(["test", "--operator-tokens", "a:lead,b:lead"]);
+        let error = match NodeConfig::from_args(cli.node) {
+            Ok(_) => panic!("duplicate operator names must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("duplicate operator name"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn duplicate_trading_participants_are_rotation_not_ambiguity() {
+        // Two trading tokens may share one participant while clients roll from
+        // the old token to the new one: attribution sees one desk either way,
+        // and no lookup becomes order-dependent because the mapped identity
+        // is identical.
+        let cli = Cli::parse_from(["test", "--api-tokens", "old-token:desk,new-token:desk"]);
+        let config = NodeConfig::from_args(cli.node).unwrap();
+        assert_eq!(config.participant_for("old-token"), Some("desk"));
+        assert_eq!(config.participant_for("new-token"), Some("desk"));
+
+        // The same holds rolling from the legacy token to a scoped token.
+        let cli = Cli::parse_from([
+            "test",
+            "--api-token",
+            "old-token",
+            "--api-participant",
+            "desk",
+            "--api-tokens",
+            "new-token:desk",
+        ]);
+        let config = NodeConfig::from_args(cli.node).unwrap();
+        assert_eq!(config.participant_for("old-token"), Some("desk"));
+        assert_eq!(config.participant_for("new-token"), Some("desk"));
+    }
+
+    #[test]
+    fn an_empty_iggy_password_fails_for_the_iggy_journal_only() {
+        let cli = Cli::parse_from(["test", "--iggy-password", ""]);
+        assert!(NodeConfig::from_args(cli.node).is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("password");
+        std::fs::write(&path, "\n").unwrap();
+        let cli = Cli::parse_from(["test", "--iggy-password-file", path.to_str().unwrap()]);
+        assert!(NodeConfig::from_args(cli.node).is_err());
+
+        // The memory journal never dials Iggy, so it needs no password.
+        let cli = Cli::parse_from(["test", "--journal", "memory", "--iggy-password", ""]);
+        assert!(NodeConfig::from_args(cli.node).is_ok());
+    }
+
+    #[test]
+    fn a_malformed_iggy_address_fails_before_any_bind() {
+        let cli = Cli::parse_from(["test", "--iggy-addr", "not a host:port"]);
+        let error = match NodeConfig::from_args(cli.node) {
+            Ok(_) => panic!("a malformed Iggy address must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("invalid Iggy address"),
+            "{error}"
+        );
+
+        // The memory journal never dials Iggy, so it accepts any placeholder.
+        let cli = Cli::parse_from([
+            "test",
+            "--journal",
+            "memory",
+            "--iggy-addr",
+            "not a host:port",
+        ]);
+        assert!(NodeConfig::from_args(cli.node).is_ok());
+
+        // Pure shape check without DNS: empty and port-0 fail.
+        let mut config = test_config();
+        config.iggy_addr = "   ".into();
+        assert!(config.check_invariants().is_err());
+        config.iggy_addr = "127.0.0.1:0".into();
+        assert!(config.check_invariants().is_err());
+        config.iggy_addr = "iggy:8090".into();
+        config.check_invariants().expect("hostname shape is valid");
+    }
+
+    #[test]
+    fn a_zero_snapshot_cadence_is_rejected() {
+        let cli = Cli::parse_from(["test", "--snapshot-every", "0"]);
+        assert!(NodeConfig::from_args(cli.node).is_err());
+        let mut config = test_config();
+        config.snapshot_every = 0;
+        assert!(config.check_invariants().is_err());
+    }
+
+    #[test]
+    fn risk_limits_accept_the_full_u64_range() {
+        // Non-negativity is by type (`u64`); the ingress guard multiplies in
+        // `i128`, so even `u64::MAX` cannot wrap the notional computation.
+        let cli = Cli::parse_from([
+            "test",
+            "--risk-max-order-qty",
+            "18446744073709551615",
+            "--risk-max-notional-cents",
+            "18446744073709551615",
+        ]);
+        let config = NodeConfig::from_args(cli.node).unwrap();
+        assert_eq!(config.risk.max_order_qty, u64::MAX);
+        assert_eq!(config.risk.max_notional_cents, u64::MAX);
+        config.check_invariants().expect("u64 limits are valid");
+    }
+
+    #[test]
+    fn check_invariants_reuses_the_exchange_validation() {
+        // Zero tick.
+        let mut config = test_config();
+        config.exchange.instruments[0].tick_size_cents = 0;
+        assert!(config.check_invariants().is_err());
+
+        // Duplicate symbol inside the exchange config.
+        let mut config = test_config();
+        let first = config.exchange.instruments[0].clone();
+        config.exchange.instruments.push(first);
+        let error = match config.check_invariants() {
+            Ok(_) => panic!("duplicate exchange symbols must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("duplicate symbol"), "{error}");
+
+        // Empty instrument set.
+        let mut config = test_config();
+        config.exchange.instruments.clear();
+        assert!(config.check_invariants().is_err());
+
+        // Partitions outside the bound on a directly built config.
+        let mut config = test_config();
+        config.exchange.partitions = 512;
+        assert!(config.check_invariants().is_err());
+    }
+
+    #[test]
+    fn check_invariants_table() {
+        type Case = (&'static str, Box<dyn Fn(&mut NodeConfig)>, bool);
+        let cases: Vec<Case> = vec![
+            ("baseline", Box::new(|_| {}), true),
+            ("turbo on iggy", Box::new(|c| c.mode = Mode::Turbo), true),
+            (
+                "turbo on memory",
+                Box::new(|c| {
+                    c.mode = Mode::Turbo;
+                    c.journal = JournalKind::Memory;
+                }),
+                false,
+            ),
+            (
+                "memory durable",
+                Box::new(|c| c.journal = JournalKind::Memory),
+                true,
+            ),
+            (
+                "zero partitions",
+                Box::new(|c| c.exchange.partitions = 0),
+                false,
+            ),
+            (
+                "warn equals crit",
+                Box::new(|c| c.storage.warn_pct = c.storage.crit_pct),
+                false,
+            ),
+            (
+                "zero snapshot cadence",
+                Box::new(|c| c.snapshot_every = 0),
+                false,
+            ),
+            (
+                "empty participant",
+                Box::new(|c| c.api_participant.clear()),
+                false,
+            ),
+            (
+                "empty legacy token",
+                Box::new(|c| c.api_token = Some(String::new())),
+                false,
+            ),
+            (
+                "duplicate scoped tokens",
+                Box::new(|c| {
+                    c.api_tokens = vec![token_pair("t", "a"), token_pair("t", "b")];
+                }),
+                false,
+            ),
+            (
+                "duplicate operator tokens",
+                Box::new(|c| {
+                    c.operator_tokens = vec![token_pair("t", "a"), token_pair("t", "b")];
+                }),
+                false,
+            ),
+            (
+                "duplicate operator names",
+                Box::new(|c| {
+                    c.operator_tokens = vec![token_pair("a", "lead"), token_pair("b", "lead")];
+                }),
+                false,
+            ),
+            (
+                "trading rotation shares a name",
+                Box::new(|c| {
+                    c.api_tokens = vec![token_pair("old", "desk"), token_pair("new", "desk")];
+                }),
+                true,
+            ),
+            (
+                "legacy duplicates scoped token",
+                Box::new(|c| {
+                    c.api_token = Some("t".into());
+                    c.api_tokens = vec![token_pair("t", "a")];
+                }),
+                false,
+            ),
+            (
+                "token spans trading and operator",
+                Box::new(|c| {
+                    c.api_tokens = vec![token_pair("t", "a")];
+                    c.operator_tokens = vec![token_pair("t", "ops")];
+                }),
+                false,
+            ),
+            (
+                "token spans trading and metrics",
+                Box::new(|c| {
+                    c.api_tokens = vec![token_pair("t", "a")];
+                    c.metrics_token = Some("t".into());
+                }),
+                false,
+            ),
+            (
+                "empty metrics token",
+                Box::new(|c| c.metrics_token = Some(String::new())),
+                false,
+            ),
+            (
+                "http equals tcp",
+                Box::new(|c| c.tcp_addr = Some(c.http_addr)),
+                false,
+            ),
+            ("tcp disabled", Box::new(|c| c.tcp_addr = None), true),
+            (
+                "empty iggy password",
+                Box::new(|c| c.iggy_password.clear()),
+                false,
+            ),
+            ("empty iggy user", Box::new(|c| c.iggy_user.clear()), false),
+            (
+                "memory ignores iggy credentials",
+                Box::new(|c| {
+                    c.journal = JournalKind::Memory;
+                    c.iggy_password.clear();
+                    c.iggy_user.clear();
+                    c.iggy_addr = "bogus".into();
+                }),
+                true,
+            ),
+        ];
+        for (name, mutate, expect_ok) in cases {
+            let mut config = test_config();
+            mutate(&mut config);
+            assert_eq!(
+                config.check_invariants().is_ok(),
+                expect_ok,
+                "case {name:?} must agree"
+            );
         }
     }
 }
