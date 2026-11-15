@@ -496,7 +496,7 @@ fn validate_batch(ctx: &NodeContext, commands: &[Command]) -> Result<Symbol, Tcp
             CommandKind::NewOrder | CommandKind::Cancel => {}
             // Operator commands are HTTP-only and require operator
             // credentials; a TCP Submit must never be able to halt a market.
-            CommandKind::Halt | CommandKind::Resume => {
+            CommandKind::Halt | CommandKind::Resume | CommandKind::SetSession => {
                 return Err(error_response(
                     TcpErrorCode::InvalidCommand,
                     format!(

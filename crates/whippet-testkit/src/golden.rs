@@ -33,7 +33,15 @@ use crate::builders;
 ///
 /// Generated from the current code. Changing matching semantics requires
 /// updating this value deliberately (see the module docs).
-pub const GOLDEN_HASH: &str = "98e70d85d2c55bc4f52ad51facf92b92062ac21f43a0d25598b62931627f7f34";
+///
+/// History:
+/// - 2026-11-15: moved for the session-state field. `SymbolEngine::state_hash`
+///   now hashes two status bytes (`halted`, `session`) instead of one, and the
+///   golden scenario runs in the default `SessionState::Open`. No matching,
+///   sequencing, or MD output changed: every command in the standard log is
+///   admitted exactly as before. The previous pin was
+///   `98e70d85d2c55bc4f52ad51facf92b92062ac21f43a0d25598b62931627f7f34`.
+pub const GOLDEN_HASH: &str = "60d6e929d350354cc6cc73dd59e15d77810be26e56090972d928cac88b1ffe3a";
 
 /// The instrument configuration used for the golden hash.
 ///

@@ -13,7 +13,8 @@ use whippet_core::config::{ExchangeConfig, InstrumentConfig};
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Seq, Symbol};
 use whippet_core::protocol::{
     Command, CommandKind, ExecKind, ExecutionReport, FLAG_MAKER, FLAG_RESTED, FLAG_TAKER,
-    MD_FLAG_HALTED, MdEvent, MdKind, MdOrder, MdSnapshot, OrderType, RejectReason, Side,
+    MD_FLAG_HALTED, MdEvent, MdKind, MdOrder, MdSnapshot, OrderType, RejectReason, SessionState,
+    Side,
 };
 
 use crate::book::{Book, BookError, BookSnapshot, RestingOrder, hash_book_snapshot};
@@ -119,6 +120,10 @@ pub struct SymbolSnapshot {
     pub last_ts_ns: u64,
     pub commands: u64,
     pub halted: bool,
+    /// The instrument session at snapshot time. Log-ordered through
+    /// [`CommandKind::SetSession`], so replay and restore agree on whether new
+    /// orders are admitted. Added by snapshot-store version 5.
+    pub session: SessionState,
     pub state_hash: [u8; 32],
 }
 
@@ -138,6 +143,9 @@ pub struct SymbolEngine {
     last_ts_ns: u64,
     commands: u64,
     halted: bool,
+    /// Instrument session. `Open` is the pre-session default, so an engine
+    /// that never sees a [`CommandKind::SetSession`] behaves as before.
+    session: SessionState,
     /// How often the node should persist engine state (book + dedup). This
     /// does not emit a market-data snapshot.
     snapshot_every: u64,
@@ -187,6 +195,7 @@ impl SymbolEngine {
             last_ts_ns: 0,
             commands: 0,
             halted: false,
+            session: SessionState::Open,
             snapshot_every: 10_000,
             md_snapshot_every: 100_000,
             until_state_snapshot: 0,
@@ -252,6 +261,13 @@ impl SymbolEngine {
         self.halted
     }
 
+    /// The instrument session. New orders are admitted only while this is
+    /// [`SessionState::Open`]; cancels and operator commands are always
+    /// allowed.
+    pub fn session(&self) -> SessionState {
+        self.session
+    }
+
     /// Set the halt flag without an input command. This bypasses the log, so
     /// replay and snapshots only stay consistent when it is used before any
     /// command is logged (bootstrap/admin paths should prefer
@@ -267,6 +283,9 @@ impl SymbolEngine {
         self.commands = self.commands.saturating_add(1);
 
         match command.kind {
+            // Session control is dispatched before the order path: it changes
+            // admission for every later command in the log, exactly like halt.
+            CommandKind::SetSession => self.process_set_session(command, out),
             CommandKind::Halt => self.process_halt(command, out),
             CommandKind::Resume => self.process_resume(command, out),
             CommandKind::Cancel => self.process_cancel(command, out),
@@ -304,17 +323,48 @@ impl SymbolEngine {
     /// event is harmless to consumers that already know.
     fn process_halt(&mut self, command: &Command, out: &mut EngineOutput) {
         self.halted = true;
-        self.push_status(out, command, MD_FLAG_HALTED);
+        self.push_status(out, command);
     }
 
     /// Resume a halted instrument. A resume on a running instrument is a no-op
     /// on the book (it still re-emits the clear status).
     fn process_resume(&mut self, command: &Command, out: &mut EngineOutput) {
         self.halted = false;
-        self.push_status(out, command, 0);
+        self.push_status(out, command);
     }
 
-    fn push_status(&mut self, out: &mut EngineOutput, command: &Command, flags: u8) {
+    /// Move the instrument to the session carried by the command.
+    ///
+    /// Like halt/resume, this is an ordered operator command: `process` has
+    /// already advanced `last_offset`, `last_ts_ns` and `commands`, so the
+    /// status event points at the command's own offset and the change survives
+    /// replay. The book is untouched: a session change stops new risk, it does
+    /// not cancel resting orders.
+    ///
+    /// A command whose `flags` do not decode (bits outside the session byte,
+    /// or an unknown code) leaves the session unchanged and still re-emits the
+    /// current status. The journal is a trust boundary, so an undecodable
+    /// session is treated as "no instruction" rather than as a value to guess
+    /// at; the gateway validates before append, so this is only reachable from
+    /// a corrupt or crafted log, and the deterministic outcome is that the
+    /// state hash does not change.
+    fn process_set_session(&mut self, command: &Command, out: &mut EngineOutput) {
+        if let Ok(session) = command.session_state() {
+            self.session = session;
+        }
+        self.push_status(out, command);
+    }
+
+    /// The MD status bits for the current venue state: the halt flag plus the
+    /// session code. Both live in one byte so a Status event (and the trailing
+    /// snapshot byte) is a complete venue-status view.
+    fn status_flags(&self) -> u8 {
+        let halted = if self.halted { MD_FLAG_HALTED } else { 0 };
+        halted | self.session.to_md_flags()
+    }
+
+    fn push_status(&mut self, out: &mut EngineOutput, command: &Command) {
+        let flags = self.status_flags();
         self.push_md(
             out,
             MdKind::Status,
@@ -378,8 +428,21 @@ impl SymbolEngine {
         // A halt blocks new risk but not risk withdrawal: cancels are
         // dispatched above this check so participants can pull resting orders
         // while the instrument is halted, and resume itself is never blocked.
+        //
+        // The halt check runs before the session check on purpose: a halted
+        // instrument is an explicit operator stop, so a client that also
+        // arrives during a pre-open or closed session should be told "halted"
+        // rather than given a session-specific reason that would read as a
+        // scheduling problem. The rejection is the same either way; only the
+        // reason differs.
         if self.halted {
             self.reject(out, command, RejectReason::Halted);
+            return;
+        }
+        // Sessions only gate new risk. Cancels stay open in every session so a
+        // closed instrument can still have its resting orders withdrawn.
+        if self.session != SessionState::Open {
+            self.reject(out, command, RejectReason::SessionNotOpen);
             return;
         }
         if command.qty.is_zero() || command.qty.0 > MAX_ORDER_QTY {
@@ -783,7 +846,7 @@ impl SymbolEngine {
             bids,
             asks,
             orders,
-            flags: if self.halted { MD_FLAG_HALTED } else { 0 },
+            flags: self.status_flags(),
         }
     }
 
@@ -803,7 +866,11 @@ impl SymbolEngine {
         hasher.update(&self.md_seq.0.to_le_bytes());
         hasher.update(&self.last_offset.to_le_bytes());
         hasher.update(&self.last_ts_ns.to_le_bytes());
-        hasher.update(&[u8::from(self.halted)]);
+        // Venue status is two bytes: halt and session. The session byte is a
+        // deliberate state-format change (snapshot store v5); it makes a
+        // restored pre-open/closed instrument hash differently from an open
+        // one, so replay cannot lose a session change.
+        hasher.update(&[u8::from(self.halted), self.session.as_code()]);
         *hasher.finalize().as_bytes()
     }
 
@@ -847,6 +914,7 @@ impl SymbolEngine {
             last_ts_ns: self.last_ts_ns,
             commands: self.commands,
             halted: self.halted,
+            session: self.session,
             state_hash: [0; 32],
         }
     }
@@ -872,6 +940,7 @@ impl SymbolEngine {
             last_ts_ns: snapshot.last_ts_ns,
             commands: snapshot.commands,
             halted: snapshot.halted,
+            session: snapshot.session,
             snapshot_every: 10_000,
             md_snapshot_every: 100_000,
             until_state_snapshot: 0,
@@ -946,7 +1015,7 @@ pub fn hash_symbol_snapshot(snapshot: &SymbolSnapshot) -> [u8; 32] {
     hasher.update(&snapshot.md_seq.0.to_le_bytes());
     hasher.update(&snapshot.last_offset.to_le_bytes());
     hasher.update(&snapshot.last_ts_ns.to_le_bytes());
-    hasher.update(&[u8::from(snapshot.halted)]);
+    hasher.update(&[u8::from(snapshot.halted), snapshot.session.as_code()]);
     *hasher.finalize().as_bytes()
 }
 
@@ -1413,7 +1482,11 @@ mod tests {
         let status = &out.md[0];
         assert_eq!(status.kind, MdKind::Status);
         assert_eq!(status.symbol, symbol());
-        assert_eq!(status.flags, MD_FLAG_HALTED);
+        assert_eq!(
+            status.flags,
+            MD_FLAG_HALTED | SessionState::Open.to_md_flags(),
+            "status carries the halt bit and the open-session bits"
+        );
         assert_eq!(status.participant, ParticipantId(9));
         assert_eq!(status.order_id, OrderId(0));
         assert_eq!(status.side, Side::Buy);
@@ -1461,7 +1534,10 @@ mod tests {
             "an operator may need the status confirmed again"
         );
         assert_eq!(out.md[0].kind, MdKind::Status);
-        assert_eq!(out.md[0].flags, MD_FLAG_HALTED);
+        assert_eq!(
+            out.md[0].flags,
+            MD_FLAG_HALTED | SessionState::Open.to_md_flags()
+        );
         assert_eq!(out.md[0].cause_offset, 2);
 
         assert_eq!(engine.book().best_bid(), bids_before);
@@ -1503,7 +1579,11 @@ mod tests {
         assert!(out.executions.is_empty());
         assert_eq!(out.md.len(), 1);
         assert_eq!(out.md[0].kind, MdKind::Status);
-        assert_eq!(out.md[0].flags, 0);
+        assert_eq!(
+            out.md[0].flags,
+            SessionState::Open.to_md_flags(),
+            "a resume clears only the halt bit"
+        );
         assert_eq!(out.md[0].participant, ParticipantId(9));
         assert_eq!(out.md[0].cause_offset, 3);
 
@@ -1539,7 +1619,7 @@ mod tests {
         );
         assert!(!restored_engine.is_halted());
         assert_eq!(out.md.len(), 1);
-        assert_eq!(out.md[0].flags, 0);
+        assert_eq!(out.md[0].flags, SessionState::Open.to_md_flags());
 
         // A rejected id stays in the dedup window, so use a fresh one.
         let out = process(&mut restored_engine, &limit(Side::Buy, 100, 1, 3, 2), 4);
@@ -1568,6 +1648,256 @@ mod tests {
         assert_eq!(a.state_hash(), b.state_hash());
         assert!(!a.is_halted());
         assert_eq!(a.book().best_bid(), Some(Price(104)));
+    }
+
+    #[test]
+    fn set_session_emits_status_and_gates_new_orders() {
+        let mut engine = SymbolEngine::new(config());
+        assert_eq!(
+            engine.session(),
+            SessionState::Open,
+            "the pre-session default stays open"
+        );
+        process(&mut engine, &limit(Side::Buy, 100, 10, 1, 1), 0);
+
+        // Pre-open: a status event, no execution report, book untouched.
+        let out = process(
+            &mut engine,
+            &Command::set_session(symbol(), SessionState::PreOpen, ParticipantId(9), 2),
+            1,
+        );
+        assert_eq!(engine.session(), SessionState::PreOpen);
+        assert!(out.executions.is_empty());
+        assert_eq!(out.md.len(), 1);
+        assert_eq!(out.md[0].kind, MdKind::Status);
+        assert_eq!(out.md[0].flags, SessionState::PreOpen.to_md_flags());
+        assert_eq!(out.md[0].participant, ParticipantId(9));
+        assert_eq!(out.md[0].cause_offset, 1);
+        assert_eq!(engine.book().best_bid(), Some(Price(100)));
+
+        let out = process(&mut engine, &limit(Side::Buy, 99, 1, 2, 2), 2);
+        assert_eq!(out.executions.len(), 1);
+        assert_eq!(out.executions[0].kind, ExecKind::Rejected);
+        assert_eq!(out.executions[0].reason, RejectReason::SessionNotOpen);
+        assert!(out.md.is_empty(), "a rejection emits no market data");
+
+        // Risk withdrawal is still allowed while the session is not open.
+        let cancel = Command::cancel(symbol(), OrderId(1), ParticipantId(1), 3);
+        let out = process(&mut engine, &cancel, 3);
+        assert_eq!(out.executions[0].kind, ExecKind::Cancelled);
+        assert_eq!(out.md[0].kind, MdKind::Remove);
+        assert_eq!(engine.book().best_bid(), None);
+        assert_eq!(engine.session(), SessionState::PreOpen);
+
+        // Closed rejects too, and reopening admits orders again.
+        let out = process(
+            &mut engine,
+            &Command::set_session(symbol(), SessionState::Closed, ParticipantId(9), 4),
+            4,
+        );
+        assert_eq!(out.md[0].flags, SessionState::Closed.to_md_flags());
+        assert_eq!(engine.session(), SessionState::Closed);
+        let out = process(&mut engine, &limit(Side::Buy, 98, 1, 3, 2), 5);
+        assert_eq!(out.executions[0].reason, RejectReason::SessionNotOpen);
+
+        process(
+            &mut engine,
+            &Command::set_session(symbol(), SessionState::Open, ParticipantId(9), 6),
+            6,
+        );
+        let out = process(&mut engine, &limit(Side::Buy, 101, 1, 4, 2), 7);
+        assert_eq!(out.executions[0].kind, ExecKind::Accepted);
+        assert_eq!(engine.book().best_bid(), Some(Price(101)));
+    }
+
+    #[test]
+    fn halt_is_checked_before_the_session() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Sell, 105, 10, 1, 1), 0);
+        process(
+            &mut engine,
+            &Command::set_session(symbol(), SessionState::PreOpen, ParticipantId(9), 2),
+            1,
+        );
+        let out = process(
+            &mut engine,
+            &Command::halt(symbol(), ParticipantId(9), 3),
+            2,
+        );
+        assert_eq!(
+            out.md[0].flags,
+            MD_FLAG_HALTED | SessionState::PreOpen.to_md_flags(),
+            "one status byte carries both bits"
+        );
+
+        // Halted and pre-open: the explicit operator stop wins the reason.
+        let out = process(&mut engine, &limit(Side::Buy, 100, 1, 2, 2), 3);
+        assert_eq!(out.executions[0].reason, RejectReason::Halted);
+
+        // Resume clears only the halt; orders are still gated by the session.
+        let out = process(
+            &mut engine,
+            &Command::resume(symbol(), ParticipantId(9), 4),
+            4,
+        );
+        assert!(!engine.is_halted());
+        assert_eq!(out.md[0].flags, SessionState::PreOpen.to_md_flags());
+        let out = process(&mut engine, &limit(Side::Buy, 100, 1, 3, 2), 5);
+        assert_eq!(out.executions[0].reason, RejectReason::SessionNotOpen);
+
+        // Cancelling is allowed in every session, halted or not.
+        let cancel = Command::cancel(symbol(), OrderId(1), ParticipantId(1), 6);
+        let out = process(&mut engine, &cancel, 6);
+        assert_eq!(out.executions[0].kind, ExecKind::Cancelled);
+    }
+
+    #[test]
+    fn session_is_part_of_the_state_hash() {
+        let mut open = SymbolEngine::new(config());
+        let mut closed = SymbolEngine::new(config());
+        for engine in [&mut open, &mut closed] {
+            process(engine, &limit(Side::Buy, 100, 10, 1, 1), 0);
+        }
+        process(
+            &mut closed,
+            &Command::set_session(symbol(), SessionState::Closed, ParticipantId(9), 2),
+            1,
+        );
+        assert_eq!(open.book().best_bid(), closed.book().best_bid());
+        assert_ne!(
+            open.state_hash(),
+            closed.state_hash(),
+            "the session byte must enter the state hash"
+        );
+    }
+
+    #[test]
+    fn session_survives_snapshot_and_restore() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Sell, 105, 10, 1, 1), 0);
+        process(
+            &mut engine,
+            &Command::set_session(symbol(), SessionState::Closed, ParticipantId(9), 2),
+            1,
+        );
+        let hash = engine.state_hash();
+        let snapshot = engine.snapshot_state();
+        assert_eq!(snapshot.session, SessionState::Closed);
+        assert_eq!(
+            snapshot.book.orders.len(),
+            1,
+            "a session change does not cancel resting orders"
+        );
+
+        let mut restored = SymbolEngine::from_snapshot(config(), snapshot).expect("restore");
+        assert_eq!(restored.session(), SessionState::Closed);
+        assert_eq!(restored.state_hash(), hash);
+
+        let out = process(&mut restored, &limit(Side::Buy, 105, 1, 2, 2), 2);
+        assert_eq!(out.executions[0].reason, RejectReason::SessionNotOpen);
+
+        process(
+            &mut restored,
+            &Command::set_session(symbol(), SessionState::Open, ParticipantId(9), 3),
+            3,
+        );
+        let out = process(&mut restored, &limit(Side::Buy, 100, 1, 3, 2), 4);
+        assert_eq!(out.executions[0].kind, ExecKind::Accepted);
+        assert_eq!(restored.book().best_bid(), Some(Price(100)));
+    }
+
+    #[test]
+    fn md_snapshot_flags_carry_halt_and_session_together() {
+        let mut engine = SymbolEngine::new(config());
+        process(
+            &mut engine,
+            &Command::set_session(symbol(), SessionState::Closed, ParticipantId(9), 1),
+            0,
+        );
+        assert_eq!(
+            engine.snapshot().flags,
+            SessionState::Closed.to_md_flags(),
+            "a snapshot alone tells a subscriber the session"
+        );
+        process(
+            &mut engine,
+            &Command::halt(symbol(), ParticipantId(9), 2),
+            1,
+        );
+        assert_eq!(
+            engine.snapshot().flags,
+            MD_FLAG_HALTED | SessionState::Closed.to_md_flags()
+        );
+        assert_eq!(
+            SessionState::from_md_flags(engine.snapshot().flags).unwrap(),
+            SessionState::Closed
+        );
+    }
+
+    #[test]
+    fn session_changes_replay_deterministically() {
+        let commands = [
+            (0, limit(Side::Sell, 105, 10, 1, 1)),
+            (
+                1,
+                Command::set_session(symbol(), SessionState::PreOpen, ParticipantId(9), 2),
+            ),
+            (2, limit(Side::Buy, 100, 4, 2, 2)),
+            (
+                3,
+                Command::cancel(symbol(), OrderId(1), ParticipantId(1), 4),
+            ),
+            (
+                4,
+                Command::set_session(symbol(), SessionState::Open, ParticipantId(9), 4),
+            ),
+            (5, limit(Side::Buy, 104, 8, 3, 3)),
+        ];
+        let mut a = SymbolEngine::new(config());
+        let mut b = SymbolEngine::new(config());
+        for (offset, command) in &commands {
+            let out_a = process(&mut a, command, *offset);
+            let out_b = process(&mut b, command, *offset);
+            assert_eq!(
+                out_a
+                    .executions
+                    .iter()
+                    .map(|e| e.encode())
+                    .collect::<Vec<_>>(),
+                out_b
+                    .executions
+                    .iter()
+                    .map(|e| e.encode())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                out_a.md.iter().map(|e| e.encode()).collect::<Vec<_>>(),
+                out_b.md.iter().map(|e| e.encode()).collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(a.state_hash(), b.state_hash());
+        assert_eq!(a.session(), SessionState::Open);
+        assert_eq!(a.book().best_bid(), Some(Price(104)));
+    }
+
+    #[test]
+    fn undecodable_session_command_changes_nothing() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Buy, 100, 10, 1, 1), 0);
+        let mut command = Command::set_session(symbol(), SessionState::Closed, ParticipantId(9), 2);
+        command.flags = 0x0102;
+        let out = process(&mut engine, &command, 1);
+        assert_eq!(
+            engine.session(),
+            SessionState::Open,
+            "an undecodable session must not silently close or reopen a market"
+        );
+        assert_eq!(out.md[0].kind, MdKind::Status);
+        assert_eq!(out.md[0].flags, SessionState::Open.to_md_flags());
+
+        // The book is untouched and new orders still work.
+        let out = process(&mut engine, &limit(Side::Buy, 101, 1, 2, 2), 2);
+        assert_eq!(out.executions[0].kind, ExecKind::Accepted);
     }
 
     #[test]

@@ -260,7 +260,7 @@ pub fn analyze(
                     acc.cancelled_notional += info.notional;
                 }
             }
-            CommandKind::Halt | CommandKind::Resume => {}
+            CommandKind::Halt | CommandKind::Resume | CommandKind::SetSession => {}
         }
     }
 

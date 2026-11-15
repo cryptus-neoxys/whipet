@@ -132,19 +132,80 @@ impl FromStr for OrderType {
     }
 }
 
-/// Input command kinds. Cancel, halt and resume reuse the fixed `Command`
-/// layout so the journal, gateway, and replay tooling have one decoder.
+/// Instrument session state.
 ///
-/// `Halt` and `Resume` are operator commands on the same input log as client
-/// traffic. Being ordered commands is what makes them replayable: a restored
-/// engine reaches the same halt state by replaying the log, and the audit
-/// trail is just the record that carried the command.
+/// The session is an engine field, not a per-command policy: it gates new
+/// orders until a later [`CommandKind::SetSession`] reopens the instrument.
+/// The default is [`SessionState::Open`] so an engine that never sees a
+/// session command behaves exactly as it did before sessions existed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    PreOpen = 0,
+    #[default]
+    Open = 1,
+    Closed = 2,
+}
+
+impl SessionState {
+    pub fn as_code(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_code(code: u8) -> Result<Self> {
+        match code {
+            0 => Ok(Self::PreOpen),
+            1 => Ok(Self::Open),
+            2 => Ok(Self::Closed),
+            other => Err(CoreError::UnknownDiscriminant {
+                kind: "SessionState",
+                value: other,
+            }),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PreOpen => "pre_open",
+            Self::Open => "open",
+            Self::Closed => "closed",
+        }
+    }
+
+    /// This session's bits in an MD status event or snapshot, placed at
+    /// [`MD_SESSION_SHIFT`] so they never collide with [`MD_FLAG_HALTED`].
+    pub fn to_md_flags(self) -> u8 {
+        (self.as_code() << MD_SESSION_SHIFT) & MD_SESSION_MASK
+    }
+
+    /// Decode the session bits of an MD status event or snapshot.
+    pub fn from_md_flags(flags: u8) -> Result<Self> {
+        Self::from_code((flags & MD_SESSION_MASK) >> MD_SESSION_SHIFT)
+    }
+}
+
+impl fmt::Display for SessionState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Input command kinds. Cancel, halt, resume and session control reuse the
+/// fixed `Command` layout so the journal, gateway, and replay tooling have one
+/// decoder.
+///
+/// `Halt`, `Resume` and `SetSession` are operator commands on the same input
+/// log as client traffic. Being ordered commands is what makes them
+/// replayable: a restored engine reaches the same halt and session state by
+/// replaying the log, and the audit trail is just the record that carried the
+/// command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandKind {
     NewOrder = 1,
     Cancel = 2,
     Halt = 3,
     Resume = 4,
+    SetSession = 5,
 }
 
 impl CommandKind {
@@ -154,6 +215,7 @@ impl CommandKind {
             2 => Ok(Self::Cancel),
             3 => Ok(Self::Halt),
             4 => Ok(Self::Resume),
+            5 => Ok(Self::SetSession),
             other => Err(CoreError::UnknownDiscriminant {
                 kind: "CommandKind",
                 value: other,
@@ -239,6 +301,36 @@ impl Command {
     /// Operator command: resume a halted instrument.
     pub fn resume(symbol: Symbol, participant: ParticipantId, timestamp_ns: u64) -> Self {
         Self::control(CommandKind::Resume, symbol, participant, timestamp_ns)
+    }
+
+    /// Operator command: move the instrument to `session`.
+    ///
+    /// The session code travels in the low byte of `flags`; every other field
+    /// keeps the zero side/price/qty/order-id shape of the other operator
+    /// commands, so [`COMMAND_ENCODED_LEN`] and the wire layout are unchanged.
+    pub fn set_session(
+        symbol: Symbol,
+        session: SessionState,
+        participant: ParticipantId,
+        timestamp_ns: u64,
+    ) -> Self {
+        let mut command = Self::control(CommandKind::SetSession, symbol, participant, timestamp_ns);
+        command.flags = u16::from(session.as_code());
+        command
+    }
+
+    /// Decode the session code carried by a [`CommandKind::SetSession`]
+    /// command. Any flag bit outside the session byte is rejected instead of
+    /// being ignored: the journal is a trust boundary, and a command that
+    /// carries two meanings is a bug, not a value to guess at.
+    pub fn session_state(&self) -> Result<SessionState> {
+        if self.flags & !u16::from(u8::MAX) != 0 {
+            return Err(CoreError::InvalidValue(format!(
+                "SetSession flags {:#06x} set bits outside the session code byte",
+                self.flags
+            )));
+        }
+        SessionState::from_code(self.flags as u8)
     }
 
     fn control(
@@ -373,6 +465,7 @@ pub enum RejectReason {
     SelfTradePrevention = 9,
     Halted = 10,
     Internal = 11,
+    SessionNotOpen = 12,
 }
 
 impl RejectReason {
@@ -394,6 +487,7 @@ impl RejectReason {
             9 => Ok(Self::SelfTradePrevention),
             10 => Ok(Self::Halted),
             11 => Ok(Self::Internal),
+            12 => Ok(Self::SessionNotOpen),
             other => Err(CoreError::InvalidValue(format!(
                 "unknown RejectReason code {other}"
             ))),
@@ -414,6 +508,7 @@ impl RejectReason {
             Self::SelfTradePrevention => "self_trade_prevention",
             Self::Halted => "halted",
             Self::Internal => "internal",
+            Self::SessionNotOpen => "session_not_open",
         }
     }
 }
@@ -551,9 +646,19 @@ impl MdKind {
 }
 
 /// Status-event flag: the instrument is halted. A resume status event carries
-/// `0`. Consumers should treat `MdKind::Status` with this flag set as "reject
-/// new orders until a status event without it".
+/// `0` in this bit. Consumers should treat `MdKind::Status` with this flag set
+/// as "reject new orders until a status event without it".
 pub const MD_FLAG_HALTED: u8 = 1 << 0;
+
+/// Where the [`SessionState`] code sits in a status-event or snapshot flag
+/// byte. Bit 0 is [`MD_FLAG_HALTED`], so the two bits above it carry the
+/// session.
+pub const MD_SESSION_SHIFT: u8 = 1;
+
+/// The two status-flag bits that carry [`SessionState`]. Extract with
+/// [`SessionState::from_md_flags`]; a snapshot with these bits and the halted
+/// bit describes the full venue status.
+pub const MD_SESSION_MASK: u8 = 0b11 << MD_SESSION_SHIFT;
 
 pub const MD_EVENT_ENCODED_LEN: usize = 1 + 1 + 16 + 8 + 8 + 8 + 1 + 1 + 8 + 8 + 16 + 8;
 
@@ -699,8 +804,9 @@ pub struct MdSnapshot {
     pub bids: Vec<MdLevel>,
     pub asks: Vec<MdLevel>,
     pub orders: Vec<MdOrder>,
-    /// Venue-status bits carried by the snapshot, e.g. [`MD_FLAG_HALTED`].
-    /// Encoded as an optional trailing byte so older snapshots decode as 0.
+    /// Venue-status bits carried by the snapshot: [`MD_FLAG_HALTED`] plus the
+    /// [`SessionState`] bits at [`MD_SESSION_SHIFT`]. Encoded as an optional
+    /// trailing byte so older snapshots decode as 0.
     pub flags: u8,
 }
 
@@ -868,11 +974,134 @@ mod tests {
             CommandKind::Cancel,
             CommandKind::Halt,
             CommandKind::Resume,
+            CommandKind::SetSession,
         ] {
             assert_eq!(CommandKind::from_code(kind as u8).unwrap(), kind);
         }
         assert!(CommandKind::from_code(0).is_err());
-        assert!(CommandKind::from_code(5).is_err());
+        assert!(CommandKind::from_code(6).is_err());
+    }
+
+    #[test]
+    fn session_state_codes_and_names_round_trip() {
+        for (session, code, name) in [
+            (SessionState::PreOpen, 0u8, "pre_open"),
+            (SessionState::Open, 1, "open"),
+            (SessionState::Closed, 2, "closed"),
+        ] {
+            assert_eq!(session.as_code(), code);
+            assert_eq!(SessionState::from_code(code).unwrap(), session);
+            assert_eq!(session.as_str(), name);
+            assert_eq!(session.to_string(), name);
+        }
+        assert_eq!(
+            SessionState::default(),
+            SessionState::Open,
+            "the default must preserve pre-session behaviour"
+        );
+        assert!(SessionState::from_code(3).is_err());
+
+        // serde names are the same snake_case strings the wire/hub uses.
+        for session in [
+            SessionState::PreOpen,
+            SessionState::Open,
+            SessionState::Closed,
+        ] {
+            let json = serde_json::to_string(&session).unwrap();
+            assert_eq!(json, format!("\"{}\"", session.as_str()));
+            assert_eq!(
+                serde_json::from_str::<SessionState>(&json).unwrap(),
+                session
+            );
+        }
+    }
+
+    #[test]
+    fn session_bits_do_not_collide_with_the_halted_flag() {
+        assert_eq!(MD_FLAG_HALTED & MD_SESSION_MASK, 0);
+        assert_eq!(SessionState::PreOpen.to_md_flags(), 0b000);
+        assert_eq!(SessionState::Open.to_md_flags(), 0b010);
+        assert_eq!(SessionState::Closed.to_md_flags(), 0b100);
+        for session in [
+            SessionState::PreOpen,
+            SessionState::Open,
+            SessionState::Closed,
+        ] {
+            // Halted is independent of the session: both compose fully.
+            let flags = MD_FLAG_HALTED | session.to_md_flags();
+            assert_eq!(flags & MD_FLAG_HALTED, MD_FLAG_HALTED);
+            assert_eq!(SessionState::from_md_flags(flags).unwrap(), session);
+        }
+    }
+
+    #[test]
+    fn set_session_round_trip() {
+        for session in [
+            SessionState::PreOpen,
+            SessionState::Open,
+            SessionState::Closed,
+        ] {
+            let command = Command::set_session(
+                symbol(),
+                session,
+                ParticipantId(7),
+                1_700_000_000_000_000_003,
+            );
+            assert_eq!(command.kind, CommandKind::SetSession);
+            assert_eq!(command.side, Side::Buy);
+            assert_eq!(command.order_type, OrderType::Limit);
+            assert_eq!(command.price, Price::ZERO);
+            assert_eq!(command.qty, Qty::ZERO);
+            assert_eq!(command.order_id, OrderId(0));
+            assert_eq!(command.participant, ParticipantId(7));
+            assert_eq!(command.nonce, 0);
+            assert_eq!(command.flags, u16::from(session.as_code()));
+            assert_eq!(command.session_state().unwrap(), session);
+
+            let bytes = command.encode();
+            assert_eq!(
+                bytes.len(),
+                COMMAND_ENCODED_LEN,
+                "the fixed wire layout is unchanged"
+            );
+            let decoded = Command::decode(&bytes).unwrap();
+            assert_eq!(decoded, command);
+            assert_eq!(decoded.session_state().unwrap(), session);
+        }
+    }
+
+    #[test]
+    fn set_session_rejects_flags_outside_the_session_byte() {
+        let mut command = Command::set_session(symbol(), SessionState::Closed, ParticipantId(7), 1);
+        command.flags = 0x0102;
+        assert!(command.session_state().is_err());
+        command.flags = 3;
+        assert!(command.session_state().is_err());
+    }
+
+    #[test]
+    fn reject_reasons_round_trip() {
+        let reasons = [
+            RejectReason::None,
+            RejectReason::UnknownSymbol,
+            RejectReason::InvalidPrice,
+            RejectReason::InvalidQty,
+            RejectReason::DuplicateOrderId,
+            RejectReason::PriceOutOfBand,
+            RejectReason::PostOnlyWouldCross,
+            RejectReason::FokUnfillable,
+            RejectReason::UnknownOrder,
+            RejectReason::SelfTradePrevention,
+            RejectReason::Halted,
+            RejectReason::Internal,
+            RejectReason::SessionNotOpen,
+        ];
+        for reason in reasons {
+            assert_eq!(RejectReason::from_code(reason.as_code()).unwrap(), reason);
+        }
+        assert_eq!(RejectReason::SessionNotOpen.as_code(), 12);
+        assert_eq!(RejectReason::SessionNotOpen.as_str(), "session_not_open");
+        assert!(RejectReason::from_code(13).is_err());
     }
 
     #[test]
@@ -927,7 +1156,7 @@ mod tests {
             cause_offset: 2,
             timestamp_ns: 3,
             side: Side::Buy,
-            flags: MD_FLAG_HALTED,
+            flags: MD_FLAG_HALTED | SessionState::Closed.to_md_flags(),
             price: Price::ZERO,
             qty: Qty::ZERO,
             order_id: OrderId(0),
@@ -935,7 +1164,13 @@ mod tests {
         };
         let bytes = event.encode();
         assert_eq!(bytes.len(), MD_EVENT_ENCODED_LEN);
-        assert_eq!(MdEvent::decode(&bytes).unwrap(), event);
+        let decoded = MdEvent::decode(&bytes).unwrap();
+        assert_eq!(decoded, event);
+        assert_eq!(
+            SessionState::from_md_flags(decoded.flags).unwrap(),
+            SessionState::Closed
+        );
+        assert_ne!(decoded.flags & MD_FLAG_HALTED, 0);
     }
 
     #[test]
@@ -971,10 +1206,15 @@ mod tests {
                 qty: Qty(10),
                 participant: ParticipantId(2),
             }],
-            flags: MD_FLAG_HALTED,
+            flags: MD_FLAG_HALTED | SessionState::Closed.to_md_flags(),
         };
         let bytes = snapshot.encode();
-        assert_eq!(MdSnapshot::decode(&bytes).unwrap(), snapshot);
+        let decoded = MdSnapshot::decode(&bytes).unwrap();
+        assert_eq!(decoded, snapshot);
+        assert_eq!(
+            SessionState::from_md_flags(decoded.flags).unwrap(),
+            SessionState::Closed
+        );
 
         // A snapshot written before the status byte decodes as running.
         let legacy = &bytes[..bytes.len() - 1];

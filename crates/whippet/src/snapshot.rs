@@ -10,13 +10,16 @@ use whippet_core::ids::Symbol;
 use whippet_engine::{ShardEngine, ShardSnapshot, fill_symbol_hashes};
 
 const MAGIC: &[u8; 8] = b"WHIPSNP1";
-/// Version 4 stores the dedup terminal-eviction queue as `u32` indices into the
-/// insertion-order walk rather than `OrderId`s, which cuts that payload from 40
-/// to 4 bytes per terminal id (~3.4 MB at the 100k dedup window) without
-/// changing the state hash. Version 3 added the terminal order; version 2 added
-/// the per-symbol config and the book's `min_price_ticks`. Older versions are
-/// rejected rather than misread.
-const VERSION: u32 = 4;
+/// Version 5 added the per-symbol `session` field (`SessionState`), so a
+/// restored engine knows whether new orders are admitted without replaying the
+/// session command again. Version 4 stores the dedup terminal-eviction queue as
+/// `u32` indices into the insertion-order walk rather than `OrderId`s, which
+/// cuts that payload from 40 to 4 bytes per terminal id (~3.4 MB at the 100k
+/// dedup window) without changing the state hash. Version 3 added the terminal
+/// order; version 2 added the per-symbol config and the book's
+/// `min_price_ticks`. Older versions are rejected rather than misread: every
+/// layout change is a hard cut, not a compatibility shim.
+const VERSION: u32 = 5;
 const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -413,6 +416,73 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_round_trip_preserves_the_session() {
+        use whippet_core::ids::{OrderId, ParticipantId, Price, Qty};
+        use whippet_core::protocol::{Command, OrderType, SessionState, Side};
+
+        let exchange = test_exchange();
+        let shard_id = test_shard(&exchange);
+        let symbol = Symbol::new("BTC-USD").unwrap();
+        let mut engine = ShardEngine::new(shard_id, &exchange);
+        let mut out = whippet_engine::EngineOutput::with_capacity(8, 8);
+        let order = Command::new_order(
+            symbol,
+            Side::Buy,
+            OrderType::Limit,
+            Price(40_000),
+            Qty(1),
+            OrderId(1),
+            ParticipantId(1),
+            1,
+        );
+        engine.process(&order, 0, &mut out).unwrap();
+        out.clear();
+        let pre_open = Command::set_session(symbol, SessionState::PreOpen, ParticipantId(9), 2);
+        engine.process(&pre_open, 1, &mut out).unwrap();
+        out.clear();
+        let live = engine.state_hash();
+        assert_eq!(
+            engine.engine(symbol).unwrap().session(),
+            SessionState::PreOpen
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::new(dir.path());
+        store.save(&engine.snapshot_state()).unwrap();
+        let loaded = store.load(shard_id).unwrap().unwrap();
+        assert_eq!(loaded.symbols[0].session, SessionState::PreOpen);
+
+        let mut restored = ShardEngine::from_snapshot(&exchange, loaded).unwrap();
+        assert_eq!(restored.state_hash(), live);
+        assert_eq!(
+            restored.engine(symbol).unwrap().session(),
+            SessionState::PreOpen
+        );
+        // v5 restores the gate, not only the flag.
+        let rejected = Command::new_order(
+            symbol,
+            Side::Buy,
+            OrderType::Limit,
+            Price(40_000),
+            Qty(1),
+            OrderId(2),
+            ParticipantId(1),
+            3,
+        );
+        engine.process(&rejected, 2, &mut out).unwrap();
+        assert_eq!(
+            out.executions[0].reason,
+            whippet_core::protocol::RejectReason::SessionNotOpen
+        );
+        out.clear();
+        restored.process(&rejected, 2, &mut out).unwrap();
+        assert_eq!(
+            out.executions[0].reason,
+            whippet_core::protocol::RejectReason::SessionNotOpen
+        );
+    }
+
+    #[test]
     fn writer_verifies_and_restores_the_same_hash() {
         let exchange = test_exchange();
         let shard_id = test_shard(&exchange);
@@ -606,10 +676,11 @@ mod tests {
 
     #[test]
     fn older_snapshot_versions_are_rejected_not_misread() {
-        // v4 changed the dedup terminal payload from `OrderId`s to `u32`
-        // indices into the dedup walk. A v3 file must fail loudly rather than
-        // deserialize into the new layout: the index list would read as ids.
-        for version in [1u32, 2, 3] {
+        // v5 added the per-symbol session field, so a v4 payload has no byte
+        // for it and must fail loudly rather than deserialize into the new
+        // layout. v4 itself changed the dedup terminal payload from `OrderId`s
+        // to `u32` indices, which v3 files would read as ids.
+        for version in [1u32, 2, 3, 4] {
             let dir = tempfile::tempdir().unwrap();
             let store = SnapshotStore::new(dir.path());
             let path = store.path(3);
