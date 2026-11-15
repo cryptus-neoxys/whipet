@@ -260,11 +260,12 @@ Scenarios:
 | `flash_crash` | Four phases over 4,000 actions: calm, sell-heavy crash (32% market, 82% sell bias, -4 tick drift), drought, recovery. |
 | `liquidity_drought` | 42% cancel, 8-tick spread, low market-order rate. |
 
-The simulator is seeded with ChaCha20. The same seed and scenario produce the
-same action sequence. The client order id is derived from the seed and a
-sequence counter, so restarting with the same seed replays the same order ids.
-The engine's dedup table rejects them. Use a new `--seed` when you want a new
-flow against an existing log.
+The simulator is seeded with ChaCha20. The same `(seed, run-nonce)` and
+scenario produce the same action sequence; a reproducible run must pin both.
+Client order ids include the full seed, nonce, and sequence, so restarting with
+the same pair replays the same ids and the engine's dedup table rejects them.
+Use a new `--seed` or a fresh `--run-nonce` when you want a new flow against an
+existing log.
 
 The simulator sends HTTP requests to the gateway. It measures gateway
 acceptance, not matching latency. It does not maintain an acknowledged ledger;
@@ -590,9 +591,10 @@ offset unless you intend to rebuild. See
 
 ### Simulator orders are rejected as duplicates
 
-The simulator derives order ids from the seed and a sequence counter.
-Restarting with the same seed regenerates the same ids, and the engine rejects
-them with `duplicate_order_id`. Use a new `--seed`, or reset the log.
+The simulator derives order ids from the seed, run nonce, and sequence counter.
+Restarting with the same pair regenerates the same ids, and the engine rejects
+them with `duplicate_order_id`. Use a new `--seed`, a fresh `--run-nonce`, or
+reset the log.
 
 ### Bench p99 is dominated by scheduler slip
 

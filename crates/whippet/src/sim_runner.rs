@@ -28,7 +28,9 @@ pub struct SimArgs {
     /// Omit for a fresh demo run. Pass a value for a reproducible run.
     #[arg(long)]
     pub seed: Option<u64>,
-    /// Extra nonce for a reproducible run; defaults to 0 when --seed is given.
+    /// Nonce for a reproducible run; defaults to 0 when --seed is given.
+    /// Pin both --seed and --run-nonce to reproduce a stream; pass a fresh
+    /// nonce when a pinned seed is rerun against a log that already knows its ids.
     #[arg(long)]
     pub run_nonce: Option<u64>,
     #[arg(

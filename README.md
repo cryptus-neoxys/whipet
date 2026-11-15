@@ -194,10 +194,11 @@ with `sent`, `errors`, `dropped`, and `open_orders`, then `simulator stopped`.
 The dashboard should show the tape and the book moving within a second.
 
 Scenarios: `calm_open`, `volatile_news`, `flash_crash`, `liquidity_drought`.
-The simulator is seeded and deterministic. Restarting it with the same seed
-regenerates the same order ids, and the engine rejects them as duplicates.
-Use a new `--seed` for a new flow. Without `--seed`, the simulator uses a fresh
-run nonce, so a restart does not replay old client order ids.
+The simulator is seeded and deterministic: pin both `--seed` and `--run-nonce`
+to reproduce an action stream. Restarting with the same pair regenerates the
+same order ids, and the engine rejects them as duplicates. Use a new `--seed`
+or a fresh `--run-nonce` for a new flow. Without `--seed`, the simulator uses a
+fresh seed and run nonce, so a restart does not replay old client order ids.
 
 ### 5. Produce a bench manifest
 
