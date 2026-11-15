@@ -861,7 +861,7 @@ pub(crate) fn journal_message_for_command(command: &Command) -> JournalMessage {
 
 /// Constant-time bearer comparison shared by the HTTP and TCP ingress paths.
 pub(crate) fn token_matches(expected: &str, presented: &str) -> bool {
-    constant_time_eq(expected.as_bytes(), presented.as_bytes())
+    crate::auth::constant_time_eq(expected.as_bytes(), presented.as_bytes())
 }
 
 async fn cancel_order(
@@ -950,18 +950,16 @@ fn authenticate<'a>(
     ctx: &'a NodeContext,
     headers: &HeaderMap,
 ) -> Result<Option<&'a str>, (StatusCode, Json<ApiError>)> {
-    let Some(expected) = ctx.config.api_token.as_deref() else {
+    if !ctx.config.auth_required() {
         return Ok(None);
-    };
+    }
     let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(bearer_token);
-    match presented {
-        Some(token) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => {
-            Ok(Some(ctx.config.api_participant.as_str()))
-        }
-        _ => Err((
+    match presented.and_then(|token| ctx.config.participant_for(token)) {
+        Some(participant) => Ok(Some(participant)),
+        None => Err((
             StatusCode::UNAUTHORIZED,
             Json(ApiError::new(
                 "unauthorized",
@@ -980,18 +978,7 @@ fn bearer_token(value: &str) -> Option<&str> {
     (!token.is_empty()).then_some(token)
 }
 
-/// Compare without early exit so a wrong token cannot be recovered byte by
-/// byte from response timing.
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (a, b) in left.iter().zip(right) {
-        diff |= a ^ b;
-    }
-    diff == 0
-}
+use crate::auth::constant_time_eq;
 
 /// Shared participant check for the HTTP ingress paths. Returns the name
 /// borrowed from the caller config, the request, or the anonymous fallback:
@@ -1130,7 +1117,23 @@ async fn instruments(
 async fn prometheus(
     State(ctx): State<Arc<NodeContext>>,
     Extension(ws_state): Extension<Arc<WsState>>,
-) -> impl IntoResponse {
+    headers: HeaderMap,
+) -> Response {
+    if !ctx.config.metrics_authorized(
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(bearer_token),
+    ) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiError::new(
+                "unauthorized",
+                "a valid Authorization: Bearer token is required for /metrics",
+            )),
+        )
+            .into_response();
+    }
     let state = ctx.hub.latest();
     let stats = ctx.group_commit.stats();
     let stages = ctx.metrics.stage_snapshot();
@@ -1217,6 +1220,7 @@ async fn prometheus(
         )],
         body,
     )
+        .into_response()
 }
 
 /// Prometheus exposition. Counters are monotonic; percentiles are gauges

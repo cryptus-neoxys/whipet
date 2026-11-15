@@ -107,6 +107,9 @@ pub async fn serve(ctx: Arc<NodeContext>, addr: SocketAddr) -> anyhow::Result<()
 /// Per-connection state that outlives a single request.
 struct ConnectionState {
     authorized: bool,
+    /// Participant bound to the token that authorized this connection. `None`
+    /// on an anonymous node; every submitted command must carry this identity.
+    participant: Option<String>,
     peer: IpAddr,
     limiter: Arc<RateLimiter>,
 }
@@ -126,6 +129,7 @@ impl ConnectionState {
         Self {
             // Anonymous ingress is only possible when no token is configured.
             authorized: !ctx.config.auth_required(),
+            participant: None,
             peer,
             limiter,
         }
@@ -234,18 +238,19 @@ fn handle_hello(
     if state.authorized {
         return (hello_ack(true), false);
     }
-    match ctx.config.api_token.as_deref() {
+    if !ctx.config.auth_required() {
         // Defensive: an anonymous node starts authorized, so this arm is only
         // reachable if that invariant ever changes.
-        None => {
+        state.authorized = true;
+        return (hello_ack(true), false);
+    }
+    match ctx.config.participant_for(token) {
+        Some(participant) => {
             state.authorized = true;
+            state.participant = Some(participant.to_string());
             (hello_ack(true), false)
         }
-        Some(expected) if token_matches(expected, token) => {
-            state.authorized = true;
-            (hello_ack(true), false)
-        }
-        Some(_) => (hello_ack(false), true),
+        None => (hello_ack(false), true),
     }
 }
 
@@ -297,6 +302,22 @@ async fn handle_submit(
         );
     }
 
+    // A token authorizes one participant, not just "some valid client". A
+    // token holder cannot submit an order attributed to another desk.
+    if let Some(participant) = &state.participant
+        && commands.iter().any(|command| {
+            command.participant.0 != 0 && command.participant.as_str() != participant
+        })
+    {
+            return (
+                error_response(
+                    TcpErrorCode::Unauthorized,
+                    "this token is bound to a different participant",
+                ),
+                false,
+            );
+        }
+    }
     let symbol = match validate_batch(ctx, &commands) {
         Ok(symbol) => symbol,
         Err(response) => return (response, false),

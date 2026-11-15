@@ -8,6 +8,7 @@ use whippet_core::config::{ExchangeConfig, Mode, default_instruments};
 use whippet_core::error::CoreError;
 use whippet_core::ids::Symbol;
 
+use crate::auth::ApiToken;
 use crate::turbo::TurboConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,15 +98,24 @@ pub struct NodeArgs {
     /// Optional build label shown on the dashboard.
     #[arg(long, env = "WHIPPET_BUILD", default_value = "dev")]
     pub build: String,
-    /// Optional bearer token for order ingress and cancel. When unset, those
-    /// endpoints accept anonymous requests: a demo convenience, not a
+    /// Optional legacy bearer token for order ingress and cancel. When unset,
+    /// those endpoints accept anonymous requests: a demo convenience, not a
     /// deployment posture. Set this for anything reachable by another host.
     #[arg(long, env = "WHIPPET_API_TOKEN")]
     pub api_token: Option<String>,
-    /// Participant name assigned to authenticated ingress. Requests may omit
+    /// Participant name assigned to the legacy single token. Requests may omit
     /// `participant`; supplying a different one is rejected with 403.
     #[arg(long, env = "WHIPPET_API_PARTICIPANT", default_value = "api")]
     pub api_participant: String,
+    /// Scoped tokens as `token:participant` pairs, comma separated. Each token
+    /// authorizes only its own participant, so self-trade prevention and order
+    /// attribution see distinct identities. Merged with `WHIPPET_API_TOKEN`.
+    #[arg(long, env = "WHIPPET_API_TOKENS")]
+    pub api_tokens: Option<String>,
+    /// Optional bearer token for `GET /metrics`. When set, the endpoint
+    /// requires it; health and readiness stay unauthenticated for probes.
+    #[arg(long, env = "WHIPPET_METRICS_TOKEN")]
+    pub metrics_token: Option<String>,
     /// Per-IP ingress token bucket, in requests per second. `0` disables the
     /// limiter, which is the single-node demo default.
     #[arg(long, env = "WHIPPET_RATE_LIMIT_PER_SEC", default_value_t = 0)]
@@ -148,8 +158,12 @@ pub struct NodeConfig {
     pub build: String,
     /// Bearer token required by ingress when set. Never logged or serialized.
     pub api_token: Option<String>,
-    /// Participant derived from a valid token.
+    /// Participant derived from the legacy single token.
     pub api_participant: String,
+    /// Scoped tokens. Never logged or serialized.
+    pub api_tokens: Vec<ApiToken>,
+    /// Optional bearer token for `/metrics`.
+    pub metrics_token: Option<String>,
     /// 0 disables per-IP ingress limiting.
     pub rate_limit_per_sec: u32,
     /// 0 disables the per-IP WebSocket sub-limit.
@@ -161,7 +175,41 @@ pub struct NodeConfig {
 
 impl NodeConfig {
     pub fn auth_required(&self) -> bool {
-        self.api_token.is_some()
+        self.api_token.is_some() || !self.api_tokens.is_empty()
+    }
+
+    /// Map a presented bearer token to its participant, or `None`.
+    ///
+    /// Every entry is compared without a length or byte shortcut, and the
+    /// loop does not stop at the first match, so response timing does not
+    /// reveal whether a token exists or which entry matched.
+    pub fn participant_for(&self, presented: &str) -> Option<&str> {
+        let presented = presented.as_bytes();
+        let mut matched: Option<&str> = None;
+        for entry in &self.api_tokens {
+            if crate::auth::constant_time_eq(entry.token.as_bytes(), presented) && matched.is_none()
+            {
+                matched = Some(entry.participant.as_str());
+            }
+        }
+        if let Some(legacy) = self.api_token.as_deref()
+            && crate::auth::constant_time_eq(legacy.as_bytes(), presented)
+            && matched.is_none()
+        {
+            matched = Some(self.api_participant.as_str());
+        }
+        matched
+    }
+
+    /// True when the presented token may read `/metrics`; always true when no
+    /// metrics token is configured.
+    pub fn metrics_authorized(&self, presented: Option<&str>) -> bool {
+        match self.metrics_token.as_deref() {
+            None => true,
+            Some(expected) => presented.is_some_and(|token| {
+                crate::auth::constant_time_eq(expected.as_bytes(), token.as_bytes())
+            }),
+        }
     }
 
     pub fn from_args(args: NodeArgs) -> Result<Self, ConfigError> {
@@ -193,6 +241,26 @@ impl NodeConfig {
             ));
         }
         let api_token = args.api_token.filter(|value| !value.trim().is_empty());
+        let api_tokens = args
+            .api_tokens
+            .as_deref()
+            .map(parse_api_tokens)
+            .transpose()?
+            .unwrap_or_default();
+        let metrics_token = args.metrics_token.filter(|value| !value.trim().is_empty());
+        // A duplicate token would make `participant_for` order-dependent; a
+        // duplicate participant is allowed (rotation, two tokens one desk).
+        for (index, entry) in api_tokens.iter().enumerate() {
+            if api_tokens[..index]
+                .iter()
+                .any(|other| other.token == entry.token)
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate token for participant {} in WHIPPET_API_TOKENS",
+                    entry.participant
+                )));
+            }
+        }
 
         let exchange = exchange_config(&args.venue, args.partitions, mode, &args.symbols)?;
 
@@ -211,11 +279,55 @@ impl NodeConfig {
             build: args.build,
             api_token,
             api_participant,
+            api_tokens,
+            metrics_token,
             rate_limit_per_sec: args.rate_limit_per_sec,
             ws_per_ip: args.ws_per_ip,
             turbo,
         })
     }
+}
+
+/// Parse `token:participant` pairs from `WHIPPET_API_TOKENS`.
+///
+/// Tokens cannot contain `:`; the first colon separates the pair. Empty pairs
+/// are ignored so a trailing comma is harmless. Both fields are trimmed and
+/// bounded like the legacy token/participant.
+fn parse_api_tokens(raw: &str) -> Result<Vec<ApiToken>, ConfigError> {
+    let mut tokens = Vec::new();
+    for pair in raw.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let Some((token, participant)) = pair.split_once(':') else {
+            return Err(ConfigError::Invalid(
+                "WHIPPET_API_TOKENS entries must be token:participant".into(),
+            ));
+        };
+        let token = token.trim();
+        let participant = participant.trim();
+        if token.is_empty() || token.len() > 256 {
+            return Err(ConfigError::Invalid(
+                "an API token must be between 1 and 256 bytes".into(),
+            ));
+        }
+        if token.contains(':') {
+            return Err(ConfigError::Invalid(
+                "API tokens cannot contain ':' (use token:participant)".into(),
+            ));
+        }
+        if participant.is_empty() || participant.len() > 64 {
+            return Err(ConfigError::Invalid(
+                "a token participant must be between 1 and 64 bytes".into(),
+            ));
+        }
+        tokens.push(ApiToken {
+            token: token.to_string(),
+            participant: participant.to_string(),
+        });
+    }
+    Ok(tokens)
 }
 
 /// Parse the optional binary TCP listen address. `off`, `none`, and an empty
@@ -306,6 +418,52 @@ mod tests {
     struct Cli {
         #[command(flatten)]
         node: NodeArgs,
+    }
+
+    #[test]
+    fn scoped_tokens_bind_distinct_participants() {
+        let cli = Cli::parse_from([
+            "test",
+            "--api-tokens",
+            "tok-a:alice, tok-b:bob",
+            "--metrics-token",
+            "metrics-secret",
+        ]);
+        let config = NodeConfig::from_args(cli.node).unwrap();
+        assert_eq!(config.participant_for("tok-a"), Some("alice"));
+        assert_eq!(config.participant_for("tok-b"), Some("bob"));
+        assert_eq!(config.participant_for("tok-c"), None);
+        assert!(config.auth_required());
+        assert!(config.metrics_authorized(Some("metrics-secret")));
+        assert!(!config.metrics_authorized(Some("nope")));
+        assert!(!config.metrics_authorized(None));
+    }
+
+    #[test]
+    fn malformed_and_duplicate_scoped_tokens_are_rejected() {
+        for raw in ["no-colon", "tok:", ":alice", "tok-a:alice,tok-a:bob"] {
+            let cli = Cli::parse_from(["test", "--api-tokens", raw]);
+            assert!(
+                NodeConfig::from_args(cli.node).is_err(),
+                "{raw} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn the_legacy_token_still_authorizes_its_participant() {
+        let cli = Cli::parse_from([
+            "test",
+            "--api-token",
+            "legacy",
+            "--api-participant",
+            "desk-1",
+            "--api-tokens",
+            "tok-a:alice",
+        ]);
+        let config = NodeConfig::from_args(cli.node).unwrap();
+        assert_eq!(config.participant_for("legacy"), Some("desk-1"));
+        assert_eq!(config.participant_for("tok-a"), Some("alice"));
     }
 
     #[test]
