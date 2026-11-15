@@ -14,7 +14,7 @@
 //! because submissions reach the writer over one channel.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -91,6 +91,10 @@ struct Inner {
     journal: Arc<Journal>,
     config: GroupCommitConfig,
     writers: Mutex<HashMap<(Topic, u32), Writer>>,
+    /// Set by [`GroupCommit::shutdown`] before it drains the writer map, so a
+    /// concurrent [`GroupCommit::append`] cannot spawn a fresh writer behind
+    /// the drain and leak a task that shutdown already waited on.
+    shutting_down: AtomicBool,
     stats: Arc<Stats>,
 }
 
@@ -130,6 +134,7 @@ impl GroupCommit {
                 journal,
                 config,
                 writers: Mutex::new(HashMap::new()),
+                shutting_down: AtomicBool::new(false),
                 stats: Arc::new(Stats::default()),
             }),
         }
@@ -142,6 +147,11 @@ impl GroupCommit {
     /// length. That offset guarantee holds within one Iggy chunk (256
     /// messages); submissions larger than that should derive per-message
     /// offsets themselves.
+    ///
+    /// An empty submission is rejected with `InvalidConfig`: the backends
+    /// disagree on what one means (Iggy reports base offset 0, the memory
+    /// journal reports the partition head), and gateway and TCP ingress
+    /// already reject empty batches before reaching group commit.
     ///
     /// Submissions on one partition are ordered by arrival at the writer, and
     /// a submission's messages are never interleaved with another submission's.
@@ -160,6 +170,13 @@ impl GroupCommit {
                 messages.len()
             )));
         }
+        // Same for the empty case, where the two backends would answer
+        // differently: see the method docs.
+        if messages.is_empty() {
+            return Err(JournalError::InvalidConfig(
+                "a group-commit submission must contain at least one message".to_string(),
+            ));
+        }
         let (reply, response) = oneshot::channel();
         let mut pending = Some((messages, reply));
 
@@ -168,7 +185,12 @@ impl GroupCommit {
         // stale entry and retrying keeps one dead task from bricking a
         // partition forever.
         for attempt in 0..2 {
-            let sender = self.sender(topic, partition);
+            let sender = match self.sender(topic, partition) {
+                Ok(sender) => sender,
+                // Shutdown started, so no fresh writer may be spawned and the
+                // job was never appended.
+                Err(error) => return Err(error),
+            };
             let (messages, reply) = pending.take().expect("job is restored on a failed send");
             match sender.send(Job { messages, reply }).await {
                 Ok(()) => {
@@ -210,6 +232,10 @@ impl GroupCommit {
     /// after flushing the jobs it already accepted. This is the awaitable form,
     /// for tests and orderly shutdown.
     pub async fn shutdown(&self) {
+        // Refuse fresh writers before draining. Draining alone leaves a window
+        // where a concurrent `append` re-inserts a writer that shutdown has
+        // already waited on, leaking the task.
+        self.inner.shutting_down.store(true, Ordering::SeqCst);
         let writers: Vec<Writer> = {
             let mut map = self.lock_writers();
             map.drain().map(|(_, writer)| writer).collect()
@@ -228,10 +254,18 @@ impl GroupCommit {
     ///
     /// The map lock is held only for the lookup/insert and never across an
     /// await. Writer tasks never touch the map, so they cannot deadlock here.
-    fn sender(&self, topic: Topic, partition: u32) -> mpsc::Sender<Job> {
+    ///
+    /// Once [`GroupCommit::shutdown`] has started, no new writer is spawned:
+    /// that would re-insert a task behind the drain and leak it. A writer
+    /// still in the map is reused — shutdown has not collected it yet, and a
+    /// job sent to it is flushed before the awaited handle exits.
+    fn sender(&self, topic: Topic, partition: u32) -> Result<mpsc::Sender<Job>> {
         let mut writers = self.lock_writers();
         if let Some(writer) = writers.get(&(topic, partition)) {
-            return writer.sender.clone();
+            return Ok(writer.sender.clone());
+        }
+        if self.inner.shutting_down.load(Ordering::SeqCst) {
+            return Err(JournalError::WriterStopped);
         }
         let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
         let handle = tokio::spawn(run_writer(
@@ -249,7 +283,7 @@ impl GroupCommit {
                 handle,
             },
         );
-        sender
+        Ok(sender)
     }
 
     fn remove_writer(&self, topic: Topic, partition: u32) {
@@ -308,9 +342,13 @@ async fn run_writer(
         }
 
         // Linger only while there is room and only when asked. `max_batch == 1`
-        // therefore never waits: the batch is already full.
+        // therefore never waits: the batch is already full. If a job was held
+        // because it did not fit, do not linger: accepting a later job now
+        // would append it before the held one, and a second oversized job
+        // would overwrite the held one and drop its waiter.
+        let held = pending.is_some();
         let mut closed = false;
-        if budget > 0 && !config.linger.is_zero() {
+        if budget > 0 && !held && !config.linger.is_zero() {
             stats.linger_waits.fetch_add(1, Ordering::Relaxed);
             let deadline = tokio::time::Instant::now() + config.linger;
             while let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
@@ -390,6 +428,26 @@ async fn flush(journal: &Journal, topic: Topic, partition: u32, jobs: Vec<Job>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::JournalRecord;
+
+    fn message(value: u64) -> JournalMessage {
+        JournalMessage::new(
+            value.to_le_bytes().to_vec(),
+            vec![("n".to_string(), value.to_string())],
+        )
+    }
+
+    async fn records(
+        journal: &Journal,
+        topic: Topic,
+        partition: u32,
+        count: u32,
+    ) -> Vec<JournalRecord> {
+        journal
+            .read(topic, partition, "group-commit-unit-test", 0, count, 0)
+            .await
+            .expect("read back appended records")
+    }
 
     #[test]
     fn default_config_is_256_and_200_microseconds() {
@@ -420,7 +478,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_empty_submission_reports_the_partition_head() {
+    async fn an_empty_submission_is_rejected() {
         let journal = Arc::new(Journal::memory());
         let group = GroupCommit::new(
             Arc::clone(&journal),
@@ -433,13 +491,62 @@ mod tests {
             .append_owned(Topic::Orders, 0, vec![JournalMessage::new(vec![1], vec![])])
             .await
             .expect("seed append");
-        let empty = group
+        let error = group
             .append(Topic::Orders, 0, Vec::new())
             .await
-            .expect("empty submission");
-        assert_eq!(empty.partition, 0);
-        assert_eq!(empty.base_offset, 1);
-        assert_eq!(empty.count, 0);
+            .expect_err("an empty submission must be rejected");
+        assert!(
+            matches!(error, JournalError::InvalidConfig(_)),
+            "expected InvalidConfig, got {error:?}"
+        );
+        // The rejection happens before any writer is spawned, so the rejected
+        // submission leaves nothing behind.
+        assert_eq!(group.writer_count(), 0);
         group.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_racing_with_appends_leaves_no_writer_behind() {
+        let journal = Arc::new(Journal::memory());
+        let group = GroupCommit::new(Arc::clone(&journal), GroupCommitConfig::default());
+
+        let mut handles = Vec::new();
+        for value in 0..64u64 {
+            let group = group.clone();
+            handles.push(tokio::spawn(async move {
+                (
+                    value,
+                    group.append(Topic::Orders, 0, vec![message(value)]).await,
+                )
+            }));
+        }
+        let shutdown = {
+            let group = group.clone();
+            tokio::spawn(async move { group.shutdown().await })
+        };
+
+        let mut successes = 0usize;
+        for handle in handles {
+            let (value, result) = handle.await.expect("submission task");
+            match result {
+                Ok(_) => successes += 1,
+                // Refused after shutdown started: the submission was never
+                // appended, which is the documented `WriterStopped` contract.
+                Err(JournalError::WriterStopped) => {}
+                Err(error) => panic!("submission {value} failed unexpectedly: {error}"),
+            }
+        }
+        shutdown.await.expect("shutdown task");
+        assert_eq!(
+            group.writer_count(),
+            0,
+            "no writer may survive or be re-inserted after shutdown"
+        );
+
+        // No job was silently dropped: exactly the successful submissions were
+        // appended, nothing more, and their acks cover distinct offsets.
+        assert_eq!(group.stats().messages, successes as u64);
+        let stored = records(&journal, Topic::Orders, 0, 64).await;
+        assert_eq!(stored.len(), successes);
     }
 }

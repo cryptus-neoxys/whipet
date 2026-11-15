@@ -37,6 +37,84 @@ pub enum HeaderMode {
     None,
 }
 
+/// The fixed set of header keys Whippet writes.
+///
+/// Iggy header keys are `String`-typed on the wire, so a producer pays one
+/// allocation per key per message when it builds `Vec<(String, String)>`.
+/// Whippet only ever writes these seven names, so producers pass this enum
+/// instead (see `MessageMeta::named_pairs` and `JournalMessage::new_named`)
+/// and the key text is a compile-time constant. `as_str` yields the exact
+/// wire name, so the two representations are byte-identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum HeaderName {
+    Symbol,
+    Seq,
+    Venue,
+    Type,
+    Schema,
+    TraceId,
+    Codec,
+}
+
+impl HeaderName {
+    /// Every header name, in `HeaderMode::Full` wire order.
+    pub const ALL: [HeaderName; 7] = [
+        HeaderName::Symbol,
+        HeaderName::Seq,
+        HeaderName::Venue,
+        HeaderName::Type,
+        HeaderName::Schema,
+        HeaderName::TraceId,
+        HeaderName::Codec,
+    ];
+
+    /// The exact wire name. Callers rely on this being byte-identical to the
+    /// keys produced by [`MessageMeta::pairs_with`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HeaderName::Symbol => "symbol",
+            HeaderName::Seq => "seq",
+            HeaderName::Venue => "venue",
+            HeaderName::Type => "type",
+            HeaderName::Schema => "schema",
+            HeaderName::TraceId => "trace_id",
+            HeaderName::Codec => "codec",
+        }
+    }
+}
+
+/// Error for [`std::str::FromStr`] on [`HeaderName`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownHeaderName(pub String);
+
+impl std::fmt::Display for UnknownHeaderName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown header name: {}", self.0)
+    }
+}
+
+impl std::error::Error for UnknownHeaderName {}
+
+impl std::str::FromStr for HeaderName {
+    type Err = UnknownHeaderName;
+
+    /// Parse a wire name back into a [`HeaderName`], for the journal's
+    /// string-pair fallback and for consumers that still hold `String` keys.
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        let known = match name {
+            "symbol" => HeaderName::Symbol,
+            "seq" => HeaderName::Seq,
+            "venue" => HeaderName::Venue,
+            "type" => HeaderName::Type,
+            "schema" => HeaderName::Schema,
+            "trace_id" => HeaderName::TraceId,
+            "codec" => HeaderName::Codec,
+            _ => return Err(UnknownHeaderName(name.to_string())),
+        };
+        Ok(known)
+    }
+}
+
 /// Header set attached to every Iggy message.
 ///
 /// Iggy headers are `String -> String` on the wire. Whippet keeps the payload
@@ -109,6 +187,45 @@ impl MessageMeta {
     /// Shorthand for [`Self::pairs_with`] with [`HeaderMode::Routing`].
     pub fn routing_pairs(&self) -> Vec<(String, String)> {
         self.pairs_with(HeaderMode::Routing)
+    }
+
+    /// Build the header pairs for `mode` with constant-time keys.
+    ///
+    /// Same contract as [`Self::pairs_with`] — `Full` emits the historical
+    /// seven pairs in the same order, `Routing` emits `symbol`, `seq`, `type`,
+    /// `schema` — but the key is a [`HeaderName`] instead of a fresh `String`,
+    /// so building this set allocates only the values. Use it with
+    /// `JournalMessage::new_named` to keep keys allocation-free through the
+    /// journal.
+    pub fn named_pairs(&self, mode: HeaderMode) -> Vec<(HeaderName, String)> {
+        match mode {
+            HeaderMode::Full => {
+                // Sized exactly: `Full` has seven pairs, `Routing` four, so
+                // neither arm reallocates.
+                let mut pairs = Vec::with_capacity(7);
+                pairs.extend([
+                    (HeaderName::Symbol, self.symbol.to_string()),
+                    (HeaderName::Seq, seq_string(self.seq.0)),
+                    (HeaderName::Venue, self.venue.to_string()),
+                    (HeaderName::Type, self.kind.to_string()),
+                    (HeaderName::Schema, self.schema.to_string()),
+                    (HeaderName::TraceId, format!("{:032x}", self.trace_id)),
+                    (HeaderName::Codec, self.codec.to_string()),
+                ]);
+                pairs
+            }
+            HeaderMode::Routing => {
+                let mut pairs = Vec::with_capacity(4);
+                pairs.extend([
+                    (HeaderName::Symbol, self.symbol.to_string()),
+                    (HeaderName::Seq, seq_string(self.seq.0)),
+                    (HeaderName::Type, self.kind.to_string()),
+                    (HeaderName::Schema, self.schema.to_string()),
+                ]);
+                pairs
+            }
+            HeaderMode::None => Vec::new(),
+        }
     }
 
     /// Read the symbol header back from an Iggy message, if present.
@@ -243,5 +360,101 @@ mod tests {
         for value in [0u64, 1, 7, 9, 10, 99, 100, 1_234_567_890, u64::MAX] {
             assert_eq!(seq_string(value), value.to_string(), "seq {value}");
         }
+    }
+
+    #[test]
+    fn header_name_is_copy_and_matches_the_wire_names() {
+        use std::str::FromStr;
+        // `Copy` is the contract: passing a name must never move-or-clone.
+        fn takes_by_value(name: HeaderName) -> HeaderName {
+            let copy = name;
+            let again = copy;
+            assert_eq!(copy, again);
+            again
+        }
+        for name in HeaderName::ALL {
+            assert_eq!(takes_by_value(name), name);
+            assert_eq!(
+                HeaderName::from_str(name.as_str()),
+                Ok(name),
+                "from_str round-trips the wire name of {name:?}"
+            );
+        }
+        assert!(matches!(
+            HeaderName::from_str("custom"),
+            Err(UnknownHeaderName(_))
+        ));
+        assert!(matches!(
+            HeaderName::from_str("Symbol"),
+            Err(UnknownHeaderName(_))
+        ));
+    }
+
+    #[test]
+    fn named_pairs_match_the_string_pairs_exactly() {
+        let meta = order_meta();
+        for mode in [HeaderMode::Full, HeaderMode::Routing, HeaderMode::None] {
+            let named = meta.named_pairs(mode);
+            let string = meta.pairs_with(mode);
+            assert_eq!(
+                named.len(),
+                string.len(),
+                "mode {mode:?} keeps the same pair count"
+            );
+            for ((name, value), (key, key_value)) in named.iter().zip(&string) {
+                assert_eq!(name.as_str(), key, "mode {mode:?} keeps the same names");
+                assert_eq!(value, key_value, "mode {mode:?} keeps the same values");
+            }
+        }
+        assert_eq!(meta.named_pairs(HeaderMode::None), Vec::new());
+    }
+
+    #[test]
+    fn named_pairs_keep_the_full_order_and_routing_subset() {
+        let meta = order_meta();
+        let full = meta.named_pairs(HeaderMode::Full);
+        assert_eq!(
+            full.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            vec![
+                HeaderName::Symbol,
+                HeaderName::Seq,
+                HeaderName::Venue,
+                HeaderName::Type,
+                HeaderName::Schema,
+                HeaderName::TraceId,
+                HeaderName::Codec,
+            ]
+        );
+        let routing = meta.named_pairs(HeaderMode::Routing);
+        assert_eq!(
+            routing.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            vec![
+                HeaderName::Symbol,
+                HeaderName::Seq,
+                HeaderName::Type,
+                HeaderName::Schema,
+            ]
+        );
+    }
+
+    #[test]
+    fn symbol_reads_back_from_a_named_routing_set() {
+        let meta = MessageMeta::new(
+            Symbol::new("BTC-USD").unwrap(),
+            Seq(42),
+            "md_event",
+            SCHEMA_MD_EVENT,
+            0,
+        );
+        let named = meta.named_pairs(HeaderMode::Routing);
+        let borrowed: Vec<(&str, &str)> = named
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        assert_eq!(
+            MessageMeta::symbol_from_pairs(borrowed),
+            Some(meta.symbol),
+            "the named set reads back like the string set"
+        );
     }
 }

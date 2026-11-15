@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use whippet_journal::{
-    GroupCommit, GroupCommitConfig, Journal, JournalMessage, JournalRecord, Topic,
+    GroupCommit, GroupCommitConfig, Journal, JournalError, JournalMessage, JournalRecord, Topic,
 };
 
 fn message(value: u64) -> JournalMessage {
@@ -245,17 +245,19 @@ async fn writer_tasks_exit_when_the_group_shuts_down() {
         },
     );
 
-    // An empty submission still creates the partition's writer and is answered
-    // with count 0, so this covers writers with no real work to do.
-    let empty = group
-        .append(Topic::Orders, 0, Vec::new())
+    // Non-empty submissions, as group commit now rejects empty ones: a
+    // one-message submission to each partition creates both writers and
+    // answers each caller with its own offset.
+    let orders = group
+        .append(Topic::Orders, 0, vec![message(1)])
         .await
-        .expect("empty submission");
-    assert_eq!(empty.count, 0);
-    group
-        .append(Topic::Md, 0, Vec::new())
+        .expect("orders submission");
+    assert_eq!(orders.base_offset, 0);
+    let md = group
+        .append(Topic::Md, 0, vec![message(2)])
         .await
-        .expect("empty submission");
+        .expect("md submission");
+    assert_eq!(md.base_offset, 0);
     assert_eq!(group.writer_count(), 2);
 
     // `shutdown` awaits the join handles, so a timeout here proves the tasks
@@ -391,4 +393,127 @@ async fn two_large_submissions_never_cross_offsets() {
     let mut starts = [first.base_offset, second.base_offset];
     starts.sort_unstable();
     assert_eq!(starts, [0, 200], "the two submissions cover 0..400");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_racing_with_appends_leaves_no_writer_and_no_dropped_job() {
+    // `shutdown` drains the writer map; without the shutdown flag an `append`
+    // running at the same moment could spawn a fresh writer behind the drain
+    // and leak it. Every append here must either succeed before shutdown or
+    // come back `WriterStopped` — never drop, never fail any other way.
+    let journal = Arc::new(Journal::memory());
+    let group = GroupCommit::new(Arc::clone(&journal), GroupCommitConfig::default());
+
+    let mut handles = Vec::new();
+    for value in 0..64u64 {
+        let group = group.clone();
+        handles.push(tokio::spawn(async move {
+            (
+                value,
+                group.append(Topic::Orders, 0, vec![message(value)]).await,
+            )
+        }));
+    }
+    let shutdown = {
+        let group = group.clone();
+        tokio::spawn(async move { group.shutdown().await })
+    };
+
+    let mut successes = 0usize;
+    for handle in handles {
+        let (value, result) = handle.await.expect("submission task");
+        match result {
+            Ok(_) => successes += 1,
+            // Refused after shutdown started: the submission was never
+            // appended, which is the documented `WriterStopped` contract.
+            Err(JournalError::WriterStopped) => {}
+            Err(error) => panic!("submission {value} failed unexpectedly: {error}"),
+        }
+    }
+    shutdown.await.expect("shutdown task");
+    assert_eq!(
+        group.writer_count(),
+        0,
+        "no writer may survive or be re-inserted after shutdown"
+    );
+
+    // No job was silently dropped: exactly the successful submissions were
+    // appended, nothing more.
+    assert_eq!(group.stats().messages, successes as u64);
+    let stored = records(&journal, Topic::Orders, 0, 64).await;
+    assert_eq!(stored.len(), successes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_job_is_never_reordered_or_dropped() {
+    // 200 + 100 + 200 messages with a 256-message cap and a 5 ms linger.
+    // The 100-message job does not fit after the first 200 and must be held;
+    // the writer must not linger and accept the next 200 before it, and must
+    // not overwrite the held job.
+    let journal = Arc::new(Journal::memory());
+    let group = GroupCommit::new(
+        Arc::clone(&journal),
+        GroupCommitConfig {
+            max_batch: 256,
+            linger: Duration::from_millis(5),
+        },
+    );
+
+    let sender = tokio::spawn({
+        let group = group.clone();
+        async move {
+            let first = group
+                .append(
+                    Topic::Orders,
+                    0,
+                    (0..200u64).map(message).collect::<Vec<_>>(),
+                )
+                .await
+                .expect("first submission");
+            let second = group
+                .append(
+                    Topic::Orders,
+                    0,
+                    (200..300u64).map(message).collect::<Vec<_>>(),
+                )
+                .await
+                .expect("second submission");
+            let third = group
+                .append(
+                    Topic::Orders,
+                    0,
+                    (300..500u64).map(message).collect::<Vec<_>>(),
+                )
+                .await
+                .expect("third submission");
+            (first, second, third)
+        }
+    });
+
+    let (first, second, third) = sender.await.expect("sender task");
+    let stored = records(&journal, Topic::Orders, 0, 500).await;
+    assert_eq!(stored.len(), 500);
+
+    for index in 0..200u64 {
+        assert_eq!(
+            stored[first.base_offset as usize + index as usize].payload,
+            payload(index),
+            "first submission payload at its own offset"
+        );
+    }
+    for index in 0..100u64 {
+        assert_eq!(
+            stored[second.base_offset as usize + index as usize].payload,
+            payload(200 + index),
+            "held submission payload at its own offset"
+        );
+    }
+    for index in 0..200u64 {
+        assert_eq!(
+            stored[third.base_offset as usize + index as usize].payload,
+            payload(300 + index),
+            "third submission payload at its own offset"
+        );
+    }
+    assert_eq!(group.stats().messages, 500, "no message was dropped");
 }

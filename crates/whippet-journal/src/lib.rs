@@ -26,6 +26,7 @@ use iggy::prelude::{
 };
 use serde::{Deserialize, Serialize};
 use whippet_core::config::ExchangeConfig;
+use whippet_core::headers::HeaderName;
 
 pub mod group;
 pub mod topic;
@@ -71,28 +72,92 @@ pub type Result<T> = std::result::Result<T, JournalError>;
 #[derive(Debug, Clone)]
 pub struct JournalMessage {
     pub payload: Vec<u8>,
-    pub headers: Vec<(String, String)>,
+    pub headers: JournalHeaders,
+}
+
+/// A message's header set, in the representation the producer chose.
+///
+/// The named variant carries [`HeaderName`] keys, so the header names cost no
+/// per-message allocation and map straight onto the connection's cached
+/// [`HeaderKey`]s when an Iggy frame is built. The pair variant keeps the
+/// historical `String -> String` shape for tests, tools, and callers that use
+/// keys outside the fixed routing set.
+#[derive(Debug, Clone)]
+pub enum JournalHeaders {
+    Named(Vec<(HeaderName, String)>),
+    Pairs(Vec<(String, String)>),
+}
+
+impl JournalHeaders {
+    /// Whether this set uses the named representation.
+    pub fn is_named(&self) -> bool {
+        matches!(self, Self::Named(_))
+    }
+
+    /// Copy the set as string pairs.
+    ///
+    /// Allocates a key `String` per pair when the set is named, so only call
+    /// this on paths that need string keys (memory journal, record reads).
+    pub fn to_pairs(&self) -> Vec<(String, String)> {
+        match self {
+            Self::Named(named) => named
+                .iter()
+                .map(|(name, value)| (name.as_str().to_string(), value.clone()))
+                .collect(),
+            Self::Pairs(pairs) => pairs.clone(),
+        }
+    }
+
+    /// Convert the set into string pairs, reusing the buffer when possible.
+    pub fn into_pairs(self) -> Vec<(String, String)> {
+        match self {
+            Self::Named(named) => named
+                .into_iter()
+                .map(|(name, value)| (name.as_str().to_string(), value))
+                .collect(),
+            Self::Pairs(pairs) => pairs,
+        }
+    }
 }
 
 impl JournalMessage {
     pub fn new(payload: Vec<u8>, headers: Vec<(String, String)>) -> Self {
-        Self { payload, headers }
+        Self {
+            payload,
+            headers: JournalHeaders::Pairs(headers),
+        }
     }
 
     /// Build a message whose header keys are compile-time constants.
     ///
     /// The pairs are still stored as `(String, String)` because
     /// [`JournalMessage`] carries the wire-format header set; this only spares
-    /// call sites the `.to_string()` noise. The per-message key parsing cost is
-    /// removed on the Iggy side by the connection's header-key cache, so a
-    /// separate `&'static str` representation would not save anything here.
+    /// call sites the `.to_string()` noise. Use [`JournalMessage::new_named`]
+    /// instead on the produce path: it keeps the keys allocation-free end to
+    /// end.
     pub fn new_static(payload: Vec<u8>, headers: Vec<(&'static str, String)>) -> Self {
         Self {
             payload,
-            headers: headers
-                .into_iter()
-                .map(|(key, value)| (key.to_string(), value))
-                .collect(),
+            headers: JournalHeaders::Pairs(
+                headers
+                    .into_iter()
+                    .map(|(key, value)| (key.to_string(), value))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Build a message with enum header keys.
+    ///
+    /// The keys are [`HeaderName`] values, so nothing allocates for the names:
+    /// not here, and not when the journal maps them onto the connection's
+    /// cached `HeaderKey`s while building the Iggy frame. Header *values*
+    /// stay owned. Use [`whippet_core::headers::MessageMeta::named_pairs`] to
+    /// build the argument.
+    pub fn new_named(payload: Vec<u8>, headers: Vec<(HeaderName, String)>) -> Self {
+        Self {
+            payload,
+            headers: JournalHeaders::Named(headers),
         }
     }
 }
@@ -204,6 +269,23 @@ impl HeaderKeys {
         }
         Ok(key)
     }
+
+    /// Resolve a [`HeaderName`] to its parsed key.
+    ///
+    /// The seven routing keys are parsed once per connection in [`Self::new`],
+    /// so this arm cannot fail and costs one refcount bump per pair — no
+    /// `HeaderKey::from_str`, no `String` key.
+    fn named(&self, name: HeaderName) -> HeaderKey {
+        match name {
+            HeaderName::Symbol => self.symbol.clone(),
+            HeaderName::Seq => self.seq.clone(),
+            HeaderName::Venue => self.venue.clone(),
+            HeaderName::Type => self.kind.clone(),
+            HeaderName::Schema => self.schema.clone(),
+            HeaderName::TraceId => self.trace_id.clone(),
+            HeaderName::Codec => self.codec.clone(),
+        }
+    }
 }
 
 fn parse_header_key(name: &str) -> Result<HeaderKey> {
@@ -223,6 +305,26 @@ fn build_iggy_message(
     let mut user_headers = BTreeMap::new();
     for (key, value) in headers {
         user_headers.insert(keys.get(key)?, HeaderValue::from_str(value)?);
+    }
+    Ok(IggyMessage::builder()
+        .payload(payload)
+        .user_headers(user_headers)
+        .build()?)
+}
+
+/// Build an Iggy frame from a payload and enum-keyed header pairs.
+///
+/// Same wire result as [`build_iggy_message`]: the keys resolve through the
+/// connection's cached `HeaderKey`s ([`HeaderKeys::named`]) without ever
+/// materialising a `String` key. Only the values are parsed per message.
+fn build_iggy_message_named(
+    keys: &HeaderKeys,
+    payload: Bytes,
+    headers: &[(HeaderName, String)],
+) -> Result<IggyMessage> {
+    let mut user_headers = BTreeMap::new();
+    for (name, value) in headers {
+        user_headers.insert(keys.named(*name), HeaderValue::from_str(value)?);
     }
     Ok(IggyMessage::builder()
         .payload(payload)
@@ -575,8 +677,17 @@ impl IggyJournal {
 
     /// Map one journal message onto an Iggy frame, reusing the cached header
     /// keys instead of parsing a `HeaderKey` per message.
-    fn iggy_message(&self, payload: Bytes, headers: &[(String, String)]) -> Result<IggyMessage> {
-        build_iggy_message(&self.header_keys, payload, headers)
+    ///
+    /// A named header set maps [`HeaderName`] straight onto the cached keys,
+    /// so no `String` key is materialised. A pair set keeps the historical
+    /// `&str`-lookup path.
+    fn iggy_message(&self, payload: Bytes, headers: &JournalHeaders) -> Result<IggyMessage> {
+        match headers {
+            JournalHeaders::Named(named) => {
+                build_iggy_message_named(&self.header_keys, payload, named)
+            }
+            JournalHeaders::Pairs(pairs) => build_iggy_message(&self.header_keys, payload, pairs),
+        }
     }
 
     async fn dispatch(
@@ -910,7 +1021,7 @@ impl MemoryJournal {
                     offset: base_offset + index as u64,
                     timestamp_ns: now_ns(),
                     payload: message.payload.clone(),
-                    headers: message.headers.clone(),
+                    headers: message.headers.to_pairs(),
                 }),
         );
         AppendResult {
@@ -937,7 +1048,7 @@ impl MemoryJournal {
                 offset: base_offset + index as u64,
                 timestamp_ns: now_ns(),
                 payload: message.payload,
-                headers: message.headers,
+                headers: message.headers.into_pairs(),
             });
         }
         AppendResult {
@@ -1417,13 +1528,143 @@ mod tests {
             vec![("symbol", "ETH-USD".to_string()), ("seq", "3".to_string())],
         );
         assert_eq!(message.payload, vec![9]);
+        assert!(!message.headers.is_named(), "new_static is the pair path");
         assert_eq!(
-            message.headers,
+            message.headers.to_pairs(),
             vec![
                 ("symbol".to_string(), "ETH-USD".to_string()),
                 ("seq".to_string(), "3".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn new_named_keeps_the_named_header_pairs() {
+        let message = JournalMessage::new_named(
+            vec![9],
+            vec![
+                (HeaderName::Symbol, "ETH-USD".to_string()),
+                (HeaderName::Seq, "3".to_string()),
+            ],
+        );
+        assert_eq!(message.payload, vec![9]);
+        assert!(message.headers.is_named());
+        assert_eq!(
+            message
+                .headers
+                .to_pairs()
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("symbol", "ETH-USD"), ("seq", "3")],
+            "the named set renders to the same string pairs"
+        );
+        // Converting to pairs consumes and preserves values.
+        assert_eq!(
+            JournalMessage::new_named(vec![], vec![(HeaderName::Codec, "x".to_string())])
+                .headers
+                .into_pairs(),
+            vec![("codec".to_string(), "x".to_string())]
+        );
+    }
+
+    #[test]
+    fn named_headers_round_trip_like_the_pair_path() {
+        let keys = HeaderKeys::new().expect("routing header keys parse");
+        let named = vec![
+            (HeaderName::Symbol, "BTC-USD".to_string()),
+            (HeaderName::Seq, "7".to_string()),
+            (HeaderName::Venue, "whippet".to_string()),
+            (HeaderName::Type, "order".to_string()),
+            (HeaderName::Schema, "1".to_string()),
+            (
+                HeaderName::TraceId,
+                "0000000000000000000000000000000a".to_string(),
+            ),
+            (HeaderName::Codec, "fixed-le-v1".to_string()),
+        ];
+        let pairs = named
+            .iter()
+            .map(|(name, value)| (name.as_str().to_string(), value.clone()))
+            .collect::<Vec<_>>();
+
+        let from_named = build_iggy_message_named(&keys, Bytes::from_static(b"payload"), &named)
+            .expect("named frame");
+        let from_pairs =
+            build_iggy_message(&keys, Bytes::from_static(b"payload"), &pairs).expect("pair frame");
+
+        let named_map = from_named
+            .user_headers_map()
+            .expect("headers decode")
+            .expect("headers present");
+        let pair_map = from_pairs
+            .user_headers_map()
+            .expect("headers decode")
+            .expect("headers present");
+
+        // Every pair of the named path reads back identically to the pair path.
+        assert_eq!(named_map.len(), pair_map.len());
+        for (name, value) in &named {
+            let key = keys.named(*name);
+            assert_eq!(
+                named_map.get(&key).map(HeaderValue::to_string_value),
+                Some(value.clone()),
+                "named header {name:?} round-trips"
+            );
+            assert_eq!(
+                named_map.get(&key),
+                pair_map.get(&key),
+                "the named frame carries the same key/value as the pair frame"
+            );
+        }
+        // And the key sets themselves are identical.
+        assert_eq!(
+            named_map.keys().collect::<Vec<_>>(),
+            pair_map.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn named_and_pair_paths_agree_on_message_meta_sets() {
+        use whippet_core::headers::{HeaderMode, MessageMeta, SCHEMA_MD_EVENT};
+        use whippet_core::ids::{Seq, Symbol};
+        let keys = HeaderKeys::new().expect("routing header keys parse");
+        let meta = MessageMeta::new(
+            Symbol::new("BTC-USD").unwrap(),
+            Seq(42),
+            "md_event",
+            SCHEMA_MD_EVENT,
+            7,
+        );
+        for mode in [HeaderMode::Full, HeaderMode::Routing] {
+            let meta_named =
+                build_iggy_message_named(&keys, Bytes::from_static(b"p"), &meta.named_pairs(mode))
+                    .expect("named frame");
+            let meta_pairs =
+                build_iggy_message(&keys, Bytes::from_static(b"p"), &meta.pairs_with(mode))
+                    .expect("pair frame");
+            let named_map = meta_named
+                .user_headers_map()
+                .expect("headers decode")
+                .expect("headers present");
+            let pair_map = meta_pairs
+                .user_headers_map()
+                .expect("headers decode")
+                .expect("headers present");
+            assert_eq!(named_map, pair_map, "mode {mode:?} wires identical headers");
+        }
+    }
+
+    #[test]
+    fn header_name_from_str_matches_the_cached_keys() {
+        let keys = HeaderKeys::new().expect("routing header keys parse");
+        for name in HeaderName::ALL {
+            assert_eq!(
+                keys.named(name),
+                keys.get(name.as_str()).expect("known key"),
+                "the named lookup resolves to the same key as the string lookup for {name:?}"
+            );
+        }
     }
 
     #[test]
