@@ -19,32 +19,19 @@ use whippet_engine::{EngineOutput, ShardEngine};
 use whippet_journal::{AppendResult, Journal, JournalMessage, PayloadRecord, Topic};
 use whippet_marketdata::{ShardMetrics, Stage};
 
+use crate::commit::{
+    COMMIT_INTERVAL_RECORDS, COMMIT_MAX_DELAY, COMMIT_TIMEOUT, CommitRetry, CommitWatermark,
+};
 use crate::context::NodeContext;
 use crate::health::{ShardRole, ShardState};
 use crate::snapshot::{SequencedSnapshot, SnapshotWriter};
 use crate::turbo::{TurboAck, TurboAdmission, TurboEntry};
-
-/// How many records a shard applies between consumer-offset commits.
-const COMMIT_INTERVAL_RECORDS: u64 = 256;
-
-/// Upper bound on how long the consumer offset may lag the applied offset.
-const COMMIT_MAX_DELAY: Duration = Duration::from_millis(100);
-
-/// A single commit attempt is bounded so a wedged broker cannot stall the loop.
-const COMMIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// An output append is retried this many times before the shard fails. Without
 /// a bound, a wedged output topic stalls matching while the gateway keeps
 /// acknowledging new orders.
 #[doc(hidden)]
 pub const APPEND_MAX_ATTEMPTS: u32 = 30;
-
-/// Backoff for a commit that failed; the loop keeps applying records meanwhile.
-const COMMIT_RETRY_INITIAL: Duration = Duration::from_millis(100);
-const COMMIT_RETRY_MAX: Duration = Duration::from_secs(2);
-
-/// Commit failures are logged at most this often, never once per record.
-const COMMIT_WARN_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Batch sizes: one poll's worth of records, and the capacity the per-batch
 /// output vectors are allocated with once.
@@ -1487,7 +1474,7 @@ pub async fn run_writer<J: JournalOps + ?Sized>(
     if let Some(offset) = watermark.pending() {
         match commit_once(journal, Topic::Orders, shard_id, &consumer, offset).await {
             Ok(()) => {
-                watermark.mark_committed(offset, Instant::now());
+                watermark.note_committed(offset);
                 info!(shard = shard_id, offset, "committed final applied offset");
             }
             Err(error) => warn!(
@@ -1563,7 +1550,7 @@ async fn md_shard(ctx: Arc<NodeContext>, shard_id: u32) -> Result<()> {
             _ = shutdown.changed() => {
                 if let Some(offset) = watermark.pending() {
                     match commit_once(journal.as_ref(), Topic::Md, shard_id, &consumer, offset).await {
-                        Ok(()) => watermark.mark_committed(offset, Instant::now()),
+                        Ok(()) => watermark.note_committed(offset),
                         Err(error) => warn!(shard = shard_id, offset, error = %error, "final MD offset commit failed"),
                     }
                 }
@@ -1671,140 +1658,6 @@ fn flush_md_events(ctx: &NodeContext, events: &mut Vec<MdEvent>) {
     events.clear();
 }
 
-/// Where a consumer stands relative to its last acknowledged offset.
-///
-/// `applied` is the last record whose outputs were appended to the journal;
-/// `committed` is the last offset the broker acknowledged. The two are allowed
-/// to drift apart by [`COMMIT_INTERVAL_RECORDS`] records or
-/// [`COMMIT_MAX_DELAY`] — whichever comes first — so the loop is not paying a
-/// broker round trip per batch.
-///
-/// The replay window that buys: a crash before the next commit re-applies up to
-/// that many already-applied records. That is safe for this shard because the
-/// engine dedup table rejects a replayed order id instead of matching it twice
-/// (books and offsets do not diverge), and because `run_md_shard` relies on the
-/// per-symbol market-data sequence, which ignores an event at or below the last
-/// applied sequence. The only visible artifact is a duplicate rejection
-/// execution, which a crash between append and commit could already produce.
-#[derive(Debug)]
-struct CommitWatermark {
-    applied: Option<u64>,
-    committed: Option<u64>,
-    last_commit_at: Instant,
-}
-
-impl CommitWatermark {
-    fn new(committed: Option<u64>) -> Self {
-        Self {
-            applied: None,
-            committed,
-            last_commit_at: Instant::now(),
-        }
-    }
-
-    /// Record that everything up to `offset` has been fully applied.
-    fn note_applied(&mut self, offset: u64) {
-        self.applied = Some(offset);
-    }
-
-    /// Record that the broker acknowledged `offset`. The watermark never moves
-    /// backwards, even if an older offset is committed by mistake.
-    fn mark_committed(&mut self, offset: u64, now: Instant) {
-        self.committed = Some(match self.committed {
-            Some(committed) => committed.max(offset),
-            None => offset,
-        });
-        self.last_commit_at = now;
-    }
-
-    /// The highest applied offset that the broker has not acknowledged yet.
-    fn pending(&self) -> Option<u64> {
-        match (self.applied, self.committed) {
-            (Some(applied), Some(committed)) if committed >= applied => None,
-            (Some(applied), _) => Some(applied),
-            (None, _) => None,
-        }
-    }
-
-    fn due(&self, now: Instant) -> bool {
-        commit_due(
-            self.applied,
-            self.committed,
-            now.saturating_duration_since(self.last_commit_at),
-            COMMIT_INTERVAL_RECORDS,
-            COMMIT_MAX_DELAY,
-        )
-    }
-}
-
-/// Decide whether the applied offset is worth a broker round trip.
-///
-/// Pure so the watermark can be tested without a journal: `applied` is the last
-/// fully applied record, `committed` the last acknowledged offset, and `elapsed`
-/// the time since the last successful commit.
-fn commit_due(
-    applied: Option<u64>,
-    committed: Option<u64>,
-    elapsed: Duration,
-    interval: u64,
-    max_delay: Duration,
-) -> bool {
-    let Some(applied) = applied else {
-        return false;
-    };
-    let uncommitted = match committed {
-        Some(committed) if committed >= applied => return false,
-        Some(committed) => applied - committed,
-        // Nothing was ever committed: every applied record is uncommitted.
-        None => applied.saturating_add(1),
-    };
-    uncommitted >= interval || elapsed >= max_delay
-}
-
-/// Backoff state for a commit that failed.
-///
-/// The shard keeps applying records while this is backing off; the warning is
-/// throttled so a broker outage logs once per [`COMMIT_WARN_INTERVAL`] instead
-/// of once per batch.
-#[derive(Debug)]
-struct CommitRetry {
-    next_at: Instant,
-    delay: Duration,
-    last_warn: Option<Instant>,
-}
-
-impl CommitRetry {
-    fn new() -> Self {
-        Self {
-            next_at: Instant::now(),
-            delay: COMMIT_RETRY_INITIAL,
-            last_warn: None,
-        }
-    }
-
-    fn ready(&self, now: Instant) -> bool {
-        now >= self.next_at
-    }
-
-    fn succeeded(&mut self) {
-        self.delay = COMMIT_RETRY_INITIAL;
-        self.next_at = Instant::now();
-    }
-
-    /// Note a failure and report whether this one should be logged.
-    fn failed(&mut self, now: Instant) -> bool {
-        let warn = self
-            .last_warn
-            .is_none_or(|at| now.saturating_duration_since(at) >= COMMIT_WARN_INTERVAL);
-        if warn {
-            self.last_warn = Some(now);
-        }
-        self.next_at = now + self.delay;
-        self.delay = (self.delay * 2).min(COMMIT_RETRY_MAX);
-        warn
-    }
-}
-
 /// Commit the watermark when it is due and the retry backoff has elapsed.
 ///
 /// A failure never propagates: the shard keeps applying records and retries the
@@ -1819,7 +1672,13 @@ async fn maybe_commit<J: JournalOps + ?Sized>(
     retry: &mut CommitRetry,
 ) {
     let now = Instant::now();
-    if !retry.ready(now) || !watermark.due(now) {
+    // Debug builds fail loudly the moment either machine is inconsistent: a
+    // shard that has lost the link between durable and acknowledged offsets is
+    // already wrong, and only the commit path sees both.
+    watermark.debug_check();
+    retry.debug_check();
+    if !retry.ready(now) || !watermark.should_commit(now, COMMIT_INTERVAL_RECORDS, COMMIT_MAX_DELAY)
+    {
         return;
     }
     let Some(offset) = watermark.pending() else {
@@ -1827,15 +1686,22 @@ async fn maybe_commit<J: JournalOps + ?Sized>(
     };
     match commit_once(journal, topic, shard_id, consumer, offset).await {
         Ok(()) => {
-            watermark.mark_committed(offset, Instant::now());
-            retry.succeeded();
+            watermark.note_committed(offset);
+            retry.reset();
         }
         Err(error) => {
-            if retry.failed(Instant::now()) {
+            // The retry budget paces the attempts and the warnings; it never
+            // stops them. A commit is the shard's only durable progress marker,
+            // so a broken broker costs commit lag, not availability.
+            let failed_at = Instant::now();
+            let within_budget = retry.record_failure(failed_at);
+            if retry.should_warn(failed_at) {
                 warn!(
                     topic = %topic,
                     partition = shard_id,
                     offset,
+                    attempts = retry.attempts(),
+                    budget_spent = !within_budget,
                     error = %error,
                     "offset commit failed; records stay applied and the commit is retried"
                 );
@@ -2164,153 +2030,5 @@ mod tests {
                 .all(|symbol| symbol.state_hash == [0u8; 32]),
             "the matcher must not hash on the shard thread"
         );
-    }
-
-    const INTERVAL: u64 = COMMIT_INTERVAL_RECORDS;
-
-    #[test]
-    fn commit_waits_for_the_record_interval() {
-        // Below the interval and inside the delay window: not worth a round trip.
-        assert!(!commit_due(
-            Some(0),
-            Some(0),
-            Duration::ZERO,
-            INTERVAL,
-            COMMIT_MAX_DELAY
-        ));
-        assert!(!commit_due(
-            Some(INTERVAL - 1),
-            Some(0),
-            Duration::ZERO,
-            INTERVAL,
-            COMMIT_MAX_DELAY
-        ));
-        assert!(commit_due(
-            Some(INTERVAL),
-            Some(0),
-            Duration::ZERO,
-            INTERVAL,
-            COMMIT_MAX_DELAY
-        ));
-    }
-
-    #[test]
-    fn commit_waits_for_the_max_delay() {
-        assert!(!commit_due(
-            Some(1),
-            Some(0),
-            COMMIT_MAX_DELAY - Duration::from_millis(1),
-            INTERVAL,
-            COMMIT_MAX_DELAY
-        ));
-        assert!(commit_due(
-            Some(1),
-            Some(0),
-            COMMIT_MAX_DELAY,
-            INTERVAL,
-            COMMIT_MAX_DELAY
-        ));
-    }
-
-    #[test]
-    fn commit_is_skipped_when_nothing_is_pending() {
-        let long = Duration::from_secs(60);
-        assert!(!commit_due(None, None, long, INTERVAL, COMMIT_MAX_DELAY));
-        assert!(!commit_due(
-            Some(7),
-            Some(7),
-            long,
-            INTERVAL,
-            COMMIT_MAX_DELAY
-        ));
-        // A committed offset ahead of the applied one never triggers a commit.
-        assert!(!commit_due(
-            Some(7),
-            Some(9),
-            long,
-            INTERVAL,
-            COMMIT_MAX_DELAY
-        ));
-    }
-
-    #[test]
-    fn commit_without_a_prior_offset_counts_every_applied_record() {
-        assert!(!commit_due(
-            Some(INTERVAL - 2),
-            None,
-            Duration::ZERO,
-            INTERVAL,
-            COMMIT_MAX_DELAY
-        ));
-        assert!(commit_due(
-            Some(INTERVAL - 1),
-            None,
-            Duration::ZERO,
-            INTERVAL,
-            COMMIT_MAX_DELAY
-        ));
-    }
-
-    #[test]
-    fn watermark_tracks_applied_and_committed() {
-        let mut watermark = CommitWatermark::new(Some(10));
-        assert!(watermark.pending().is_none());
-
-        watermark.note_applied(11);
-        assert_eq!(watermark.pending(), Some(11));
-
-        let now = Instant::now();
-        watermark.mark_committed(11, now);
-        assert!(watermark.pending().is_none());
-        assert!(!watermark.due(now));
-
-        // A stale commit must not move the watermark backwards.
-        watermark.mark_committed(5, now);
-        assert_eq!(watermark.committed, Some(11));
-
-        watermark.note_applied(12);
-        assert_eq!(watermark.pending(), Some(12));
-    }
-
-    #[test]
-    fn watermark_is_due_after_the_delay() {
-        let mut watermark = CommitWatermark::new(None);
-        let now = Instant::now();
-        watermark.note_applied(1);
-        assert!(!watermark.due(now));
-        assert!(watermark.due(now + COMMIT_MAX_DELAY));
-    }
-
-    #[test]
-    fn retry_backoff_is_bounded_and_throttles_warnings() {
-        let mut retry = CommitRetry::new();
-        let start = Instant::now();
-        assert!(retry.ready(start));
-
-        assert!(retry.failed(start), "the first failure is logged");
-        assert!(!retry.ready(start), "the retry waits for the backoff");
-
-        // Within the warning window: silent, but the backoff still doubles.
-        let early = start + Duration::from_millis(10);
-        assert!(!retry.failed(early));
-        assert!(!retry.ready(early + COMMIT_RETRY_INITIAL));
-
-        // Once the window passes, one more warning is allowed.
-        let later = start + COMMIT_WARN_INTERVAL;
-        assert!(retry.failed(later));
-
-        // The backoff never exceeds the cap.
-        let mut delay = retry.delay;
-        let mut now = later;
-        for _ in 0..16 {
-            retry.failed(now);
-            delay = retry.delay;
-            now += Duration::from_secs(10);
-        }
-        assert!(delay <= COMMIT_RETRY_MAX);
-
-        retry.succeeded();
-        assert_eq!(retry.delay, COMMIT_RETRY_INITIAL);
-        assert!(retry.ready(Instant::now()));
     }
 }

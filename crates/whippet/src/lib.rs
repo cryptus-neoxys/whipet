@@ -4,6 +4,7 @@
 
 pub mod auth;
 pub mod cli;
+mod commit;
 pub mod config;
 pub mod context;
 pub mod engine_runner;
