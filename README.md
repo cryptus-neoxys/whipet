@@ -23,7 +23,9 @@ and market data back to it.
   optional bearer auth, per-IP rate limiting, readiness, and `whippet doctor`.
 - A Prometheus text endpoint at `GET /metrics`.
 
-What is **not** in this build: turbo mode, 3-node VSR/HA, surveillance, the
+Turbo mode is implemented: `WHIPPET_MODE=turbo` acknowledges after the match,
+with a bounded write-behind window and an explicit `matched_unjournaled`
+guarantee. What is **not** in this build: 3-node VSR/HA, surveillance, the
 audit archive and replay scrubber, PATs, TLS, stream encryption, FIX,
 cross-symbol atomicity, clearing, and headline Linux benchmark numbers. The
 `alerts`, `audit`, and `commands` topics are created but have no producers or
@@ -247,7 +249,7 @@ manual offsets, not group members.
                 ▼
 ┌──────────────────────────────────────────────────────────────┐
 │ Iggy stream whippet-trading                                  │
-│ topic orders           16 partitions, persisted, 24 h        │
+│ topic orders           WHIPPET_PARTITIONS, persisted, 24 h    │
 └───────────────┬──────────────────────────────────────────────┘
                 │ named consumer whippet-engine-p<N>, manual offset
                 ▼
@@ -260,7 +262,7 @@ manual offsets, not group members.
         ▼                               ▼
 ┌───────────────────────┐      ┌───────────────────────────────┐
 │ whippet-trading       │      │ whippet-md/md                 │
-│ executions            │      │ 16 partitions, replicated, 1h │
+│ executions            │      │ WHIPPET_PARTITIONS, replicated, 1h │
 │ persisted, 7 d        │      └───────────────┬───────────────┘
 └───────────────────────┘                      │ consumer whippet-md-p<N>
                                                ▼
@@ -293,7 +295,7 @@ are in [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Low-single-digit-millisecond durable path on Linux | Not measured. No headline numbers yet. |
 | No acknowledged loss across one node failure | Not implemented. Single node, no failover. |
 | End-to-end once-only delivery | Not claimed. The pipeline is at-least-once; the engine deduplicates order ids. |
-| Turbo mode | Not implemented. `WHIPPET_MODE=turbo` is rejected at startup. |
+| Turbo mode | Implemented. Match-complete ack (`matched_unjournaled`), bounded per-shard window (10,000 commands / 50 ms defaults), write-behind orders/executions/MD, tail replay on restart. The window, not the log, is the crash-loss bound. |
 | HA / 3-node VSR | Not implemented. |
 | Surveillance, audit archive, replay scrubber, PATs, TLS, encryption | Not implemented. |
 
@@ -329,7 +331,11 @@ benchmark.
 Inside the Compose network, use `--iggy-addr iggy:8090` and the same
 `WHIPPET_IGGY_USER` and `WHIPPET_IGGY_PASSWORD` as the node. The replay
 consumer does not commit offsets, so it does not disturb the live engine or MD
-consumers.
+consumers. If the node runs a non-default universe or partition count, pass
+the same `--symbols` (`WHIPPET_SYMBOLS`) and `--exchange-partitions` the node
+uses; `make verify` / `make replay` read `WHIPPET_PARTITIONS` (default 16)
+and `scripts/replay.sh` replays partition `WHIPPET_REPLAY_PARTITION`
+(default 1).
 
 The examples assume `whippet` is on your `PATH`. Without it, use
 `cargo run --release -p whippet -- replay ...`, or run the binary in the node

@@ -91,15 +91,51 @@ There are two ingress transports with the same durable semantics:
 
 The TCP frame is `[u32 body_len][u8 kind][body]`. `Submit` carries up to 256
 fixed-layout `Command` payloads of one symbol; `Hello` carries an optional
-bearer token when the node requires one; `Ping` measures liveness. A `Submit`
-is answered with one ack carrying `partition`, `base_offset`, and `count`; order
-`i` has offset `base_offset + i` because the whole batch is one append. The
+bearer token when the node requires one; `Ping` measures liveness. A durable
+`Submit` is answered with one ack carrying `partition`, `base_offset`, and
+`count`; order `i` has offset `base_offset + i` because the whole batch is one
+append. In turbo mode `base_offset` is the first local seq and the per-order
+seqs are not necessarily contiguous across concurrent batches; the fixed ack
+frame keeps its shape, and a full window returns `WindowFull`. The
 wire types live in `crates/whippet-core/src/tcp.rs`.
 
 Both transports call the same encoding and append path, so the engine cannot
 tell how an order arrived. TCP does not change durability: the ack is sent
 after the Iggy append confirms. TLS is not terminated in-process in Phase 1;
 put a proxy in front of the TCP port if the network is untrusted.
+
+### Turbo mode
+
+`WHIPPET_MODE=turbo` keeps the same matcher but changes where its input comes
+from and when the client is told. [ADR 0013](adr/0013-turbo-mode.md) is the
+design record; the implementation is:
+
+```text
+HTTP/TCP -> TurboIngress (one bounded lane + window per active shard)
+         -> feed_turbo -> input ring -> matcher thread (sole sequencer)
+         -> ack {seq, accepted, reject}          (before any journal I/O)
+         -> output ring -> writer: orders, executions, md
+         -> release window slot -> applied offset -> commit
+```
+
+- The matcher assigns the local `seq` (0 on an empty log,
+  `snapshot_last_offset + 1` after a restore), calls the same
+  `ShardEngine::process`, and sends the ack immediately. The journal message
+  was built once at ingress, so the write-behind appends exactly the bytes the
+  durable path would have appended.
+- `TurboWindow` bounds the crash loss by count and age; a full window rejects
+  with `window_full` and never falls back to durable.
+- The writer appends `orders` first-class alongside executions and MD, and
+  releases the window permits only after all three appends are durable.
+- A restart replays the journaled tail to the log head before the lane opens.
+  With no snapshot, a non-empty orders log is a startup error: the local seq
+  domain must be anchored to an empty log.
+- Acks carry `guarantee: "matched_unjournaled"`; durable acks carry
+  `"accepted_by_log"`. `/metrics` exposes
+  `whippet_turbo_uncommitted_window{shard}`,
+  `whippet_turbo_journal_lag{shard}` (the same set in this design),
+  `whippet_turbo_window_drops_total`, and the
+  `whippet_turbo_ack_latency_microseconds` summary.
 
 ### Group commit
 
@@ -251,15 +287,19 @@ The design rules:
   would run ahead of the writer is deferred to the next batch boundary where
   the gate is open. The snapshot never claims a resume offset whose outputs
   were lost.
-- **Off-loop hash.** The matcher calls `snapshot_state_without_hash`; the
-  blocking writer fills the per-symbol hashes and verifies the final snapshot
-  by rebuilding it. The earlier ~170k-order mismatch was a dedup-count bug:
-  the off-loop hash used the insertion-walk length where the live hash uses
-  the distinct-id count, and a re-admitted id made them differ. The fix is
-  pinned by a 100-engine × 200k-command test. The snapshot file format is
-  version 4 (per-symbol config, `BookSnapshot.min_price_ticks`, and the dedup
-  terminal-eviction order stored as `u32` indices into the dedup walk instead
-  of full `OrderId`s); versions 3 and older are rejected.
+- **Off-loop hash.** The matcher calls `snapshot_state_without_hash_compacted`,
+  which compacts the dedup queues first so the saved walk matches the live
+  one; the blocking writer fills the per-symbol hashes (a supplied non-zero
+  hash that disagrees is rejected, not repaired) and verifies the final snapshot
+  by rebuilding it. The terminal-eviction queue is hashed with the live ids in
+  eviction order, so a reordered-but-valid queue changes the hash. The earlier
+  ~170k-order mismatch was a dedup-count bug: the off-loop hash used the
+  insertion-walk length where the live hash uses the distinct-id count, and a
+  re-admitted id made them differ. The fix is pinned by a 100-engine ×
+  200k-command test. The snapshot file format is version 4 (per-symbol config,
+  `BookSnapshot.min_price_ticks`, and the dedup terminal-eviction order stored
+  as `u32` indices into the dedup walk instead of full `OrderId`s); versions 3
+  and older are rejected.
 - **Per-shard metrics.** Each matcher records into its own lock-free
   `ShardMetrics`, merged into the global `Metrics` once per second and once
   on exit, instead of taking a global histogram lock per command.
@@ -316,8 +356,10 @@ ingress and match latency quantiles, throughput, Iggy connectivity, partition
 count, mode, MD freshness, and MD sequence. Uptime is exposed as a monotonic
 counter. The values come from the same process-lifetime HDR histograms as
 `/api/state`, so the latency quantiles are cumulative, not windowed.
-`whippet_consumer_lag` is a placeholder set to zero after each MD batch; it is
-not a computed lag. The full series list is in
+`whippet_consumer_lag` is the computed lag summed over the active shards:
+every five seconds the health monitor reads each shard's committed offset and
+head through that shard's engine-pool client and reports the total. The full
+series list is in
 [OPERATIONS.md](OPERATIONS.md#prometheus-metrics).
 
 ## Recovery
@@ -331,15 +373,30 @@ to `data/snapshots/partition-<N>.snapshot`:
 
 - Magic `WHIPSNP1`, format version `4`, then a bincode payload. The v4
   terminal-eviction order is stored as `u32` indices into the dedup walk
-  instead of full `OrderId`s, so the file is smaller than v3. Version 3 and
-  older files are rejected: `SymbolSnapshot` now carries the per-symbol config
-  and `BookSnapshot` carries `min_price_ticks`, plus the compact eviction
-  order, so the state hash can be reproduced from the snapshot alone. An
-  existing deployment must rebuild snapshots (replay, or a graceful-shutdown
-  final snapshot) before upgrading. The writer's serialize/fsync remains the
-  dominant snapshot cost: at 170k commands / 68k dedup entries the measured
-  stage split is clone-only 0.28 ms on the shard, hash 5.35 ms on the writer,
-  and serialize (+fsync) 38.7 ms (see
+  instead of full `OrderId`s, so the file is smaller than v3: the recovery
+  test's 225,000-command workload (95,000 terminal ids) writes a 7,940,220-byte
+  v4 file (measured with `cargo test --release -p whippet --test recovery`;
+  file size only, not timing). Version 3 and older files are rejected with
+  `BadVersion`: `SymbolSnapshot` now carries the per-symbol config and
+  `BookSnapshot` carries `min_price_ticks`, plus the compact eviction order,
+  so the state hash can be reproduced from the snapshot alone. There is no
+  in-binary migration and no automatic fallback: delete or move the old
+  snapshot files (or `make reset`), start the new node so it full-replays from
+  0, and let it write v4. The terminal queue is part of the state hash
+  (`DedupTable::hash_into` and `hash_symbol_snapshot` hash the live terminal
+  ids in eviction order), so a reordered-but-valid `dedup_terminal_idx`
+  changes the snapshot hash and `whippet verify` fails. Snapshots are taken
+  from a compacted dedup walk (`snapshot_state_without_hash_compacted`), so a
+  restored walk is exact even if an id that was dead at snapshot time is
+  re-admitted by the tail. Restore rejects malformed indices (out of range,
+  pointing at a non-terminal entry, or a terminal id missing from the queue);
+  repeated indices for the same id are allowed. Decoding enforces a 256 MiB
+  cap: an oversized file is `TooLarge`, not `BadMagic`, and the bincode
+  payload is decoded with a size limit, trailing-byte rejection, and a
+  top-level symbol-count prefix check before allocating. The writer's
+  serialize/fsync remains the dominant snapshot cost (v3-era stage split at
+  170k commands / 68k dedup entries: clone-only 0.28 ms on the shard,
+  hash 5.35 ms on the writer, serialize (+fsync) 38.7 ms; see
   [PERFORMANCE.md](PERFORMANCE.md#phase-15e-implemented-dev-loop-measured)).
 - Written to a temporary file, `fsync`ed, then renamed over the previous
   snapshot. A reader never sees a partial file.
@@ -367,11 +424,14 @@ On startup, for each active shard:
 The dedup table is snapshotted with the book and the input offset. It is a
 business-level table keyed by the derived `OrderId`, not Iggy's producer
 idempotence. Capacity is `min(2 * max_orders, 100,000)` per symbol with
-FIFO eviction; an order id older than the retained window can be accepted
+terminal-first eviction (active resting orders are never evicted to make room);
+an order id older than the retained window can be accepted
 again.
 
-The state hash covers the book levels and FIFO order, the dedup entries
-(sorted by order id), both sequence counters, the last offset, the last
+The state hash covers the instrument config (tick size, ladder bounds,
+max orders, snapshot depth, market collar), the book levels and FIFO order,
+the dedup entries in insertion order, the terminal-eviction queue in eviction
+order, the command count, both sequence counters, the last offset, the last
 timestamp, and the halt flag. The shard hash covers the shard id and each
 symbol hash in symbol order. `whippet verify` loads each snapshot, rebuilds the
 engines, and prints the recomputed hash.
@@ -382,12 +442,21 @@ and never commits an offset. With `--from`, it starts at that offset and
 ignores any snapshot. Without `--from`, it restores the partition snapshot and
 replays the tail after the snapshot's maximum `last_offset`. `--to` is
 inclusive. `--expect-hash` turns a hash mismatch into a non-zero exit.
-`--require-snapshot` fails closed when the snapshot file is missing instead of
-falling back to a full replay from zero; the replay summary reports the
-broker's committed offset, the log head, and the tail length after the snapshot
-so an empty or stale snapshot is visible. `whippet verify --require-snapshot`
-applies the same rule to verification, and `whippet verify --partitions`
-checks a non-default partition-count layout.
+Both `verify` and `replay` accept `--symbols` (`WHIPPET_SYMBOLS`); the
+universe must match the node's, or a valid snapshot is rejected for a symbol
+the node never wrote. `verify` takes `--partitions`, `replay` takes
+`--partition` plus `--exchange-partitions`, and the partition count must match
+the layout the snapshots were written with. `whippet verify
+--require-snapshot` requires a snapshot for every active shard (a shard that
+owns at least one configured symbol), not just one file. `whippet replay
+--require-snapshot` requires the run to be seeded from a snapshot that is a
+real resume point, fails when any record was skipped or undecodable, fails
+when `snapshot_offset > head` or `snapshot_offset >= head` (there must be a
+tail to replay), and reports `snapshot_offset`, `committed_offset`, `head`,
+and `tail` in the summary. The commit watermark may lag the snapshot; only
+the log head bounds it. Node startup applies the same head bound: a snapshot
+ahead of its partition's head is rejected before the reader waits on a tail
+that will never arrive.
 
 On a local single-node run (M4, Docker Desktop, dev-loop), partition 1 had a
 snapshot at offset 158548. Full replay from offset 0 and snapshot-seeded replay

@@ -1,6 +1,6 @@
 # ADR 0013: Turbo mode — local sequencer, direct fanout, bounded uncommitted window
 
-- **Status:** Proposed
+- **Status:** Accepted (implemented 2026-11-15)
 - **Date:** 2026-11-15
 - **Deciders:** Whippet maintainers
 - **Related:** [ADR 0002](0002-durable-default-turbo-toggle.md) (durable default, turbo deferred),
@@ -36,8 +36,8 @@ semantics.
 
 `whippet_core::config::Mode::Turbo`, `Mode::as_str`, and `Mode::guarantee`
 already exist so the type surface does not change. `NodeConfig::from_args` in
-`crates/whippet/src/config.rs` currently rejects `--mode turbo`; this ADR
-specifies what replaces that rejection. Nothing here is implemented yet.
+`crates/whippet/src/config.rs` used to reject `--mode turbo`; this ADR replaces
+that rejection. It is implemented in the tree at this revision.
 
 ## Decision
 
@@ -161,7 +161,7 @@ not a silent seq reset.
 
 Recovery code is shared with durable and does not change in shape:
 
-1. The shard loads `data/snapshots/partition-<N>.snapshot` (format v2) and
+1. The shard loads `data/snapshots/partition-<N>.snapshot` (format v4) and
    verifies the state hash as today.
 2. The resume point is `resume_offset`'s maximum symbol `last_offset`, which in
    turbo is a **local seq**, recovered from the seq headers on replay, not from
@@ -257,6 +257,43 @@ second, as the match-latency histogram already is), surfaced through
 `GET /metrics` and documented in [OPERATIONS.md](../OPERATIONS.md). No numbers
 are claimed here; the first turbo benchmark run publishes them under the rules
 in [PERFORMANCE.md](../PERFORMANCE.md).
+
+## Implementation notes (2026-11-15)
+
+What landed, and the two places the implementation is stricter or more
+concrete than the design above:
+
+- `crates/whippet/src/turbo.rs` owns `TurboConfig` (the two knobs),
+  `TurboWindow` (a `Semaphore` count bound plus a mutex-guarded age queue),
+  `TurboAdmission` (the permit, released on `Drop`), `TurboEntry` (typed
+  command + prebuilt journal message + ack sender), `TurboAck`, and
+  `TurboIngress` (one bounded lane per active shard).
+- Ingress (`gateway.rs`, `tcp.rs`) admits through `TurboIngress::enqueue`.
+  HTTP and TCP enqueue the whole batch before awaiting any ack. Acks carry
+  `guarantee: "matched_unjournaled"`; a rejected match also carries the engine
+  reject reason. TCP keeps its fixed ack frame and returns `WindowFull` (wire
+  code 9) when admission fails.
+- The matcher is still the only sequencer. `feed_turbo` coalesces admitted
+  entries into the existing input ring; the matcher assigns each command the
+  next local seq, calls the same `ShardEngine::process`, sends the ack, and
+  hands the prebuilt order message plus the admission to the writer.
+- The writer coalesces up to eight matcher output batches, appends `orders`,
+  `executions`, and `md` in one overlapped join, and releases the admissions as
+  soon as the **orders** append is durable (the derived outputs still gate the
+  applied offset and commit). This is the write-behind's group commit;
+  without it the writer was the bottleneck at batch-10 ingress.
+- **Recovery is stricter than the draft above:** a turbo restart with a
+  snapshot replays `snapshot_offset + 1 ..= log_head` before the lane opens.
+  A restart with no snapshot requires an empty orders log; a non-empty log
+  without a snapshot is a startup error (the seq anchor cannot be
+  established). Turbo seq == broker offset because the write-behind appends
+  one order record per seq from an empty log, which is also the differential
+  test's stated precondition.
+- The window gauge is per shard:
+  `whippet_turbo_uncommitted_window{shard="<id>"}`. In this design it equals
+  `whippet_turbo_journal_lag{shard="<id>"}` because every admitted command is
+  matched and waiting for its orders append.
+- Switching modes on an existing log is not supported; reset the log.
 
 ## Files the next phase touches
 

@@ -405,13 +405,24 @@ Flags:
 - `--snapshot-dir` defaults to `data/snapshots`.
 - `--expect-hash <hex>` exits non-zero unless the final hash matches, which is
   useful in a script.
+- `--require-snapshot` fails closed: the run must be seeded from a snapshot
+  that is a real resume point, no record may be skipped or undecodable, and
+  `snapshot_offset` must be before the log head (`snapshot_offset >= head`
+  fails). The summary reports `snapshot_offset`, `committed_offset`, `head`,
+  and `tail`. The commit watermark may lag the snapshot; only the head bounds
+  it. `scripts/replay.sh` runs this gate and also fails when either run skips
+  records, when the seeded run's `head < snapshot_offset`, or when the seeded
+  run's `tail != decoded`.
 - `--iggy-user` and `--iggy-password` default to `iggy`/`iggy`. The CLI also
   reads `WHIPPET_IGGY_USER` and `WHIPPET_IGGY_PASSWORD`, the same variables as
   the node. Export the Compose credentials before running it from the host.
 
 The replay engine uses the default instrument set. If you changed
 `WHIPPET_PARTITIONS`, pass `--exchange-partitions N` so the symbol-to-partition
-mapping matches the log.
+mapping matches the log. If you changed `WHIPPET_SYMBOLS`, pass `--symbols`
+with the same list (or export it), or a valid snapshot is rejected for a
+symbol the node never wrote. `verify --partitions` / `--symbols` follow the
+same rule.
 
 Order types and matching semantics are summarized in
 [EXCHANGE-101.md](EXCHANGE-101.md).
@@ -445,8 +456,8 @@ The Live page:
 
 The metrics are live, conflated, and cumulative for the process lifetime. They
 are not benchmark results and they are not windowed percentiles. `consumer
-lag` is a placeholder set to zero after each MD batch; it is not a computed
-lag.
+lag` is the computed per-shard sweep (committed offset to head, summed over
+the active shards, refreshed every five seconds).
 
 The Bench page describes the method and the run matrix. It also shows the live
 dev-loop metrics. The About page restates the scope and the pinned versions.

@@ -219,7 +219,7 @@ p50 is within host noise while the tail moved.
 | Workstream | Change | Expected effect | Status |
 |---|---|---|---|
 | Shard thread and rings | One dedicated OS thread (`whippet-shard-<id>`) per active shard; bounded input ring (reader → matcher) and output ring (matcher → writer), capacity 2, plus a recycle channel that returns the polled buffer to the reader; the matcher does no I/O and no await; the reader/writer tasks own the journal edge | Removes the runtime migration and interleaving jitter from the match path; bounds in-flight memory per shard; backpressure when a ring fills instead of unbounded queueing | Implemented ([ADR 0010](adr/0010-shard-thread-and-journal-pipeline.md)); end-to-end sweep pending |
-| Snapshot hash | The matcher calls `snapshot_state_without_hash`; the writer fills the hashes and verifies the final snapshot by rebuilding. Snapshots are gated by `appended_offset`; cadence is 30 s (5–300). | Removes the hash from the match path; the final snapshot cannot claim a bad hash. The earlier scale mismatch was a dedup-count bug, now fixed and pinned by a 100-engine × 200k test | Implemented |
+| Snapshot hash | The matcher calls `snapshot_state_without_hash_compacted` (compacted walk, hashes zeroed); the writer fills the hashes and verifies the final snapshot by rebuilding. The terminal-eviction queue is hashed with the live ids in eviction order. Snapshots are gated by `appended_offset`; cadence is 30 s (5–300). | Removes the hash from the match path; the final snapshot cannot claim a bad hash. The earlier scale mismatch was a dedup-count bug, now fixed and pinned by a 100-engine × 200k test | Implemented |
 | Per-shard metrics | Each matcher records into its own lock-free `ShardMetrics` (counters + local histogram), merged into the global `Metrics` once per second and on exit | Removes one `Mutex<Histogram>` lock per command from every shard's serial path | Implemented; merge cost measured below |
 | Gateway/journal allocation pass | Per-event allocations on the edges: `execution_message`/`md_message` payload `Vec` + header `String`s remain the target; the reader's per-batch read `Vec` is now recycled | Lower CPU and allocation per event; fewer transient allocations per output | Partially implemented (recycle channel); message-construction pass pending |
 
@@ -259,7 +259,7 @@ final snapshot at write time, and moves the last stage sample off the matcher
 thread.
 
 Snapshot stage split at 170k commands / 68k dedup entries (targeted release
-bench, shared host):
+bench, shared host, v3 format):
 
 | Stage | Thread | Time |
 |---|---|---:|
@@ -269,10 +269,14 @@ bench, shared host):
 | `writer_serialize` (+fsync) | writer | **38.7 ms** |
 
 The clone was the shard stall; the writer's serialize/fsync dominates the
-periodic tail. At 225k commands the split was clone 0.4–0.6 ms, hash 8.1–8.3 ms,
-write 33.8–38.1 ms. Snapshot format v4 stores the terminal-eviction order as
+periodic tail. At 225k commands the v3-era split was clone 0.4–0.6 ms, hash
+8.1–8.3 ms, write 33.8–38.1 ms. Snapshot format v4 stores the terminal-eviction order as
 `u32` indices into the dedup walk instead of full `OrderId`s, so the file is
-smaller than v3; versions 3 and older are rejected. Serialize/fsync remains
+smaller than v3; versions 3 and older are rejected. The terminal queue is part
+of the state hash, and snapshots are taken from a compacted walk. The recovery
+test's 225,000-command workload (95,000 terminal ids) writes a 7,940,220-byte
+v4 file (measured with `cargo test --release -p whippet --test recovery`;
+file size only, not timing). Serialize/fsync remains
 the dominant snapshot cost.
 
 Dev-loop soak after the split (fresh stack, 5,000/s, batch 10, 90 s): p50
@@ -470,9 +474,10 @@ These do not show up in a steady-state per-order measurement, but they can own a
 tail sample:
 
 - **Snapshot build.** Every `WHIPPET_SNAPSHOT_EVERY` commands (default 10,000),
-  the matcher calls `snapshot_state()`, which clones the book,
-  the dedup table between batches; the blocking snapshot writer then computes
-  the live state hash and writes the file. The snapshot is
+  the matcher calls `snapshot_state_without_hash_compacted()`, which compacts
+  the dedup queues and clones the book and the dedup walk between batches with
+  the hashes left zeroed; the blocking snapshot writer then fills the hashes
+  off the match path and writes the file. The snapshot is
   gated by `appended_offset`, so it is only taken once every output up to the
   matcher's offset is in the journal. At the default dedup cap (100,000
   entries per symbol), the clone is large; the hash that used to accompany it
@@ -480,9 +485,14 @@ tail sample:
   periodic tail-latency source, not a per-order cost.
 - **Initial MD snapshot.** At startup, each shard publishes a full MD snapshot
   before it begins consuming. This is a startup cost, not a steady-state cost.
-- **Health monitor.** Every five seconds the node pings Iggy and refreshes
-  consumer lag with `committed` plus `lag` per active shard. That is several
-  broker round trips every five seconds. It is small, but it is not free.
+- **Health monitor.** Every five seconds the node pings the ingress client and
+  every engine-pool client concurrently, caches one aggregate flag (which
+  `/readyz` reads without journal I/O), and refreshes consumer lag with
+  `committed` plus `lag` per active shard through that shard's pool client.
+  That is several broker round trips every five seconds. It is small, but it
+  is not free. The engine pool's total pending-operations budget is
+  `WHIPPET_ENGINE_JOURNAL_PENDING_MIB` (default 256, clamped 16–4096), split
+  as `max(16 MiB, total / pool_size)` per client.
 - **Snapshot restore.** `from_snapshot` verifies the state hash twice: once after
   construction and once after canonical re-derivation. This is a startup cost
   that catches ordering mistakes early.
@@ -915,6 +925,27 @@ Record them at batch boundaries, not inside `SymbolEngine::process`. Do not add
 a clock read to the match loop to measure the match loop; measure around it.
 Populate the manifest's `stages` array only when the timestamps exist. An empty
 array is honest; a fabricated one is not.
+
+## Turbo mode (dev-loop, one run per mode)
+
+Turbo is a different guarantee, not a faster durable path, so the two rows are
+not interchangeable and the manifests now record the mode. Both runs below are
+the same 60 s soak shape on the same Docker Desktop host (3 active shards,
+5,000 orders/s offered, 300,000 orders, zero errors), one repetition each, run
+minutes apart. They are `dev-loop` smoke output, not a headline result.
+
+| Mode | p50 | p99 | p99.9 | Ack point |
+|---|---|---|---|---|
+| durable | 1,058 µs | 25,743 µs | 284,159 µs | after the Iggy append |
+| turbo | 1,086 µs | 11,575 µs | 160,767 µs | after the match (`matched_unjournaled`) |
+
+Both summary p50s include the first sample, when the bench and node are still
+warming; the steady 15 s samples were 864–894 µs p50 in durable and 481–516 µs
+p50 in turbo. The turbo p99 is dominated by HTTP/scheduler tail, not the window: the
+window gauge stayed at 0 after each sample, and a single-order smoke ack was
+88 µs. These are one-run observations; no claim is made about a Linux headline
+or sub-millisecond end-to-end durable latency. The differential test, not this
+table, is what proves turbo and durable match identically.
 
 ## Guardrails
 

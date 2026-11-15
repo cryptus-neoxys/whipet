@@ -10,8 +10,11 @@ Whippet is pre-1.0; minor releases may change internal APIs.
 
 ### Fixed
 
-- Snapshot terminal indices are validated on restore: out-of-range, duplicate,
-  non-terminal, or missing entries are rejected instead of silently skipped.
+- Snapshot terminal indices are validated on restore: out-of-range,
+  non-terminal, and missing entries are rejected instead of silently skipped,
+  while repeated indices for the same id are allowed. The terminal-eviction
+  queue is hashed with the live ids in eviction order, so a reordered-but-valid
+  queue changes the snapshot hash and `whippet verify` fails.
 - The dedup queues are compacted before a snapshot, so a restored table's
   insertion walk matches the live one even if an evicted id is re-admitted
   after the tail.
@@ -23,22 +26,59 @@ Whippet is pre-1.0; minor releases may change internal APIs.
 - Node startup rejects a snapshot ahead of its partition's log head.
 - Snapshot writes are serialized across shards; concurrent fsyncs were
   contending with Iggy's WAL.
+- The health monitor pings the ingress client and every engine-pool client
+  concurrently and caches one flag; `/readyz` reads the cached flag with no
+  journal I/O, and the lag sweep reads each shard through its per-shard pool
+  client. New `WHIPPET_ENGINE_JOURNAL_PENDING_MIB` (default 256, clamped
+  16–4096): the total pending-operations budget for the engine pool, split as
+  `max(16 MiB, total / pool_size)` per client; the ingress client keeps its
+  own 256 MiB.
+- `whippet replay --require-snapshot` fails when any record was skipped or
+  undecodable, when the run was not seeded, or when `snapshot_offset >= head`;
+  the summary reports `snapshot_offset`, `committed_offset`, `head`, and
+  `tail`. `scripts/replay.sh` fails on `skipped != 0` for either run and on
+  `tail != decoded` / `head < snapshot_offset` for the seeded run.
+- Oversized snapshot files decode as `TooLarge` (not `BadMagic`); decoding
+  enforces a bincode size limit, rejects trailing bytes, and validates the
+  top-level symbol-count prefix before allocating.
+- `verify`/`verify-strict` use `WHIPPET_PARTITIONS` (default 16);
+  `WHIPPET_REPLAY_PARTITION` still defaults to 1.
 - TCP charges the batch before auth/shard-health, and a batch is size-checked
   before the rate-limit charge; a request without a peer identity is charged
   the full batch.
 
 ### Added
 
-- Snapshot format v3 carries the dedup terminal-eviction order, so a restored
-  table evicts at the same point as a continuous replay. The dedup capacity is
-  no longer inflated by the insertion-walk length; a 33.9k-record replay tail
-  now matches full replay.
+- Turbo mode (`WHIPPET_MODE=turbo`, requires the Iggy journal). Ingress
+  acknowledges after `ShardEngine::process` returns with
+  `guarantee: "matched_unjournaled"`; a per-shard bounded window
+  (`WHIPPET_TURBO_WINDOW_COMMANDS`, default 10,000;
+  `WHIPPET_TURBO_WINDOW_MS`, default 50) bounds the crash loss, and a full
+  window returns `window_full` (HTTP 503, TCP `WindowFull`) instead of falling
+  back. The write-behind appends orders, executions, and MD before releasing
+  the window slot. On restart a snapshot is replayed to the log head before
+  ingress opens; a non-empty log with no snapshot is a startup error. Metrics:
+  `whippet_turbo_uncommitted_window{shard}`, `whippet_turbo_journal_lag{shard}`,
+  `whippet_turbo_window_drops_total`,
+  `whippet_turbo_ack_latency_microseconds`. The differential test proves
+  identical executions, MD, and state hash against the durable path on the
+  golden log.
+- Snapshot format v4 carries the dedup terminal-eviction order as `u32`
+  indices into a compacted dedup walk, so a restored table evicts at the same
+  point as a continuous replay and the walk is exact even after a
+  re-admission tail. The dedup capacity is no longer inflated by the
+  insertion-walk length; a 33.9k-record replay tail now matches full replay.
+  Versions 3 and older are rejected with `BadVersion`: there is no in-binary
+  migration and no automatic fallback.
 - The off-loop snapshot hash is restored with the distinct-id dedup count fix
   and pinned by a 100-engine × 200k-command stress test.
 - Snapshot cadence is configurable (`WHIPPET_SNAPSHOT_MIN_INTERVAL_SECS`,
   default 30 s, 5–300 s).
 - Per-IP WebSocket sub-limit (`WHIPPET_WS_PER_IP`, default off), plus
   `whippet_ws_connections` / `whippet_ws_rejected_total`.
+- `verify` and `replay` accept `--symbols` (`WHIPPET_SYMBOLS`) so the snapshot
+  universe matches the node's; `replay` takes `--exchange-partitions` and
+  `verify` takes `--partitions` for non-default layouts.
 - `GatewayValidate` and cancel stage samples; TCP batch rate cost.
 - Turbo design in ADR 0013.
 

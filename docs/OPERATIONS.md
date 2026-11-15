@@ -24,12 +24,15 @@ credentials explicitly.
 | `WHIPPET_MAX_WS_CONNECTIONS` | `2048` | Concurrent WebSocket subscriber cap. |
 | `WHIPPET_WS_PER_IP` | `0` | Per-IP WebSocket subscriber sub-limit; `0` disables it. The fanout benchmark leaves it off because all subscribers share one host. |
 | `WHIPPET_JOURNAL` | `iggy` | `iggy` for the demo, `memory` for tests and brokerless development. |
-| `WHIPPET_MODE` | `durable` | Only `durable` is enabled. `turbo` is rejected at startup with a Phase 2 message. |
+| `WHIPPET_MODE` | `durable` | `durable` or `turbo`. Turbo requires `WHIPPET_JOURNAL=iggy`, acknowledges after the match (`matched_unjournaled`), and can lose at most the bounded uncommitted window on a crash. Mode is fixed at startup; switching modes on an existing log requires a reset (see [Turbo mode](#turbo-mode)). |
 | `WHIPPET_SYMBOLS` | `BTC-USD,ETH-USD,SOL-USD` | Comma-separated subset of the built-in instruments. Unknown symbols are rejected. |
 | `WHIPPET_PARTITIONS` | `16` | Trading partitions, 1-256. This is a create-time contract; see below. |
 | `WHIPPET_SNAPSHOT_DIR` | `data/snapshots` | Directory for `partition-<N>.snapshot` files. |
 | `WHIPPET_SNAPSHOT_EVERY` | `10000` | Commands per symbol between state snapshots. The node also enforces a minimum interval (default 30 s, `WHIPPET_SNAPSHOT_MIN_INTERVAL_SECS`, clamped 5–300 s), so a high-throughput run snapshots at most once per interval. Values below 1 are clamped to 1. |
-| `WHIPPET_ENGINE_JOURNAL_CLIENTS` | active shard count | Engine-side Iggy connections in the per-shard pool, 1–16, clamped to that range. Defaults to the active shard count (one connection per active shard). `engine_journal_for(shard)` maps each shard deterministically to one pool client; the shard reader/writer, the MD consumer, and the lag observer (`committed`/`lag` per active shard) all use the engine pool, never the ingress client. |
+| `WHIPPET_ENGINE_JOURNAL_CLIENTS` | active shard count | Engine-side Iggy connections in the per-shard pool, 1–16, clamped to that range. Defaults to the active shard count (one connection per active shard). `engine_journal_for(shard)` maps each shard deterministically to one pool client; the shard reader/writer tasks and both MD consumers select through it, and the consumer-lag sweep reads each active shard's `committed`/`lag` through its own pool client — never the ingress client. The `engine_journal` observer handle shares pool entry 0 and opens no extra connection; neither the health monitor nor the lag sweep reads through it. |
+| `WHIPPET_ENGINE_JOURNAL_PENDING_MIB` | `256` | Total client-side pending-operations budget for the engine pool, in MiB, clamped to 16–4096. Split as `max(16 MiB, total / pool_size)` per client and passed to `IggyJournal::connect_with_pending`. A large pool can therefore exceed the configured total rather than starve a client. The ingress client keeps its own 256 MiB budget via `IggyJournal::connect`. Unused in `memory` journal mode, where every pool entry is the ingress `Arc`. |
+| `WHIPPET_TURBO_WINDOW_COMMANDS` | `10000` | Turbo only: commands allowed in one shard's uncommitted window. Validated at startup (1–1,000,000); a zero or oversized value is a startup error. |
+| `WHIPPET_TURBO_WINDOW_MS` | `50` | Turbo only: maximum age of the oldest unjournaled command in one shard's window, in ms (1–60,000). The binding limit is whichever of count or age is hit first. |
 | `WHIPPET_HTTP_TRACE` | unset | Set to `1` to enable per-request `tower-http` trace spans; off by default for throughput. |
 
 Concurrent single-order submissions on one partition are coalesced into one
@@ -64,6 +67,41 @@ Other processes:
 durability, no broker, and no cross-process consumers. The demo and every
 published result use `iggy`.
 
+## Turbo mode
+
+`WHIPPET_MODE=turbo` (or `--mode turbo`) acknowledges an order after
+`ShardEngine::process` returns, before the write-behind has appended it. The
+ack carries `guarantee: "matched_unjournaled"`; durable acks carry
+`"accepted_by_log"`. Matching semantics, the books, the state hash, and the
+snapshot format are identical to durable. The difference is the crash window:
+commands admitted but not yet appended are lost, bounded by
+`WHIPPET_TURBO_WINDOW_COMMANDS` and `WHIPPET_TURBO_WINDOW_MS`.
+
+- **Ingress.** HTTP and TCP admit the command through a per-shard bounded lane.
+  A full window returns HTTP 503 `window_full` (TCP error code `WindowFull`)
+  with nothing journaled; the node never silently falls back to durable.
+- **Write-behind.** The shard writer appends `orders` first, then executions
+  and MD, and only then releases the window slot, advances the applied offset,
+  and commits. A failed orders append stops the shard exactly like a failed
+  output append.
+- **Recovery.** A turbo restart from a snapshot replays the journaled tail
+  from `snapshot_offset + 1` through the log head before accepting ingress, so
+  the engine is at the log head when the lane opens. A restart with no
+  snapshot requires an empty orders log (the seq domain must be anchored); a
+  non-empty log without a snapshot is a startup error.
+- **Mode switch.** Switching durable ↔ turbo on an existing log is not
+  supported; `make reset` (or a new topic set) is required.
+- **Metrics.** `whippet_turbo_uncommitted_window{shard}`,
+  `whippet_turbo_journal_lag{shard}` (the same set in this design),
+  `whippet_turbo_window_drops_total{reason="count"|"age"}`, and the
+  `whippet_turbo_ack_latency_microseconds` summary.
+- **Backpressure is expected, not a failure.** On a host whose journal stalls
+  exceed the age bound (Docker Desktop routinely does), bursts are rejected
+  with `window_full`; clients retry. The dev-loop 5,000 orders/s run saw
+  1,052/300,000 commands rejected by the age bound and zero by the count
+  bound. Raise `WHIPPET_TURBO_WINDOW_MS` only as an explicit loss-window
+  decision.
+
 ## Topic creation
 
 On startup the node ensures three streams and six topics exist:
@@ -71,8 +109,8 @@ On startup the node ensures three streams and six topics exist:
 | Stream | Topic | Partitions | Durability | Retention | Max size |
 |---|---|---|---|---|---|
 | `whippet-trading` | `orders` | `WHIPPET_PARTITIONS` (16) | persisted | 24 h | 8 GiB |
-| `whippet-trading` | `executions` | 16 | persisted | 7 d | 8 GiB |
-| `whippet-md` | `md` | 16 | replicated | 1 h | 8 GiB |
+| `whippet-trading` | `executions` | `WHIPPET_PARTITIONS` (16) | persisted | 7 d | 8 GiB |
+| `whippet-md` | `md` | `WHIPPET_PARTITIONS` (16) | replicated | 1 h | 8 GiB |
 | `whippet-ops` | `alerts` | 4 | persisted | 30 d | 2 GiB |
 | `whippet-ops` | `audit` | 4 | persisted | 90 d | 2 GiB |
 | `whippet-ops` | `commands` | 1 | persisted | 7 d | 2 GiB |
@@ -244,14 +282,19 @@ There are no per-order log lines on the hot path.
 ## Health and metrics
 
 `GET /readyz` returns 200 only when the journal is reachable and every shard
-task is alive; otherwise 503. Use it for container readiness. `GET /api/health`
+task is alive; otherwise 503. Use it for container readiness. It reads a
+cached flag and performs no journal I/O: every five seconds the health monitor
+pings the ingress client and every engine-pool client concurrently and caches
+the single aggregate, then refreshes the consumer-lag sweep. `GET /api/health`
 returns HTTP 200 with `status: "ok"` or `"degraded"`. It is
 `ok` only when the journal is reachable (or the in-memory journal is selected)
 and every shard task is alive; `shards_ok` reports the latter. A corrupt
 snapshot or a shard task panic therefore degrades health instead of leaving a
-silent "up but not matching" node. The
-node pings Iggy at startup and every five seconds. `degraded` means the last
-ping failed; it does not mean the process is down.
+silent "up but not matching" node. The health monitor pings all pool entries
+because every entry is its own Iggy connection: an ingress link that is up
+while any engine link is down still means orders are accepted and never
+matched. `degraded` means the last ping failed; it does not mean the process
+is down.
 
 ```sh
 docker compose -f deploy/compose.yaml exec node whippet healthcheck
@@ -285,7 +328,7 @@ Series:
 | `whippet_trades_total` | counter | Trade events observed by the MD consumer. |
 | `whippet_md_events_total` | counter | MD records applied by the hub, including snapshots. |
 | `whippet_engine_commands_total` | counter | Input commands applied by the matcher. |
-| `whippet_consumer_lag` | gauge | Placeholder, set to 0 after each MD batch. Not a computed lag. |
+| `whippet_consumer_lag` | gauge | Records waiting behind the engine consumers, summed over the active shards. Every five seconds the monitor reads each shard's committed offset and head through that shard's engine-pool client. |
 | `whippet_ingress_latency_microseconds{quantile="0.5"}` | gauge | Gateway append path p50, cumulative histogram. |
 | `whippet_ingress_latency_microseconds{quantile="0.99"}` | gauge | Gateway append path p99, cumulative histogram. |
 | `whippet_match_latency_microseconds{quantile="0.5"}` | gauge | Synchronous engine call p50, cumulative histogram. |
@@ -304,8 +347,9 @@ Caveats:
   cumulative, not windowed, and they are not benchmark results.
 - Counters reset when the node restarts. Prometheus handles the reset, but a
   rate over a restart boundary is meaningless.
-- `whippet_consumer_lag` is not wired to a real lag calculation yet. Do not
-  alert on it.
+- `whippet_consumer_lag` is the per-shard sweep described above, not a
+  placeholder. Do not alert on it across restarts: the committed offsets reset
+  with the broker state.
 - `/metrics` has no authentication in Phase 1. Publish it only on the Compose
   network, or put it behind a reverse proxy. Do not expose it to the internet.
 - The exposition types `whippet_uptime_seconds` as a counter. It is monotonic
@@ -376,17 +420,22 @@ Neither command proves that the snapshot is the newest possible state.
 
 Fail-closed verification and replay:
 
-- `whippet verify --require-snapshot` exits non-zero when a shard has no
-  snapshot file instead of reporting "no snapshots" as success.
+- `whippet verify --require-snapshot` exits non-zero unless every active
+  shard (a shard that owns at least one configured symbol) has a snapshot
+  file; a partial set is not a proof. `--symbols` (`WHIPPET_SYMBOLS`) must
+  match the node's universe.
 - `whippet verify --partitions 4` checks shards `0..4` with a 4-partition
   exchange layout (a snapshot written with one partition count must be
   verified with the same count, not the 16-partition default).
 - `whippet replay --require-snapshot` refuses to fall back to a full replay
-  from zero when the snapshot is missing or unusable (no applied commands,
-  ahead of the engine's committed offset, or at/past the log head); the replay
-  summary reports the broker's committed offset, the log head, and the tail
-  length after the snapshot so an empty or stale snapshot is visible in the
-  summary.
+  from zero when the snapshot is missing, unusable (no applied commands),
+  or not before the log head (`snapshot_offset > head` and
+  `snapshot_offset >= head` both fail); it also fails when any record was
+  skipped or undecodable or the run was not seeded. Use `--symbols`
+  (`WHIPPET_SYMBOLS`) and `--exchange-partitions` to match the node's layout.
+  The replay summary reports `snapshot_offset`, `committed_offset`, `head`,
+  and `tail` so an empty or stale snapshot is visible. The commit watermark
+  may lag the snapshot; only the log head bounds it.
 
 Restore:
 
@@ -394,13 +443,22 @@ Restore:
 2. Put the `partition-<N>.snapshot` files back in `WHIPPET_SNAPSHOT_DIR`.
 3. Start the node. Each shard verifies its hash before using the snapshot. A
    mismatch aborts that shard with an error; the node does not silently use a
-   corrupt file.
+   corrupt file. `whippet replay` never writes a snapshot; it only reads the
+   log and the existing files.
 
 To rebuild a shard from scratch, delete the snapshot; the engine starts at
 offset zero and replays the whole log (the committed offset only seeds the
 commit watermark). That is a full replay. If the log has been truncated by
 retention, replay from zero hits a gap and the shard fails closed; the safe
 reset for the demo is `make reset`.
+
+Upgrade path for the snapshot format: v3 and older files are rejected with
+`BadVersion`, and a file that fails verification fails its shard closed (the
+shard is marked failed). There is no in-binary migration and no automatic
+fallback to a previous file or to a full replay. Delete or move the old
+snapshot files (or `make reset`), start the new node so it full-replays from
+0, and let it write v4. Recovery always requires operator action; the node
+never recovers silently.
 
 If you want to cold-copy the Iggy volume, stop the whole stack first. Do not
 copy a live volume.
@@ -429,8 +487,9 @@ Upgrade procedure:
 5. Update this table and the manifest docs.
 
 Rollback: pin both artifacts back. Snapshots use format version 4 with a
-`WHIPSNP1` magic and bincode; versions 3 and older are rejected. A
-snapshot-format change is a data migration, not
-a rolling upgrade; reset the data if the format is not compatible.
+`WHIPSNP1` magic and bincode; versions 3 and older are rejected with
+`BadVersion`, and a snapshot-format change is a data migration, not
+a rolling upgrade: delete or move the old files (or reset the data) and let
+the new node full-replay from 0 and write v4.
 
 The phase gates for larger changes are in [ROADMAP.md](ROADMAP.md).
