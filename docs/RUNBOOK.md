@@ -92,7 +92,7 @@ Safe response on critical (link: [ADR 0014](adr/0014-bounded-storage-and-replay-
 ## 3. Snapshot and verify
 
 Snapshots live in `WHIPPET_SNAPSHOT_DIR` (`data/snapshots` in the container)
-as `partition-<N>.snapshot` files. Format is v5 (`WHIPSNP1` magic); v4 and
+as `partition-<N>.snapshot` files. Format is v6 (`WHIPSNP1` magic); v5 and
 older are rejected with `BadVersion`. Each file is written to a temporary
 file, `fsync`ed, and renamed, so an individual file is never partial. A set
 of shard files is not a global point-in-time; shards snapshot independently,
@@ -223,14 +223,22 @@ recorded, results pending — see section 12.
 `pre_open`, `open`, or `closed`. Only `open` admits new orders
 (`session_not_open`); cancels remain allowed. The change is log-ordered,
 audited (`action: set_session`), visible in `/api/state` and the dashboard,
-and replayed by `verify`/`replay`. Snapshot v5 includes the session.
+and replayed by `verify`/`replay`. Snapshot v6 includes the session and the
+per-symbol risk table.
 
 ### Risk and positions
 
 - The ingress risk guard is configured with `WHIPPET_RISK_MAX_ORDER_QTY` and
   `WHIPPET_RISK_MAX_NOTIONAL_CENTS` (0 disables). A rejection is HTTP 422
   `risk_limit` / TCP `RiskRejected`; `whippet_risk_rejected_total` shows the
-  reason. It is an ingress guard, not engine-enforced risk.
+  reason. It is a stateless per-order guard.
+- Engine risk is per participant and symbol:
+  `POST /api/admin/instruments/{symbol}/risk` with an operator token and
+  `{"participant":"desk-a","max_net_qty":500,"max_open_buy_notional_cents":25000000}`.
+  Both bounds are required; `0` disables one. The command is log-ordered and
+  audited (`action: set_risk`), and the engine rejects new orders that would
+  breach it with `risk_limit` (reject reason `risk_limit`). Limits survive
+  replay and snapshot v6; existing exposure is preserved when limits change.
 - `whippet positions --partition 1 [--symbol] [--participant N]` reconstructs
   net/buy/sell quantity, cash flow, fills, and unresolved maker legs from the
   logs. Read-only; not a settlement ledger.
@@ -240,8 +248,9 @@ and replayed by `verify`/`replay`. Snapshot v5 includes the session.
 Both are read-only CLI views over the logs:
 
 ```sh
-make audit                       # operator halt/resume records, partition, offset
+make audit                       # operator records, partition, offset
 whippet audit --operator ops1 --action halt --json
+whippet audit --action set_risk --json
 whippet order-trace --partition 1 --order-id <decimal|0xhex> --verify
 ```
 
@@ -351,10 +360,10 @@ together, `make reset && make up`, then `make demo`, `make verify`, and a
 `whippet replay --expect-hash` check against a known log. Record the new
 image digest in `WHIPPET_IMAGE_DIGEST`.
 
-Snapshot version: v5 current; v4 and older rejected with `BadVersion`. A
+Snapshot version: v6 current; v5 and older rejected with `BadVersion`. A
 snapshot-format change is a data migration, not a rolling upgrade: delete or
 move the old files (or reset the data) and let the new node full-replay from
-0 and write v5.
+0 and write v6.
 
 `make reset` is destructive: it deletes the Iggy log, broker-stored consumer
 offsets, and snapshots in the named volume. It keeps host `data/`,

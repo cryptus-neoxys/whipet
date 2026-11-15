@@ -96,6 +96,44 @@ instead of the removed order's side, and a post-acceptance cancel hardcoded
   log, so replay and snapshot restore reproduce them; the state hash covers
   both.
 
+## 3.1 Engine-enforced risk (`whippet-engine::risk`)
+
+Per-participant limits are engine state, not an edge filter:
+
+- `SetRisk` is a `CommandKind` record on the same ordered orders log as client
+  traffic. The engine applies it at the command's log position, so replay and
+  snapshot restore reach the same limits and exposure. `RiskTable::set_limits`
+  preserves the participant's existing exposure; zero disables a bound.
+- `RiskLimits { max_net_qty, max_open_buy_notional_cents }` bounds the
+  worst-case position (`net + open buy` for a buy candidate, `net - open sell`
+  for a sell candidate, charged the candidate's full quantity) and the quote
+  cents in resting buys (charged the candidate's full quantity even if it
+  would cross). Only `Limit`/`PostOnly` buys are charged notional.
+- Admission runs after the order's own validity/fillability checks and before
+  the dedup id is accepted: a refused order produces one `risk_limit`
+  rejection and no book, MD, dedup, or exposure mutation.
+- Exposure moves only with the book and fills: a rest adds open quantity and
+  buy notional, a cancel/STP removal subtracts them, a taker or maker fill
+  moves `net_qty` (the maker's resting quantity leaves with the fill), and an
+  opposite fill that nets to zero prunes a flat unrestricted entry.
+- `RiskTable::check_invariants` requires strictly ordered participant entries
+  and no empty entry; `check_against_orders` re-derives every participant's
+  open quantity and buy notional from the book at the instrument's tick size
+  and requires an exact match in both directions. Both run in
+  `SymbolEngine::check_invariants` (test/diagnostic) and on snapshot restore
+  (cold path).
+- Risk limits and exposure are in the `whippet-engine-v2` state-hash domain
+  and in snapshot format v6, so a dropped `SetRisk` or a stale exposure cannot
+  hash or restore as a valid engine.
+- The operator API is `POST /api/admin/instruments/{symbol}/risk` with
+  `participant`, `max_net_qty`, and `max_open_buy_notional_cents` (both bounds
+  required, zero disables). It is operator-only, appended before the audit
+  record, and the audit names the participant and both bounds.
+
+The static ingress guard (`whippet::config::RiskConfig`) remains a separate,
+stateless per-order filter. Engine risk is the authority for a participant's
+accumulated position and open interest; the ingress guard is not.
+
 ## 4. Shard lifecycle and readiness (`whippet::health`)
 
 Each active shard has two roles (engine, MD), each with:
@@ -121,7 +159,7 @@ failure paths that mark only the failing role.
 
 ## 5. Snapshot and journal
 
-- The snapshot file is `WHIPSNP1` + version `5` + bincode; load rejects bad
+- The snapshot file is `WHIPSNP1` + version `6` + bincode; load rejects bad
   magic, an old version, the wrong shard id, a hash mismatch, oversized
   lengths, trailing bytes, and a snapshot ahead of the log head.
 - Before any file exists, `ShardSnapshot::check_invariants` requires: a
@@ -144,8 +182,10 @@ failure paths that mark only the failing role.
 - A commandless snapshot written by an older node or by hand is still rejected
   by the reader (`--require-snapshot` fails closed), even though the current
   writer refuses to produce one.
-- The dedup terminal queue and session are part of the state hash; the
-  terminal queue is validated on restore.
+- The dedup terminal queue, session, and per-symbol risk table are part of the
+  state hash; the terminal queue and the risk table are validated on restore,
+  and risk open exposure is re-derived from the book at the instrument's tick
+  size.
 - The engine consumer commits only after the orders, executions, and MD
   appends land, and only for a batch that actually consumed an input record:
   the empty shutdown batch carries `applied = false`, so it cannot claim
@@ -183,13 +223,16 @@ failure paths that mark only the failing role.
 - Credential namespaces are disjoint: a token cannot be both a trading token
   and an operator token (or a metrics token); duplicate trading tokens and
   duplicate operator tokens are rejected at startup. Operator tokens are
-  HTTP-only; TCP `Submit` rejects `Halt`/`Resume`/`SetSession`.
+  HTTP-only; TCP `Submit` rejects `Halt`/`Resume`/`SetSession`/`SetRisk`.
 - Batches are same-symbol, non-empty, at most 256 orders; the whole batch is
   validated before any append; TCP participant ids must match the token's
   derived id.
 - Optional per-order quantity/notional limits are enforced before the append
   (HTTP 422 `risk_limit`, TCP `RiskRejected`); both zero disables them. They
-  are an admission guard, not engine-enforced risk.
+  are a stateless admission guard; accumulated per-participant exposure is
+  enforced by the engine (section 3.1).
+- Operator risk changes are HTTP-only, operator-token-only, and log-ordered
+  like halt/session; TCP `Submit` rejects `SetRisk`.
 - Rate limits are charged before validation; a full turbo window rejects with
   `window_full`, never a durable fallback; storage-critical rejects with
   `storage_pressure`.
@@ -267,8 +310,10 @@ deposits, withdrawals, margin, or clearing. See ADR 0022.
   verified snapshot or replay is the cross-check.
 - Commit state is in-process: a broker outage can extend commit lag up to the
   retry cadence, and only a restart proves what was acknowledged.
-- The ingress risk guard is bypassable by a direct log producer; engine-level
-  exposure/account state is not implemented.
+- The ingress risk guard is bypassable by a direct log producer. Engine risk
+  closes that gap for the participants an operator has configured, but it
+  tracks only net quantity and resting buy notional: there is no cash,
+  margin, fees, funding, or cross-symbol aggregation.
 - Position reconstruction and the ledger are projections, not settlement: no
   fees, funding, margin, or clearing; unknown legs are reported rather than
   inferred, and the ledger excludes a whole trade with an unresolved leg.

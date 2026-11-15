@@ -33,7 +33,7 @@ Topic creation records finite retention and size bounds, but nothing trims the l
 - Snapshots are recovery accelerators, not backups ([OPERATIONS.md](../OPERATIONS.md) "Backup and
   restore"). A snapshot file is only meaningful with its `last_offset` and state hash
   (`whippet verify`, `whippet replay --require-snapshot` report `snapshot_offset`,
-  `committed_offset`, `head`, `tail`). Format is v5 (`WHIPSNP1`); v4 and older are rejected.
+  `committed_offset`, `head`, `tail`). Format is v6 (`WHIPSNP1`); v5 and older are rejected.
   Consumers commit manually (`CommitPolicy::Manual`): the engine commits only after executions
   **and** MD appends land; the MD consumer commits after applying. A crash between output
   append and offset commit replays at-least-once.

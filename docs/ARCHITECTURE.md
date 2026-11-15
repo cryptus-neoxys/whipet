@@ -139,9 +139,10 @@ HTTP/TCP -> TurboIngress (one bounded lane + window per active shard)
 
 ### Instrument control plane
 
-Halt and resume are `CommandKind::Halt`/`Resume` records in the **orders** log,
-not a side channel. The matcher processes them in log order, so a restore or a
-full replay reproduces the halted state and the state hash covers it. The
+Halt/resume, session changes, and risk limits are `CommandKind::Halt`/
+`Resume`/`SetSession`/`SetRisk` records in the **orders** log, not a side
+channel. The matcher processes them in log order, so a restore or a full replay
+reproduces the halted, session, and risk state and the state hash covers it. The
 engine rejects new orders with `Rejected/Halted` while halted, allows cancels,
 and emits a `MdKind::Status` event (`MD_FLAG_HALTED`) that the MD hub applies to
 `BookView.halted`. The engine's state snapshot carries `halted`; the MD
@@ -152,7 +153,10 @@ or an MD-sequence bump.
 The HTTP endpoints are operator-only (`WHIPPET_OPERATOR_TOKENS`, a namespace
 separate from trading tokens); the binary TCP channel rejects operator
 commands. One JSON audit record per accepted request lands in the `audit`
-topic; see [ADR 0015](adr/0015-audited-instrument-control-plane.md).
+topic; see [ADR 0015](adr/0015-audited-instrument-control-plane.md) and
+[ADR 0026](adr/0026-engine-enforced-risk-limits.md). Engine risk bounds each
+participant's worst-case net position and resting buy notional; the static
+ingress guard is only a per-order filter.
 
 ### Group commit
 
@@ -226,8 +230,9 @@ and there is no rebalancing.
 
 1. Update `last_offset` and `last_ts_ns`.
 2. Dispatch to cancel or new order.
-3. Validate: symbol, halt state, quantity, price, ladder bounds, duplicate id,
-   post-only crossing, FOK fillability.
+3. Validate: symbol, halt/session state, quantity, price, ladder bounds,
+   duplicate id, post-only crossing, FOK fillability, and the participant's
+   engine risk bounds.
 4. Record the order in the dedup table.
 5. Match against the opposite side in price-time priority.
 6. Emit executions and MD events into the caller's reused `EngineOutput`.
@@ -247,8 +252,8 @@ Implemented order types: limit (GTC), market with a 500 bps collar, IOC, FOK,
 and post-only. Cancel removes a resting order. Self-trade prevention cancels
 the resting order and emits a maker cancellation; the aggressor keeps its
 remaining quantity. There are no stop, iceberg, pegged, trailing, auction, or
-multi-leg orders. A `halted` flag exists in the engine state, but no API or log
-command sets it in Phase 1.
+multi-leg orders. Halt, session, and risk changes are log-ordered operator
+commands with an audited HTTP control plane; see ADRs 0015, 0018, and 0026.
 
 ## Single writer, not a pinned thread
 
@@ -313,7 +318,7 @@ The design rules:
   ~170k-order mismatch was a dedup-count bug: the off-loop hash used the
   insertion-walk length where the live hash uses the distinct-id count, and a
   re-admitted id made them differ. The fix is pinned by a 100-engine ×
-  200k-command test. The snapshot file format is version 5 (per-symbol config,
+  200k-command test. The snapshot file format is version 6 (per-symbol config, risk table,
   `BookSnapshot.min_price_ticks`, and the dedup terminal-eviction order stored
   as `u32` indices into the dedup walk instead of full `OrderId`s); versions 3
   and older are rejected.
@@ -428,28 +433,31 @@ series list is in
 
 ## Recovery
 
-The engine state per symbol is: the book, the dedup table, `exec_seq`,
-`md_seq`, `last_offset`, `last_ts_ns`, the command count, the halt flag, and a
-BLAKE3 state hash.
+The engine state per symbol is: the book, the dedup table, the risk table,
+`exec_seq`, `md_seq`, `last_offset`, `last_ts_ns`, the command count, the halt
+flag, the session, and a BLAKE3 state hash.
 
 A shard snapshot contains all symbol states for one partition and is written
 to `data/snapshots/partition-<N>.snapshot`:
 
-- Magic `WHIPSNP1`, format version `5`, then a bincode payload. The v5
-  terminal-eviction order is stored as `u32` indices into the dedup walk
-  instead of full `OrderId`s, so the file is smaller than v3: the recovery
-  test's 225,000-command workload (95,000 terminal ids) writes a 7,940,220-byte
-  v4 file (measured with `cargo test --release -p whippet --test recovery`;
-  file size only, not timing). Version 3 and older files are rejected with
-  `BadVersion`: `SymbolSnapshot` now carries the per-symbol config and
-  `BookSnapshot` carries `min_price_ticks`, plus the compact eviction order,
-  so the state hash can be reproduced from the snapshot alone. There is no
-  in-binary migration and no automatic fallback: delete or move the old
-  snapshot files (or `make reset`), start the new node so it full-replays from
-  0, and let it write v5. The terminal queue is part of the state hash
-  (`DedupTable::hash_into` and `hash_symbol_snapshot` hash the live terminal
-  ids in eviction order), so a reordered-but-valid `dedup_terminal_idx`
-  changes the snapshot hash and `whippet verify` fails. Snapshots are taken
+- Magic `WHIPSNP1`, format version `6`, then a bincode payload. The
+  terminal-eviction order (added in v4) is stored as `u32` indices into the
+  dedup walk instead of full `OrderId`s, so the file is smaller than v3: the
+  recovery test's 225,000-command workload (95,000 terminal ids) writes a
+  7,940,220-byte v4 file (measured with `cargo test --release -p whippet
+  --test recovery`; file size only, not timing). Format history: v2 added the
+  per-symbol config and `BookSnapshot.min_price_ticks`, v4 the compact
+  eviction order, v5 the session byte, and v6 the per-symbol risk table.
+  Version 5 and older files are rejected with `BadVersion`. Because the
+  snapshot carries the full per-symbol state (config, book, dedup, session,
+  risk), the state hash is reproducible from it alone. There is no in-binary migration
+  and no automatic fallback: delete or move the old snapshot files (or
+  `make reset`), start the new node so it full-replays from 0, and let it
+  write v6. The terminal queue and risk table are part of the state hash
+  (`DedupTable::hash_into` hashes the live terminal ids in eviction order and
+  `RiskTable::hash_into` hashes participant entries in key order), so a
+  reordered-but-valid `dedup_terminal_idx` changes the snapshot hash and
+  `whippet verify` fails. Snapshots are taken
   from a compacted dedup walk (`snapshot_state_without_hash_compacted`), so a
   restored walk is exact even if an id that was dead at snapshot time is
   re-admitted by the tail. Restore rejects malformed indices (out of range,

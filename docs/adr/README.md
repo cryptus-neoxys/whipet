@@ -22,8 +22,8 @@ supersedes an earlier one.
 | [0014](0014-bounded-storage-and-replay-safe-retention.md) | Bounded storage guard and replay-safe retention rule | Proposed (guard implemented; deletion rule design-only — never delete without consumer + verified-baseline proof) |
 | [0015](0015-audited-instrument-control-plane.md) | Audited instrument halt/resume control plane | Accepted (implemented; log-ordered commands, operator tokens, audit topic) |
 | [0016](0016-sequenced-price-level-market-data-feed.md) | Sequenced price-level market-data feed | Accepted (implemented; `/ws/md`, snapshot + deltas + resync) |
-| [0017](0017-ingress-risk-and-position-reconstruction.md) | Ingress pre-trade risk and read-only position reconstruction | Accepted (per-order qty/notional guard + `whippet positions`; engine-enforced risk/ledger proposed) |
-| [0018](0018-instrument-session-state.md) | Instrument session state | Accepted (log-ordered `set_session`, snapshot v5, hub/dashboard visibility) |
+| [0017](0017-ingress-risk-and-position-reconstruction.md) | Ingress pre-trade risk and read-only position reconstruction | Accepted (per-order qty/notional guard + `whippet positions`; engine-enforced risk now ADR 0026) |
+| [0018](0018-instrument-session-state.md) | Instrument session state | Accepted (log-ordered `set_session`, snapshot v5 now v6 via 0026, hub/dashboard visibility) |
 | [0019](0019-executable-engine-invariants.md) | Executable engine invariants and the order lifecycle | Accepted (book/dedup/engine checks, dedup transition table) |
 | [0020](0020-explicit-shard-lifecycle.md) | Explicit shard lifecycle and readiness | Accepted (per-role state machine, readiness = all engine+MD running) |
 | [0021](0021-durable-path-state-machines.md) | Durable-path state machines: snapshot, commit, turbo admission | Accepted (save-time snapshot invariants, commit watermark/retry, admission lifecycle) |
@@ -31,6 +31,7 @@ supersedes an earlier one.
 | [0023](0023-resume-points-and-feed-baselines.md) | Resume points and feed baselines | Accepted (journal commit bounds, MD baseline phase, seq advances iff applied) |
 | [0024](0024-execution-output-invariants.md) | Execution output provenance invariants | Accepted (one fill ↔ one trade ↔ one maker reduce/remove; role/seq/offset checks) |
 | [0025](0025-price-units-ticks-vs-cents.md) | Price units: ticks on the wire, quote cents in projections | Accepted (`TickSizes`, `--tick-size-cents`, ledger entries carry both) |
+| [0026](0026-engine-enforced-risk-limits.md) | Engine-enforced per-participant risk limits | Accepted (log-ordered `set_risk`, exposure from book/fills, snapshot v6, operator API + audit) |
 
 Template:
 

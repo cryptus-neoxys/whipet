@@ -293,7 +293,7 @@ bench, shared host, v3 format):
 
 The clone was the shard stall; the writer's serialize/fsync dominates the
 periodic tail. At 225k commands the v3-era split was clone 0.4–0.6 ms, hash
-8.1–8.3 ms, write 33.8–38.1 ms. Snapshot format v4 (the measurement below is v4-era; v5 adds the session byte) stores the terminal-eviction order as
+8.1–8.3 ms, write 33.8–38.1 ms. Snapshot format v4 (the measurement below is v4-era; v5 added the session byte and v6 the risk table) stores the terminal-eviction order as
 `u32` indices into the dedup walk instead of full `OrderId`s, so the file is
 smaller than v3; versions 3 and older are rejected. The terminal queue is part
 of the state hash, and snapshots are taken from a compacted walk. The recovery

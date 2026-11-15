@@ -88,15 +88,16 @@ dashboard replay scrubber, which is Phase 2.
 
 ## State and recovery
 
-**Snapshot.** A serialized copy of a shard's books, dedup table, sequence
-counters, and last input offset. Whippet writes one file per active partition,
-atomically via temp file, `fsync`, and rename. A snapshot is a recovery
-accelerator, not a backup of the log.
+**Snapshot.** A serialized copy of a shard's books, dedup table, risk table,
+session/halt state, sequence counters, and last input offset. Whippet writes
+one file per active partition, atomically via temp file, `fsync`, and rename.
+A snapshot is a recovery accelerator, not a backup of the log.
 
 **State hash.** A BLAKE3 digest over the book levels and FIFO order, the dedup
-entries, both sequence counters, the last offset, the last timestamp, and the
-halt flag. The shard hash combines the per-symbol hashes. Equal hashes after
-replay mean the engine reached the same state.
+entries, the per-participant risk table (limits and exposure), both sequence
+counters, the last offset, the last timestamp, the halt flag, and the session.
+The shard hash combines the per-symbol hashes. Equal hashes after replay mean
+the engine reached the same state.
 
 **Dedup table.** Whippet's business-level table of order ids and their status.
 It is snapshotted with the book and the input offset. Iggy's idempotent
@@ -104,6 +105,18 @@ producer dedup is a different mechanism and is not used here. Capacity is
 `min(2 * max_orders, 100,000)` entries per symbol with terminal-first
 eviction. The window is count-based, not a time TTL, and an id evicted from
 the window can be re-admitted.
+
+**Engine risk.** Per-participant, per-symbol limits enforced by the matcher:
+`max_net_qty` bounds the worst-case absolute position (net position plus
+resting orders on the side that could fill) and
+`max_open_buy_notional_cents` bounds quote cents in resting `Limit`/`PostOnly`
+buys. Limits arrive as log-ordered `SetRisk` commands and are part of the
+state hash and snapshot. Distinct from the **ingress guard**, a stateless
+per-order quantity/notional filter at the gateway.
+
+**Exposure.** What a participant currently has at risk in one symbol: net
+position (buys filled minus sells filled), open buy/sell quantity in the book,
+and open buy notional. It moves only with rests, cancels, and fills.
 
 **Single writer.** Exactly one task applies commands to a partition's books.
 Whippet gets this from one dedicated matcher OS thread per active shard, not

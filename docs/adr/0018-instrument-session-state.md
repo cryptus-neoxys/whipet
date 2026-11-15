@@ -65,11 +65,12 @@ offset is appended to the audit topic. The ack carries `session`; its
 `halted: false` field is not a halt statement, because a session change does
 not touch the halt flag.
 
-### Snapshot format v5
+### Snapshot format v5 (superseded by v6)
 
 `SymbolSnapshot` gains `session`, and the state hash gains the session byte.
 The snapshot file format is bumped to v5; v4 and older are rejected with
-`BadVersion` and there is no compatibility shim. An upgrade therefore requires
+`BadVersion` and there is no compatibility shim. ADR 0026 later bumps the
+format to v6 for the per-symbol risk table; v5 and older are now rejected. An upgrade therefore requires
 a reset or a full replay from an empty log. The golden state hash moves
 deliberately; the standard log runs in `open`, so matching and sequencing are
 unchanged.
@@ -90,7 +91,7 @@ unchanged.
 
 - Session changes consume an orders-log offset and are visible in the state
   hash; they are rare, but they are part of the log's history.
-- v4 snapshots are rejected; upgrade means reset/full replay. The MD status
+- v5 snapshots are rejected by the v6 reader; upgrade means reset/full replay. The MD status
   byte is present in new snapshots and Status events; a v5 upgrade resets the
   log, so no old MD snapshot is consumed by a v5 node.
 - Auctions, automatic session schedules, and price-band changes are still

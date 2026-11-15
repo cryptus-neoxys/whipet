@@ -319,12 +319,13 @@ are in [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Batch ingress + binary TCP | Implemented | Up to 256 same-symbol orders per append; TCP on port 8081. |
 | Per-partition group commit | Implemented | Concurrent single-order appends coalesced, up to 256 per append. |
 | Dedicated matcher thread + bounded rings | Implemented | Reader → input ring → matcher OS thread → output ring → writer; see [ARCHITECTURE.md](docs/ARCHITECTURE.md). |
-| Snapshot v5 + verify | Implemented | `whippet verify` recomputes the state hash, including the terminal-eviction queue. |
+| Snapshot v6 + verify | Implemented | `whippet verify` recomputes the state hash, including the terminal-eviction queue and per-symbol risk table. |
 | Replay | Implemented | `whippet replay` rebuilds from the full log or from a snapshot plus tail. |
 | Turbo mode | Implemented | `WHIPPET_MODE=turbo`: match-complete ack (`matched_unjournaled`), bounded window; see [ADR 0013](docs/adr/0013-turbo-mode.md). |
 | Scoped tokens + metrics auth | Implemented | `WHIPPET_API_TOKENS` binds each token to one participant; `WHIPPET_METRICS_TOKEN` can protect `/metrics`. |
 | Consumer groups | Planned | Named consumers with manual offsets today; groups are Phase 2 work. |
-| Ingress pre-trade risk | Implemented | Optional per-order quantity/notional caps (`WHIPPET_RISK_MAX_*`), enforced before the Iggy append, with 422 `risk_limit` / TCP `RiskRejected` and rejection metrics. An admission guard, not engine-enforced risk. |
+| Ingress pre-trade risk | Implemented | Optional per-order quantity/notional caps (`WHIPPET_RISK_MAX_*`), enforced before the Iggy append, with 422 `risk_limit` / TCP `RiskRejected` and rejection metrics. A stateless per-order guard. |
+| Engine-enforced participant risk | Implemented | `POST /api/admin/instruments/{symbol}/risk` appends a log-ordered `set_risk` command; the engine bounds each participant's worst-case net position and resting buy notional, tracks exposure from book/fills, rejects with `risk_limit`, and restores limits/exposure from snapshot v6. See ADR 0026. |
 | Position reconstruction | Implemented (read-only) | `whippet positions` reconstructs per-participant/symbol net quantity, buy/sell, fills, and cash flow from the orders + executions logs. Not a settlement ledger. |
 | Surveillance indicators | Implemented (educational) | `whippet surveillance` reports windowed cancel-ratio, large-cancel-without-fill, self-trade-prevention, and duplicate-id indicators per participant. Read-only; not a regulatory finding. |
 | Sequenced market-data feed | Implemented | `GET /ws/md?symbol=...` sends a full-depth price-level snapshot, then every delta with a per-symbol `seq`, and resyncs a lagged consumer with a fresh snapshot. Separate from the conflated dashboard `/ws`. |
@@ -334,7 +335,7 @@ are in [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Journal commit contract | Implemented | Offsets are contiguous, commits are monotonic and bounded by the head; an ahead-of-head claim never advances a resume point. See ADR 0023. |
 | Durable-path state machines | Implemented | Save-time snapshot invariants and hash requirement, commit watermark/retry (`committed <= applied`, bounded drift), and turbo admission (`Queued -> Completed/Abandoned`, exactly-once permit, counted full-window reasons). See [INVARIANTS.md](docs/INVARIANTS.md) and ADR 0021. |
 | Explicit shard lifecycle and readiness | Implemented | Each active shard's engine and MD role is `Starting`/`Running`/`Failed`/`Stopped` (atomics); readiness requires every active role to be Running, and `/api/health` names the failing partition/role. See [INVARIANTS.md](docs/INVARIANTS.md). |
-| Instrument session state | Implemented | `POST /api/admin/instruments/{symbol}/session` moves an instrument between `pre_open`/`open`/`closed`; only `open` admits new orders, cancels stay allowed, the change is log-ordered/audited and survives replay (snapshot v5). |
+| Instrument session state | Implemented | `POST /api/admin/instruments/{symbol}/session` moves an instrument between `pre_open`/`open`/`closed`; only `open` admits new orders, cancels stay allowed, the change is log-ordered/audited and survives replay (snapshot v6). |
 | Instrument halt/resume | Implemented | Operator-only HTTP control plane (`WHIPPET_OPERATOR_TOKENS`), log-ordered with orders, audited in the `audit` topic, `halted` in `/api/state` and the dashboard. Cancels remain allowed; new orders reject with `halted`. |
 | Retention enforcement | Planned | Policies are recorded but the cleaner is off; ADR 0014 defines the replay-safe rule, and the read-only `whippet retention-plan` computes the safe boundary from consumer commits + a verified snapshot. Nothing deletes segments yet. |
 | Surveillance / audit archive | Planned | Phase 2. |

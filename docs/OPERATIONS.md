@@ -192,7 +192,8 @@ The command is appended to the orders log and replayed; only `open` accepts
 new orders (`session_not_open` otherwise), while cancels stay allowed in every
 session. The state is shown on `/api/state`, the dashboard, and the sequenced
 feed; the audit record uses action `set_session` and carries the session. The
-snapshot format is v5 (session byte); v4 and older are rejected.
+snapshot format is v6 (session byte plus per-symbol risk table); v5 and older
+are rejected.
 
 ## Pre-trade ingress risk
 
@@ -200,11 +201,33 @@ The gateway and TCP listener enforce two optional per-order limits before any
 journal append: `WHIPPET_RISK_MAX_ORDER_QTY` and
 `WHIPPET_RISK_MAX_NOTIONAL_CENTS` (both `0` = disabled). Rejections are explicit
 — HTTP 422 `risk_limit`, TCP `RiskRejected` — and counted in
-`whippet_risk_rejected_total{reason}`. This is an admission guard, not an
-engine-enforced risk control: a producer that appends directly to the orders
-topic bypasses it, and the engine remains the matching authority. Market orders
-are quantity-checked but not notional-checked. See
+`whippet_risk_rejected_total{reason}`. This is a stateless per-order admission
+guard; it cannot see accumulated exposure. Market orders are quantity-checked
+but not notional-checked. See
 [ADR 0017](adr/0017-ingress-risk-and-position-reconstruction.md).
+
+## Engine-enforced participant risk
+
+Per-participant limits are engine state, not an edge filter. Set them with an
+operator token:
+
+```sh
+curl -sS -X POST "$WHIPPET_URL/api/admin/instruments/BTC-USD/risk" \
+  -H "Authorization: Bearer $WHIPPET_OPERATOR_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"participant":"desk-a","max_net_qty":500,"max_open_buy_notional_cents":25000000}'
+```
+
+Both bounds are required; `0` disables one. `max_net_qty` bounds the
+worst-case absolute position (net plus resting orders on the side that could
+fill), and `max_open_buy_notional_cents` bounds quote cents in resting
+`Limit`/`PostOnly` buys. The command is appended to the orders log before the
+audit record, so replay and snapshot restore reproduce the limits; changing
+them preserves existing exposure. New orders that would breach a bound are
+rejected by the engine with reject reason `risk_limit`; cancels and fills
+remain allowed so a participant can reduce risk. The endpoint is operator-only
+and TCP `Submit` rejects `SetRisk`. See
+[ADR 0026](adr/0026-engine-enforced-risk-limits.md).
 
 ## Position reconstruction (read-only)
 
@@ -674,12 +697,12 @@ commit watermark). That is a full replay. If the log has been truncated by
 retention, replay from zero hits a gap and the shard fails closed; the safe
 reset for the demo is `make reset`.
 
-Upgrade path for the snapshot format: v4 and older files are rejected with
+Upgrade path for the snapshot format: v5 and older files are rejected with
 `BadVersion`, and a file that fails verification fails its shard closed (the
 shard is marked failed). There is no in-binary migration and no automatic
 fallback to a previous file or to a full replay. Delete or move the old
 snapshot files (or `make reset`), start the new node so it full-replays from
-0, and let it write v5. Recovery always requires operator action; the node
+0, and let it write v6. Recovery always requires operator action; the node
 never recovers silently.
 
 If you want to cold-copy the Iggy volume, stop the whole stack first. Do not
@@ -708,10 +731,10 @@ Upgrade procedure:
 4. Record the new image digest in `WHIPPET_IMAGE_DIGEST` for new manifests.
 5. Update this table and the manifest docs.
 
-Rollback: pin both artifacts back. Snapshots use format version 5 with a
-`WHIPSNP1` magic and bincode; versions 3 and older are rejected with
+Rollback: pin both artifacts back. Snapshots use format version 6 with a
+`WHIPSNP1` magic and bincode; versions 5 and older are rejected with
 `BadVersion`, and a snapshot-format change is a data migration, not
 a rolling upgrade: delete or move the old files (or reset the data) and let
-the new node full-replay from 0 and write v5.
+the new node full-replay from 0 and write v6.
 
 The phase gates for larger changes are in [ROADMAP.md](ROADMAP.md).
