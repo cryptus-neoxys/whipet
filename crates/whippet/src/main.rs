@@ -17,6 +17,9 @@ struct Cli {
     command: Commands,
 }
 
+// The CLI is parsed once at startup; the enum size is irrelevant, and boxing
+// `NodeArgs` would only add an indirection to the one path that runs a node.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Commands {
     /// Run the exchange node: gateway, engine shards, journal, and dashboard API.

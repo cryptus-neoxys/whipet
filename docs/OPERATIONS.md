@@ -92,7 +92,11 @@ commands admitted but not yet appended are lost, bounded by
   snapshot requires an empty orders log (the seq domain must be anchored); a
   non-empty log without a snapshot is a startup error.
 - **Mode switch.** Switching durable ↔ turbo on an existing log is not
-  supported; `make reset` (or a new topic set) is required.
+  supported; `make reset` (or a new topic set) is required. The snapshot does
+  not carry the mode, so the node cannot detect a mismatch: with Compose, run
+  `WHIPPET_MODE=turbo docker compose up -d node` (not a bare
+  `docker compose restart`, which re-renders the default `${WHIPPET_MODE}` and
+  can recreate the container in durable mode).
 - **Metrics.** `whippet_turbo_uncommitted_window{shard}`,
   `whippet_turbo_journal_lag{shard}` (the same set in this design),
   `whippet_turbo_window_drops_total{reason="count"|"age"}`, and the
