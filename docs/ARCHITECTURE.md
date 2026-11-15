@@ -353,7 +353,7 @@ On startup, for each active shard:
 
 The dedup table is snapshotted with the book and the input offset. It is a
 business-level table keyed by the derived `OrderId`, not Iggy's producer
-idempotence. Capacity is `2 * max_orders` per symbol (500,000 by default) with
+idempotence. Capacity is `min(2 * max_orders, 100,000)` per symbol with
 FIFO eviction; an order id older than the retained window can be accepted
 again.
 

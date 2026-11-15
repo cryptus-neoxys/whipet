@@ -152,7 +152,7 @@ The next tranche attacks the remaining per-order wait and the warm paths:
 | MD batch apply | `MdHub::apply_batch` | One hub lock and one clock read per poll batch instead of per event | 2.49× batch apply in the criterion bench (loaded host) |
 | WS serialize once | gateway `FrameCache`, `Subscribe`, `?trades=N` | One serialization per `(filter, tick)` instead of per subscriber; smaller tape | Implemented; fanout benchmark pending |
 | Routing headers | `MessageMeta::routing_pairs` | Executions/MD carry four header pairs instead of seven | Implemented |
-| Snapshot writer pipeline | `SnapshotWriter`, sequenced snapshots | Snapshot serialization/fsync leaves the shard loop; stale writes rejected | Implemented; 5 s cadence, soak pending |
+| Snapshot writer pipeline | `SnapshotWriter`, sequenced snapshots | Snapshot serialization/fsync leaves the shard loop; stale writes rejected | Implemented; 15 s cadence, soak measured |
 | Decoupled offset commit | `CommitWatermark` | Commit no longer blocks every poll; window is 256 records or 100 ms | Replay proof rerun below |
 
 Final sweep on the new tree (dev-loop, Docker Desktop, simulator stopped, one
@@ -250,6 +250,23 @@ are not headline numbers and the Linux matrix is still the publishable
 artifact. Per [ADR 0009](adr/0009-performance-budget-and-optimization-order.md),
 a change without a manifest is not a performance result; the manifests are in
 `artifacts/bench` and are local.
+
+### Phase 1.5d (in progress)
+
+Phase 1.5d is specified in
+[ADR 0011](adr/0011-fault-injection-and-stage-budget.md). It does not chase a
+new p50; it makes the current pipeline provable and attributable.
+
+| Workstream | Change | Why | Status |
+|---|---|---|---|
+| Fault-injection harness | `JournalOps` seam plus a fake journal; tests for output-append failure, matcher panic, ring full, and reader gap/overlap | The shard pipeline's failure handling is code without a test; a regression could restore the silent "gateway acks, engine stops matching" mode | In progress |
+| Message-construction allocation pass | Static header names and reused payload buffers for executions/MD | The remaining per-event allocation on the produce path | In progress |
+| Stage histograms | `whippet_stage_p50_us{stage=...}` / `p99` for gateway parse/validate/encode/append, engine process/append/commit, MD apply, WS frame | The harness sees send/wire; the node does not expose where the durable p50 goes | In progress |
+| Soak, crash, fanout-with-ingress | `make soak`, `make crash-test`, `--ingress-rate` on the fanout harness | Long-run drift, crash replay, and whether 100 subscribers slow the engine at 10k/s are all unmeasured | In progress |
+
+No end-to-end numbers are claimed for this phase until the soak and the
+Linux matrix run. The current measured rows above remain the last recorded
+dev-loop results.
 
 ## Stage budget
 
@@ -424,7 +441,7 @@ tail sample:
   the dedup table between batches; the blocking snapshot writer then computes
   the state hash (`fill_symbol_hashes`) and writes the file. The snapshot is
   gated by `appended_offset`, so it is only taken once every output up to the
-  matcher's offset is in the journal. At the default dedup capacity (500,000
+  matcher's offset is in the journal. At the default dedup cap (100,000
   entries per symbol), the clone is large; the hash that used to accompany it
   on the match path is ~2.51 ms on a 20k/20k book (measured above). It is a
   periodic tail-latency source, not a per-order cost.

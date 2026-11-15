@@ -16,6 +16,7 @@ supersedes an earlier one.
 | [0008](0008-security-model-and-scoped-identities.md) | Security model and scoped identities | Accepted for Phase 1 demo posture; Phase 2 target proposed |
 | [0009](0009-performance-budget-and-optimization-order.md) | Performance budget and optimization order | Accepted |
 | [0010](0010-shard-thread-and-journal-pipeline.md) | Shard thread and journal pipeline | Accepted — implemented (fault-injection tests pending) |
+| [0011](0011-fault-injection-and-stage-budget.md) | Fault injection, stage budgets, and soak gates | Proposed — implementation in progress |
 
 Template:
 

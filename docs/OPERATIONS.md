@@ -26,7 +26,7 @@ credentials explicitly.
 | `WHIPPET_SYMBOLS` | `BTC-USD,ETH-USD,SOL-USD` | Comma-separated subset of the built-in instruments. Unknown symbols are rejected. |
 | `WHIPPET_PARTITIONS` | `16` | Trading partitions, 1-256. This is a create-time contract; see below. |
 | `WHIPPET_SNAPSHOT_DIR` | `data/snapshots` | Directory for `partition-<N>.snapshot` files. |
-| `WHIPPET_SNAPSHOT_EVERY` | `10000` | Commands per symbol between state snapshots. The node also enforces a 5-second minimum interval, so a high-throughput run snapshots at most once per 5 s. Values below 1 are clamped to 1. |
+| `WHIPPET_SNAPSHOT_EVERY` | `10000` | Commands per symbol between state snapshots. The node also enforces a 15-second minimum interval, so a high-throughput run snapshots at most once per 15 s. Values below 1 are clamped to 1. |
 | `WHIPPET_HTTP_TRACE` | unset | Set to `1` to enable per-request `tower-http` trace spans; off by default for throughput. |
 
 Concurrent single-order submissions on one partition are coalesced into one
@@ -102,7 +102,7 @@ Rough sizing, not a measurement:
 - MD events are 84 bytes each. A snapshot carries the full resting-order set plus the display levels; size it from the book, not a fixed header. One hour of MD at a few hundred orders/s is
   hundreds of MB, depending on how many events each order produces.
 - A snapshot is proportional to resting orders plus dedup entries. The dedup
-  table can hold up to 500,000 entries per symbol. Measure the files with
+  table is capped at 100,000 entries per symbol (roughly 20 s of history at 5,000 commands/s), which bounds the snapshot size. Measure the files with
   `du -h data/snapshots`; do not assume a fixed size.
 - Full MD snapshots are deliberately coarse (every 1,000,000 commands, plus
   startup). The MD hub normally rebuilds from the delta stream; periodic full
