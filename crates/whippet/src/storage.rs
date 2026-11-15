@@ -22,6 +22,7 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -171,6 +172,9 @@ pub struct StorageSnapshot {
 /// A background task calls [`StorageMonitor::refresh`] every five seconds.
 pub struct StorageMonitor {
     config: StorageConfig,
+    /// Hot-path admission reads this atomic; the snapshot is only for
+    /// diagnostics and the critical-path error message.
+    state: AtomicU8,
     snapshot: RwLock<StorageSnapshot>,
 }
 
@@ -180,6 +184,7 @@ impl StorageMonitor {
     pub fn new(config: StorageConfig) -> Arc<Self> {
         let monitor = Arc::new(Self {
             config,
+            state: AtomicU8::new(state_code(StorageState::Ok)),
             snapshot: RwLock::new(StorageSnapshot {
                 whippet: VolumeStat::unknown(WHIPPET_VOLUME),
                 iggy: None,
@@ -216,7 +221,7 @@ impl StorageMonitor {
 
     /// The cached aggregate state, for readiness and admission checks.
     pub fn state(&self) -> StorageState {
-        self.snapshot().state
+        state_from_code(self.state.load(Ordering::Relaxed))
     }
 
     /// Thresholds and volume roots this monitor was built with.
@@ -240,10 +245,29 @@ impl StorageMonitor {
     }
 
     fn store(&self, snapshot: StorageSnapshot) {
+        self.state
+            .store(state_code(snapshot.state), Ordering::Relaxed);
         match self.snapshot.write() {
             Ok(mut guard) => *guard = snapshot,
             Err(poisoned) => *poisoned.into_inner() = snapshot,
         }
+    }
+}
+
+/// Compact encoding for the atomic admission state.
+fn state_code(state: StorageState) -> u8 {
+    match state {
+        StorageState::Ok => 0,
+        StorageState::Warn => 1,
+        StorageState::Critical => 2,
+    }
+}
+
+fn state_from_code(code: u8) -> StorageState {
+    match code {
+        0 => StorageState::Ok,
+        1 => StorageState::Warn,
+        _ => StorageState::Critical,
     }
 }
 
@@ -378,6 +402,7 @@ impl StorageMonitor {
     pub fn from_snapshot(snapshot: StorageSnapshot) -> Arc<Self> {
         Arc::new(Self {
             config: StorageConfig::default(),
+            state: AtomicU8::new(state_code(snapshot.state)),
             snapshot: RwLock::new(snapshot),
         })
     }

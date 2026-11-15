@@ -284,8 +284,8 @@ fn ensure_shards_ready(ctx: &NodeContext) -> Result<(), (StatusCode, Json<ApiErr
             )),
         ));
     }
-    let storage = ctx.storage.snapshot();
-    if storage.state == StorageState::Critical {
+    if ctx.storage.state() == StorageState::Critical {
+        let storage = ctx.storage.snapshot();
         let volume = storage
             .iggy
             .filter(|iggy| iggy.available && iggy.used_pct >= ctx.storage.config().crit_pct)
