@@ -549,6 +549,24 @@ async fn refresh_lag(ctx: &NodeContext) {
         total = total.saturating_add(lag);
     }
     ctx.metrics.set_consumer_lag(total);
+    // Broker-reported log growth, refreshed on the same five-second cycle.
+    // The storage guard acts on free space; this gauge explains what is
+    // consuming it and feeds the read-only retention plan.
+    for (index, topic) in [
+        whippet_journal::Topic::Orders,
+        whippet_journal::Topic::Executions,
+        whippet_journal::Topic::Md,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        match ctx.journal.topic_stats(topic).await {
+            Ok((bytes, messages)) => ctx.metrics.set_topic_stats(index, bytes, messages),
+            Err(error) => {
+                warn!(?topic, error = %error, "topic size query failed");
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -521,6 +521,9 @@ pub struct Metrics {
     /// are omitted from [`Metrics::consumer_lag_by_shard`] to keep the metric
     /// cardinality bounded.
     consumer_lag_by_shard: [AtomicU64; METRIC_SHARD_SLOTS],
+    /// Broker-reported bytes per log topic; index order is [`LOG_TOPICS`].
+    log_bytes: [AtomicU64; 3],
+    log_messages: [AtomicU64; 3],
     iggy_connected: AtomicBool,
     partition_count: AtomicU64,
     /// Lifetime and rolling-window latency histograms behind one mutex, so a
@@ -567,6 +570,8 @@ impl Metrics {
             engine_commands: AtomicU64::new(0),
             consumer_lag: AtomicU64::new(0),
             consumer_lag_by_shard: std::array::from_fn(|_| AtomicU64::new(0)),
+            log_bytes: std::array::from_fn(|_| AtomicU64::new(0)),
+            log_messages: std::array::from_fn(|_| AtomicU64::new(0)),
             ring_input_depth: std::array::from_fn(|_| AtomicU32::new(0)),
             ring_output_depth: std::array::from_fn(|_| AtomicU32::new(0)),
             ring_capacity: std::array::from_fn(|_| AtomicU32::new(0)),
@@ -607,6 +612,31 @@ impl Metrics {
 
     pub fn set_consumer_lag(&self, lag: u64) {
         self.consumer_lag.store(lag, Ordering::Relaxed);
+    }
+
+    /// Record the broker-reported size of one log topic.
+    pub fn set_topic_stats(&self, index: usize, bytes: u64, messages: u64) {
+        if let (Some(bytes_slot), Some(messages_slot)) =
+            (self.log_bytes.get(index), self.log_messages.get(index))
+        {
+            bytes_slot.store(bytes, Ordering::Relaxed);
+            messages_slot.store(messages, Ordering::Relaxed);
+        }
+    }
+
+    /// Bytes and message counts for the three trading topics.
+    pub fn topic_stats(&self) -> Vec<(&'static str, u64, u64)> {
+        LOG_TOPICS
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                (
+                    *name,
+                    self.log_bytes[index].load(Ordering::Relaxed),
+                    self.log_messages[index].load(Ordering::Relaxed),
+                )
+            })
+            .collect()
     }
 
     /// Consumer lag of one shard, in records.
@@ -921,6 +951,9 @@ impl Metrics {
         }
     }
 }
+
+/// Topic order shared by `set_topic_stats` and the Prometheus renderer.
+pub const LOG_TOPICS: [&str; 3] = ["orders", "executions", "md"];
 
 fn new_histogram() -> Histogram<u64> {
     Histogram::new_with_max(60_000_000, 3).expect("valid histogram bounds")

@@ -527,6 +527,18 @@ impl IggyJournal {
         self.client.ping().await.is_ok()
     }
 
+    /// Broker-reported size and message count for one topic.
+    ///
+    /// This is the storage-growth signal the disk guard and the retention
+    /// planner need; it is a read and never touches retention.
+    pub async fn topic_stats(&self, topic: Topic) -> Result<(u64, u64)> {
+        let (stream_id, topic_id) = self.ids.get(topic)?;
+        let Some(details) = self.client.get_topic(stream_id, topic_id).await? else {
+            return Ok((0, 0));
+        };
+        Ok((details.size.as_bytes_u64(), details.messages_count))
+    }
+
     /// Settle a retained Iggy operation whose outcome is unknown.
     ///
     /// When the broker restarts under load, a mutation can be left with an
@@ -1186,6 +1198,28 @@ impl MemoryJournal {
             .copied()
     }
 
+    /// Approximate in-memory size: payload plus header text, all partitions.
+    pub fn topic_stats(&self, topic: Topic) -> (u64, u64) {
+        let state = self.state.lock().expect("memory journal poisoned");
+        let mut bytes = 0u64;
+        let mut messages = 0u64;
+        for ((queued, _), records) in &state.logs {
+            if *queued != topic {
+                continue;
+            }
+            messages = messages.saturating_add(records.len() as u64);
+            for record in records {
+                bytes = bytes.saturating_add(record.payload.len() as u64);
+                for (key, value) in &record.headers {
+                    bytes = bytes
+                        .saturating_add(key.len() as u64)
+                        .saturating_add(value.len() as u64);
+                }
+            }
+        }
+        (bytes, messages)
+    }
+
     pub fn high_watermark(&self, topic: Topic, partition: u32) -> u64 {
         let state = self.state.lock().expect("memory journal poisoned");
         state
@@ -1349,6 +1383,14 @@ impl Journal {
         match self {
             Self::Iggy(journal) => journal.recover_operation(operation_id).await,
             Self::Memory(_) => false,
+        }
+    }
+
+    /// Bytes and messages for a topic, across all partitions.
+    pub async fn topic_stats(&self, topic: Topic) -> Result<(u64, u64)> {
+        match self {
+            Self::Iggy(journal) => journal.topic_stats(topic).await,
+            Self::Memory(journal) => Ok(journal.topic_stats(topic)),
         }
     }
 

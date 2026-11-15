@@ -1253,6 +1253,18 @@ async fn prometheus(
             "whippet_ring_capacity{{shard=\"{shard}\"}} {capacity}\n"
         ));
     }
+    body.push_str("# HELP whippet_iggy_log_bytes Broker-reported bytes per trading topic.\n");
+    body.push_str("# TYPE whippet_iggy_log_bytes gauge\n");
+    body.push_str("# HELP whippet_iggy_log_messages Broker-reported messages per trading topic.\n");
+    body.push_str("# TYPE whippet_iggy_log_messages gauge\n");
+    for (topic, bytes, messages) in ctx.metrics.topic_stats() {
+        body.push_str(&format!(
+            "whippet_iggy_log_bytes{{topic=\"{topic}\"}} {bytes}\n"
+        ));
+        body.push_str(&format!(
+            "whippet_iggy_log_messages{{topic=\"{topic}\"}} {messages}\n"
+        ));
+    }
     let storage = ctx.storage.snapshot();
     body.push_str("# HELP whippet_disk_free_bytes Free bytes on a monitored data volume.\n");
     body.push_str("# TYPE whippet_disk_free_bytes gauge\n");
