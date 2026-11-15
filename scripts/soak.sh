@@ -138,9 +138,14 @@ import json, sys
 
 t, state_raw, health_raw, rss_raw = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 try:
-    metrics = json.loads(state_raw)["metrics"]
+    state = json.loads(state_raw)
+    metrics = state["metrics"]
+    mode = state.get("mode")
+    guarantee = state.get("guarantee")
 except Exception:
     metrics = {}
+    mode = None
+    guarantee = None
 try:
     shards_ok = json.loads(health_raw)["shards_ok"]
 except Exception:
@@ -152,6 +157,8 @@ print(json.dumps({
     "lag": metrics.get("consumer_lag"),
     "rss": rss_raw or None,
     "shards_ok": shards_ok,
+    "mode": mode,
+    "guarantee": guarantee,
 }))
 PY
     count=$((count + 1))
@@ -202,8 +209,11 @@ failed = (
     or (drift is not None and drift > 5.0)
 )
 
+modes = sorted({s["mode"] for s in samples if s.get("mode")})
 summary = {
     "kind": "soak",
+    "mode": modes[0] if len(modes) == 1 else (modes or None),
+    "scope": os.environ.get("WHIPPET_SOAK_SCOPE", "dev-loop"),
     "created_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
     "git_sha": git_sha,
     "git_dirty": git_dirty,

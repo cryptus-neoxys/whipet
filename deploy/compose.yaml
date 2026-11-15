@@ -32,7 +32,7 @@ x-whippet-build: &whippet-build
 
 x-whippet-env: &whippet-env
   WHIPPET_JOURNAL: iggy
-  WHIPPET_MODE: durable
+  WHIPPET_MODE: ${WHIPPET_MODE:-durable}
   WHIPPET_SYMBOLS: BTC-USD,ETH-USD,SOL-USD
   WHIPPET_PARTITIONS: "16"
   WHIPPET_VENUE: whippet
