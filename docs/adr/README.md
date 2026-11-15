@@ -21,6 +21,7 @@ supersedes an earlier one.
 | [0013](0013-turbo-mode.md) | Turbo mode: local sequencer, direct fanout, bounded uncommitted window | Accepted (implemented; startup anchor, tail replay, per-shard window gauge) |
 | [0014](0014-bounded-storage-and-replay-safe-retention.md) | Bounded storage guard and replay-safe retention rule | Proposed (guard implemented; deletion rule design-only — never delete without consumer + verified-baseline proof) |
 | [0015](0015-audited-instrument-control-plane.md) | Audited instrument halt/resume control plane | Accepted (implemented; log-ordered commands, operator tokens, audit topic) |
+| [0016](0016-sequenced-price-level-market-data-feed.md) | Sequenced price-level market-data feed | Accepted (implemented; `/ws/md`, snapshot + deltas + resync) |
 
 Template:
 

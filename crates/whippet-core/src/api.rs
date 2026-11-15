@@ -8,8 +8,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::Mode;
-use crate::ids::{OrderId, Seq, Symbol};
-use crate::protocol::{OrderType, Side};
+use crate::ids::{OrderId, ParticipantId, Seq, Symbol};
+use crate::protocol::{MdKind, OrderType, Side};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderRequest {
@@ -316,6 +316,81 @@ impl ApiError {
     }
 }
 
+/// One frame of the sequenced market-data feed.
+///
+/// The dashboard keeps its 20 Hz conflated [`StateView`]; this is the separate
+/// contract for a consumer that must see every change, with a sequence scope
+/// per symbol:
+///
+/// 1. Subscribe and read a [`MdFeedSnapshot`] at `seq`.
+/// 2. Apply [`MdFeedDelta`] frames with `seq > snapshot.seq` in order.
+/// 3. On a gap (or a slow-consumer drop) request a new snapshot; the feed may
+///    also emit [`MdFeedResync`] to say "discard local state, resnapshot".
+///
+/// `seq` is the engine's per-symbol sequence, so it is comparable across
+/// snapshots and deltas for the same symbol and never across symbols.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MdFeedMessage {
+    Snapshot(MdFeedSnapshot),
+    Delta(MdFeedDelta),
+    Resync(MdFeedResync),
+}
+
+/// Point-in-time image of one symbol's book at `seq`.
+///
+/// This is the *full* price-level book: every level the hub holds, not the
+/// dashboard's depth-limited [`BookView`] window. A consumer that started
+/// from a truncated snapshot could never reconstruct the deeper levels from
+/// later deltas, so completeness beats frame size here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MdFeedSnapshot {
+    pub symbol: Symbol,
+    /// Per-symbol sequence of the last event folded into this image.
+    pub seq: u64,
+    /// Input offset that produced `seq`; `0` before the first event.
+    pub cause_offset: u64,
+    /// Every bid level, best (highest) price first.
+    pub bids: Vec<LevelView>,
+    /// Every ask level, best (lowest) price first.
+    pub asks: Vec<LevelView>,
+    pub halted: bool,
+}
+
+/// One applied market-data delta in the engine's shape.
+///
+/// The only transformation from [`crate::protocol::MdEvent`] is that `price`
+/// ticks become `price_cents`. Every accepted event advances the symbol's
+/// sequence, including `MdKind::Status` and `MdKind::Snapshot`
+/// (book-replacing image) events; a consumer that skips a kind would see a
+/// hole in `seq`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MdFeedDelta {
+    pub symbol: Symbol,
+    pub seq: u64,
+    /// Input offset that caused this event.
+    pub cause_offset: u64,
+    pub timestamp_ns: u64,
+    pub kind: MdKind,
+    pub side: Side,
+    pub flags: u8,
+    /// Price in integer cents, already scaled by the instrument tick size.
+    pub price_cents: i64,
+    pub qty: u64,
+    pub order_id: OrderId,
+    pub participant: ParticipantId,
+}
+
+/// Instruction to drop local book state and take a fresh snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MdFeedResync {
+    pub symbol: Symbol,
+    /// The sequence the consumer should snapshot at or after.
+    pub seq: u64,
+    /// Operator-readable cause, for example `lagged` or `gap`.
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsServerMessage {
@@ -370,6 +445,67 @@ mod tests {
         };
         let json = serde_json::to_string(&message).unwrap();
         assert!(json.contains("\"type\":\"notice\""));
+    }
+
+    #[test]
+    fn feed_messages_are_tagged_and_round_trip() {
+        let delta = MdFeedMessage::Delta(MdFeedDelta {
+            symbol: Symbol::new("BTC-USD").unwrap(),
+            seq: 7,
+            cause_offset: 11,
+            timestamp_ns: 22,
+            kind: MdKind::Add,
+            side: Side::Buy,
+            flags: 0,
+            price_cents: 6_500_000,
+            qty: 10,
+            order_id: OrderId(1),
+            participant: ParticipantId(2),
+        });
+        let json = serde_json::to_string(&delta).unwrap();
+        assert!(json.starts_with(r#"{"type":"delta","#), "{json}");
+        match serde_json::from_str::<MdFeedMessage>(&json).unwrap() {
+            MdFeedMessage::Delta(parsed) => {
+                assert_eq!(parsed.seq, 7);
+                assert_eq!(parsed.price_cents, 6_500_000);
+                assert_eq!(parsed.kind, MdKind::Add);
+            }
+            other => panic!("expected delta, got {other:?}"),
+        }
+
+        let snapshot = MdFeedMessage::Snapshot(MdFeedSnapshot {
+            symbol: Symbol::new("BTC-USD").unwrap(),
+            seq: 7,
+            cause_offset: 11,
+            bids: vec![LevelView {
+                price_cents: 6_500_000,
+                qty: 10,
+                orders: 1,
+            }],
+            asks: Vec::new(),
+            halted: true,
+        });
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(json.starts_with(r#"{"type":"snapshot","#), "{json}");
+        match serde_json::from_str::<MdFeedMessage>(&json).unwrap() {
+            MdFeedMessage::Snapshot(parsed) => {
+                assert_eq!(parsed.bids.len(), 1);
+                assert!(parsed.halted);
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+
+        let resync = MdFeedMessage::Resync(MdFeedResync {
+            symbol: Symbol::new("BTC-USD").unwrap(),
+            seq: 9,
+            reason: "lagged".into(),
+        });
+        let json = serde_json::to_string(&resync).unwrap();
+        assert!(json.starts_with(r#"{"type":"resync","#), "{json}");
+        assert!(matches!(
+            serde_json::from_str::<MdFeedMessage>(&json).unwrap(),
+            MdFeedMessage::Resync(_)
+        ));
     }
 
     #[test]

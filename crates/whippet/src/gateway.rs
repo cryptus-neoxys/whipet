@@ -27,8 +27,8 @@ use tracing::warn;
 use whippet_core::api::{
     AdminAck, AdminRequest, ApiError, BatchOrderAck, BatchOrderRequest, BatchOrderRequestRef,
     CancelAck, CancelRequest, GUARANTEE_DURABLE, GUARANTEE_TURBO, HealthView, MAX_BATCH_ORDERS,
-    OrderAck, OrderRequest, OrderRequestRef, StateView, TradeView, WsClientMessage,
-    WsServerMessage,
+    MdFeedMessage, MdFeedResync, OrderAck, OrderRequest, OrderRequestRef, StateView, TradeView,
+    WsClientMessage, WsServerMessage,
 };
 use whippet_core::headers::{HeaderMode, MessageMeta, SCHEMA_ORDER};
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Seq, Symbol};
@@ -97,7 +97,8 @@ pub fn router(ctx: Arc<NodeContext>) -> Router {
         .route("/api/instruments", get(instruments))
         .route("/api/trades", get(trades))
         .route("/metrics", get(prometheus))
-        .route("/ws", get(ws_upgrade));
+        .route("/ws", get(ws_upgrade))
+        .route("/ws/md", get(md_feed_upgrade));
 
     let dashboard_dir = ctx.config.dashboard_dir.clone();
     let index = dashboard_dir.join("index.html");
@@ -1408,6 +1409,30 @@ async fn prometheus(
     );
     body.push_str("# TYPE whippet_ws_rejected_total counter\n");
     body.push_str(&format!("whippet_ws_rejected_total {ws_rejected}\n"));
+    // Sequenced market-data feed: subscribers come from the hub's live
+    // receiver count; sent/lagged/resyncs are the hub's feed bookkeeping.
+    let (feed_sent, feed_lagged, feed_resyncs) = ctx.hub.feed_stats();
+    body.push_str("# HELP whippet_md_feed_subscribers Sequenced market-data feed receivers.\n");
+    body.push_str("# TYPE whippet_md_feed_subscribers gauge\n");
+    body.push_str(&format!(
+        "whippet_md_feed_subscribers {}\n",
+        ctx.hub.feed_receiver_count()
+    ));
+    body.push_str(
+        "# HELP whippet_md_feed_sent_total Delta frames delivered on the sequenced feed.\n",
+    );
+    body.push_str("# TYPE whippet_md_feed_sent_total counter\n");
+    body.push_str(&format!("whippet_md_feed_sent_total {feed_sent}\n"));
+    body.push_str(
+        "# HELP whippet_md_feed_lagged_total Sequenced-feed receivers that fell behind the hub.\n",
+    );
+    body.push_str("# TYPE whippet_md_feed_lagged_total counter\n");
+    body.push_str(&format!("whippet_md_feed_lagged_total {feed_lagged}\n"));
+    body.push_str(
+        "# HELP whippet_md_feed_resyncs_total Resync (lagged-receiver snapshot) flows issued.\n",
+    );
+    body.push_str("# TYPE whippet_md_feed_resyncs_total counter\n");
+    body.push_str(&format!("whippet_md_feed_resyncs_total {feed_resyncs}\n"));
     body.push_str("# HELP whippet_group_commit_batches_total Group-commit appends completed.\n");
     body.push_str("# TYPE whippet_group_commit_batches_total counter\n");
     body.push_str(&format!(
@@ -2111,6 +2136,154 @@ async fn ws_loop(
                         warn!(error = %error, "websocket receive error");
                         break;
                     }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MdFeedQuery {
+    /// The one symbol this connection streams. Required.
+    symbol: Option<String>,
+}
+
+/// `GET /ws/md?symbol=BTC-USD`: the sequenced market-data feed.
+///
+/// Unlike the conflated `/ws` state stream, this endpoint forwards every
+/// applied delta with the engine's per-symbol sequence, after one
+/// snapshot-at-sequence handshake. Admission shares the `/ws` global
+/// subscriber cap: one permit from the same semaphore, taken with
+/// `try_acquire_owned`, held for the connection lifetime, refused with the
+/// same JSON `ws_capacity` shape. The per-IP sub-limit stays a `/ws` concern;
+/// the feed's subscriber gauge is the hub's own receiver count.
+async fn md_feed_upgrade(
+    ws: WebSocketUpgrade,
+    State(ctx): State<Arc<NodeContext>>,
+    Extension(ws_state): Extension<Arc<WsState>>,
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Query(query): Query<MdFeedQuery>,
+) -> Response {
+    // A missing, empty, malformed, or unconfigured symbol is one 400
+    // `unknown_symbol`, decided before any capacity is consumed.
+    let raw = query
+        .symbol
+        .as_deref()
+        .map(str::trim)
+        .filter(|symbol| !symbol.is_empty());
+    let symbol = match raw.map(|raw| parse_configured_symbol(&ctx, raw)) {
+        Some(Ok(symbol)) => symbol,
+        Some(Err((status, Json(error)))) => return (status, Json(error)).into_response(),
+        None => {
+            return bad_request("unknown_symbol", "the symbol query parameter is required")
+                .into_response();
+        }
+    };
+    let ip = connect.map(|Extension(ConnectInfo(address))| address.ip());
+    let permit = match Arc::clone(&ctx.ws_connections).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return ws_capacity_response(ws_state.as_ref(), ip, "global connection cap reached");
+        }
+    };
+    ws.max_message_size(64 * 1024)
+        .max_frame_size(64 * 1024)
+        .on_upgrade(move |socket| async move {
+            let _permit = permit;
+            md_feed_loop(socket, ctx, symbol).await;
+        })
+}
+
+/// Serve one sequenced feed connection.
+///
+/// Ordering rules:
+/// - Subscribe to the feed BEFORE taking the snapshot, so a delta applied
+///   between the two calls waits in the receiver and is replayed after the
+///   snapshot instead of being lost.
+/// - An event with `seq <= last_seq` raced the snapshot and is skipped;
+///   only strictly newer sequence numbers are forwarded.
+/// - A lagged receiver means the client silently missed frames. The
+///   slow-consumer policy is to resync, never to stall the node: count the
+///   drop, send `Resync`, then a fresh snapshot, and resume from its seq.
+/// - A failed send or a client close ends the task and releases the permit.
+///
+/// The delta frames arrive pre-serialized from the hub, so fan-out is one
+/// refcounted-string clone per subscriber, not a per-subscriber re-encode.
+async fn md_feed_loop(mut socket: WebSocket, ctx: Arc<NodeContext>, symbol: Symbol) {
+    eprintln!("DBG-SRV: loop entered for {symbol}");
+    let mut receiver = ctx.hub.subscribe_feed();
+    // The symbol was validated against the exchange config, so the hub has a
+    // book for it; a missing snapshot is a wiring bug and ends the feed.
+    let Some(snapshot) = ctx.hub.feed_snapshot(symbol) else {
+        eprintln!("DBG-SRV: no snapshot, exiting");
+        return;
+    };
+    let mut last_seq = snapshot.seq;
+    eprintln!("DBG-SRV: subscribed, snapshot seq={}", snapshot.seq);
+    if send_json(&mut socket, &MdFeedMessage::Snapshot(snapshot))
+        .await
+        .is_err()
+    {
+        eprintln!("DBG-SRV: snapshot send failed, exiting");
+        return;
+    }
+    eprintln!("DBG-SRV: snapshot sent");
+    loop {
+        tokio::select! {
+            delivered = receiver.recv() => {
+                match delivered {
+                    Ok(event) => {
+                        if event.symbol != symbol || event.seq <= last_seq {
+                            continue;
+                        }
+                        last_seq = event.seq;
+                        if socket
+                            .send(Message::Text(event.frame.as_ref().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        ctx.hub.record_feed_lagged();
+                        // Fresh state first, then announce the resync with the
+                        // seq the client must adopt, so a client that replays
+                        // its log sees the reason before the new baseline.
+                        let Some(snapshot) = ctx.hub.feed_snapshot(symbol) else {
+                            continue;
+                        };
+                        last_seq = snapshot.seq;
+                        let resync = MdFeedMessage::Resync(MdFeedResync {
+                            symbol,
+                            seq: snapshot.seq,
+                            reason: format!("lagged {missed}"),
+                        });
+                        if send_json(&mut socket, &resync).await.is_err()
+                            || send_json(&mut socket, &MdFeedMessage::Snapshot(snapshot))
+                                .await
+                                .is_err()
+                        {
+                            break;
+                        }
+                        ctx.hub.record_feed_resync();
+                    }
+                    // The hub is gone; nothing will ever be delivered again.
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            incoming = socket.next() => {
+                match incoming {
+                    Some(Ok(Message::Ping(payload))) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    // The feed is send-only: any client text is ignored, and a
+                    // close frame (or a closed stream) ends the loop promptly.
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => break,
                 }
             }
         }

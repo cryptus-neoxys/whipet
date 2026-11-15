@@ -49,6 +49,12 @@ Whippet is pre-1.0; minor releases may change internal APIs.
 
 ### Added
 
+- Sequenced price-level market-data feed: `GET /ws/md?symbol=...` sends a
+  full-depth snapshot at the current per-symbol sequence, then every accepted
+  delta in order, and resyncs a lagged subscriber with a fresh snapshot. The
+  hub serializes each event once and shares the frame; with no subscriber the
+  MD apply path does no feed work. Metrics for subscribers, sent frames, lag,
+  and resyncs (ADR 0016).
 - Audited instrument halt/resume: operator-only `POST /api/admin/instruments/{symbol}/halt`
   and `/resume` (`WHIPPET_OPERATOR_TOKENS`, separate from trading tokens),
   log-ordered `CommandKind::Halt/Resume`, `Rejected/Halted` for new orders while

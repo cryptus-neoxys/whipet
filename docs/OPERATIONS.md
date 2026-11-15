@@ -395,6 +395,25 @@ docker compose -f deploy/compose.yaml exec node whippet healthcheck
 `whippet healthcheck` prints the JSON and exits non-zero unless the status is
 `ok`. A container healthcheck should use it.
 
+### Sequenced market-data feed
+
+`GET /ws/md?symbol=BTC-USD` is a price-level feed separate from the dashboard's
+conflated `/ws` stream. It sends one full-depth `snapshot` at the current
+per-symbol `seq`, then every accepted `delta` in sequence order. If a client
+falls behind the hub's bounded feed buffer, the server sends a `resync` notice
+naming the new sequence and a fresh snapshot; a client that sees an
+unexplained gap should reconnect. The feed shares the global WebSocket
+subscriber cap and is a market-by-price feed, not order-by-order.
+
+```sh
+websocat 'ws://127.0.0.1:8080/ws/md?symbol=BTC-USD'
+```
+
+Metrics: `whippet_md_feed_subscribers`, `whippet_md_feed_sent_total`,
+`whippet_md_feed_lagged_total`, `whippet_md_feed_resyncs_total`. With no feed
+subscriber the MD apply path does no feed work. See
+[ADR 0016](adr/0016-sequenced-price-level-market-data-feed.md).
+
 ### Prometheus metrics
 
 `GET /metrics` returns the Prometheus text exposition format
@@ -441,6 +460,10 @@ Series:
 | `whippet_mode{mode="durable"}` | gauge | One-hot operating mode. |
 | `whippet_md_freshness_milliseconds` | gauge | Age of the newest MD event. |
 | `whippet_md_sequence` | gauge | Maximum per-symbol MD sequence observed. |
+| `whippet_md_feed_subscribers` | gauge | Active sequenced feed receivers. |
+| `whippet_md_feed_sent_total` | counter | Delta frames broadcast to feed subscribers. |
+| `whippet_md_feed_lagged_total` | counter | Feed receivers that fell behind the bounded broadcast. |
+| `whippet_md_feed_resyncs_total` | counter | Resync notices sent (fresh snapshot follows). |
 
 Caveats:
 

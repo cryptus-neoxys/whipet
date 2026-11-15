@@ -372,6 +372,24 @@ envelope's routing headers carry `symbol`, `seq`, `type`, and `schema` but not
 the fixed payload. Keeping the full identity in one canonical place avoids
 paying for a duplicate header on every output record.
 
+## Sequenced market-data feed
+
+The dashboard's `/ws` stream is deliberately conflated: one full `StateView` at
+20 Hz, and a slow browser simply misses intermediate frames. External
+consumers get a separate additive endpoint, `GET /ws/md?symbol=...`, with a
+different contract:
+
+- one full-depth **price-level** snapshot at the hub's current per-symbol
+  `seq`, then every accepted `MdEvent` as a `delta` in sequence order;
+- a `resync` notice followed by a fresh snapshot when the bounded broadcast
+  buffer lags, so a slow consumer never stalls the hub and never silently
+  loses a frame mid-sequence;
+- zero feed work on the MD apply path when no subscriber is attached, and one
+  JSON serialization per event shared by all subscribers when one is.
+
+The feed mirrors the order book at price-level granularity; it is not an
+order-by-order feed. See [ADR 0016](adr/0016-sequenced-price-level-market-data-feed.md).
+
 ## Observability
 
 The node exposes `GET /metrics` in Prometheus text format. Counters cover

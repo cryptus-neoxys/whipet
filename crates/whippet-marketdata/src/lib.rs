@@ -7,6 +7,13 @@
 //! it receives a conflated snapshot at 20 Hz, which is the correct rendering
 //! discipline for a ladder. Trades are retained losslessly in the visible tape
 //! window; audit consumes the log, not the UI.
+//!
+//! A second, deliberately separate contract is the sequenced feed
+//! ([`MdHub::subscribe_feed`]): every accepted delta is encoded once as an
+//! [`whippet_core::api::MdFeedMessage::Delta`] frame and broadcast as an
+//! `Arc`, paired with [`MdHub::feed_snapshot`] for a full depth-unlimited
+//! image at a known sequence. Conflation is the dashboard's policy; it is not
+//! the external feed's contract.
 
 #![forbid(unsafe_code)]
 
@@ -17,14 +24,25 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
-use tokio::sync::watch;
-use whippet_core::api::{BookView, LevelView, MetricsView, StateView, TradeView};
+use tokio::sync::{broadcast, watch};
+use whippet_core::api::{
+    BookView, LevelView, MdFeedDelta, MdFeedMessage, MdFeedSnapshot, MetricsView, StateView,
+    TradeView,
+};
 use whippet_core::config::{ExchangeConfig, Mode};
 use whippet_core::ids::{OrderId, Price, Seq, Symbol};
 use whippet_core::protocol::{MD_FLAG_HALTED, MdEvent, MdKind, MdSnapshot, Side};
 
 const TRADE_TAPE_LEN: usize = 250;
 const BOOK_DEPTH: usize = 20;
+
+/// Bounded buffer for the sequenced feed, in frames.
+///
+/// The hub keeps no per-subscriber queue: a subscriber that falls further
+/// behind than this is told it lagged and must take a fresh
+/// [`MdFeedSnapshot`]. Sized for a short network hiccup on a demo feed, not
+/// for replaying minutes of history — Iggy is the replay path.
+pub const MD_FEED_CAPACITY: usize = 1024;
 
 /// Publisher cadence. `spawn_publisher` ticks at this interval.
 const PUBLISH_INTERVAL: Duration = Duration::from_millis(50);
@@ -74,6 +92,10 @@ struct BookState {
     /// carries no book change; this flag is the only thing a status event
     /// mutates besides `seq`.
     halted: bool,
+    /// Input offset of the event that produced `seq`, or `0` before the first
+    /// applied event. It is the snapshot header's link back to the input log:
+    /// a consumer can say "my image is at seq S, caused by offset O".
+    last_cause_offset: u64,
     /// Running sum of every bid level, including levels below the visible
     /// depth. Kept in step with the level maps so `view()` never folds them.
     depth_bid_qty: u64,
@@ -94,6 +116,7 @@ impl BookState {
             last_trade_side: None,
             seq: Seq(0),
             halted: false,
+            last_cause_offset: 0,
             depth_bid_qty: 0,
             depth_ask_qty: 0,
         }
@@ -131,6 +154,7 @@ impl BookState {
             return false;
         }
         self.seq = event.seq;
+        self.last_cause_offset = event.cause_offset;
         match event.kind {
             MdKind::Add => {
                 let price_cents = self.price_cents(event.price);
@@ -233,6 +257,7 @@ impl BookState {
             return false;
         }
         self.seq = snapshot.seq;
+        self.last_cause_offset = snapshot.cause_offset;
         self.halted = snapshot.flags & MD_FLAG_HALTED != 0;
         self.bids.clear();
         self.asks.clear();
@@ -340,6 +365,42 @@ impl BookState {
             depth_ask_qty: self.depth_ask_qty,
             halted: self.halted,
         }
+    }
+
+    /// Full price-level image for the sequenced feed.
+    ///
+    /// Same `LevelView` shape and ordering as [`Self::view`], but every level
+    /// is included instead of the best [`BOOK_DEPTH`]. A level-2 consumer that
+    /// starts from a depth-capped image can never recover the levels it did
+    /// not receive, because a delta only names the single level it changes.
+    fn feed_snapshot(&self) -> MdFeedSnapshot {
+        let bids: Vec<LevelView> = self
+            .bids
+            .iter()
+            .rev()
+            .map(|(price_cents, level)| level_view(*price_cents, level))
+            .collect();
+        let asks: Vec<LevelView> = self
+            .asks
+            .iter()
+            .map(|(price_cents, level)| level_view(*price_cents, level))
+            .collect();
+        MdFeedSnapshot {
+            symbol: self.symbol,
+            seq: self.seq.0,
+            cause_offset: self.last_cause_offset,
+            bids,
+            asks,
+            halted: self.halted,
+        }
+    }
+}
+
+fn level_view(price_cents: i64, level: &LevelState) -> LevelView {
+    LevelView {
+        price_cents,
+        qty: level.qty,
+        orders: level.orders,
     }
 }
 
@@ -1161,12 +1222,36 @@ impl ShardMetrics {
     }
 }
 
+/// One sequenced feed frame, encoded once and shared by every subscriber.
+///
+/// `frame` is the serialized [`MdFeedMessage::Delta`] JSON with no trailing
+/// newline. The MD consumer thread builds it and the hub broadcasts an
+/// `Arc<str>`, so each subscriber pays a refcount bump rather than a second
+/// serialization.
+#[derive(Debug, Clone)]
+pub struct MdFeedEvent {
+    pub symbol: Symbol,
+    pub seq: u64,
+    pub frame: Arc<str>,
+}
+
 /// Market-data hub. Cloneable handle shared by the consumer, HTTP API, and
 /// WebSocket tasks.
 pub struct MdHub {
     config: ExchangeConfig,
     state: Mutex<HubState>,
     watch: watch::Sender<Arc<StateView>>,
+    /// Sequenced delta feed. Bounded on purpose: the hub keeps one buffer,
+    /// never one queue per subscriber.
+    feed: broadcast::Sender<Arc<MdFeedEvent>>,
+    /// Frames handed to the feed buffer since process start. Stays `0` while
+    /// no subscriber is attached: the no-subscriber path encodes nothing.
+    feed_sent: AtomicU64,
+    /// `Lagged` results reported by subscribers through
+    /// [`MdHub::record_feed_lagged`].
+    feed_lagged: AtomicU64,
+    /// Resnapshots triggered through [`MdHub::record_feed_resync`].
+    feed_resyncs: AtomicU64,
     metrics: Arc<Metrics>,
     iggy_addr: String,
     journal: String,
@@ -1179,6 +1264,27 @@ impl MdHub {
         iggy_addr: String,
         journal: String,
         dashboard_build: Option<String>,
+    ) -> Arc<Self> {
+        Self::with_feed_capacity(
+            config,
+            iggy_addr,
+            journal,
+            dashboard_build,
+            MD_FEED_CAPACITY,
+        )
+    }
+
+    /// Like [`Self::new`] with an explicit feed buffer size, in frames.
+    ///
+    /// `0` is clamped to `1` because `broadcast::channel` needs a non-zero
+    /// capacity. Tests use a small value to reach the lag path without
+    /// applying a thousand events.
+    pub fn with_feed_capacity(
+        config: ExchangeConfig,
+        iggy_addr: String,
+        journal: String,
+        dashboard_build: Option<String>,
+        feed_capacity: usize,
     ) -> Arc<Self> {
         let mut books = BTreeMap::new();
         for instrument in &config.instruments {
@@ -1211,6 +1317,7 @@ impl MdHub {
             dashboard_build: dashboard_build.clone(),
         });
         let (watch, _) = watch::channel(initial);
+        let (feed, _) = broadcast::channel(feed_capacity.max(1));
         Arc::new(Self {
             config,
             state: Mutex::new(HubState {
@@ -1224,6 +1331,10 @@ impl MdHub {
                 dirty: true,
             }),
             watch,
+            feed,
+            feed_sent: AtomicU64::new(0),
+            feed_lagged: AtomicU64::new(0),
+            feed_resyncs: AtomicU64::new(0),
             metrics,
             iggy_addr,
             journal,
@@ -1237,6 +1348,54 @@ impl MdHub {
 
     pub fn subscribe(&self) -> watch::Receiver<Arc<StateView>> {
         self.watch.subscribe()
+    }
+
+    /// Subscribe to the sequenced delta feed.
+    ///
+    /// Frames arrive in apply order as long as one task drives
+    /// [`Self::apply_batch`]; concurrent appliers, each keeping per-symbol
+    /// order internally, may interleave at batch boundaries. Pair the first
+    /// received frames with [`Self::feed_snapshot`]: the snapshot carries the
+    /// sequence, and the consumer drops deltas at or below it.
+    pub fn subscribe_feed(&self) -> broadcast::Receiver<Arc<MdFeedEvent>> {
+        self.feed.subscribe()
+    }
+
+    /// Attached feed subscribers. Zero means [`Self::apply_batch`] does no
+    /// feed work at all: it neither builds nor serializes a delta.
+    pub fn feed_receiver_count(&self) -> usize {
+        self.feed.receiver_count()
+    }
+
+    /// Full price-level snapshot of `symbol` at its current sequence.
+    ///
+    /// Built under the hub lock, so the image cannot straddle a batch, and on
+    /// demand rather than at 20 Hz. Unlike [`Self::latest`]'s `BookView`, this
+    /// is **not** capped at `BOOK_DEPTH` levels. `None` for a symbol the hub
+    /// does not track.
+    pub fn feed_snapshot(&self, symbol: Symbol) -> Option<MdFeedSnapshot> {
+        let state = self.state.lock().expect("md state poisoned");
+        state.books.get(&symbol).map(BookState::feed_snapshot)
+    }
+
+    /// `(frames sent, lag reports, resyncs)` for the sequenced feed.
+    pub fn feed_stats(&self) -> (u64, u64, u64) {
+        (
+            self.feed_sent.load(Ordering::Relaxed),
+            self.feed_lagged.load(Ordering::Relaxed),
+            self.feed_resyncs.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Record one `Lagged` result observed on a feed receiver. Only the
+    /// receiver can see it, so the WS task reports it to the hub.
+    pub fn record_feed_lagged(&self) {
+        self.feed_lagged.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one resnapshot the WS task asked a subscriber to perform.
+    pub fn record_feed_resync(&self) {
+        self.feed_resyncs.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Apply one delta. Thin wrapper so the batch and single-event paths can
@@ -1254,6 +1413,11 @@ impl MdHub {
         if events.is_empty() {
             return;
         }
+        // Feed frames are only worth building when someone is listening.
+        // `Vec::new()` does not allocate, and the push below is skipped, so a
+        // hub with no feed subscriber allocates nothing on this path.
+        let broadcasting = self.feed.receiver_count() > 0;
+        let mut accepted: Vec<(&MdEvent, i64)> = Vec::new();
         // One clock for the whole batch. The stage records the slice the hub
         // spends under its own lock, including duplicate/stale rejection.
         let started = Instant::now();
@@ -1279,6 +1443,11 @@ impl MdHub {
             let price_cents = book.price_cents(event.price);
             applied += 1;
             max_seq = max_seq.max(event.seq.0);
+            if broadcasting {
+                // A duplicate or stale record never reaches this point, so
+                // the feed cannot publish a frame the book rejected.
+                accepted.push((event, price_cents));
+            }
             if event.kind == MdKind::Trade {
                 trades_applied += 1;
                 if state.trades.len() == TRADE_TAPE_LEN {
@@ -1309,10 +1478,63 @@ impl MdHub {
         state.md_events = state.md_events.saturating_add(applied);
         state.trades_count = state.trades_count.saturating_add(trades_applied);
         state.dirty = true;
-        // Drop the hub lock before touching the histogram mutex.
+        // Drop the hub lock before touching the histogram mutex or encoding a
+        // single feed frame.
         drop(state);
         self.metrics
             .record_stage_us(Stage::MdApply, micros_since(started));
+        if broadcasting {
+            self.publish_feed(&accepted);
+        }
+    }
+
+    /// Encode each accepted event once and hand the shared frame to the feed.
+    ///
+    /// Called after the hub lock is released, so JSON encoding and channel
+    /// bookkeeping never block a state reader. Every accepted event is
+    /// broadcast, including `MdKind::Status` and `MdKind::Snapshot`: both
+    /// advance the symbol's sequence, and skipping them would show the
+    /// consumer a hole it cannot distinguish from a lost frame.
+    ///
+    /// One asymmetry is inherited from [`BookState::apply`]: an over-reduce
+    /// advances the sequence and *then* rejects the event, so it is not
+    /// broadcast. The consumer sees a gap and resnapshots, which is the honest
+    /// outcome for a producer bug rather than inventing a frame for it.
+    fn publish_feed(&self, accepted: &[(&MdEvent, i64)]) {
+        let mut sent = 0u64;
+        for (event, price_cents) in accepted {
+            let message = MdFeedMessage::Delta(MdFeedDelta {
+                symbol: event.symbol,
+                seq: event.seq.0,
+                cause_offset: event.cause_offset,
+                timestamp_ns: event.timestamp_ns,
+                kind: event.kind,
+                side: event.side,
+                flags: event.flags,
+                price_cents: *price_cents,
+                qty: event.qty.0,
+                order_id: event.order_id,
+                participant: event.participant,
+            });
+            // Integers, enum codes, and a fixed ASCII symbol: infallible while
+            // the DTOs stay that shape. Skip rather than panic if that ever
+            // changes; the sequence gap makes the consumer resnapshot.
+            let Ok(frame) = serde_json::to_string(&message) else {
+                debug_assert!(false, "MdFeedMessage must serialize");
+                continue;
+            };
+            let feed_event = Arc::new(MdFeedEvent {
+                symbol: event.symbol,
+                seq: event.seq.0,
+                frame: Arc::from(frame),
+            });
+            if self.feed.send(feed_event).is_ok() {
+                sent += 1;
+            }
+        }
+        if sent > 0 {
+            self.feed_sent.fetch_add(sent, Ordering::Relaxed);
+        }
     }
 
     pub fn apply_snapshot(&self, snapshot: &MdSnapshot) {
@@ -2369,6 +2591,229 @@ mod tests {
         let latest = hub.latest();
         assert_eq!(latest.symbols.len(), 3);
         assert_eq!(latest.trades.len(), 70);
+    }
+
+    fn decode_feed(frame: &str) -> MdFeedMessage {
+        serde_json::from_str(frame).expect("feed frame is JSON")
+    }
+
+    #[test]
+    fn feed_snapshot_reflects_levels_seq_and_halt_state() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        let btc = Symbol::new("BTC-USD").unwrap();
+        let bid = event_at(MdKind::Add, btc, 1, Side::Buy, 65_000, 10, 1);
+        hub.apply(&bid);
+        hub.apply(&event_at(MdKind::Add, btc, 2, Side::Buy, 65_000, 5, 2));
+        hub.apply(&event_at(MdKind::Add, btc, 3, Side::Sell, 65_100, 7, 3));
+        let mut halt = event_at(MdKind::Status, btc, 4, Side::Buy, 0, 0, 0);
+        halt.flags = MD_FLAG_HALTED;
+        hub.apply(&halt);
+
+        let snapshot = hub.feed_snapshot(btc).expect("BTC-USD snapshot");
+        assert_eq!(snapshot.symbol, btc);
+        assert_eq!(snapshot.seq, 4);
+        // The snapshot names the input offset that produced its sequence.
+        assert_eq!(snapshot.cause_offset, 4);
+        assert!(snapshot.halted);
+        assert_eq!(snapshot.bids.len(), 1);
+        assert_eq!(snapshot.bids[0].price_cents, 6_500_000);
+        assert_eq!(snapshot.bids[0].qty, 15);
+        assert_eq!(snapshot.bids[0].orders, 2);
+        assert_eq!(snapshot.asks.len(), 1);
+        assert_eq!(snapshot.asks[0].qty, 7);
+
+        // A symbol the hub does not track has no image.
+        let unknown = Symbol::new("XRP-USD").unwrap();
+        assert!(hub.feed_snapshot(unknown).is_none());
+
+        // An untouched configured symbol is a valid, empty snapshot.
+        let eth = Symbol::new("ETH-USD").unwrap();
+        let empty = hub.feed_snapshot(eth).expect("configured symbol");
+        assert_eq!(empty.seq, 0);
+        assert_eq!(empty.cause_offset, 0);
+        assert!(empty.bids.is_empty() && empty.asks.is_empty());
+        assert!(!empty.halted);
+    }
+
+    #[test]
+    fn feed_snapshot_is_not_capped_at_the_dashboard_depth() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        let btc = Symbol::new("BTC-USD").unwrap();
+        // 25 distinct bid levels and 25 ask levels: more than BOOK_DEPTH.
+        for level in 0..25i64 {
+            hub.apply(&event_at(
+                MdKind::Add,
+                btc,
+                2 * level as u64 + 1,
+                Side::Buy,
+                65_000 - level,
+                1,
+                level as u128 + 1,
+            ));
+            hub.apply(&event_at(
+                MdKind::Add,
+                btc,
+                2 * level as u64 + 2,
+                Side::Sell,
+                65_001 + level,
+                1,
+                100 + level as u128,
+            ));
+        }
+
+        let snapshot = hub.feed_snapshot(btc).expect("BTC-USD snapshot");
+        assert_eq!(snapshot.bids.len(), 25);
+        assert_eq!(snapshot.asks.len(), 25);
+        // Best-first on both sides: highest bid, lowest ask.
+        assert_eq!(snapshot.bids[0].price_cents, 6_500_000);
+        assert_eq!(snapshot.bids[24].price_cents, 6_497_600);
+        assert_eq!(snapshot.asks[0].price_cents, 6_500_100);
+        assert_eq!(snapshot.asks[24].price_cents, 6_502_500);
+        // Bids descend strictly, asks ascend strictly.
+        assert!(
+            snapshot
+                .bids
+                .windows(2)
+                .all(|pair| pair[0].price_cents > pair[1].price_cents)
+        );
+        assert!(
+            snapshot
+                .asks
+                .windows(2)
+                .all(|pair| pair[0].price_cents < pair[1].price_cents)
+        );
+
+        // The dashboard view keeps its own 20-level window.
+        let book = btc_book(&hub.state());
+        assert_eq!(book.bids.len(), BOOK_DEPTH);
+        assert_eq!(book.asks.len(), BOOK_DEPTH);
+    }
+
+    #[test]
+    fn feed_is_silent_without_subscribers() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        assert_eq!(hub.feed_receiver_count(), 0);
+
+        hub.apply_batch(&mixed_stream());
+        hub.apply(&event(MdKind::Add, Side::Buy, 65_003, 1, 99));
+
+        assert_eq!(hub.feed_receiver_count(), 0);
+        // No frame was built, so nothing was counted and nothing panicked.
+        assert_eq!(hub.feed_stats(), (0, 0, 0));
+    }
+
+    #[test]
+    fn subscribed_feed_delivers_every_applied_event_in_sequence() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        let btc = Symbol::new("BTC-USD").unwrap();
+        let mut receiver = hub.subscribe_feed();
+        assert_eq!(hub.feed_receiver_count(), 1);
+
+        hub.apply(&event_at(MdKind::Add, btc, 1, Side::Buy, 65_000, 10, 1));
+        hub.apply(&event_at(MdKind::Reduce, btc, 2, Side::Buy, 65_000, 4, 1));
+        let mut halt = event_at(MdKind::Status, btc, 3, Side::Buy, 0, 0, 0);
+        halt.flags = MD_FLAG_HALTED;
+        hub.apply(&halt);
+
+        let mut frames = Vec::new();
+        for _ in 0..3 {
+            let frame = receiver.try_recv().expect("queued frame");
+            assert_eq!(frame.symbol, btc);
+            frames.push(frame);
+        }
+        assert!(receiver.try_recv().is_err(), "exactly three frames");
+
+        let seqs: Vec<u64> = frames.iter().map(|frame| frame.seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
+        // Encoding happens once; all subscribers share the same buffer.
+        let expected = [
+            (MdKind::Add, Side::Buy, 6_500_000, 10),
+            (MdKind::Reduce, Side::Buy, 6_500_000, 4),
+            (MdKind::Status, Side::Buy, 0, 0),
+        ];
+        for (frame, (kind, side, price_cents, qty)) in frames.iter().zip(expected) {
+            match decode_feed(&frame.frame) {
+                MdFeedMessage::Delta(delta) => {
+                    assert_eq!(delta.symbol, btc);
+                    assert_eq!(delta.seq, frame.seq);
+                    assert_eq!(delta.cause_offset, frame.seq);
+                    assert_eq!(delta.timestamp_ns, frame.seq);
+                    assert_eq!(delta.kind, kind);
+                    assert_eq!(delta.side, side);
+                    assert_eq!(delta.price_cents, price_cents);
+                    assert_eq!(delta.qty, qty);
+                }
+                other => panic!("expected a delta frame, got {other:?}"),
+            }
+        }
+        match decode_feed(&frames[2].frame) {
+            MdFeedMessage::Delta(delta) => assert_eq!(delta.flags, MD_FLAG_HALTED),
+            other => panic!("expected a delta frame, got {other:?}"),
+        }
+        assert_eq!(hub.feed_stats(), (3, 0, 0));
+    }
+
+    #[test]
+    fn feed_skips_duplicate_and_stale_events() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        let btc = Symbol::new("BTC-USD").unwrap();
+        let mut receiver = hub.subscribe_feed();
+        let add = event_at(MdKind::Add, btc, 1, Side::Buy, 65_000, 10, 1);
+        hub.apply(&add);
+        hub.apply(&add);
+        // Stale: below the applied sequence.
+        hub.apply(&event_at(MdKind::Reduce, btc, 1, Side::Buy, 65_000, 4, 1));
+
+        let first = receiver.try_recv().expect("one frame");
+        assert_eq!(first.seq, 1);
+        assert!(receiver.try_recv().is_err(), "rejected events are silent");
+        assert_eq!(hub.feed_stats().0, 1);
+    }
+
+    #[test]
+    fn feed_reports_lag_and_counts_sent_frames() {
+        // Capacity 2: five published frames overwrite the receiver's view.
+        let hub = MdHub::with_feed_capacity(config(), "test".into(), "memory".into(), None, 2);
+        let btc = Symbol::new("BTC-USD").unwrap();
+        let mut receiver = hub.subscribe_feed();
+        for seq in 1..=5u64 {
+            hub.apply(&event_at(
+                MdKind::Add,
+                btc,
+                seq,
+                Side::Buy,
+                65_000 + seq as i64,
+                1,
+                seq as u128,
+            ));
+        }
+
+        // Every frame reached the bounded buffer; the receiver lost the old
+        // ones instead of the hub growing a queue.
+        assert_eq!(hub.feed_stats(), (5, 0, 0));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(dropped)) if dropped > 0
+        ));
+        // The receiver reports the lag; the hub only keeps the counter.
+        hub.record_feed_lagged();
+        assert_eq!(hub.feed_stats(), (5, 1, 0));
+        hub.record_feed_resync();
+        assert_eq!(hub.feed_stats(), (5, 1, 1));
+
+        // After a `Lagged` the receiver is positioned at the oldest retained
+        // frame, so it resumes with the tail of the buffer. The lost frames
+        // are what the resync is for.
+        assert_eq!(receiver.try_recv().expect("retained frame").seq, 4);
+        assert_eq!(receiver.try_recv().expect("retained frame").seq, 5);
+
+        // It resynchronises from a fresh snapshot and continues.
+        let snapshot = hub.feed_snapshot(btc).expect("BTC-USD snapshot");
+        assert_eq!(snapshot.seq, 5);
+        assert_eq!(snapshot.bids.len(), 5);
+        hub.apply(&event_at(MdKind::Add, btc, 6, Side::Buy, 65_100, 1, 6));
+        let frame = receiver.try_recv().expect("post-lag frame");
+        assert_eq!(frame.seq, 6);
     }
 }
 
