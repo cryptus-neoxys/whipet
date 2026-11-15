@@ -155,7 +155,20 @@ pub fn run_verify(args: VerifyArgs) -> Result<()> {
         ..ExchangeConfig::default()
     };
     let store = SnapshotStore::new(args.snapshot_dir.clone());
+    // Active shards own at least one configured symbol. A `--require-snapshot`
+    // gate must cover every one of them, not just "some file exists".
+    let active_shards: Vec<u32> = {
+        let mut shards: Vec<u32> = exchange
+            .instruments
+            .iter()
+            .map(|instrument| instrument.symbol.partition(exchange.partitions))
+            .collect();
+        shards.sort_unstable();
+        shards.dedup();
+        shards
+    };
     let mut found = 0;
+    let mut found_shards: Vec<u32> = Vec::new();
     for shard in 0..args.partitions {
         let Some(snapshot) = store
             .load(shard)
@@ -183,6 +196,7 @@ pub fn run_verify(args: VerifyArgs) -> Result<()> {
             symbols.join(", ")
         );
         found += 1;
+        found_shards.push(shard);
     }
     if found == 0 {
         // Lenient by default so a fresh checkout can run `verify` without a
@@ -198,9 +212,22 @@ pub fn run_verify(args: VerifyArgs) -> Result<()> {
             "no snapshots in {}; nothing verified (the node writes one every N commands)",
             args.snapshot_dir.display()
         );
-    } else {
-        println!("verified {found} shard snapshot(s); all state hashes match");
+        return Ok(());
     }
+    if args.require_snapshot {
+        let missing: Vec<u32> = active_shards
+            .iter()
+            .copied()
+            .filter(|shard| !found_shards.contains(shard))
+            .collect();
+        if !missing.is_empty() {
+            bail!(
+                "missing snapshots for active shard(s) {missing:?} in {}; a partial set is not a proof (--require-snapshot)",
+                args.snapshot_dir.display()
+            );
+        }
+    }
+    println!("verified {found} shard snapshot(s); all state hashes match");
     Ok(())
 }
 
@@ -288,16 +315,14 @@ pub async fn replay_with_journal(args: ReplayArgs, journal: Journal) -> Result<s
         .with_context(|| format!("reading committed offset for {engine_consumer}"))?;
     // Head is the last offset in the partition, inclusive. `lag` reports the
     // records after the committed offset, so committed + lag is the head on
-    // both journal backends.
-    let head = match committed_offset {
-        Some(committed) => {
-            let lag = journal
-                .lag(Topic::Orders, args.partition, committed)
-                .await
-                .with_context(|| format!("reading lag for partition {}", args.partition))?;
-            Some(committed.saturating_add(lag))
-        }
-        None => None,
+    // both journal backends. Read it even when nothing has been committed yet.
+    let head = {
+        let committed = committed_offset.unwrap_or(0);
+        let lag = journal
+            .lag(Topic::Orders, args.partition, committed)
+            .await
+            .with_context(|| format!("reading lag for partition {}", args.partition))?;
+        Some(committed.saturating_add(lag))
     };
 
     // An explicit --from means a clean replay from that offset. Without it,
@@ -356,19 +381,6 @@ pub async fn replay_with_journal(args: ReplayArgs, journal: Journal) -> Result<s
                  offset {offset}"
             );
         }
-        let Some(committed) = committed_offset else {
-            bail!(
-                "--require-snapshot: {engine_consumer} has no committed offset; \
-                 cannot prove snapshot offset {offset} is behind the log"
-            );
-        };
-        if offset > committed {
-            bail!(
-                "--require-snapshot: snapshot offset {offset} is ahead of the engine \
-                 committed offset {committed} for {engine_consumer}; the snapshot cannot \
-                 be a resume point"
-            );
-        }
         let Some(head) = head else {
             bail!(
                 "--require-snapshot: could not read the log head for partition {}; \
@@ -376,6 +388,13 @@ pub async fn replay_with_journal(args: ReplayArgs, journal: Journal) -> Result<s
                 args.partition
             );
         };
+        if offset > head {
+            bail!(
+                "--require-snapshot: snapshot offset {offset} is ahead of the log head \
+                 {head} on partition {}; the snapshot cannot be a resume point",
+                args.partition
+            );
+        }
         if offset >= head {
             bail!(
                 "--require-snapshot: snapshot offset {offset} is not before the log head \

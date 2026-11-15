@@ -404,13 +404,36 @@ async fn submit_orders(
     };
     ctx.metrics
         .record_stage_us(Stage::GatewayParse, split_elapsed(&mut stage_at));
+    // Enforce the documented batch cap before charging: a 300-order request is
+    // a 400, not a 429 that also burns the bucket.
+    if request.orders.is_empty() {
+        return Err(
+            bad_request("empty_batch", "orders must contain at least one order").into_response(),
+        );
+    }
+    if request.orders.len() > MAX_BATCH_ORDERS {
+        return Err(bad_request(
+            "batch_too_large",
+            format!("at most {MAX_BATCH_ORDERS} orders per batch"),
+        )
+        .into_response());
+    }
     // The middleware charged one token for the request; charge the rest of the
     // batch here, after parsing and BEFORE validation, so a 256-order request
-    // cannot spend (or bypass) the per-second budget on validate work. The
-    // whole batch costs `len` tokens: 1 from the middleware plus `len - 1`.
-    if let Some(Extension(ConnectInfo(address))) = connect {
-        let extra = request.orders.len().saturating_sub(1) as u32;
-        if extra > 0 && !ctx.rate_limiter.charge(address.ip(), extra) {
+    // cannot spend (or bypass) the per-second budget on validate work. Without
+    // a peer (in-process callers) the middleware did not charge, so charge the
+    // whole batch instead of assuming its token.
+    let cost = if connect.is_some() {
+        request.orders.len().saturating_sub(1)
+    } else {
+        request.orders.len()
+    } as u32;
+    if cost > 0 {
+        let ip = match &connect {
+            Some(Extension(ConnectInfo(address))) => address.ip(),
+            None => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        };
+        if !ctx.rate_limiter.charge(ip, cost) {
             return Err(too_many_requests());
         }
     }

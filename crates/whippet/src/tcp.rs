@@ -261,6 +261,21 @@ async fn handle_submit(
     state: &ConnectionState,
     commands: Vec<Command>,
 ) -> (TcpResponse, bool) {
+    // Charge before auth and shard-health: otherwise an unauthenticated client
+    // can send Submit frames at wire speed for free.
+    if !state
+        .limiter
+        .charge(state.peer, commands.len().max(1) as u32)
+    {
+        return (
+            error_response(
+                TcpErrorCode::RateLimited,
+                "ingress rate limit exceeded; retry shortly",
+            ),
+            false,
+        );
+    }
+
     if !state.authorized {
         return (
             error_response(
@@ -276,20 +291,6 @@ async fn handle_submit(
             error_response(
                 TcpErrorCode::JournalUnavailable,
                 "the matching shard is not running; orders are not being accepted",
-            ),
-            false,
-        );
-    }
-
-    // Charge for the whole batch, not one token per frame.
-    if !state
-        .limiter
-        .charge(state.peer, commands.len().max(1) as u32)
-    {
-        return (
-            error_response(
-                TcpErrorCode::RateLimited,
-                "ingress rate limit exceeded; retry shortly",
             ),
             false,
         );

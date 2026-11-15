@@ -160,7 +160,12 @@ fn verify_require_snapshot_fails_on_an_empty_directory() {
 fn verify_with_matching_partitions_accepts_a_four_partition_snapshot() {
     let exchange = four_partition_exchange();
     let dir = tempfile::tempdir().expect("temp snapshot dir");
-    let shard = write_snapshot(dir.path(), &exchange, btc(), 5);
+    let mut shards = Vec::new();
+    for instrument in &exchange.instruments {
+        shards.push(write_snapshot(dir.path(), &exchange, instrument.symbol, 5));
+    }
+    shards.sort_unstable();
+    shards.dedup();
 
     let output = verify_binary(dir.path(), 4, true);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -173,10 +178,12 @@ fn verify_with_matching_partitions_accepts_a_four_partition_snapshot() {
         stdout.contains("all state hashes match"),
         "unexpected verify output: {stdout}"
     );
-    assert!(
-        stdout.contains(&format!("shard {shard:>2}")),
-        "verify did not report shard {shard}: {stdout}"
-    );
+    for shard in shards {
+        assert!(
+            stdout.contains(&format!("shard {shard:>2}")),
+            "verify did not report shard {shard}: {stdout}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -202,14 +209,14 @@ async fn replay_require_snapshot_rejects_a_snapshot_with_no_applied_commands() {
 }
 
 #[tokio::test]
-async fn replay_require_snapshot_fails_when_the_snapshot_is_ahead_of_the_committed_offset() {
+async fn replay_require_snapshot_fails_when_the_snapshot_is_ahead_of_the_log_head() {
     let exchange = four_partition_exchange();
     let dir = tempfile::tempdir().expect("temp snapshot dir");
     let symbol = btc();
     let partition = symbol.partition(exchange.partitions);
 
-    // The snapshot claims 20 applied commands, but the live engine has only
-    // committed through offset 5. That cannot be a resume point.
+    // The snapshot claims 20 applied commands, but the log head is offset 5.
+    // That cannot be a resume point even though the committed offset is lower.
     let shard = write_snapshot(dir.path(), &exchange, symbol, 20);
     assert_eq!(shard, partition);
     let journal = memory_journal(partition, &orders(symbol, 6), 5);
@@ -221,10 +228,10 @@ async fn replay_require_snapshot_fails_when_the_snapshot_is_ahead_of_the_committ
     };
     let error = replay_with_journal(args, journal)
         .await
-        .expect_err("a snapshot ahead of the committed offset must fail closed");
+        .expect_err("a snapshot ahead of the log head must fail closed");
     let message = error.to_string();
     assert!(
-        message.contains("ahead of the engine committed offset"),
+        message.contains("ahead of the log head"),
         "unexpected error: {message}"
     );
 }

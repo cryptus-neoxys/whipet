@@ -8,6 +8,25 @@ Whippet is pre-1.0; minor releases may change internal APIs.
 
 ## [Unreleased]
 
+### Fixed
+
+- Snapshot terminal indices are validated on restore: out-of-range, duplicate,
+  non-terminal, or missing entries are rejected instead of silently skipped.
+- The dedup queues are compacted before a snapshot, so a restored table's
+  insertion walk matches the live one even if an evicted id is re-admitted
+  after the tail.
+- A partially filled resting order's original quantity is restored with its
+  remaining quantity; a snapshot round-trip is now exact.
+- `whippet verify --require-snapshot` requires a snapshot for every active
+  shard, and `replay` bounds the snapshot by the log head rather than the
+  commit watermark.
+- Node startup rejects a snapshot ahead of its partition's log head.
+- Snapshot writes are serialized across shards; concurrent fsyncs were
+  contending with Iggy's WAL.
+- TCP charges the batch before auth/shard-health, and a batch is size-checked
+  before the rate-limit charge; a request without a peer identity is charged
+  the full batch.
+
 ### Added
 
 - Snapshot format v3 carries the dedup terminal-eviction order, so a restored
