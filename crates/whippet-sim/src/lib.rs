@@ -4,13 +4,27 @@
 //!
 //! This is a synthetic workload, not a calibrated venue model. It produces a
 //! credible mix of limit orders, cancels, IOC orders, post-only orders, and
-//! occasional market orders around a random-walk mid. The same seed and
-//! scenario produce the same action sequence, which is what the demo and the
-//! regression tests rely on.
+//! occasional market orders around a random-walk mid.
+//!
+//! # Reproducibility
+//!
+//! The action stream is a pure function of the [`SimConfig`] seen by
+//! [`Simulator::new`]; nothing in the simulator reads the wall clock, the
+//! environment, or the OS RNG. Reproducing a run requires pinning **both**
+//! [`SimConfig::seed`] and [`SimConfig::run_nonce`]:
+//!
+//! - `(seed, run_nonce)` seeds the ChaCha20 stream, so both values decide the
+//!   action sequence.
+//! - the client order id is `sim-{seed:016x}-{nonce:016x}-{sequence:016x}`, so
+//!   both values decide the id space and a different nonce never replays ids
+//!   that a durable node's dedup table has already accepted.
+//!
+//! The action-stream hash in `tests/` pins one 1,000-action stream per
+//! scenario, which is the regression gate for accidental stream changes.
 
 #![forbid(unsafe_code)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 
 use rand::Rng;
@@ -61,16 +75,30 @@ impl FromStr for Scenario {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimConfig {
+    /// Selects the action stream together with [`Self::run_nonce`]. Pinned
+    /// seeds are only reproducible on the same scenario and instrument set.
     pub seed: u64,
-    /// Distinguishes two runs that use the same deterministic seed. The
-    /// default demo uses a fresh nonce so a simulator restart does not replay
-    /// client order ids that the durable dedup table has already seen.
+    /// Extra entropy folded into the RNG seed and into every client order id.
+    ///
+    /// A restart against a durable node must change this: the dedup table
+    /// remembers client order ids, so replaying a `(seed, nonce)` pair sends
+    /// duplicates and every order is rejected. The default demo uses a fresh
+    /// nonce; a reproducible run pins it (the CLI defaults it to `0` when
+    /// `--seed` is given). Two runs are identical only when *both* values
+    /// match.
     #[serde(default)]
     pub run_nonce: u64,
+    /// Advisory pacing. The simulator does not rate-limit itself; the runner
+    /// sleeps between calls and never reads this field.
     pub rate_per_sec: u64,
+    /// Advisory run length, also unused by the simulator itself.
     pub duration_secs: u64,
     pub scenario: Scenario,
+    /// Participant universe size. Names are `sim-01..=sim-N`; zero behaves as
+    /// one, so at least one participant always exists.
     pub participants: u64,
+    /// Empty means "every instrument in the exchange config". Unknown symbols
+    /// are dropped, duplicates are collapsed, so the tracked set can be empty.
     pub symbols: Vec<Symbol>,
 }
 
@@ -100,6 +128,46 @@ impl SimAction {
             Self::New(_) => "order",
             Self::Cancel(_) => "cancel",
         }
+    }
+}
+
+/// Hard cap on tracked open orders. When the cap is reached, the oldest open
+/// order is dropped from the simulator's own book before the new one is
+/// pushed. The dropped id is never reused, but no cancel is emitted for it, so
+/// the venue may still hold it.
+const OPEN_ORDER_CAPACITY: usize = 4_096;
+
+/// Fold `(seed, run_nonce)` into one RNG seed.
+///
+/// This is the SplitMix64 finalizer, applied to a nonce-scaled XOR. It needs no
+/// extra dependency and is a bijection on `u64`, so for a fixed nonce every
+/// seed selects a distinct stream seed. Keeping the mix here (rather than
+/// seeding only from `seed`) is what makes `run_nonce` affect the actions.
+fn stream_seed(seed: u64, run_nonce: u64) -> u64 {
+    let mut z = seed ^ run_nonce.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// The simulator's client id space.
+///
+/// Every field is fixed-width lowercase hex, so `(seed, run_nonce, sequence)`
+/// maps 1:1 onto the id: no field can absorb a neighbour's digits, and the
+/// full `u64` sequence survives instead of being truncated to 32 bits.
+pub fn client_order_id(seed: u64, run_nonce: u64, sequence: u64) -> String {
+    format!("sim-{seed:016x}-{run_nonce:016x}-{sequence:016x}")
+}
+
+/// Clamp without the panic `i64::clamp` raises when `min > max`; a corrupt
+/// ladder must surface through `check_invariants`, not abort the caller.
+fn clamp_ticks(value: i64, min: i64, max: i64) -> i64 {
+    if value < min {
+        min
+    } else if value > max {
+        max
+    } else {
+        value
     }
 }
 
@@ -233,10 +301,27 @@ impl Simulator {
                 .filter(|symbol| exchange.instrument(*symbol).is_some())
                 .collect()
         };
-        let mut state = HashMap::new();
+        // A config can name a symbol twice; the state map would already collapse
+        // the duplicate, so collapse the schedule too or `symbols` and `state`
+        // silently disagree about how many symbols are tracked.
+        let mut seen = HashSet::with_capacity(symbols.len());
+        let symbols: Vec<Symbol> = symbols
+            .into_iter()
+            .filter(|symbol| seen.insert(*symbol))
+            .collect();
+        let mut state = HashMap::with_capacity(symbols.len());
         for symbol in &symbols {
             let instrument = exchange.instrument(*symbol).expect("filtered above");
-            let margin = (instrument.ladder_len() as i64 / 10).max(10);
+            let ladder_len = instrument.ladder_len() as i64;
+            // Keep the interior band inside the ladder and around the reference
+            // price, so `min_ticks <= mid_ticks <= max_ticks` holds at birth even
+            // on a two-tick ladder (where a fixed 10-tick margin would invert the
+            // bounds and make `i64::clamp` panic). A malformed ladder (inverted
+            // bounds) yields a zero margin and is caught by `check_invariants`.
+            let margin = (ladder_len / 10)
+                .max(10)
+                .min(((ladder_len - 1) / 2).max(0))
+                .max(0);
             state.insert(
                 *symbol,
                 SymbolState {
@@ -247,13 +332,13 @@ impl Simulator {
                 },
             );
         }
-        let rng = ChaCha20Rng::seed_from_u64(config.seed);
+        let rng = ChaCha20Rng::seed_from_u64(stream_seed(config.seed, config.run_nonce));
         Self {
             config,
             rng,
             symbols,
             state,
-            open: VecDeque::with_capacity(4_096),
+            open: VecDeque::with_capacity(OPEN_ORDER_CAPACITY),
             sequence: 0,
             emitted: 0,
             symbol_cursor: 0,
@@ -268,12 +353,34 @@ impl Simulator {
         self.open.len()
     }
 
+    /// Orders emitted so far. One per [`SimAction::New`], so this is also the
+    /// newest sequence number.
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Actions emitted so far, cancels included. `emitted - sequence` is the
+    /// number of cancels produced.
+    pub fn emitted(&self) -> u64 {
+        self.emitted
+    }
+
     /// Generate the next deterministic action.
+    ///
+    /// Returns `None` when no symbol is tracked, which means "the simulator has
+    /// nothing to trade": the tracked set came back empty after filtering
+    /// `config.symbols` against the exchange (or the exchange has no
+    /// instruments). That is a configuration outcome, not exhaustion, so the
+    /// caller must stop rather than retry, and repeated calls keep returning
+    /// `None` without advancing any counter, the RNG, or the open book.
     pub fn next_action(&mut self) -> Option<SimAction> {
         if self.symbols.is_empty() {
             return None;
         }
         let symbol = self.symbols[self.symbol_cursor % self.symbols.len()];
+        // Resolve the per-symbol state before touching a counter or the RNG, so
+        // a missing entry can never leave a half-advanced simulator behind.
+        let state = self.state.get_mut(&symbol)?;
         self.symbol_cursor = self.symbol_cursor.wrapping_add(1);
         self.emitted = self.emitted.saturating_add(1);
         let regime = Regime::for_scenario(self.config.scenario, self.emitted);
@@ -289,10 +396,12 @@ impl Simulator {
             }
         }
 
-        let state = self.state.get_mut(&symbol)?;
-        let drift = regime.drift_ticks;
-        state.mid_ticks = (state.mid_ticks + self.rng.gen_range(-1..=1) + drift)
-            .clamp(state.min_ticks, state.max_ticks);
+        let step = self.rng.gen_range(-1..=1) + regime.drift_ticks;
+        state.mid_ticks = clamp_ticks(
+            state.mid_ticks.saturating_add(step),
+            state.min_ticks,
+            state.max_ticks,
+        );
         let mid = state.mid_ticks;
         let tick = state.tick_size_cents;
 
@@ -317,20 +426,21 @@ impl Simulator {
 
         let offset = self.rng.gen_range(0..=regime.spread_ticks.max(1));
         let price_ticks = match side {
-            Side::Buy => (mid - offset).max(state.min_ticks),
-            Side::Sell => (mid + offset).min(state.max_ticks),
+            Side::Buy => mid.saturating_sub(offset).max(state.min_ticks),
+            Side::Sell => mid.saturating_add(offset).min(state.max_ticks),
         };
         let price_cents = price_ticks * tick;
         let qty = self.rng.gen_range(1..=25);
 
-        self.sequence = self.sequence.wrapping_add(1);
-        let client_order_id = format!("sim-{:016x}-{:08x}", self.config.seed, self.sequence as u32);
+        self.sequence = self.sequence.saturating_add(1);
+        let client_order_id =
+            client_order_id(self.config.seed, self.config.run_nonce, self.sequence);
         let order_id = OrderId::derive(symbol, &client_order_id);
         let participant_index = self.rng.gen_range(1..=self.config.participants.max(1));
         let participant = format!("sim-{participant_index:02}");
 
         if matches!(order_type, OrderType::Limit | OrderType::PostOnly) {
-            if self.open.len() >= 4_096 {
+            if self.open.len() >= OPEN_ORDER_CAPACITY {
                 self.open.pop_front();
             }
             self.open.push_back(OpenOrder {
@@ -350,83 +460,143 @@ impl Simulator {
             participant: Some(participant),
         }))
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn same_seed_same_actions() {
-        let exchange = ExchangeConfig::default();
-        let config = SimConfig {
-            seed: 42,
-            ..SimConfig::default()
-        };
-        let mut a = Simulator::new(config.clone(), &exchange);
-        let mut b = Simulator::new(config, &exchange);
-        for _ in 0..200 {
-            let left = a.next_action().unwrap();
-            let right = b.next_action().unwrap();
-            match (left, right) {
-                (SimAction::New(a), SimAction::New(b)) => {
-                    assert_eq!(a.symbol, b.symbol);
-                    assert_eq!(a.side, b.side);
-                    assert_eq!(a.order_type, b.order_type);
-                    assert_eq!(a.price_cents, b.price_cents);
-                    assert_eq!(a.qty, b.qty);
-                    assert_eq!(a.client_order_id, b.client_order_id);
-                }
-                (SimAction::Cancel(a), SimAction::Cancel(b)) => {
-                    assert_eq!(a.order_id, b.order_id);
-                }
-                _ => panic!("action kind diverged"),
+    /// Executable definition of the simulator's invariants. `O(tracked + open)`,
+    /// allocation-bounded by the open book, and never panics: a corrupted
+    /// simulator is reported as `Err`, not an abort.
+    ///
+    /// Checked here:
+    ///
+    /// - `symbols` is deduped and every entry has exactly one `state` entry;
+    ///   `state` holds no untracked key. An empty tracked set is legal (nothing
+    ///   to trade, `next_action` returns `None` forever) but then must be fully
+    ///   empty: no state, no open orders.
+    /// - per symbol: `tick_size_cents > 0`, `min_ticks <= mid_ticks <=
+    ///   max_ticks`. The exchange ladder is not stored, so only internal
+    ///   consistency is checked; `new` derives the band from the ladder.
+    /// - the open book: at most [`OPEN_ORDER_CAPACITY`] entries, every entry on
+    ///   a tracked symbol, every id non-zero and unique.
+    /// - counters: `sequence <= emitted`, neither at `u64::MAX` (saturation
+    ///   would start repeating ids), and `emitted - sequence` cancels.
+    /// - client ids: `sim-{seed:016x}-{nonce:016x}-{sequence:016x}` round-trips
+    ///   for a spread of sequence values, so `(seed, nonce, sequence)` stays 1:1
+    ///   and a full-width `u64` sequence cannot alias its low 32 bits.
+    pub fn check_invariants(&self) -> std::result::Result<(), String> {
+        let mut tracked: HashSet<Symbol> = HashSet::with_capacity(self.symbols.len());
+        for symbol in &self.symbols {
+            if !tracked.insert(*symbol) {
+                return Err(format!("duplicate tracked symbol {symbol}"));
             }
         }
-    }
-
-    #[test]
-    fn prices_stay_inside_the_ladder() {
-        let exchange = ExchangeConfig::default();
-        let mut sim = Simulator::new(
-            SimConfig {
-                seed: 7,
-                scenario: Scenario::FlashCrash,
-                ..SimConfig::default()
-            },
-            &exchange,
-        );
-        for _ in 0..5_000 {
-            if let Some(SimAction::New(order)) = sim.next_action()
-                && let Some(price_cents) = order.price_cents
-            {
-                let instrument = exchange.instrument(order.symbol).unwrap();
-                assert!(price_cents >= instrument.min_price_cents());
-                assert!(price_cents <= instrument.max_price_cents());
+        if self.state.len() != tracked.len() {
+            return Err(format!(
+                "state holds {} symbols but {} are tracked",
+                self.state.len(),
+                tracked.len()
+            ));
+        }
+        for symbol in self.state.keys() {
+            if !tracked.contains(symbol) {
+                return Err(format!("state key {symbol} is not a tracked symbol"));
             }
         }
-    }
+        if tracked.is_empty() && (!self.open.is_empty() || self.sequence != 0 || self.emitted != 0)
+        {
+            return Err("no tracked symbol but the simulator has produced actions".into());
+        }
 
-    #[test]
-    fn cancels_reference_real_open_orders() {
-        let exchange = ExchangeConfig::default();
-        let mut sim = Simulator::new(
-            SimConfig {
-                seed: 11,
-                ..SimConfig::default()
-            },
-            &exchange,
-        );
-        let mut cancels = 0;
-        for _ in 0..2_000 {
-            match sim.next_action() {
-                Some(SimAction::Cancel(cancel)) => {
-                    assert!(cancel.order_id.0 != 0);
-                    cancels += 1;
-                }
-                Some(SimAction::New(_)) | None => {}
+        for (symbol, state) in &self.state {
+            if state.tick_size_cents <= 0 {
+                return Err(format!(
+                    "{symbol} has non-positive tick size {}",
+                    state.tick_size_cents
+                ));
+            }
+            if state.min_ticks > state.max_ticks {
+                return Err(format!(
+                    "{symbol} has inverted band [{}, {}]",
+                    state.min_ticks, state.max_ticks
+                ));
+            }
+            if state.mid_ticks < state.min_ticks || state.mid_ticks > state.max_ticks {
+                return Err(format!(
+                    "{symbol} mid {} is outside [{}, {}]",
+                    state.mid_ticks, state.min_ticks, state.max_ticks
+                ));
             }
         }
-        assert!(cancels > 0);
+
+        if self.open.len() > OPEN_ORDER_CAPACITY {
+            return Err(format!(
+                "open book holds {} orders, above the {OPEN_ORDER_CAPACITY} cap",
+                self.open.len()
+            ));
+        }
+        let mut ids = HashSet::with_capacity(self.open.len());
+        for order in &self.open {
+            if !tracked.contains(&order.symbol) {
+                return Err(format!(
+                    "open order {} sits on untracked symbol {}",
+                    order.order_id.to_hex(),
+                    order.symbol
+                ));
+            }
+            if order.order_id.0 == 0 {
+                return Err(format!("open order on {} has a zero id", order.symbol));
+            }
+            if !ids.insert(order.order_id) {
+                return Err(format!(
+                    "open order id {} appears twice",
+                    order.order_id.to_hex()
+                ));
+            }
+        }
+
+        if self.sequence > self.emitted {
+            return Err(format!(
+                "sequence {} is ahead of emitted {}",
+                self.sequence, self.emitted
+            ));
+        }
+        if self.sequence == u64::MAX || self.emitted == u64::MAX {
+            return Err("action counters are saturated".into());
+        }
+
+        // The id must survive a round trip for every field width, including the
+        // 32-bit boundary where the old `sequence as u32` truncation wrapped.
+        let mut samples = vec![
+            0,
+            1,
+            u64::from(u32::MAX),
+            u64::from(u32::MAX) + 1,
+            u64::MAX - 1,
+        ];
+        if !samples.contains(&self.sequence) {
+            samples.push(self.sequence);
+        }
+        let mut seen = HashSet::with_capacity(samples.len());
+        for sequence in samples {
+            let id = client_order_id(self.config.seed, self.config.run_nonce, sequence);
+            if !seen.insert(id.clone()) {
+                return Err(format!("client id {id} derives twice"));
+            }
+            let fields = id.split('-').collect::<Vec<_>>();
+            let parsed = match fields.as_slice() {
+                ["sim", seed, nonce, sequence] => u64::from_str_radix(seed, 16)
+                    .ok()
+                    .zip(u64::from_str_radix(nonce, 16).ok())
+                    .zip(u64::from_str_radix(sequence, 16).ok())
+                    .map(|((seed, nonce), sequence)| (seed, nonce, sequence)),
+                _ => None,
+            };
+            if parsed != Some((self.config.seed, self.config.run_nonce, sequence)) {
+                return Err(format!(
+                    "client id {id} does not round-trip to ({:#x}, {:#x}, {:#x})",
+                    self.config.seed, self.config.run_nonce, sequence
+                ));
+            }
+        }
+
+        Ok(())
     }
 }
