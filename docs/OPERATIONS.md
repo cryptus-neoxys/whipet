@@ -41,6 +41,8 @@ credentials explicitly.
 | `WHIPPET_OPERATOR_TOKENS` | unset | Operator credentials for the instrument control plane, as `token:operator-name` pairs, comma separated. Separate from `WHIPPET_API_TOKENS`: operator tokens cannot submit orders, and trading tokens cannot halt/resume. With none configured, every admin request is 403 `operator_not_configured`. |
 | `WHIPPET_DATA_DIR` | `/data` | Directory on the node's own data volume; the storage monitor samples the filesystem that holds it. |
 | `WHIPPET_IGGY_DATA_DIR` | `/iggy-data` | Read-only mount of Iggy's data volume. Resolved once at startup; a missing path disables the Iggy sample instead of failing the node. |
+| `WHIPPET_RISK_MAX_ORDER_QTY` | `0` | Optional per-order quantity cap at HTTP/TCP ingress. `0` disables. A violation returns HTTP 422 `risk_limit` or TCP `RiskRejected` before any append. |
+| `WHIPPET_RISK_MAX_NOTIONAL_CENTS` | `0` | Optional per-order notional cap (`price × qty`, priced orders only) at HTTP/TCP ingress. `0` disables. Market orders are not notional-checked in this slice. |
 | `WHIPPET_DISK_WARN_PCT` | `70` | Volume usage percentage that raises the warning state. 1–99 and strictly below the critical value. |
 | `WHIPPET_DISK_CRIT_PCT` | `85` | Volume usage percentage that raises the critical state: readiness fails and new orders/cancels are refused with `storage_pressure`. 1–99 and strictly above the warning value. |
 | `WHIPPET_HTTP_TRACE` | unset | Set to `1` to enable per-request `tower-http` trace spans; off by default for throughput. |
@@ -173,6 +175,28 @@ These retention values are recorded at topic creation, but in Iggy 0.10 they
 are enforced only by the messages cleaner — and the default stack disables
 it, so nothing trims the log. See
 [Log growth and retention](#log-growth-and-retention) for the exact state.
+
+## Pre-trade ingress risk
+
+The gateway and TCP listener enforce two optional per-order limits before any
+journal append: `WHIPPET_RISK_MAX_ORDER_QTY` and
+`WHIPPET_RISK_MAX_NOTIONAL_CENTS` (both `0` = disabled). Rejections are explicit
+— HTTP 422 `risk_limit`, TCP `RiskRejected` — and counted in
+`whippet_risk_rejected_total{reason}`. This is an admission guard, not an
+engine-enforced risk control: a producer that appends directly to the orders
+topic bypasses it, and the engine remains the matching authority. Market orders
+are quantity-checked but not notional-checked. See
+[ADR 0017](adr/0017-ingress-risk-and-position-reconstruction.md).
+
+## Position reconstruction (read-only)
+
+`whippet positions --partition 1 [--symbols ...] [--participant N] [--json]`
+reconstructs per-participant, per-symbol net/buy/sell quantity, fills, cash
+flow, and turnover from the orders and executions logs. One execution report is
+one trade; the maker leg is the opposite side and is attributed through the
+orders log. Unknown order ids are reported as unresolved counters, never
+inferred. It is a reconstruction, not a settlement ledger: no balances,
+deposits, fees, funding, margin, or clearing. It never appends or commits.
 
 ## Surveillance indicators (read-only)
 

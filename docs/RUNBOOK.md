@@ -217,6 +217,16 @@ workload (defaults 1,000 orders/s, batch 10, 20 s), SIGKILLs the node
 JSON summary land in `artifacts/bench/`. Status as documented: method
 recorded, results pending — see section 12.
 
+### Risk and positions
+
+- The ingress risk guard is configured with `WHIPPET_RISK_MAX_ORDER_QTY` and
+  `WHIPPET_RISK_MAX_NOTIONAL_CENTS` (0 disables). A rejection is HTTP 422
+  `risk_limit` / TCP `RiskRejected`; `whippet_risk_rejected_total` shows the
+  reason. It is an ingress guard, not engine-enforced risk.
+- `whippet positions --partition 1 [--symbol] [--participant N]` reconstructs
+  net/buy/sell quantity, cash flow, fills, and unresolved maker legs from the
+  logs. Read-only; not a settlement ledger.
+
 ### Audit and order trace
 
 Both are read-only CLI views over the logs:

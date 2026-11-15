@@ -49,6 +49,14 @@ Whippet is pre-1.0; minor releases may change internal APIs.
 
 ### Added
 
+- Ingress pre-trade risk: optional per-order quantity and notional caps
+  (`WHIPPET_RISK_MAX_ORDER_QTY`, `WHIPPET_RISK_MAX_NOTIONAL_CENTS`), enforced by
+  HTTP and TCP before the orders-log append with 422 `risk_limit` / TCP
+  `RiskRejected` and `whippet_risk_rejected_total{reason}`. An admission guard,
+  not engine-enforced risk (ADR 0017).
+- `whippet positions`: read-only reconstruction of per-participant/symbol net,
+  buy/sell quantities, fills, cash flow, and unresolved maker fills from the
+  orders and executions logs. Not a settlement ledger.
 - Read-only surveillance indicators: `whippet surveillance` scans one
   partition's orders/executions window and reports per-participant
   cancel-ratio, large-cancelled-without-fill, self-trade-prevention, and

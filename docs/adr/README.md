@@ -22,6 +22,7 @@ supersedes an earlier one.
 | [0014](0014-bounded-storage-and-replay-safe-retention.md) | Bounded storage guard and replay-safe retention rule | Proposed (guard implemented; deletion rule design-only — never delete without consumer + verified-baseline proof) |
 | [0015](0015-audited-instrument-control-plane.md) | Audited instrument halt/resume control plane | Accepted (implemented; log-ordered commands, operator tokens, audit topic) |
 | [0016](0016-sequenced-price-level-market-data-feed.md) | Sequenced price-level market-data feed | Accepted (implemented; `/ws/md`, snapshot + deltas + resync) |
+| [0017](0017-ingress-risk-and-position-reconstruction.md) | Ingress pre-trade risk and read-only position reconstruction | Accepted (per-order qty/notional guard + `whippet positions`; engine-enforced risk/ledger proposed) |
 
 Template:
 
