@@ -350,6 +350,15 @@ async fn md_feed_sends_a_snapshot_then_every_delta() {
     assert_eq!(snapshot["symbol"], "BTC-USD");
     assert_eq!(snapshot["seq"], 0, "a fresh hub has applied no events");
 
+    // Before the startup image, a book-state delta is refused: it advances no
+    // sequence, is not framed, and is visible as a counter.
+    node.ctx.hub.apply(&add_event(4, 65_000, 99, 4));
+    let (_, text) = get_text(&app, "/metrics").await;
+    assert_eq!(
+        metric_value(&text, "whippet_md_events_without_baseline_total "),
+        1.0
+    );
+
     // Deltas are applied the way the engine's MD consumer would: straight
     // into the hub, which sequences and broadcasts them. The startup image
     // must exist first; the initial WS frame above is not that image.

@@ -1603,6 +1603,14 @@ async fn prometheus(
     );
     body.push_str("# TYPE whippet_md_feed_resyncs_total counter\n");
     body.push_str(&format!("whippet_md_feed_resyncs_total {feed_resyncs}\n"));
+    body.push_str(
+        "# HELP whippet_md_events_without_baseline_total Book-state deltas refused because no image seeded the symbol.\n",
+    );
+    body.push_str("# TYPE whippet_md_events_without_baseline_total counter\n");
+    body.push_str(&format!(
+        "whippet_md_events_without_baseline_total {}\n",
+        ctx.hub.events_without_baseline()
+    ));
     body.push_str("# HELP whippet_group_commit_batches_total Group-commit appends completed.\n");
     body.push_str("# TYPE whippet_group_commit_batches_total counter\n");
     body.push_str(&format!(
