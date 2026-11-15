@@ -21,7 +21,9 @@ use whippet::engine_runner::{
     InputBatch, OutputBatch, SHARD_RING_CAPACITY, run_engine_shard, run_matcher,
 };
 use whippet::snapshot::{SequencedSnapshot, SnapshotStore, SnapshotWriter};
-use whippet::turbo::{TurboConfig, TurboEntry, TurboIngress, TurboWindow, now_ns};
+use whippet::turbo::{
+    AdmitError, EnqueueError, TurboConfig, TurboEntry, TurboIngress, TurboWindow, now_ns,
+};
 use whippet_core::config::{ExchangeConfig, Mode};
 use whippet_core::headers::{HeaderMode, MessageMeta, SCHEMA_ORDER};
 use whippet_core::ids::Seq;
@@ -652,4 +654,184 @@ async fn a_turbo_node_never_falls_back_to_the_durable_reader() {
         error.to_string().contains("refusing to fall back"),
         "unexpected error: {error}"
     );
+}
+
+// --- Admission lifecycle -----------------------------------------------------
+//
+// The window is the crash-loss bound, so its admission lifecycle is checked,
+// not just its limits: which bound rejected, that a freed slot admits again,
+// that an abandoned entry leaks nothing, and that the bookkeeping invariants
+// survive a randomized admit/complete/abandon sequence.
+
+/// A dead lane: the shard receiver is gone, so `try_send` fails closed.
+fn dead_lane_ingress(config: TurboConfig) -> (Arc<TurboIngress>, u32) {
+    let shard = 0;
+    let (ingress, mut receivers) = TurboIngress::new(config, [shard]);
+    drop(receivers.remove(&shard));
+    (ingress, shard)
+}
+
+#[test]
+fn enqueue_reports_the_binding_bound_and_frees_slots_on_failure() {
+    let command = GoldenLog::standard().commands()[0].clone();
+    let message = JournalMessage::new(vec![0], Vec::new());
+
+    // The count bound is asserted at the window level below, where the clock
+    // is fillable deterministically; here the lane is dead, so every send
+    // fails closed after admission and the abandoned entry must release its
+    // permit either way.
+    let config = TurboConfig::new(2, 60_000).expect("valid config");
+    let (ingress, shard) = dead_lane_ingress(config);
+    assert!(
+        matches!(
+            ingress.enqueue(shard, command.clone(), message.clone()),
+            Err(EnqueueError::ShardUnavailable)
+        ),
+        "a dead lane fails closed"
+    );
+    let window = ingress.window(shard).expect("a lane exists");
+    assert_eq!(window.in_flight(), 0, "the failed send frees the slot");
+    window.check_invariants().expect("invariants hold");
+
+    // Age bound: a tiny window rejects by age, and the reason is distinct
+    // from the count reason.
+    let window = TurboWindow::new(TurboConfig::new(2, 1).expect("valid config"));
+    let held = window.try_admit(now_ns()).expect("first admits");
+    std::thread::sleep(Duration::from_millis(2));
+    assert!(
+        matches!(window.try_admit(now_ns()), Err(AdmitError::AgeFull)),
+        "a window older than 1 ms rejects by age, not count"
+    );
+    assert_eq!(window.drop_reasons(), (0, 1));
+    assert_eq!(window.drops(), 1);
+    window.check_invariants().expect("invariants hold");
+    drop(held);
+
+    // Count bound at the window level: the third admit of a two-slot window
+    // is rejected by count, the counters split, and completing one admission
+    // frees a slot that admits again.
+    let window = TurboWindow::new(TurboConfig::new(2, 60_000).expect("valid config"));
+    let mut first = window.try_admit(1_000).expect("first");
+    let second = window.try_admit(2_000).expect("second");
+    assert!(
+        matches!(window.try_admit(3_000), Err(AdmitError::CountFull)),
+        "a full window rejects by count, not age"
+    );
+    assert_eq!(window.drop_reasons(), (1, 0));
+    first.complete();
+    assert!(
+        window.try_admit(4_000).is_ok(),
+        "a freed slot must admit again"
+    );
+    drop(second);
+    window.check_invariants().expect("invariants hold");
+}
+
+#[test]
+fn completing_admissions_out_of_order_releases_every_slot() {
+    // The writer completes admissions in seq order, so the window front is
+    // the id being completed and the release is an O(1) pop. A raced send
+    // failure or a disconnect can abandon an entry ahead of its predecessors;
+    // the release fallback search then removes it from the middle of the
+    // clock, because a leaked slot would be a permanent capacity loss. Either
+    // way the slot count must stay exact.
+    let window = TurboWindow::new(TurboConfig::new(3, 60_000).expect("valid config"));
+    let mut first = window.try_admit(1_000).expect("first");
+    let mut second = window.try_admit(2_000).expect("second");
+    let mut third = window.try_admit(3_000).expect("third");
+    window.check_invariants().expect("invariants hold");
+
+    second.complete();
+    window.check_invariants().expect("invariants hold");
+    third.complete();
+    window.check_invariants().expect("invariants hold");
+    assert_eq!(window.in_flight(), 1, "the out-of-order entries released");
+    // The front entry is the last to complete: the fast pop.
+    first.complete();
+    window.check_invariants().expect("invariants hold");
+    assert_eq!(window.in_flight(), 0);
+    assert_eq!(window.oldest_queued_ns(), None);
+}
+
+#[test]
+fn randomized_admission_sequences_hold_invariants() {
+    // A deterministic LCG (no dependency on a rand crate) drives admit,
+    // complete, and abandon. The invariant check runs after every operation,
+    // so any step that loses a permit or a clock entry fails here.
+    let window = TurboWindow::new(TurboConfig::new(16, 1).expect("valid config"));
+    let mut held: Vec<whippet::turbo::TurboAdmission> = Vec::new();
+    // (count, age) rejections this driver has observed, to compare against
+    // the window's counters at the end.
+    let mut seen = (0u64, 0u64);
+    let mut ts: u64 = 0;
+    let mut state = 0x2F1E3D4C5B6A7988u64;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        state >> 33
+    };
+
+    for _ in 0..500 {
+        ts += 200_000; // 0.2 ms per attempt, so the 1 ms age bound bites.
+        match next() % 8 {
+            0..=4 => match window.try_admit(ts) {
+                Ok(admission) => held.push(admission),
+                Err(AdmitError::CountFull) => seen.0 += 1,
+                Err(AdmitError::AgeFull) => seen.1 += 1,
+            },
+            5..=7 => {
+                if let Some(index) = (!held.is_empty()).then(|| next() as usize % held.len()) {
+                    let mut admission = held.swap_remove(index);
+                    if next() & 1 == 0 {
+                        admission.complete();
+                    } else {
+                        drop(admission); // abandoned
+                    }
+                }
+            }
+            _ => unreachable!("modulo 8"),
+        }
+        window
+            .check_invariants()
+            .expect("invariants hold after every operation");
+    }
+
+    while let Some(mut admission) = held.pop() {
+        if next() & 1 == 0 {
+            admission.complete();
+        } else {
+            drop(admission);
+        }
+        window
+            .check_invariants()
+            .expect("invariants hold while draining");
+    }
+    assert_eq!(window.in_flight(), 0);
+    assert_eq!(window.drop_reasons(), seen, "counters split by the bound");
+    assert_eq!(window.drops(), seen.0 + seen.1);
+    window.check_invariants().expect("invariants hold");
+}
+
+#[test]
+fn an_admission_failed_send_abandons_its_entry_not_its_slot() {
+    let config = TurboConfig::new(4, 60_000).expect("valid config");
+    let (ingress, shard) = dead_lane_ingress(config);
+    let command = GoldenLog::standard().commands()[0].clone();
+    let message = JournalMessage::new(vec![0], Vec::new());
+    for _ in 0..4 {
+        let result = ingress.enqueue(shard, command.clone(), message.clone());
+        assert!(
+            matches!(result, Err(EnqueueError::ShardUnavailable)),
+            "a dead lane fails closed"
+        );
+    }
+    let window = ingress.window(shard).expect("a lane exists");
+    assert_eq!(
+        window.in_flight(),
+        0,
+        "no failed send may leak a window slot"
+    );
+    assert_eq!(ingress.total_in_flight(), 0);
+    window.check_invariants().expect("invariants hold");
 }

@@ -355,7 +355,7 @@ async fn handle_submit(
         for (command, message) in commands.into_iter().zip(messages) {
             match turbo.enqueue(partition, command, message) {
                 Ok(receiver) => receivers.push(receiver),
-                Err(EnqueueError::WindowFull) => {
+                Err(EnqueueError::WindowFull(_)) => {
                     return (
                         error_response(
                             TcpErrorCode::WindowFull,

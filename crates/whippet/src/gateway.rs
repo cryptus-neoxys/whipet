@@ -360,7 +360,9 @@ fn turbo_enqueue(
     turbo
         .enqueue(partition, command, message)
         .map_err(|error| match error {
-            turbo::EnqueueError::WindowFull => window_full(),
+            // The admit reason is for counters and tests; the HTTP answer is
+            // the same `window_full` whichever bound bound.
+            turbo::EnqueueError::WindowFull(_) => window_full(),
             turbo::EnqueueError::ShardUnavailable => shard_unavailable(),
         })
 }
