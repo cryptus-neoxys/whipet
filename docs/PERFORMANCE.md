@@ -928,24 +928,38 @@ array is honest; a fabricated one is not.
 
 ## Turbo mode (dev-loop, one run per mode)
 
-Turbo is a different guarantee, not a faster durable path, so the two rows are
-not interchangeable and the manifests now record the mode. Both runs below are
+Turbo is a different guarantee, not a faster durable path, so the two rows
+are not interchangeable and the manifests record the mode. Both runs below use
 the same 60 s soak shape on the same Docker Desktop host (3 active shards,
-5,000 orders/s offered, 300,000 orders, zero errors), one repetition each, run
-minutes apart. They are `dev-loop` smoke output, not a headline result.
+5,000 orders/s offered, 300,000 orders), one repetition each. They are
+`dev-loop` smoke output, not a headline result.
 
-| Mode | p50 | p99 | p99.9 | Ack point |
-|---|---|---|---|---|
-| durable | 1,058 µs | 25,743 µs | 284,159 µs | after the Iggy append |
-| turbo | 1,086 µs | 11,575 µs | 160,767 µs | after the match (`matched_unjournaled`) |
+| Mode | p50 | p99 | p99.9 | Offered | Errored | Ack point |
+|---|---|---|---|---|---|---|
+| durable | 1,173 µs | 30,991 µs | 184,831 µs | 300,000 | 0 | after the Iggy append |
+| turbo | 256 µs | 3,495 µs | 229,887 µs | 300,000 | 2,230 | after the match (`matched_unjournaled`) |
 
 Both summary p50s include the first sample, when the bench and node are still
-warming; the steady 15 s samples were 864–894 µs p50 in durable and 481–516 µs
-p50 in turbo. The turbo p99 is dominated by HTTP/scheduler tail, not the window: the
-window gauge stayed at 0 after each sample, and a single-order smoke ack was
-88 µs. These are one-run observations; no claim is made about a Linux headline
-or sub-millisecond end-to-end durable latency. The differential test, not this
-table, is what proves turbo and durable match identically.
+warming; the steady 15 s samples were 861–879 µs p50 in durable and 231–390 µs
+p50 in turbo. The durable row is the final build; the turbo row is the last
+turbo run of the same coalesced writer. They are separate one-repetition runs
+on a dev host, not a controlled A/B.
+
+The turbo errors are not transport failures. They are HTTP 503 `window_full`
+rejections: 1,052 commands hit the **age** bound
+(`whippet_turbo_window_drops_total{reason="age"}`); the count bound never
+bound. Goodput was 297,770/300,000. A burst that outlives the 50 ms window is
+rejected rather than acked into a window that cannot be journaled in time;
+clients retry. On this Docker Desktop host, scheduler/WAL stalls exceed 50 ms,
+so the default bound is binding at 5,000 orders/s offered. A larger
+`WHIPPET_TURBO_WINDOW_MS` trades a wider crash-loss window for fewer rejects;
+the defaults are the guarantee, not a promise of zero backpressure. A native
+Linux run is required before any claim that the bound is non-binding.
+
+A single-order turbo smoke ack measured 88 µs. These are one-run observations;
+no claim is made about a Linux headline or sub-millisecond end-to-end durable
+latency. The differential test, not this table, is what proves turbo and
+durable match identically.
 
 ## Guardrails
 
