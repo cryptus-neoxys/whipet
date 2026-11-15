@@ -203,8 +203,8 @@ single-order path was p50 838 ms with 40k errors before the tranche.
 
 The 5,000/s single-order path was p50 838 ms with 40k errors before group
 commit. The replay proof was rerun after the tranche: full and snapshot-seeded
-replay both end at `0f90672d75d2af2e028f3a0532836a361d24b85c03cad8636a3ad89c0d29e218`
-from snapshot offset 17038 (tail 16600).
+replay both end at `ceddf1c94cfdb121541ae726d4001fb43daaf92dc54a8ef19216761a5330e510`
+from snapshot offset 108466 (tail 364).
 
 ### Phase 1.5c (implemented; dev-loop measured)
 
@@ -219,7 +219,7 @@ p50 is within host noise while the tail moved.
 | Workstream | Change | Expected effect | Status |
 |---|---|---|---|
 | Shard thread and rings | One dedicated OS thread (`whippet-shard-<id>`) per active shard; bounded input ring (reader → matcher) and output ring (matcher → writer), capacity 2, plus a recycle channel that returns the polled buffer to the reader; the matcher does no I/O and no await; the reader/writer tasks own the journal edge | Removes the runtime migration and interleaving jitter from the match path; bounds in-flight memory per shard; backpressure when a ring fills instead of unbounded queueing | Implemented ([ADR 0010](adr/0010-shard-thread-and-journal-pipeline.md)); end-to-end sweep pending |
-| Snapshot hash off-loop | The matcher calls `snapshot_state_without_hash`; the blocking snapshot writer calls `whippet_engine::fill_symbol_hashes` before saving; snapshots are gated by `appended_offset` | Removes the state-hash cost from the match path; the snapshot can no longer claim a resume offset whose outputs were lost | Implemented; hash cost measured below |
+| Snapshot hash | The matcher supplies the engine's live `state_hash`; the writer saves it and verifies the final snapshot by rebuilding. Snapshots are gated by `appended_offset` | The final snapshot cannot claim a bad hash; a periodic snapshot is checked on restore. Off-loop hash was reverted after a scale mismatch | Implemented; off-loop variant reverted |
 | Per-shard metrics | Each matcher records into its own lock-free `ShardMetrics` (counters + local histogram), merged into the global `Metrics` once per second and on exit | Removes one `Mutex<Histogram>` lock per command from every shard's serial path | Implemented; merge cost measured below |
 | Gateway/journal allocation pass | Per-event allocations on the edges: `execution_message`/`md_message` payload `Vec` + header `String`s remain the target; the reader's per-batch read `Vec` is now recycled | Lower CPU and allocation per event; fewer transient allocations per output | Partially implemented (recycle channel); message-construction pass pending |
 
@@ -245,7 +245,7 @@ the same host:
 | TCP batch 10, 10,000/s | 598 / 10,647 µs | 527 / 3,921 µs |
 
 The p50 differences are inside one-repetition host noise; the p99 collapse is
-the shard thread plus the off-loop snapshot hash and per-shard metrics. These
+the shard thread plus the per-shard metrics. These
 are not headline numbers and the Linux matrix is still the publishable
 artifact. Per [ADR 0009](adr/0009-performance-budget-and-optimization-order.md),
 a change without a manifest is not a performance result; the manifests are in
@@ -258,13 +258,15 @@ rate limiter across HTTP and TCP, caps WebSocket connections, verifies the
 final snapshot at write time, and moves the last stage sample off the matcher
 thread.
 
-Dev-loop soak after the split (fresh stack, 5,000/s, batch 10, 120 s): p50
-**0.51–0.89 ms** (previously 1.2–3.0 ms), p99 **0.2–0.34 s**, RSS 120 → 276 MiB.
-The p50 improvement is the per-role clients and the smaller snapshot; the p99
-is the periodic snapshot path (clone on the matcher, hash/serialize/fsync on
-the writer), not matching. `engine_process` stayed at 4 µs and `md_apply` at
-3 µs. A 10-minute soak still fails the 5% drift gate on Docker Desktop; the
-next step is a copy-on-write snapshot or a longer cadence, then the Linux run.
+Dev-loop soak after the split (fresh stack, 5,000/s, batch 10, 60 s): p50
+**1.14 ms**, p99 **0.54 s**, 0 errors. The p50 is the per-role clients; the
+p99 is the periodic snapshot path (live hash and clone on the matcher,
+serialize/fsync on the writer), not matching. `engine_process` stays at 4 µs
+and `md_apply` at 3 µs. An off-loop hash was tried and reverted after a
+~170k-order shard disagreed with the restored engine; correctness wins over
+the snapshot tail. A 10-minute soak still fails the 5% drift gate on Docker
+Desktop; the next step is a copy-on-write snapshot or a longer cadence, then
+the Linux run.
 
 ### Phase 1.5d (implemented)
 
@@ -439,7 +441,7 @@ does not, and the edge is where the baseline knee lives.
 
 | Rule | Where it must hold | Current status | Gap or evidence |
 |---|---|---|---|
-| No allocation in the match loop | `SymbolEngine::process`, `Book` operations | Holds in steady state. Output vectors are caller-owned and reused; the arena, free list, and index are preallocated. | The snapshot-interval state clone (`snapshot_state_without_hash`) still allocates, but between batches on the matcher thread, not per command; the hash itself is computed on the blocking snapshot writer. Journal-edge message construction allocates per event: `MessageMeta::pairs` (7 `String`s), `execution_message`/`md_message` (payload `Vec` + 7 `String`s), `build_order`. The reader's polled buffer is recycled, not reallocated per batch. |
+| No allocation in the match loop | `SymbolEngine::process`, `Book` operations | Holds in steady state. Output vectors are caller-owned and reused; the arena, free list, and index are preallocated. | The snapshot-interval state clone and live `state_hash` still allocate and run between batches on the matcher thread, not per command. Journal-edge message construction allocates per event: `MessageMeta::pairs` (7 `String`s), `execution_message`/`md_message` (payload `Vec` + 7 `String`s), `build_order`. The reader's polled buffer is recycled, not reallocated per batch. |
 | No syscall in the match loop | `SymbolEngine::process` | Holds. The matcher performs no I/O. | The matcher thread reads the clock once per record for the latency sample (`Instant::now()` in `run_matcher`) and the hub reads it once per MD event (`now_ns()` in `MdHub::apply`). On Linux these are vDSO clock reads, not syscalls, but they are still work on the serial path. |
 | No lock in the match loop | `SymbolEngine::process` | Holds for the per-command path. The matcher thread owns each partition's books; the engine crate has no lock. | Match latency and counters go into the per-shard lock-free `ShardMetrics`, merged into the global `Metrics` once per second. One `EngineProcess` stage sample per batch still takes the global stage-histogram mutex, so the rule is per batch, not per command. `MdHub::apply_batch` takes the hub mutex once per poll batch. |
 | No async in the engine | `whippet-engine` | Holds. The crate has no Tokio dependency, and the matcher thread has no async context at all. | The async boundary lives in the `read_orders` and `run_writer` tasks around the matcher; the matcher never awaits. |
@@ -452,9 +454,9 @@ These do not show up in a steady-state per-order measurement, but they can own a
 tail sample:
 
 - **Snapshot build.** Every `WHIPPET_SNAPSHOT_EVERY` commands (default 10,000),
-  the matcher calls `snapshot_state_without_hash()`, which clones the book and
+  the matcher calls `snapshot_state()`, which clones the book,
   the dedup table between batches; the blocking snapshot writer then computes
-  the state hash (`fill_symbol_hashes`) and writes the file. The snapshot is
+  the live state hash and writes the file. The snapshot is
   gated by `appended_offset`, so it is only taken once every output up to the
   matcher's offset is in the journal. At the default dedup cap (100,000
   entries per symbol), the clone is large; the hash that used to accompany it
@@ -540,7 +542,7 @@ the input ring.
 
 **Done since.** The match-latency histogram is now per-shard (`ShardMetrics`,
 lock-free, merged once per second), and the state-hash computation moved into
-the snapshot writer (`fill_symbol_hashes`), both measured in
+the snapshot writer, both measured in
 [Phase 1.5c](#phase-15c-implemented-end-to-end-sweep-pending) above.
 
 **Next optimization.** The remaining per-event costs are message construction:

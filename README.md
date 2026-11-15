@@ -288,7 +288,7 @@ are in [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Durable order ingress | Implemented on one node. The gateway returns after the Iggy append confirmation. `persisted` protects against a process restart, not disk or host loss. |
 | Executions and market data through Iggy | Implemented. Both are published to the log; the MD hub consumes the MD topic. Executions have no Phase 1 consumer. |
 | Snapshot restore with a state hash | Implemented. `whippet verify` recomputes each snapshot hash. |
-| Replay reproduces the state hash | Implemented. `whippet replay` rebuilds an engine from the order log. One local dev-loop check: full replay from offset 0 and snapshot-seeded replay from a snapshot at offset 17038 both ended at `0f90672d...e218`. One run, not a benchmark. |
+| Replay reproduces the state hash | Implemented. `whippet replay` rebuilds an engine from the order log. One local dev-loop check: full replay from offset 0 and snapshot-seeded replay from a snapshot at offset 108466 both ended at `ceddf1c9...e510`. One run, not a benchmark. |
 | Sub-millisecond matching | Not published. It is a design target and a live in-process metric only. No benchmark result exists. |
 | Low-single-digit-millisecond durable path on Linux | Not measured. No headline numbers yet. |
 | No acknowledged loss across one node failure | Not implemented. Single node, no failover. |
@@ -313,15 +313,15 @@ whippet replay --iggy-addr 127.0.0.1:8090 --partition 1 --snapshot-dir data/snap
 ```
 
 On a local single-node run (M4, Docker Desktop, dev-loop), the snapshot was
-written at offset 17038 and both replays ended with:
+written at offset 108466 and both replays ended with:
 
 ```text
-state_hash = 0f90672d75d2af2e028f3a0532836a361d24b85c03cad8636a3ad89c0d29e218
+state_hash = ceddf1c94cfdb121541ae726d4001fb43daaf92dc54a8ef19216761a5330e510
 ```
 
 The first replay reports `"seeded_from_snapshot": false` and `"from": 0`. The
-second reports `"seeded_from_snapshot": true`, `"snapshot_offset": 17038`, and
-`"from": 17039`. Equal hashes mean the snapshot state plus the replayed tail is
+second reports `"seeded_from_snapshot": true`, `"snapshot_offset": 108466`, and
+`"from": 108467`. Equal hashes mean the snapshot state plus the replayed tail is
 the same state as replaying the whole log. That is a determinism check for
 this log and this build. It is not a crash test, not an audit proof, and not a
 benchmark.

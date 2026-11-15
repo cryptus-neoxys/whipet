@@ -251,11 +251,13 @@ The design rules:
   would run ahead of the writer is deferred to the next batch boundary where
   the gate is open. The snapshot never claims a resume offset whose outputs
   were lost.
-- **Off-loop hash.** The matcher calls `snapshot_state_without_hash`; the
-  blocking snapshot writer computes the hashes (`fill_symbol_hashes`) before
-  saving. The snapshot file format is version 2 (`SymbolSnapshot` carries the
-  per-symbol config, `BookSnapshot` carries `min_price_ticks`); version 1
-  files are rejected.
+- **Live hash.** The matcher calls `snapshot_state()`, which computes the
+  engine's own `state_hash`; the writer saves those hashes and, for the final
+  snapshot, rebuilds the shard to verify them before the atomic rename. An
+  off-loop hash was tried and reverted: at ~170k orders it disagreed with the
+  restored engine on one shard, so the node does not use it. The snapshot file
+  format is version 2 (`SymbolSnapshot` carries the per-symbol config,
+  `BookSnapshot` carries `min_price_ticks`); version 1 files are rejected.
 - **Per-shard metrics.** Each matcher records into its own lock-free
   `ShardMetrics`, merged into the global `Metrics` once per second and once
   on exit, instead of taking a global histogram lock per command.
@@ -373,11 +375,11 @@ replays the tail after the snapshot's maximum `last_offset`. `--to` is
 inclusive. `--expect-hash` turns a hash mismatch into a non-zero exit.
 
 On a local single-node run (M4, Docker Desktop, dev-loop), partition 1 had a
-snapshot at offset 17038. Full replay from offset 0 and snapshot-seeded replay
-from offset 17039 both produced:
+snapshot at offset 108466. Full replay from offset 0 and snapshot-seeded replay
+from offset 108467 both produced:
 
 ```text
-state_hash = 0f90672d75d2af2e028f3a0532836a361d24b85c03cad8636a3ad89c0d29e218
+state_hash = ceddf1c94cfdb121541ae726d4001fb43daaf92dc54a8ef19216761a5330e510
 ```
 
 Equal hashes mean the snapshot state plus the replayed tail matches a replay

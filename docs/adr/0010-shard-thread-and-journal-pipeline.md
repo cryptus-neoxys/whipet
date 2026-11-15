@@ -79,8 +79,9 @@ run_writer (async task, owns the journal client for outputs)
   open. The snapshot can therefore never claim a resume offset whose outputs
   were lost.
 - **The snapshot hash moves off the shard.** The matcher calls
-  `snapshot_state_without_hash`; the blocking snapshot writer calls
-  `whippet_engine::fill_symbol_hashes` before saving. The clone still happens
+  `snapshot_state()` with the live hash; the blocking writer saves it and
+  verifies the final snapshot by rebuilding. (An off-loop hash was tried and
+  reverted after a ~170k-order shard disagreed with the restored engine.) The clone still happens
   on the matcher thread at the snapshot interval; the hash and the file write
   happen on the writer.
 - **Per-shard metrics.** Each matcher records into its own `ShardMetrics`
@@ -142,7 +143,7 @@ Negative:
   matched forever and silently; the new behavior is loud but is still a stop.
   Operators see degraded health and must restart the node.
 - **New failure surface.** Thread panic detection, ring drain on shutdown, the
-  off-loop hash path, and the bounded append retry each need fault handling
+  final-snapshot verification and the bounded append retry each need fault handling
   that the single-task design did not have. The code paths exist; the
   panic-injection and ring-full fault tests are still pending
   ([FAILURE-MODES.md](../FAILURE-MODES.md#matrix)).
@@ -157,7 +158,7 @@ Negative:
 
 Neutral:
 
-- The microbenchmarks that came with the implementation (the off-loop hash
+- The microbenchmarks that came with the implementation (the hash
   cost and the per-shard merge cost) are recorded in
   [PERFORMANCE.md](../PERFORMANCE.md#phase-15c-implemented-end-to-end-sweep-pending). No end-to-end before/after
   sweep exists yet, so the latency effects remain structural expectations,

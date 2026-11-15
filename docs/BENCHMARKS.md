@@ -86,7 +86,7 @@ headline results.
 ### After the dedicated shard thread (dev-loop)
 
 Same host, simulator stopped, 8 s measured, 2 s warmup, one repetition. The
-shard thread, off-loop snapshot hash, and per-shard metrics mainly moved the
+shard thread and per-shard metrics mainly moved the
 tail; p50 is within host noise:
 
 | Path | Before p50 / p99 | After p50 / p99 |
@@ -508,8 +508,8 @@ mode, not a latency result.
 
 The replay proof was rerun after the change. Full replay and snapshot-seeded
 replay both end at
-`0f90672d75d2af2e028f3a0532836a361d24b85c03cad8636a3ad89c0d29e218` from
-snapshot offset 17038 (tail 16600). This is a correctness check, not a latency
+`ceddf1c94cfdb121541ae726d4001fb43daaf92dc54a8ef19216761a5330e510` from
+snapshot offset 108466 (tail 364). This is a correctness check, not a latency
 measurement.
 
 ## TCP-ingress sweep (dev-loop measured, headline pending)
