@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 COMPOSE := docker compose -f deploy/compose.yaml
 
-.PHONY: help secrets up down demo bench bench-smoke bench-sweep bench-tcp bench-fanout bench-matcher soak crash-test crash-matrix retention-plan verify verify-strict verify-dev replay replay-strict replay-dev doctor reset logs build dashboard ci obs chaos ha ps
+.PHONY: help secrets up down demo bench bench-smoke bench-sweep bench-tcp bench-fanout bench-matcher soak crash-test crash-matrix retention-plan audit order-trace verify verify-strict verify-dev replay replay-strict replay-dev doctor reset logs build dashboard ci obs chaos ha ps
 
 help:
 	@printf '%s\n' \
@@ -18,6 +18,8 @@ help:
 		'make crash-test   kill/restart/replay proof (Docker stack)' \
 		'make crash-matrix Rust failure-injection tests (append-before-commit, writer failure)' \
 		'make retention-plan read-only safe-deletion plan (never deletes)' \
+		'make audit       list operator halt/resume audit records (read-only)' \
+		'make order-trace ORDER=<id> reconstruct one order across the logs (read-only)' \
 		'make verify      healthcheck, crossing pair, snapshot hash check (lenient dev path; WHIPPET_PARTITIONS overrides 16)' \
 		'make verify-strict fail-closed verify: exit non-zero when no snapshot exists (WHIPPET_PARTITIONS)' \
 		'make verify-dev  alias for the lenient verify path' \
@@ -80,6 +82,14 @@ crash-matrix:
 # Read-only retention plan: consumers + verified snapshot -> safe offset.
 retention-plan:
 	@$(COMPOSE) exec -T node /usr/local/bin/whippet retention-plan --snapshot-dir /data/snapshots --partitions $${WHIPPET_PARTITIONS:-16}
+
+# Read-only operator views over the logs.
+audit:
+	@$(COMPOSE) exec -T node /usr/local/bin/whippet audit --partitions 4
+
+order-trace:
+	@test -n "$(ORDER)" || { echo "order-trace: set ORDER=<decimal|0xhex order id>"; exit 2; }
+	@$(COMPOSE) exec -T node /usr/local/bin/whippet order-trace --partition $${WHIPPET_TRACE_PARTITION:-1} --order-id $(ORDER)
 
 # Criterion microbenchmarks. Developer tools, not CI gates.
 bench-matcher:

@@ -217,6 +217,23 @@ workload (defaults 1,000 orders/s, batch 10, 20 s), SIGKILLs the node
 JSON summary land in `artifacts/bench/`. Status as documented: method
 recorded, results pending — see section 12.
 
+### Audit and order trace
+
+Both are read-only CLI views over the logs:
+
+```sh
+make audit                       # operator halt/resume records, partition, offset
+whippet audit --operator ops1 --action halt --json
+whippet order-trace --partition 1 --order-id <decimal|0xhex> --verify
+```
+
+`audit` scans the four audit-topic partitions from offset 0 and never commits.
+`order-trace` decodes the orders and executions logs for one partition,
+matches the order's own and maker-side events, and reports the stable
+`(symbol, cause_offset, seq, kind)` identities; `--verify` fails when a
+`cause_offset` does not resolve to a decoded order/cancel record. Neither tool
+appends, commits, or trims; an empty result is a successful exit.
+
 ## 7. Control plane
 
 Halt and resume are operator-only HTTP endpoints (link:
