@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 
 use clap::Parser;
-use whippet::cli::{LedgerArgs, ledger_with_journal};
+use whippet::cli::{LedgerArgs, TickSizeOverride, ledger_with_journal};
 use whippet::ledger::{AccountBalance, Asset, LedgerReport, build_ledger};
 use whippet::positions::{TickSizes, build_positions};
 use whippet_core::config::{ExchangeConfig, InstrumentConfig, Mode};
@@ -51,7 +51,7 @@ fn ledger_args(partition: u32) -> LedgerArgs {
         partition,
         symbols: Vec::new(),
         participant: None,
-        tick_size_cents: Some(1),
+        tick_size_cents: vec![TickSizeOverride::All(1)],
         json: false,
     }
 }
@@ -917,7 +917,7 @@ async fn ledger_uses_the_builtin_tick_size_without_the_flag() {
     append(&journal, Topic::Executions, &execution_payloads).await;
 
     let mut args = ledger_args(PARTITION);
-    args.tick_size_cents = None;
+    args.tick_size_cents = Vec::new();
     let report = ledger_with_journal(args, &journal)
         .await
         .expect("the built-in config prices BTC-USD");
@@ -927,6 +927,70 @@ async fn ledger_uses_the_builtin_tick_size_without_the_flag() {
     assert_eq!(entry.price_cents, 10_000);
     assert_eq!(account(&report, 7, Asset::Cash).unwrap().balance, -30_000);
     assert_eq!(account(&report, 8, Asset::Cash).unwrap().balance, 30_000);
+}
+
+#[tokio::test]
+async fn ledger_prices_each_symbol_with_its_own_tick_size() {
+    // One complete trade per symbol: BTC-USD at 100 ticks, ETH-USD at 50.
+    let journal = Journal::memory();
+    let orders = [
+        new_order(symbol(), 1, 7, Side::Buy, 100, 2),
+        new_order(symbol(), 2, 8, Side::Sell, 100, 2),
+        new_order(eth(), 3, 9, Side::Buy, 50, 4),
+        new_order(eth(), 4, 10, Side::Sell, 50, 4),
+    ];
+    let executions = [
+        fill(10, symbol(), 2, 1, Side::Sell, 100, 2, ExecKind::Filled),
+        fill(11, eth(), 4, 3, Side::Sell, 50, 4, ExecKind::Filled),
+    ];
+    let order_payloads: Vec<Vec<u8>> = orders.iter().map(Command::encode).collect();
+    let execution_payloads: Vec<Vec<u8>> = executions.iter().map(ExecutionReport::encode).collect();
+    append(&journal, Topic::Orders, &order_payloads).await;
+    append(&journal, Topic::Executions, &execution_payloads).await;
+
+    // BTC=100 cents, ETH=1 cent: 100*2 = 20,000 and 50*4 = 200 cents.
+    let mut args = ledger_args(PARTITION);
+    args.tick_size_cents = vec![
+        TickSizeOverride::Symbol {
+            symbol: symbol(),
+            cents: 100,
+        },
+        TickSizeOverride::Symbol {
+            symbol: eth(),
+            cents: 1,
+        },
+    ];
+    let report = ledger_with_journal(args, &journal)
+        .await
+        .expect("both symbols have a per-symbol override");
+    assert_eq!(report.entries[0].tick_size_cents, 100);
+    assert_eq!(report.entries[0].price_cents, 10_000);
+    assert_eq!(account(&report, 7, Asset::Cash).unwrap().balance, -20_000);
+    assert_eq!(account(&report, 8, Asset::Cash).unwrap().balance, 20_000);
+    assert_eq!(report.entries[1].tick_size_cents, 1);
+    assert_eq!(report.entries[1].price_cents, 50);
+    assert_eq!(account(&report, 9, Asset::Cash).unwrap().balance, -200);
+    assert_eq!(account(&report, 10, Asset::Cash).unwrap().balance, 200);
+
+    // A plain fallback with a per-symbol override: BTC at 7, ETH at the
+    // fallback 100 cents.
+    let mut args = ledger_args(PARTITION);
+    args.tick_size_cents = vec![
+        TickSizeOverride::All(100),
+        TickSizeOverride::Symbol {
+            symbol: symbol(),
+            cents: 7,
+        },
+    ];
+    let report = ledger_with_journal(args, &journal)
+        .await
+        .expect("the override and fallback compose");
+    assert_eq!(report.entries[0].price_ticks, 100);
+    assert_eq!(report.entries[0].tick_size_cents, 7);
+    assert_eq!(report.entries[0].price_cents, 700);
+    assert_eq!(account(&report, 7, Asset::Cash).unwrap().balance, -1_400);
+    assert_eq!(report.entries[1].tick_size_cents, 100);
+    assert_eq!(account(&report, 9, Asset::Cash).unwrap().balance, -20_000);
 }
 
 #[tokio::test]
@@ -1020,7 +1084,7 @@ fn ledger_args_defaults_and_overrides_parse() {
     assert_eq!(cli.ledger.partition, 1);
     assert!(cli.ledger.symbols.is_empty());
     assert!(cli.ledger.participant.is_none());
-    assert!(cli.ledger.tick_size_cents.is_none());
+    assert!(cli.ledger.tick_size_cents.is_empty());
     assert!(!cli.ledger.json);
 
     let cli = Cli::parse_from([
@@ -1035,6 +1099,8 @@ fn ledger_args_defaults_and_overrides_parse() {
         "7",
         "--tick-size-cents",
         "10",
+        "--tick-size-cents",
+        "BTC-USD=100",
         "--json",
         "--iggy-password-file",
         "/tmp/iggy-password",
@@ -1043,7 +1109,16 @@ fn ledger_args_defaults_and_overrides_parse() {
     assert_eq!(cli.ledger.partition, 5);
     assert_eq!(cli.ledger.symbols, vec![symbol(), eth()]);
     assert_eq!(cli.ledger.participant, Some(7));
-    assert_eq!(cli.ledger.tick_size_cents, Some(10));
+    assert_eq!(
+        cli.ledger.tick_size_cents,
+        vec![
+            TickSizeOverride::All(10),
+            TickSizeOverride::Symbol {
+                symbol: symbol(),
+                cents: 100,
+            },
+        ]
+    );
     assert!(cli.ledger.json);
     assert_eq!(
         cli.ledger.iggy_password_file,

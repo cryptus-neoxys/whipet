@@ -1,6 +1,6 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -1750,35 +1750,108 @@ fn priced_symbols(requested: &[Symbol], executions: &[ExecutionReport]) -> Vec<S
     symbols.into_iter().collect()
 }
 
+/// One `--tick-size-cents` occurrence.
+///
+/// The flag is repeatable and has two forms: `CENTS` sets a plain fallback for
+/// every priced symbol, and `SYMBOL=CENTS` overrides one symbol. Parsing
+/// guarantees a positive value and a valid, non-empty symbol; resolution is
+/// per-symbol override first, then the plain fallback, then the built-in
+/// default config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TickSizeOverride {
+    /// `--tick-size-cents CENTS`: applies to every symbol without a
+    /// per-symbol override.
+    All(i64),
+    /// `--tick-size-cents SYMBOL=CENTS`: applies to one symbol.
+    Symbol { symbol: Symbol, cents: i64 },
+}
+
+/// Parse one `--tick-size-cents` value.
+///
+/// `CENTS` is a plain fallback; `SYMBOL=CENTS` is a per-symbol override. The
+/// first `=` separates the two halves, so a malformed extra `=` fails on the
+/// cents side. Empty symbols, empty cents and non-positive cents are rejected
+/// here rather than at projection time, so a typo fails as a usage error.
+fn parse_tick_size_override(value: &str) -> Result<TickSizeOverride, String> {
+    let Some((symbol, cents)) = value.split_once('=') else {
+        let cents = value
+            .parse::<i64>()
+            .map_err(|_| format!("invalid tick size {value:?}: expected CENTS or SYMBOL=CENTS"))?;
+        if cents <= 0 {
+            return Err(format!("tick size must be at least 1 cent; got {cents}"));
+        }
+        return Ok(TickSizeOverride::All(cents));
+    };
+    if symbol.is_empty() {
+        return Err(format!(
+            "invalid tick size {value:?}: the symbol before '=' is empty"
+        ));
+    }
+    if cents.is_empty() {
+        return Err(format!(
+            "invalid tick size {value:?}: '=' must be followed by cents"
+        ));
+    }
+    let symbol = Symbol::new(symbol)
+        .map_err(|error| format!("invalid symbol in tick size {value:?}: {error}"))?;
+    let cents = cents.parse::<i64>().map_err(|_| {
+        format!("invalid tick size {value:?}: {cents:?} is not an integer number of cents")
+    })?;
+    if cents <= 0 {
+        return Err(format!(
+            "tick size for {symbol} must be at least 1 cent; got {cents}"
+        ));
+    }
+    Ok(TickSizeOverride::Symbol { symbol, cents })
+}
+
 /// Resolve the tick size for every symbol a projection will price.
 ///
 /// The logs store `Price` as an integer ladder tick, so a value cannot be
-/// labelled "cents" without the instrument's tick size. `--tick-size-cents` is
-/// the explicit authority and applies to every symbol in the scan. Without it
-/// the built-in [`ExchangeConfig::default`] is the fallback; a symbol it does
-/// not know is an error, never a silent factor of one, because a node's real
-/// universe and tick sizes can differ from the default.
-fn resolve_tick_sizes(override_cents: Option<i64>, symbols: &[Symbol]) -> Result<TickSizes> {
-    if let Some(cents) = override_cents {
-        if cents <= 0 {
-            bail!("--tick-size-cents must be at least 1; got {cents}");
+/// labelled "cents" without the instrument's tick size. Resolution order per
+/// symbol:
+///
+/// 1. a `--tick-size-cents SYMBOL=CENTS` override for that symbol;
+/// 2. a plain `--tick-size-cents CENTS` fallback;
+/// 3. the built-in [`ExchangeConfig::default`] instrument;
+/// 4. an error naming the symbol and the flag. Never a silent factor of one:
+///    a node's real universe and tick sizes can differ from the default.
+///
+/// A later occurrence of the same form replaces an earlier one. A plain
+/// fallback and a per-symbol override may both be supplied; the per-symbol
+/// entry wins for its symbol and the fallback covers the rest.
+fn resolve_tick_sizes(overrides: &[TickSizeOverride], symbols: &[Symbol]) -> Result<TickSizes> {
+    let mut per_symbol: BTreeMap<Symbol, i64> = BTreeMap::new();
+    let mut fallback: Option<i64> = None;
+    for tick_size in overrides {
+        match tick_size {
+            TickSizeOverride::All(cents) => fallback = Some(*cents),
+            TickSizeOverride::Symbol { symbol, cents } => {
+                per_symbol.insert(*symbol, *cents);
+            }
         }
-        return Ok(symbols.iter().map(|symbol| (*symbol, cents)).collect());
     }
+
     let default = ExchangeConfig::default();
     let mut tick_sizes = TickSizes::default();
     for symbol in symbols {
-        let Some(instrument) = default
+        if let Some(cents) = per_symbol.get(symbol) {
+            tick_sizes.insert(*symbol, *cents);
+        } else if let Some(cents) = fallback {
+            tick_sizes.insert(*symbol, cents);
+        } else if let Some(instrument) = default
             .instruments
             .iter()
             .find(|instrument| instrument.symbol == *symbol)
-        else {
+        {
+            tick_sizes.insert(*symbol, instrument.tick_size_cents);
+        } else {
             bail!(
                 "no tick size for symbol {symbol}: it is not in the built-in default config; \
-                 pass --tick-size-cents to project a deployment with a custom universe or tick size"
+                 pass --tick-size-cents {symbol}=CENTS or --tick-size-cents CENTS to project a \
+                 deployment with a custom universe or tick size"
             );
-        };
-        tick_sizes.insert(*symbol, instrument.tick_size_cents);
+        }
     }
     Ok(tick_sizes)
 }
@@ -1806,12 +1879,15 @@ pub struct PositionsArgs {
     /// name cannot be resolved offline; pass the numeric id the engine saw.
     #[arg(long)]
     pub participant: Option<u64>,
-    /// Tick size in cents for the requested symbols. The logs store prices as
+    /// Tick size in cents for the priced symbols. The logs store prices as
     /// integer ladder ticks, so the projection needs this to report quote
-    /// cents. Omit to use the built-in default config; pass it for a custom
-    /// deployment, whose universe and tick sizes may differ.
-    #[arg(long)]
-    pub tick_size_cents: Option<i64>,
+    /// cents. Repeatable, two forms: `--tick-size-cents SYMBOL=CENTS` sets one
+    /// symbol, and `--tick-size-cents CENTS` sets a fallback for every symbol
+    /// without a per-symbol override. Precedence per symbol: per-symbol
+    /// override, then the plain fallback, then the built-in default config; a
+    /// symbol in neither is an error.
+    #[arg(long, value_name = "SYMBOL=CENTS|CENTS", value_parser = parse_tick_size_override)]
+    pub tick_size_cents: Vec<TickSizeOverride>,
     /// Print the report as one JSON document instead of a table.
     #[arg(long)]
     pub json: bool,
@@ -1892,7 +1968,7 @@ pub async fn positions_with_journal(
 
     let symbols = (!args.symbols.is_empty()).then_some(args.symbols.as_slice());
     let tick_sizes = resolve_tick_sizes(
-        args.tick_size_cents,
+        &args.tick_size_cents,
         &priced_symbols(&args.symbols, &executions),
     )?;
     let mut report = build_positions(args.partition, &orders, &executions, symbols, &tick_sizes)?;
@@ -2006,12 +2082,15 @@ pub struct LedgerArgs {
     /// name cannot be resolved offline; pass the numeric id the engine saw.
     #[arg(long)]
     pub participant: Option<u64>,
-    /// Tick size in cents for the requested symbols. The logs store prices as
+    /// Tick size in cents for the priced symbols. The logs store prices as
     /// integer ladder ticks, so the projection needs this to report quote
-    /// cents. Omit to use the built-in default config; pass it for a custom
-    /// deployment, whose universe and tick sizes may differ.
-    #[arg(long)]
-    pub tick_size_cents: Option<i64>,
+    /// cents. Repeatable, two forms: `--tick-size-cents SYMBOL=CENTS` sets one
+    /// symbol, and `--tick-size-cents CENTS` sets a fallback for every symbol
+    /// without a per-symbol override. Precedence per symbol: per-symbol
+    /// override, then the plain fallback, then the built-in default config; a
+    /// symbol in neither is an error.
+    #[arg(long, value_name = "SYMBOL=CENTS|CENTS", value_parser = parse_tick_size_override)]
+    pub tick_size_cents: Vec<TickSizeOverride>,
     /// Print the report as one JSON document instead of a table.
     #[arg(long)]
     pub json: bool,
@@ -2091,7 +2170,7 @@ pub async fn ledger_with_journal(args: LedgerArgs, journal: &Journal) -> Result<
 
     let symbols = (!args.symbols.is_empty()).then_some(args.symbols.as_slice());
     let tick_sizes = resolve_tick_sizes(
-        args.tick_size_cents,
+        &args.tick_size_cents,
         &priced_symbols(&args.symbols, &executions),
     )?;
     let mut report = build_ledger(args.partition, &orders, &executions, symbols, &tick_sizes)?;

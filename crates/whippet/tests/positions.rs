@@ -11,7 +11,7 @@
 //! and no record is appended.
 
 use clap::Parser;
-use whippet::cli::{PositionsArgs, positions_with_journal};
+use whippet::cli::{PositionsArgs, TickSizeOverride, positions_with_journal};
 use whippet::positions::{PositionReport, TickSizes, build_positions};
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Seq, Symbol};
 use whippet_core::protocol::{Command, ExecKind, ExecutionReport, OrderType, RejectReason, Side};
@@ -41,7 +41,7 @@ fn positions_args(partition: u32) -> PositionsArgs {
         partition,
         symbols: Vec::new(),
         participant: None,
-        tick_size_cents: Some(1),
+        tick_size_cents: vec![TickSizeOverride::All(1)],
         json: false,
     }
 }
@@ -367,7 +367,7 @@ async fn positions_use_the_builtin_tick_size_without_the_flag() {
     append(&journal, Topic::Executions, &execution_payloads).await;
 
     let mut args = positions_args(PARTITION);
-    args.tick_size_cents = None;
+    args.tick_size_cents = Vec::new();
     let report = positions_with_journal(args, &journal)
         .await
         .expect("the built-in config prices BTC-USD");
@@ -393,7 +393,7 @@ async fn positions_name_a_symbol_with_no_tick_size() {
     append(&journal, Topic::Executions, &execution_payloads).await;
 
     let mut args = positions_args(PARTITION);
-    args.tick_size_cents = None;
+    args.tick_size_cents = Vec::new();
     let error = positions_with_journal(args, &journal)
         .await
         .expect_err("DOGE-USD is outside the built-in default config");
@@ -403,7 +403,7 @@ async fn positions_name_a_symbol_with_no_tick_size() {
 
     // The explicit flag makes the same log priceable.
     let mut args = positions_args(PARTITION);
-    args.tick_size_cents = Some(50);
+    args.tick_size_cents = vec![TickSizeOverride::All(50)];
     let report = positions_with_journal(args, &journal)
         .await
         .expect("the flag resolves the custom symbol");
@@ -411,14 +411,103 @@ async fn positions_name_a_symbol_with_no_tick_size() {
 }
 
 #[tokio::test]
-async fn positions_reject_a_non_positive_tick_size_flag() {
+async fn positions_price_each_symbol_with_its_own_tick_size() {
+    // One BTC-USD trade and one ETH-USD trade, both at 3 ticks and qty 2.
+    // With BTC=100 and ETH=1 the values are 600 and 6 cents respectively.
     let journal = Journal::memory();
+    let orders = [
+        new_order(symbol(), 1, 7, Side::Buy, 3, 2),
+        new_order(symbol(), 2, 8, Side::Sell, 3, 2),
+        new_order(eth(), 3, 9, Side::Buy, 3, 2),
+        new_order(eth(), 4, 10, Side::Sell, 3, 2),
+    ];
+    let executions = [
+        fill(0, symbol(), 2, 1, Side::Sell, 3, 2, ExecKind::Filled),
+        fill(1, eth(), 4, 3, Side::Sell, 3, 2, ExecKind::Filled),
+    ];
+    let order_payloads: Vec<Vec<u8>> = orders.iter().map(Command::encode).collect();
+    let execution_payloads: Vec<Vec<u8>> = executions.iter().map(ExecutionReport::encode).collect();
+    append(&journal, Topic::Orders, &order_payloads).await;
+    append(&journal, Topic::Executions, &execution_payloads).await;
+
+    let cash = |report: &PositionReport, participant: u64| {
+        report
+            .participants
+            .iter()
+            .find(|position| position.participant == ParticipantId(participant))
+            .expect("the participant traded")
+            .cash_cents
+    };
+
+    // Per-symbol overrides.
     let mut args = positions_args(PARTITION);
-    args.tick_size_cents = Some(0);
-    let error = positions_with_journal(args, &journal)
+    args.tick_size_cents = vec![
+        TickSizeOverride::Symbol {
+            symbol: symbol(),
+            cents: 100,
+        },
+        TickSizeOverride::Symbol {
+            symbol: eth(),
+            cents: 1,
+        },
+    ];
+    let report = positions_with_journal(args, &journal)
         .await
-        .expect_err("a zero tick size is a usage error");
-    assert!(error.to_string().contains("--tick-size-cents"));
+        .expect("both symbols have an override");
+    assert_eq!(cash(&report, 7), -600);
+    assert_eq!(cash(&report, 8), 600);
+    assert_eq!(cash(&report, 9), -6);
+    assert_eq!(cash(&report, 10), 6);
+
+    // A plain fallback prices every symbol at the same size.
+    let mut args = positions_args(PARTITION);
+    args.tick_size_cents = vec![TickSizeOverride::All(100)];
+    let report = positions_with_journal(args, &journal)
+        .await
+        .expect("the fallback covers both symbols");
+    assert_eq!(cash(&report, 7), -600);
+    assert_eq!(cash(&report, 9), -600);
+
+    // A per-symbol override wins for its symbol; the fallback covers the rest.
+    let mut args = positions_args(PARTITION);
+    args.tick_size_cents = vec![
+        TickSizeOverride::All(100),
+        TickSizeOverride::Symbol {
+            symbol: symbol(),
+            cents: 7,
+        },
+    ];
+    let report = positions_with_journal(args, &journal)
+        .await
+        .expect("the override and fallback compose");
+    assert_eq!(cash(&report, 7), -42, "3 ticks * 7 cents * 2");
+    assert_eq!(cash(&report, 9), -600, "3 ticks * 100 cents * 2");
+}
+
+#[test]
+fn malformed_tick_size_forms_are_rejected() {
+    #[derive(Debug, Parser)]
+    struct Cli {
+        #[command(flatten)]
+        positions: PositionsArgs,
+    }
+
+    for (value, expected) in [
+        ("=100", "symbol before '=' is empty"),
+        ("BTC-USD=", "'=' must be followed by cents"),
+        ("BTC-USD=0", "at least 1 cent"),
+        ("BTC-USD=-1", "at least 1 cent"),
+        ("BTC-USD", "expected CENTS or SYMBOL=CENTS"),
+        ("BTC-USD=ten", "not an integer"),
+    ] {
+        let error = Cli::try_parse_from(["test", "--tick-size-cents", value])
+            .expect_err("a malformed tick size is a usage error");
+        let message = error.to_string();
+        assert!(
+            message.contains(expected),
+            "expected {expected:?} in {message:?}"
+        );
+    }
 }
 
 #[test]
@@ -437,7 +526,7 @@ fn positions_args_defaults_and_overrides_parse() {
     assert_eq!(cli.positions.partition, 1);
     assert!(cli.positions.symbols.is_empty());
     assert!(cli.positions.participant.is_none());
-    assert!(cli.positions.tick_size_cents.is_none());
+    assert!(cli.positions.tick_size_cents.is_empty());
     assert!(!cli.positions.json);
 
     let cli = Cli::parse_from([
@@ -452,6 +541,10 @@ fn positions_args_defaults_and_overrides_parse() {
         "7",
         "--tick-size-cents",
         "100",
+        "--tick-size-cents",
+        "BTC-USD=7",
+        "--tick-size-cents",
+        "ETH-USD=1",
         "--json",
         "--iggy-password-file",
         "/tmp/iggy-password",
@@ -464,7 +557,21 @@ fn positions_args_defaults_and_overrides_parse() {
         "symbols parse as a comma-separated list"
     );
     assert_eq!(cli.positions.participant, Some(7));
-    assert_eq!(cli.positions.tick_size_cents, Some(100));
+    assert_eq!(
+        cli.positions.tick_size_cents,
+        vec![
+            TickSizeOverride::All(100),
+            TickSizeOverride::Symbol {
+                symbol: symbol(),
+                cents: 7,
+            },
+            TickSizeOverride::Symbol {
+                symbol: eth(),
+                cents: 1,
+            },
+        ],
+        "the flag is repeatable and preserves both forms"
+    );
     assert!(cli.positions.json);
     assert_eq!(
         cli.positions.iggy_password_file,
