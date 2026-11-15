@@ -867,11 +867,14 @@ pub fn run_matcher(
         // The reader counted this batch when its send succeeded; the ring
         // occupancy drops by one as soon as the matcher holds it.
         input_queued.fetch_sub(1, Ordering::Relaxed);
-        let mut executions: Vec<JournalMessage> = Vec::with_capacity(BATCH_CAPACITY);
-        let mut md_messages: Vec<JournalMessage> = Vec::with_capacity(BATCH_CAPACITY);
-        let mut orders: Vec<TurboJournalRecord> = Vec::with_capacity(BATCH_CAPACITY);
+        // Size to the input batch, not the maximum ring capacity: batch-10
+        // ingress was allocating ~230 KB of output vectors per batch.
+        let input_len = batch.records.len() + batch.turbo.len();
+        let mut executions: Vec<JournalMessage> = Vec::with_capacity(input_len);
+        let mut md_messages: Vec<JournalMessage> = Vec::with_capacity(input_len);
+        let mut orders: Vec<TurboJournalRecord> = Vec::with_capacity(batch.turbo.len());
         let mut snapshot_due = false;
-        let mut process_us: u64 = 0;
+        let batch_started = Instant::now();
         // If a snapshot was deferred, this boundary is a candidate: the state
         // is still at `last_offset`, which the writer may now have caught up to.
         let durable = appended_offset.load(Ordering::Acquire);
@@ -896,7 +899,10 @@ pub fn run_matcher(
         for record in &batch.records {
             match Command::decode(&record.payload) {
                 Ok(command) => {
-                    let started = Instant::now();
+                    // Sample one command in 32: the metric is microsecond
+                    // resolution and two clock reads per command cost more
+                    // than the matching work they measure.
+                    let started = (record.offset & 31 == 0).then(Instant::now);
                     if let Err(error) = engine.process(&command, record.offset, &mut out) {
                         warn!(
                             shard = shard_id,
@@ -905,9 +911,10 @@ pub fn run_matcher(
                             "engine rejected an input for this shard"
                         );
                     } else {
-                        let elapsed = started.elapsed().as_micros() as u64;
-                        process_us = process_us.saturating_add(elapsed);
-                        shard_metrics.record_match_latency_us(elapsed);
+                        if let Some(started) = started {
+                            shard_metrics
+                                .record_match_latency_us(started.elapsed().as_micros() as u64);
+                        }
                         shard_metrics.record_engine_command();
                         for execution in &out.executions {
                             shard_metrics.record_execution();
@@ -945,12 +952,12 @@ pub fn run_matcher(
         for entry in batch.turbo {
             let seq = next_turbo_seq;
             next_turbo_seq = next_turbo_seq.saturating_add(1);
-            let started = Instant::now();
+            let started = (seq & 31 == 0).then(Instant::now);
             match engine.process(&entry.command, seq, &mut out) {
                 Ok(()) => {
-                    let elapsed = started.elapsed().as_micros() as u64;
-                    process_us = process_us.saturating_add(elapsed);
-                    shard_metrics.record_match_latency_us(elapsed);
+                    if let Some(started) = started {
+                        shard_metrics.record_match_latency_us(started.elapsed().as_micros() as u64);
+                    }
                     shard_metrics.record_engine_command();
                     // Ack the match before building the output messages. The
                     // engine state is final here; the ~1 us of encoding and
@@ -1022,9 +1029,12 @@ pub fn run_matcher(
         }
 
         // One stage sample per batch, not per command: the global stage
-        // histogram is not on the per-command path.
-        ctx.metrics
-            .record_stage_us(Stage::EngineProcess, process_us);
+        // histogram is not on the per-command path. This is the batch wall
+        // time, including decode and output encoding.
+        ctx.metrics.record_stage_us(
+            Stage::EngineProcess,
+            batch_started.elapsed().as_micros() as u64,
+        );
         // Hand the polled buffer back for reuse.
         let _ = recycle.try_send(batch.records);
         // One global merge per second, not one lock per command. The ring
