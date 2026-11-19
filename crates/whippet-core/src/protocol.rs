@@ -225,9 +225,9 @@ impl TradingStatus {
     }
 }
 
-/// Input command kinds. Cancel, halt, resume, session control, and risk limits
-/// reuse the fixed `Command` layout so the journal, gateway, and replay tooling
-/// have one decoder.
+/// Input command kinds. Amend, cancel, halt, resume, session control, and risk
+/// limits reuse the fixed `Command` layout so the journal, gateway, and replay
+/// tooling have one decoder.
 ///
 /// `Halt`, `Resume`, `SetSession`, and `SetRisk` are operator commands on the
 /// same input log as client traffic. Being ordered commands is what makes them
@@ -242,6 +242,10 @@ pub enum CommandKind {
     Resume = 4,
     SetSession = 5,
     SetRisk = 6,
+    /// Atomic cancel-replace of one resting order. See [ADR 0027].
+    ///
+    /// [ADR 0027]: https://github.com/cryptus-neoxys/whipet/blob/main/docs/adr/0027-amend-replace-semantics.md
+    Amend = 7,
 }
 
 impl CommandKind {
@@ -257,6 +261,7 @@ impl CommandKind {
             4 => Ok(Self::Resume),
             5 => Ok(Self::SetSession),
             6 => Ok(Self::SetRisk),
+            7 => Ok(Self::Amend),
             other => Err(CoreError::UnknownDiscriminant {
                 kind: "CommandKind",
                 value: other,
@@ -272,6 +277,7 @@ impl CommandKind {
             Self::Resume => "resume",
             Self::SetSession => "set_session",
             Self::SetRisk => "set_risk",
+            Self::Amend => "amend",
         }
     }
 }
@@ -340,6 +346,39 @@ impl Command {
             order_type: OrderType::Limit,
             price: Price::ZERO,
             qty: Qty::ZERO,
+            order_id,
+            participant,
+            timestamp_ns,
+            nonce: 0,
+            flags: 0,
+        }
+    }
+
+    /// Client command: atomically replace the price and/or remaining quantity
+    /// of a resting order.
+    ///
+    /// The order keeps its id and loses time priority. `price` and `qty` carry
+    /// the target values; the book is authoritative for the order's side, so
+    /// the fixed layout's `side` stays canonical `Buy`. The engine refuses a
+    /// size increase and a price that would cross the opposite best; see
+    /// [ADR 0027].
+    ///
+    /// [ADR 0027]: https://github.com/cryptus-neoxys/whipet/blob/main/docs/adr/0027-amend-replace-semantics.md
+    pub fn amend(
+        symbol: Symbol,
+        order_id: OrderId,
+        price: Price,
+        qty: Qty,
+        participant: ParticipantId,
+        timestamp_ns: u64,
+    ) -> Self {
+        Self {
+            kind: CommandKind::Amend,
+            symbol,
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            price,
+            qty,
             order_id,
             participant,
             timestamp_ns,
@@ -503,6 +542,11 @@ pub enum ExecKind {
     Filled = 3,
     PartiallyFilled = 4,
     Cancelled = 5,
+    /// A resting order was replaced in place. The report carries the new price
+    /// and remaining quantity; the order id is unchanged. See [ADR 0027].
+    ///
+    /// [ADR 0027]: https://github.com/cryptus-neoxys/whipet/blob/main/docs/adr/0027-amend-replace-semantics.md
+    Amended = 6,
 }
 
 impl ExecKind {
@@ -517,6 +561,7 @@ impl ExecKind {
             3 => Ok(Self::Filled),
             4 => Ok(Self::PartiallyFilled),
             5 => Ok(Self::Cancelled),
+            6 => Ok(Self::Amended),
             other => Err(CoreError::UnknownDiscriminant {
                 kind: "ExecKind",
                 value: other,
@@ -531,6 +576,7 @@ impl ExecKind {
             Self::Filled => "filled",
             Self::PartiallyFilled => "partially_filled",
             Self::Cancelled => "cancelled",
+            Self::Amended => "amended",
         }
     }
 }
@@ -552,6 +598,12 @@ pub enum RejectReason {
     Internal = 11,
     SessionNotOpen = 12,
     RiskLimit = 13,
+    /// An amend tried to increase the order's remaining quantity. A size
+    /// increase is a new order, not a replacement.
+    AmendQtyIncrease = 14,
+    /// An amend price would cross the opposite best. Amend is a resting-order
+    /// operation, never a hidden taker.
+    AmendWouldCross = 15,
 }
 
 impl RejectReason {
@@ -575,6 +627,8 @@ impl RejectReason {
             11 => Ok(Self::Internal),
             12 => Ok(Self::SessionNotOpen),
             13 => Ok(Self::RiskLimit),
+            14 => Ok(Self::AmendQtyIncrease),
+            15 => Ok(Self::AmendWouldCross),
             other => Err(CoreError::InvalidValue(format!(
                 "unknown RejectReason code {other}"
             ))),
@@ -597,6 +651,8 @@ impl RejectReason {
             Self::Internal => "internal",
             Self::SessionNotOpen => "session_not_open",
             Self::RiskLimit => "risk_limit",
+            Self::AmendQtyIncrease => "amend_qty_increase",
+            Self::AmendWouldCross => "amend_would_cross",
         }
     }
 }
@@ -709,6 +765,12 @@ pub enum MdKind {
     Bbo = 5,
     Status = 6,
     Snapshot = 7,
+    /// A resting order was replaced. The event carries the same order id with
+    /// its new price and quantity; consumers apply it as remove-then-add at the
+    /// back of the new level. See [ADR 0027].
+    ///
+    /// [ADR 0027]: https://github.com/cryptus-neoxys/whipet/blob/main/docs/adr/0027-amend-replace-semantics.md
+    Replace = 8,
 }
 
 impl MdKind {
@@ -725,6 +787,7 @@ impl MdKind {
             5 => Ok(Self::Bbo),
             6 => Ok(Self::Status),
             7 => Ok(Self::Snapshot),
+            8 => Ok(Self::Replace),
             other => Err(CoreError::UnknownDiscriminant {
                 kind: "MdKind",
                 value: other,
@@ -1087,6 +1150,7 @@ mod tests {
             (CommandKind::Resume, 4, "resume"),
             (CommandKind::SetSession, 5, "set_session"),
             (CommandKind::SetRisk, 6, "set_risk"),
+            (CommandKind::Amend, 7, "amend"),
         ] {
             assert_eq!(kind.as_code(), code);
             assert_eq!(CommandKind::from_code(code).unwrap(), kind);
@@ -1094,7 +1158,7 @@ mod tests {
             assert_eq!(kind.to_string(), name);
         }
         assert!(CommandKind::from_code(0).is_err());
-        assert!(CommandKind::from_code(7).is_err());
+        assert!(CommandKind::from_code(8).is_err());
     }
 
     #[test]
@@ -1236,6 +1300,8 @@ mod tests {
             RejectReason::Internal,
             RejectReason::SessionNotOpen,
             RejectReason::RiskLimit,
+            RejectReason::AmendQtyIncrease,
+            RejectReason::AmendWouldCross,
         ];
         for reason in reasons {
             assert_eq!(RejectReason::from_code(reason.as_code()).unwrap(), reason);
@@ -1244,7 +1310,14 @@ mod tests {
         assert_eq!(RejectReason::SessionNotOpen.as_str(), "session_not_open");
         assert_eq!(RejectReason::RiskLimit.as_code(), 13);
         assert_eq!(RejectReason::RiskLimit.as_str(), "risk_limit");
-        assert!(RejectReason::from_code(14).is_err());
+        assert_eq!(RejectReason::AmendQtyIncrease.as_code(), 14);
+        assert_eq!(
+            RejectReason::AmendQtyIncrease.as_str(),
+            "amend_qty_increase"
+        );
+        assert_eq!(RejectReason::AmendWouldCross.as_code(), 15);
+        assert_eq!(RejectReason::AmendWouldCross.as_str(), "amend_would_cross");
+        assert!(RejectReason::from_code(16).is_err());
     }
 
     #[test]

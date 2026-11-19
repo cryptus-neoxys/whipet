@@ -291,6 +291,8 @@ impl EngineOutput {
         let mut fill_reports: Vec<&ExecutionReport> = Vec::new();
         let mut fills_by_maker: FxHashMap<OrderId, &ExecutionReport> = FxHashMap::default();
         let mut cancels_by_order: FxHashMap<OrderId, &ExecutionReport> = FxHashMap::default();
+        let mut amended_by_order: FxHashMap<OrderId, &ExecutionReport> = FxHashMap::default();
+        let mut replaces_by_order: FxHashMap<OrderId, &MdEvent> = FxHashMap::default();
 
         for (index, exec) in self.executions.iter().enumerate() {
             let role = exec.flags & (FLAG_TAKER | FLAG_RESTED | FLAG_MAKER);
@@ -522,6 +524,57 @@ impl EngineOutput {
                     summary.cancel_qty = Some(exec.qty);
                     cancels_by_order.insert(exec.order_id, exec);
                 }
+                ExecKind::Amended => {
+                    // An amendment replaces an order admitted in an earlier
+                    // output, so it is a self-contained report: exactly one
+                    // execution and no other order's traffic in this output.
+                    if index != 0 || self.executions.len() != 1 {
+                        return Err(format!(
+                            "output mixes an Amended report for order {} with other reports; an amendment is the only execution of its command",
+                            exec.order_id
+                        ));
+                    }
+                    if summary.accepted_qty.is_some() || summary.terminal.is_some() {
+                        return Err(format!(
+                            "Amended order {} also carries an Acceptance or terminal report in this output; an amendment acts on an order admitted earlier",
+                            exec.order_id
+                        ));
+                    }
+                    if exec.flags != FLAG_RESTED {
+                        return Err(format!(
+                            "Amended order {} carries flags {:#06x}; a replacement is always a resting order",
+                            exec.order_id, exec.flags
+                        ));
+                    }
+                    if exec.qty.is_zero() {
+                        return Err(format!("Amended order {} has zero quantity", exec.order_id));
+                    }
+                    if exec.remaining != exec.qty {
+                        return Err(format!(
+                            "Amended order {} reports remaining {} but quantity {}; a replacement has nothing filled",
+                            exec.order_id, exec.remaining, exec.qty
+                        ));
+                    }
+                    if exec.price.0 <= 0 {
+                        return Err(format!(
+                            "Amended order {} has non-positive price {}",
+                            exec.order_id, exec.price
+                        ));
+                    }
+                    if exec.maker_order_id != OrderId(0) {
+                        return Err(format!(
+                            "Amended order {} names maker {}; a replacement has no maker leg",
+                            exec.order_id, exec.maker_order_id
+                        ));
+                    }
+                    if exec.reason != RejectReason::None {
+                        return Err(format!(
+                            "Amended order {} carries reject reason {:?}",
+                            exec.order_id, exec.reason
+                        ));
+                    }
+                    amended_by_order.insert(exec.order_id, exec);
+                }
                 ExecKind::Rejected => {
                     if index != 0 || self.executions.len() != 1 || !self.md.is_empty() {
                         return Err(format!(
@@ -684,6 +737,45 @@ impl EngineOutput {
                     state.last_qty = Some(Qty::ZERO);
                     removes_by_order.insert(event.order_id, event);
                 }
+                MdKind::Replace => {
+                    if event.order_id == OrderId(0) {
+                        return Err(format!(
+                            "market-data Replace at index {index} has order id 0"
+                        ));
+                    }
+                    if event.qty.is_zero() {
+                        return Err(format!(
+                            "market-data Replace for order {} has zero quantity",
+                            event.order_id
+                        ));
+                    }
+                    if event.price.0 <= 0 {
+                        return Err(format!(
+                            "market-data Replace for order {} has non-positive price {}",
+                            event.order_id, event.price
+                        ));
+                    }
+                    let state = md_states.entry(event.order_id).or_default();
+                    if state.removed {
+                        return Err(format!(
+                            "market-data Replace for order {} follows a Remove for the same id",
+                            event.order_id
+                        ));
+                    }
+                    if state.added || state.reduced {
+                        return Err(format!(
+                            "market-data Replace for order {} is mixed with an Add/Reduce for the same id in one output",
+                            event.order_id
+                        ));
+                    }
+                    if replaces_by_order.insert(event.order_id, event).is_some() {
+                        return Err(format!(
+                            "order {} is replaced more than once in one output",
+                            event.order_id
+                        ));
+                    }
+                    state.last_qty = Some(event.qty);
+                }
                 MdKind::Trade => {
                     if event.order_id == OrderId(0) {
                         return Err(format!("market-data Trade at index {index} has order id 0"));
@@ -721,6 +813,29 @@ impl EngineOutput {
                 // The engine never emits these on `EngineOutput::md`; snapshots
                 // travel separately and BBO is a derived book view.
                 MdKind::Bbo | MdKind::Snapshot => {}
+            }
+        }
+
+        // Every amended order has exactly one Replace with the same side,
+        // price, and quantity, and every Replace has an Amended report.
+        for (order_id, exec) in &amended_by_order {
+            let Some(event) = replaces_by_order.get(order_id) else {
+                return Err(format!(
+                    "Amended order {order_id} has no Replace market-data event"
+                ));
+            };
+            if event.side != exec.side || event.price != exec.price || event.qty != exec.qty {
+                return Err(format!(
+                    "Amended order {order_id} reports side {} price {} qty {} but its Replace event says side {} price {} qty {}",
+                    exec.side, exec.price, exec.qty, event.side, event.price, event.qty
+                ));
+            }
+        }
+        for order_id in replaces_by_order.keys() {
+            if !amended_by_order.contains_key(order_id) {
+                return Err(format!(
+                    "market-data Replace for order {order_id} has no Amended report in this output"
+                ));
             }
         }
 
@@ -1130,6 +1245,7 @@ impl SymbolEngine {
             CommandKind::Halt => self.process_halt(command, out),
             CommandKind::Resume => self.process_resume(command, out),
             CommandKind::Cancel => self.process_cancel(command, out),
+            CommandKind::Amend => self.process_amend(command, out),
             CommandKind::NewOrder => self.process_new_order(command, out),
         }
 
@@ -1292,6 +1408,163 @@ impl SymbolEngine {
             Qty::ZERO,
             removed.order_id,
             removed.participant,
+            0,
+        );
+    }
+
+    /// Atomically replace one resting order's price and remaining quantity.
+    ///
+    /// Every check runs before the book is touched, so a refusal leaves the
+    /// book, dedup table, risk table, and market-data sequence exactly as they
+    /// were. In particular, a refused amendment does not call [`Self::reject`]:
+    /// that helper creates a dedup record for a new id, and the target id here
+    /// is a live resting order whose record must stay `Resting`.
+    fn process_amend(&mut self, command: &Command, out: &mut EngineOutput) {
+        if command.symbol != self.config.symbol {
+            self.reject_amend(out, command, command.side, RejectReason::UnknownSymbol);
+            return;
+        }
+        let Some(index) = self.book.order_index(command.order_id) else {
+            self.reject_amend(out, command, command.side, RejectReason::UnknownOrder);
+            return;
+        };
+        let slot = *self.book.slot(index);
+        if !slot.active || slot.participant != command.participant {
+            self.reject_amend(out, command, command.side, RejectReason::UnknownOrder);
+            return;
+        }
+        let side = slot.side;
+        // An amendment can raise resting buy notional by moving a bid up, so
+        // it is new risk and follows the same halt/session gate as a new
+        // order. Cancels remain available in every state.
+        if self.halted {
+            self.reject_amend(out, command, side, RejectReason::Halted);
+            return;
+        }
+        if self.session != SessionState::Open {
+            self.reject_amend(out, command, side, RejectReason::SessionNotOpen);
+            return;
+        }
+        if command.price.0 <= 0 {
+            self.reject_amend(out, command, side, RejectReason::InvalidPrice);
+            return;
+        }
+        if !self.config.contains_ticks(command.price) {
+            self.reject_amend(out, command, side, RejectReason::PriceOutOfBand);
+            return;
+        }
+        if command.qty.is_zero() || command.qty.0 > MAX_ORDER_QTY {
+            self.reject_amend(out, command, side, RejectReason::InvalidQty);
+            return;
+        }
+        if command.qty > slot.remaining {
+            self.reject_amend(out, command, side, RejectReason::AmendQtyIncrease);
+            return;
+        }
+
+        // Amend is a resting-order operation: a replacement that would cross
+        // the opposite best is refused rather than turned into a taker. This
+        // also makes a self-trade impossible, because a non-crossing order
+        // never meets a resting order.
+        let opposite = side.opposite();
+        let crosses = match (side, self.book.best_index(opposite)) {
+            (Side::Buy, Some(index)) => self.book.price_at(index).0 <= command.price.0,
+            (Side::Sell, Some(index)) => self.book.price_at(index).0 >= command.price.0,
+            _ => false,
+        };
+        if crosses {
+            self.reject_amend(out, command, side, RejectReason::AmendWouldCross);
+            return;
+        }
+
+        let old_price_cents = self.quote_cents(self.book.price_at(slot.price_idx as usize));
+        if self
+            .risk
+            .check_amend(
+                command.participant,
+                side,
+                old_price_cents,
+                slot.remaining.0,
+                self.quote_cents(command.price),
+                command.qty.0,
+            )
+            .is_err()
+        {
+            self.reject_amend(out, command, side, RejectReason::RiskLimit);
+            return;
+        }
+
+        let amended = match self.book.amend(
+            command.order_id,
+            command.participant,
+            command.price,
+            command.qty,
+            self.exec_seq.0,
+        ) {
+            Ok(amended) => amended,
+            Err(_) => {
+                // The book mirrors every check above. A failure here is a
+                // bug, but the shard thread must report it, not panic.
+                self.reject_amend(out, command, side, RejectReason::Internal);
+                return;
+            }
+        };
+        self.risk.on_cancel(
+            amended.participant,
+            amended.side,
+            self.quote_cents(amended.price),
+            amended.remaining.0,
+        );
+        self.risk.on_rest(
+            amended.participant,
+            amended.side,
+            self.quote_cents(command.price),
+            command.qty.0,
+        );
+        self.push_exec(
+            out,
+            ExecKind::Amended,
+            command,
+            side,
+            command.price,
+            command.qty,
+            command.qty,
+            OrderId(0),
+            RejectReason::None,
+            FLAG_RESTED,
+        );
+        self.push_md(
+            out,
+            MdKind::Replace,
+            side,
+            command.price,
+            command.qty,
+            command.order_id,
+            amended.participant,
+            0,
+        );
+    }
+
+    /// Report a refused amendment without touching the target order's dedup
+    /// record. The order is still live, so a later retry can still amend or
+    /// cancel it.
+    fn reject_amend(
+        &mut self,
+        out: &mut EngineOutput,
+        command: &Command,
+        side: Side,
+        reason: RejectReason,
+    ) {
+        self.push_exec(
+            out,
+            ExecKind::Rejected,
+            command,
+            side,
+            Price::ZERO,
+            Qty::ZERO,
+            Qty::ZERO,
+            OrderId(0),
+            reason,
             0,
         );
     }
@@ -3441,6 +3714,41 @@ mod tests {
     }
 
     #[test]
+    fn amend_survives_a_snapshot_round_trip() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Sell, 150, 10, 1, 1), 0);
+        process(&mut engine, &limit(Side::Buy, 120, 5, 2, 2), 1);
+        process(
+            &mut engine,
+            &Command::amend(
+                symbol(),
+                OrderId(2),
+                Price(119),
+                Qty(3),
+                ParticipantId(2),
+                1,
+            ),
+            2,
+        );
+
+        let snapshot = engine.snapshot_state();
+        let restored = SymbolEngine::from_snapshot(config(), snapshot).expect("restore");
+        assert_eq!(restored.state_hash(), engine.state_hash());
+        assert_eq!(restored.book().best_bid(), Some(Price(119)));
+        assert_eq!(
+            restored
+                .risk_table()
+                .entry(ParticipantId(2))
+                .exposure
+                .open_buy_qty,
+            3
+        );
+        restored
+            .check_invariants()
+            .expect("the restored book and risk table agree");
+    }
+
+    #[test]
     fn snapshot_hash_matches_full_snapshot_hash() {
         let mut engine = SymbolEngine::new(config());
         process(&mut engine, &limit(Side::Sell, 104, 5, 1, 1), 0);
@@ -4226,6 +4534,332 @@ mod tests {
         engine
             .check_invariants()
             .expect("only the post-only order holds notional");
+    }
+
+    #[test]
+    fn amend_replaces_price_and_quantity_and_loses_time_priority() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Buy, 120, 5, 1, 1), 0);
+        process(&mut engine, &limit(Side::Buy, 120, 5, 2, 2), 1);
+
+        let out = process(
+            &mut engine,
+            &Command::amend(
+                symbol(),
+                OrderId(1),
+                Price(121),
+                Qty(3),
+                ParticipantId(1),
+                1,
+            ),
+            2,
+        );
+        assert_eq!(out.executions.len(), 1);
+        assert_eq!(out.executions[0].kind, ExecKind::Amended);
+        assert_eq!(out.executions[0].price, Price(121));
+        assert_eq!(out.executions[0].qty, Qty(3));
+        assert_eq!(out.executions[0].remaining, Qty(3));
+        assert_eq!(out.md.len(), 1);
+        assert_eq!(out.md[0].kind, MdKind::Replace);
+        assert_eq!(out.md[0].price, Price(121));
+        assert_eq!(out.md[0].qty, Qty(3));
+        assert_eq!(engine.book().best_bid(), Some(Price(121)));
+
+        // Moving back to the original price is a new arrival at that level.
+        process(
+            &mut engine,
+            &Command::amend(
+                symbol(),
+                OrderId(1),
+                Price(120),
+                Qty(3),
+                ParticipantId(1),
+                1,
+            ),
+            3,
+        );
+        let out = process(&mut engine, &limit(Side::Sell, 120, 6, 3, 3), 4);
+        let makers: Vec<OrderId> = out
+            .executions
+            .iter()
+            .filter(|exec| exec.maker_order_id != OrderId(0))
+            .map(|exec| exec.maker_order_id)
+            .collect();
+        assert_eq!(
+            makers,
+            vec![OrderId(2), OrderId(1)],
+            "the untouched order keeps priority over the amended one"
+        );
+        engine
+            .check_invariants()
+            .expect("book and risk agree after the amendment");
+    }
+
+    #[test]
+    fn refused_amends_leave_the_resting_order_live() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Buy, 120, 10, 1, 1), 0);
+        process(&mut engine, &limit(Side::Sell, 130, 5, 2, 2), 1);
+
+        let increase = process(
+            &mut engine,
+            &Command::amend(
+                symbol(),
+                OrderId(1),
+                Price(120),
+                Qty(11),
+                ParticipantId(1),
+                1,
+            ),
+            2,
+        );
+        assert_eq!(increase.executions.len(), 1);
+        assert_eq!(increase.executions[0].kind, ExecKind::Rejected);
+        assert_eq!(
+            increase.executions[0].reason,
+            RejectReason::AmendQtyIncrease
+        );
+        assert!(
+            increase.md.is_empty(),
+            "a refused amendment mutates no market data"
+        );
+        assert_eq!(
+            engine.dedup().status(OrderId(1)),
+            Some(DedupStatus::Resting),
+            "a refused amendment must not overwrite the live order's dedup record"
+        );
+
+        let crossing = process(
+            &mut engine,
+            &Command::amend(
+                symbol(),
+                OrderId(1),
+                Price(130),
+                Qty(5),
+                ParticipantId(1),
+                1,
+            ),
+            3,
+        );
+        assert_eq!(crossing.executions[0].reason, RejectReason::AmendWouldCross);
+        assert_eq!(engine.book().best_bid(), Some(Price(120)));
+
+        let unknown = process(
+            &mut engine,
+            &Command::amend(
+                symbol(),
+                OrderId(999),
+                Price(120),
+                Qty(5),
+                ParticipantId(1),
+                1,
+            ),
+            4,
+        );
+        assert_eq!(unknown.executions[0].reason, RejectReason::UnknownOrder);
+
+        let foreign = process(
+            &mut engine,
+            &Command::amend(
+                symbol(),
+                OrderId(1),
+                Price(120),
+                Qty(5),
+                ParticipantId(2),
+                1,
+            ),
+            5,
+        );
+        assert_eq!(foreign.executions[0].reason, RejectReason::UnknownOrder);
+
+        // The order is still amendable and cancellable after every refusal.
+        let amended = process(
+            &mut engine,
+            &Command::amend(
+                symbol(),
+                OrderId(1),
+                Price(119),
+                Qty(4),
+                ParticipantId(1),
+                1,
+            ),
+            6,
+        );
+        assert_eq!(amended.executions[0].kind, ExecKind::Amended);
+        let cancelled = process(
+            &mut engine,
+            &Command::cancel(symbol(), OrderId(1), ParticipantId(1), 7),
+            7,
+        );
+        assert_eq!(cancelled.executions[0].kind, ExecKind::Cancelled);
+        engine
+            .check_invariants()
+            .expect("refusals preserved book, dedup, and risk");
+    }
+
+    #[test]
+    fn amend_output_requires_both_the_report_and_the_replace_event() {
+        let setup = |engine: &mut SymbolEngine| {
+            process(engine, &limit(Side::Buy, 120, 5, 1, 1), 0);
+        };
+
+        let mut missing_md = SymbolEngine::new(config());
+        setup(&mut missing_md);
+        let mut out = process(
+            &mut missing_md,
+            &Command::amend(
+                symbol(),
+                OrderId(1),
+                Price(119),
+                Qty(4),
+                ParticipantId(1),
+                1,
+            ),
+            1,
+        );
+        out.md.clear();
+        assert_output_violation(&out, "has no Replace market-data event");
+
+        let mut missing_report = SymbolEngine::new(config());
+        setup(&mut missing_report);
+        let mut out = process(
+            &mut missing_report,
+            &Command::amend(
+                symbol(),
+                OrderId(1),
+                Price(119),
+                Qty(4),
+                ParticipantId(1),
+                1,
+            ),
+            1,
+        );
+        out.executions.clear();
+        assert_output_violation(&out, "has no Amended report");
+    }
+
+    #[test]
+    fn amend_is_gated_by_halt_and_session_but_cancel_is_not() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &limit(Side::Buy, 120, 5, 1, 1), 0);
+        process(
+            &mut engine,
+            &Command::halt(symbol(), ParticipantId(1), 2),
+            1,
+        );
+        let halted = process(
+            &mut engine,
+            &Command::amend(
+                symbol(),
+                OrderId(1),
+                Price(119),
+                Qty(4),
+                ParticipantId(1),
+                1,
+            ),
+            2,
+        );
+        assert_eq!(halted.executions[0].reason, RejectReason::Halted);
+
+        process(
+            &mut engine,
+            &Command::resume(symbol(), ParticipantId(1), 3),
+            3,
+        );
+        process(
+            &mut engine,
+            &Command::set_session(symbol(), SessionState::PreOpen, ParticipantId(1), 4),
+            4,
+        );
+        let pre_open = process(
+            &mut engine,
+            &Command::amend(
+                symbol(),
+                OrderId(1),
+                Price(119),
+                Qty(4),
+                ParticipantId(1),
+                1,
+            ),
+            5,
+        );
+        assert_eq!(pre_open.executions[0].reason, RejectReason::SessionNotOpen);
+
+        // Cancels remain the risk-withdrawal path in every state.
+        let cancelled = process(
+            &mut engine,
+            &Command::cancel(symbol(), OrderId(1), ParticipantId(1), 6),
+            6,
+        );
+        assert_eq!(cancelled.executions[0].kind, ExecKind::Cancelled);
+        engine.check_invariants().expect("the cancel was admitted");
+    }
+
+    #[test]
+    fn amend_risk_projection_charges_the_new_notional_atomically() {
+        let mut engine = SymbolEngine::new(config());
+        // 15,000 quote cents of resting buy notional.
+        process(&mut engine, &set_risk(2, 0, 15_000), 0);
+        process(&mut engine, &limit(Side::Buy, 120, 1, 1, 2), 1);
+        assert_eq!(
+            engine
+                .risk_table()
+                .entry(ParticipantId(2))
+                .exposure
+                .open_buy_notional_cents,
+            12_000
+        );
+
+        // 151 ticks is 15,100 cents: one tick over the bound.
+        let refused = process(
+            &mut engine,
+            &Command::amend(
+                symbol(),
+                OrderId(1),
+                Price(151),
+                Qty(1),
+                ParticipantId(2),
+                1,
+            ),
+            2,
+        );
+        assert_eq!(refused.executions[0].reason, RejectReason::RiskLimit);
+        assert_eq!(engine.book().best_bid(), Some(Price(120)));
+        assert_eq!(
+            engine
+                .risk_table()
+                .entry(ParticipantId(2))
+                .exposure
+                .open_buy_notional_cents,
+            12_000,
+            "a refused amendment leaves the old charge in place"
+        );
+
+        // 150 ticks is exactly 15,000 cents and is admitted.
+        let accepted = process(
+            &mut engine,
+            &Command::amend(
+                symbol(),
+                OrderId(1),
+                Price(150),
+                Qty(1),
+                ParticipantId(2),
+                1,
+            ),
+            3,
+        );
+        assert_eq!(accepted.executions[0].kind, ExecKind::Amended);
+        assert_eq!(
+            engine
+                .risk_table()
+                .entry(ParticipantId(2))
+                .exposure
+                .open_buy_notional_cents,
+            15_000
+        );
+        engine
+            .check_invariants()
+            .expect("the risk table mirrors the new price");
     }
 
     #[test]

@@ -486,14 +486,14 @@ fn validate_batch(ctx: &NodeContext, commands: &[Command]) -> Result<Symbol, Tcp
         }
         match command.kind {
             // A cancel reuses the fixed layout with a zero qty, so only new
-            // orders are held to the positive-quantity rule.
-            CommandKind::NewOrder if command.qty.0 == 0 => {
+            // orders and amendments are held to the positive-quantity rule.
+            CommandKind::NewOrder | CommandKind::Amend if command.qty.0 == 0 => {
                 return Err(error_response(
                     TcpErrorCode::InvalidCommand,
                     format!("command {index}: qty must be greater than zero"),
                 ));
             }
-            CommandKind::NewOrder | CommandKind::Cancel => {}
+            CommandKind::NewOrder | CommandKind::Cancel | CommandKind::Amend => {}
             // Operator commands are HTTP-only and require operator
             // credentials; a TCP Submit must never be able to halt a market.
             CommandKind::Halt
@@ -513,7 +513,9 @@ fn validate_batch(ctx: &NodeContext, commands: &[Command]) -> Result<Symbol, Tcp
         // append. This is an admission guard, not engine-enforced risk: the
         // matcher stays the authority for what executes, and a direct
         // producer appending to the orders log bypasses it. `0` disables
-        // each check. Cancels carry no quantity and are never risk-checked.
+        // each check. Cancels carry no quantity and are never risk-checked;
+        // amendments are bounded by the engine's per-participant risk table,
+        // which sees the order being replaced.
         if command.kind == CommandKind::NewOrder {
             let risk = &ctx.config.risk;
             if risk.max_order_qty > 0 && command.qty.0 > risk.max_order_qty {

@@ -338,7 +338,7 @@ fn assert_quantity_conservation(executions: &[ExecutionReport], book: &Book) {
             ExecKind::Cancelled => {
                 *cancelled.entry(exec.order_id).or_default() += exec.qty.0;
             }
-            ExecKind::Accepted | ExecKind::Rejected => {}
+            ExecKind::Accepted | ExecKind::Rejected | ExecKind::Amended => {}
         }
     }
 

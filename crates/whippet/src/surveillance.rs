@@ -234,6 +234,14 @@ pub fn analyze(
     // that re-uses an id keeps a deterministic answer.
     let mut order_by_id: BTreeMap<OrderId, OrderInfo> = BTreeMap::new();
     for (_, command) in orders {
+        if command.kind == CommandKind::Amend {
+            // An amendment keeps the order id; track its latest price and
+            // remaining quantity for the cancel-notional heuristic.
+            if let Some(info) = order_by_id.get_mut(&command.order_id) {
+                info.notional = notional(command.price, command.qty);
+            }
+            continue;
+        }
         order_by_id.entry(command.order_id).or_insert(OrderInfo {
             participant: command.participant,
             is_new_order: command.kind == CommandKind::NewOrder,
@@ -260,7 +268,8 @@ pub fn analyze(
                     acc.cancelled_notional += info.notional;
                 }
             }
-            CommandKind::Halt
+            CommandKind::Amend
+            | CommandKind::Halt
             | CommandKind::Resume
             | CommandKind::SetSession
             | CommandKind::SetRisk => {}
@@ -294,7 +303,7 @@ pub fn analyze(
                 acc.filled_notional += notional(report.price, report.qty);
             }
             ExecKind::Rejected => acc.rejected += 1,
-            ExecKind::Accepted | ExecKind::Cancelled => {}
+            ExecKind::Accepted | ExecKind::Cancelled | ExecKind::Amended => {}
         }
     }
 

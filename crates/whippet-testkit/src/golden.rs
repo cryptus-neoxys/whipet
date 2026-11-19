@@ -223,6 +223,7 @@ pub struct ExecutionSummary {
     pub filled: usize,
     pub partially_filled: usize,
     pub cancelled: usize,
+    pub amended: usize,
     pub filled_qty: u64,
     pub rejected_by_reason: BTreeMap<&'static str, usize>,
 }
@@ -236,6 +237,7 @@ impl ExecutionSummary {
             filled: 0,
             partially_filled: 0,
             cancelled: 0,
+            amended: 0,
             filled_qty: 0,
             rejected_by_reason: BTreeMap::new(),
         };
@@ -258,6 +260,7 @@ impl ExecutionSummary {
                     summary.filled_qty = summary.filled_qty.saturating_add(report.qty.0);
                 }
                 ExecKind::Cancelled => summary.cancelled += 1,
+                ExecKind::Amended => summary.amended += 1,
             }
         }
         summary
@@ -282,6 +285,7 @@ pub struct MdSummary {
     pub bbo: usize,
     pub status: usize,
     pub snapshots: usize,
+    pub replace: usize,
     pub traded_qty: u64,
 }
 
@@ -296,6 +300,7 @@ impl MdSummary {
             bbo: 0,
             status: 0,
             snapshots,
+            replace: 0,
             traded_qty: 0,
         };
         for event in events {
@@ -310,6 +315,7 @@ impl MdSummary {
                 MdKind::Bbo => summary.bbo += 1,
                 MdKind::Status => summary.status += 1,
                 MdKind::Snapshot => summary.snapshots += 1,
+                MdKind::Replace => summary.replace += 1,
             }
         }
         summary

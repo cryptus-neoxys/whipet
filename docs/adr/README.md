@@ -32,6 +32,7 @@ supersedes an earlier one.
 | [0024](0024-execution-output-invariants.md) | Execution output provenance invariants | Accepted (one fill ↔ one trade ↔ one maker reduce/remove; role/seq/offset checks) |
 | [0025](0025-price-units-ticks-vs-cents.md) | Price units: ticks on the wire, quote cents in projections | Accepted (`TickSizes`, `--tick-size-cents`, ledger entries carry both) |
 | [0026](0026-engine-enforced-risk-limits.md) | Engine-enforced per-participant risk limits | Accepted (log-ordered `set_risk`, exposure from book/fills, snapshot v6, operator API + audit) |
+| [0027](0027-amend-replace-semantics.md) | Amend/replace semantics | Accepted (atomic cancel-replace, same id, no crossing or size increase, loses priority, `amended` + `replace` wire kinds) |
 
 Template:
 

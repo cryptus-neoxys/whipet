@@ -162,7 +162,12 @@ impl ApplyOutcome {
 const fn carries_book_state(kind: MdKind) -> bool {
     matches!(
         kind,
-        MdKind::Add | MdKind::Reduce | MdKind::Remove | MdKind::Trade | MdKind::Bbo
+        MdKind::Add
+            | MdKind::Reduce
+            | MdKind::Remove
+            | MdKind::Trade
+            | MdKind::Bbo
+            | MdKind::Replace
     )
 }
 
@@ -291,6 +296,7 @@ impl BookState {
             MdKind::Add => self.apply_add(event),
             MdKind::Reduce => self.apply_reduce(event),
             MdKind::Remove => self.apply_remove(event),
+            MdKind::Replace => self.apply_replace(event),
             MdKind::Trade => {
                 self.last_trade_price_cents = Some(self.price_cents(event.price));
                 self.last_trade_qty = event.qty.0;
@@ -400,6 +406,57 @@ impl BookState {
             self.drop_order_from_levels(order);
         }
         ApplyOutcome::Applied
+    }
+
+    /// Apply a replace: the same order id leaves its old level and joins the
+    /// back of its new level.
+    ///
+    /// An unknown order ref is an accepted no-op, matching [`Self::apply_reduce`]:
+    /// a level-only snapshot has aggregates but no per-order refs.
+    fn apply_replace(&mut self, event: &MdEvent) -> ApplyOutcome {
+        let Some(old) = self.orders.get(&event.order_id).copied() else {
+            return ApplyOutcome::Applied;
+        };
+        let new_price_cents = self.price_cents(event.price);
+        let same_level = old.side == event.side && old.price_cents == new_price_cents;
+        let target = self
+            .side_levels(event.side)
+            .get(&new_price_cents)
+            .copied()
+            .unwrap_or_default();
+        // Project the level after removing the old ref (only when it shares
+        // the target level) and adding the replacement. A refusal happens
+        // before any mutation, so the old order is never lost halfway.
+        let base_qty = if same_level {
+            target.qty.saturating_sub(old.qty)
+        } else {
+            target.qty
+        };
+        let base_orders = if same_level {
+            target.orders.saturating_sub(1)
+        } else {
+            target.orders
+        };
+        if base_qty.checked_add(event.qty.0).is_none() || base_orders.checked_add(1).is_none() {
+            return ApplyOutcome::Refused;
+        }
+        if old.side == event.side {
+            if self
+                .depth(old.side)
+                .checked_sub(old.qty)
+                .and_then(|depth| depth.checked_add(event.qty.0))
+                .is_none()
+            {
+                return ApplyOutcome::Refused;
+            }
+        } else if self.depth(old.side).checked_sub(old.qty).is_none()
+            || self.depth(event.side).checked_add(event.qty.0).is_none()
+        {
+            return ApplyOutcome::Refused;
+        }
+        self.orders.remove(&event.order_id);
+        self.drop_order_from_levels(old);
+        self.apply_add(event)
     }
 
     /// Subtract a removed order's remaining quantity from its level, drop the
@@ -2495,6 +2552,47 @@ mod tests {
             .unwrap();
         assert_eq!(btc.bids[0].qty, 5);
         assert_eq!(btc.bids[0].orders, 1);
+    }
+
+    #[test]
+    fn replace_moves_an_order_between_levels() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        seed_symbol(&hub, btc());
+        hub.apply(&event(MdKind::Add, Side::Buy, 65_000, 10, 1));
+        hub.apply(&event(MdKind::Add, Side::Buy, 65_000, 5, 2));
+
+        hub.apply(&event(MdKind::Replace, Side::Buy, 64_900, 4, 1));
+        let view = hub
+            .state()
+            .symbols
+            .into_iter()
+            .find(|book| book.symbol.as_str() == "BTC-USD")
+            .unwrap();
+        assert_eq!(view.best_bid_cents, Some(6_500_000));
+        assert_eq!(view.depth_bid_qty, 9);
+        assert_eq!(view.bids[0].qty, 5, "the untouched order stays at the best");
+        assert_eq!(view.bids[0].orders, 1);
+        assert_eq!(view.bids[1].price_cents, 6_490_000);
+        assert_eq!(view.bids[1].qty, 4);
+        assert_eq!(view.bids[1].orders, 1);
+    }
+
+    #[test]
+    fn replace_of_the_only_order_keeps_the_level_aggregate_sound() {
+        let hub = MdHub::new(config(), "test".into(), "memory".into(), None);
+        seed_symbol(&hub, btc());
+        hub.apply(&event(MdKind::Add, Side::Buy, 65_000, 10, 1));
+        hub.apply(&event(MdKind::Replace, Side::Buy, 65_000, 3, 1));
+        let view = hub
+            .state()
+            .symbols
+            .into_iter()
+            .find(|book| book.symbol.as_str() == "BTC-USD")
+            .unwrap();
+        assert_eq!(view.bids[0].price_cents, 6_500_000);
+        assert_eq!(view.bids[0].qty, 3);
+        assert_eq!(view.bids[0].orders, 1);
+        assert_eq!(view.depth_bid_qty, 3);
     }
 
     #[test]

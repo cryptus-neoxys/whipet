@@ -29,6 +29,8 @@ pub enum BookError {
     BookFull,
     #[error("duplicate order id {0}")]
     DuplicateOrderId(OrderId),
+    #[error("order {0} is not resting for this participant")]
+    UnknownOrder(OrderId),
     #[error("order quantity overflow")]
     Overflow,
     #[error("order quantity {0} exceeds the engine limit")]
@@ -233,7 +235,6 @@ impl Book {
             return Err(BookError::InvalidQty(qty.0));
         }
         let price_idx = self.price_index(price)?;
-        let was_empty = self.levels(side)[price_idx].orders == 0;
         if self.levels(side)[price_idx]
             .qty
             .checked_add(qty.0)
@@ -262,10 +263,6 @@ impl Book {
             return Err(BookError::DuplicateOrderId(order_id));
         }
 
-        let prev = match side {
-            Side::Buy => self.bids[price_idx].tail,
-            Side::Sell => self.asks[price_idx].tail,
-        };
         {
             let slot = &mut self.slots[slot_index as usize];
             *slot = Slot {
@@ -275,33 +272,178 @@ impl Book {
                 qty,
                 remaining: qty,
                 side,
-                prev,
+                prev: NONE,
                 next: NONE,
                 seq,
                 active: true,
             };
         }
+        self.attach(slot_index);
+        debug_assert_eq!(self.best_index(side), self.bitmap_best_index(side));
+        self.order_count += 1;
+        Ok(slot_index)
+    }
 
+    /// Link an initialized active slot at the tail of its price level and
+    /// update the level aggregate, occupancy bit, and cached best.
+    ///
+    /// The caller has already validated that the level aggregate cannot
+    /// overflow and that the slot's `price_idx` and `side` are in range.
+    fn attach(&mut self, index: u32) {
+        let slot = self.slots[index as usize];
+        debug_assert!(slot.active);
+        let price_idx = slot.price_idx as usize;
+        let side = slot.side;
+        let was_empty = self.levels(side)[price_idx].orders == 0;
+        let prev = self.levels(side)[price_idx].tail;
+        self.slots[index as usize].prev = prev;
+        self.slots[index as usize].next = NONE;
         if prev != NONE {
-            self.slots[prev as usize].next = slot_index;
+            self.slots[prev as usize].next = index;
         }
-        let level = match side {
-            Side::Buy => &mut self.bids[price_idx],
-            Side::Sell => &mut self.asks[price_idx],
-        };
+        let level = &mut self.levels_mut(side)[price_idx];
         if prev == NONE {
-            level.head = slot_index;
+            level.head = index;
         }
-        level.tail = slot_index;
-        level.qty = level.qty.saturating_add(qty.0);
+        level.tail = index;
+        level.qty = level.qty.saturating_add(slot.remaining.0);
         level.orders += 1;
         self.set_bit(side, price_idx);
         if was_empty && self.is_better_best(side, price_idx) {
             self.set_best(side, Some(price_idx));
         }
-        self.order_count += 1;
+    }
+
+    /// Unlink an active slot from its level and update the level aggregate,
+    /// occupancy bit, and cached best. The arena slot, its index entry, and
+    /// the order count are left for the caller: [`Book::unlink`] retires the
+    /// slot, while [`Book::amend`] reuses it for the replacement.
+    fn detach(&mut self, index: u32) {
+        let slot = self.slots[index as usize];
+        if !slot.active {
+            return;
+        }
+        let price_idx = slot.price_idx as usize;
+        let side = slot.side;
+        let prev = slot.prev;
+        let next = slot.next;
+        let remaining = slot.remaining.0;
+
+        let level = match side {
+            Side::Buy => &mut self.bids[price_idx],
+            Side::Sell => &mut self.asks[price_idx],
+        };
+        if prev != NONE {
+            self.slots[prev as usize].next = next;
+        } else {
+            level.head = next;
+        }
+        if next != NONE {
+            self.slots[next as usize].prev = prev;
+        } else {
+            level.tail = prev;
+        }
+        level.qty = level.qty.saturating_sub(remaining);
+        level.orders = level.orders.saturating_sub(1);
+        let empty = level.orders == 0;
+        if empty {
+            let word = price_idx / 64;
+            let bit = price_idx % 64;
+            let bitmap = match side {
+                Side::Buy => &mut self.bid_bitmap,
+                Side::Sell => &mut self.ask_bitmap,
+            };
+            bitmap[word] &= !(1u64 << bit);
+            let was_best = match side {
+                Side::Buy => self.best_bid_idx == Some(price_idx),
+                Side::Sell => self.best_ask_idx == Some(price_idx),
+            };
+            if was_best {
+                // The removed level was the cached best. The next occupied
+                // level in matching order is the new best; `next_index` only
+                // scans the current bitmap word and upward/downward as needed.
+                let recomputed = self.next_index(side, price_idx);
+                self.set_best(side, recomputed);
+            }
+        }
         debug_assert_eq!(self.best_index(side), self.bitmap_best_index(side));
-        Ok(slot_index)
+    }
+
+    /// Atomically replace a resting order's price and remaining quantity.
+    ///
+    /// The order keeps its id and its arena slot, but it is unlinked from its
+    /// old level and linked at the tail of the new one: an amendment always
+    /// loses time priority. `new_qty` must be positive and no larger than the
+    /// order's current remaining quantity. The engine owns the client-facing
+    /// rejection reasons; this method is the book's last-line guard.
+    ///
+    /// Returns the order as it was before the amendment.
+    pub fn amend(
+        &mut self,
+        order_id: OrderId,
+        participant: ParticipantId,
+        new_price: Price,
+        new_qty: Qty,
+        seq: u64,
+    ) -> Result<RestingOrder, BookError> {
+        let index = self
+            .order_index(order_id)
+            .ok_or(BookError::UnknownOrder(order_id))?;
+        let slot = self.slots[index as usize];
+        if !slot.active || slot.participant != participant {
+            return Err(BookError::UnknownOrder(order_id));
+        }
+        if new_qty.0 == 0 || new_qty.0 > crate::MAX_ORDER_QTY {
+            return Err(BookError::InvalidQty(new_qty.0));
+        }
+        if new_qty > slot.remaining {
+            return Err(BookError::InvalidQty(new_qty.0));
+        }
+        let new_price_idx = self.price_index(new_price)?;
+
+        // Validate the new level aggregate before detaching: a same-level
+        // amendment must subtract the order's own remaining quantity, and a
+        // cross-level amendment adds to a level that does not include it.
+        let same_level = slot.price_idx as usize == new_price_idx;
+        let target = &self.levels(slot.side)[new_price_idx];
+        let base_qty = if same_level {
+            target.qty.saturating_sub(slot.remaining.0)
+        } else {
+            target.qty
+        };
+        let base_orders = if same_level {
+            target.orders.saturating_sub(1)
+        } else {
+            target.orders
+        };
+        if base_qty.checked_add(new_qty.0).is_none() || base_orders.checked_add(1).is_none() {
+            return Err(BookError::Overflow);
+        }
+
+        let removed = RestingOrder {
+            order_id: slot.order_id,
+            participant: slot.participant,
+            side: slot.side,
+            price: self.price_at(slot.price_idx as usize),
+            qty: slot.qty,
+            remaining: slot.remaining,
+            seq: slot.seq,
+        };
+
+        self.detach(index);
+        {
+            let slot = &mut self.slots[index as usize];
+            slot.price_idx = new_price_idx as u32;
+            slot.qty = new_qty;
+            slot.remaining = new_qty;
+            slot.seq = seq;
+        }
+        self.attach(index);
+        debug_assert_eq!(
+            self.best_index(removed.side),
+            self.bitmap_best_index(removed.side)
+        );
+        Ok(removed)
     }
 
     pub fn order_index(&self, order_id: OrderId) -> Option<u32> {
@@ -361,57 +503,13 @@ impl Book {
         if !slot.active {
             return;
         }
-        let price_idx = slot.price_idx as usize;
-        let side = slot.side;
-        let prev = slot.prev;
-        let next = slot.next;
-        let remaining = slot.remaining.0;
-
-        let level = match side {
-            Side::Buy => &mut self.bids[price_idx],
-            Side::Sell => &mut self.asks[price_idx],
-        };
-        if prev != NONE {
-            self.slots[prev as usize].next = next;
-        } else {
-            level.head = next;
-        }
-        if next != NONE {
-            self.slots[next as usize].prev = prev;
-        } else {
-            level.tail = prev;
-        }
-        level.qty = level.qty.saturating_sub(remaining);
-        level.orders = level.orders.saturating_sub(1);
-        let empty = level.orders == 0;
-        if empty {
-            let word = price_idx / 64;
-            let bit = price_idx % 64;
-            let bitmap = match side {
-                Side::Buy => &mut self.bid_bitmap,
-                Side::Sell => &mut self.ask_bitmap,
-            };
-            bitmap[word] &= !(1u64 << bit);
-            let was_best = match side {
-                Side::Buy => self.best_bid_idx == Some(price_idx),
-                Side::Sell => self.best_ask_idx == Some(price_idx),
-            };
-            if was_best {
-                // The removed level was the cached best. The next occupied
-                // level in matching order is the new best; `next_index` only
-                // scans the current bitmap word and upward/downward as needed.
-                let recomputed = self.next_index(side, price_idx);
-                self.set_best(side, recomputed);
-            }
-        }
-
+        self.detach(index);
         self.index.remove(&slot.order_id);
         self.slots[index as usize].active = false;
         self.slots[index as usize].next = NONE;
         self.slots[index as usize].prev = NONE;
         self.free.push(index);
         self.order_count = self.order_count.saturating_sub(1);
-        debug_assert_eq!(self.best_index(side), self.bitmap_best_index(side));
     }
 
     /// Reduce a resting order by `fill`. Returns `true` when it was fully
@@ -1183,6 +1281,119 @@ mod tests {
             restored.snapshot().orders[0].remaining,
             snapshot.orders[0].remaining
         );
+    }
+
+    #[test]
+    fn amend_relinks_at_the_tail_of_the_same_level() {
+        let mut book = Book::new(&config());
+        book.insert(
+            OrderId(1),
+            ParticipantId(1),
+            Side::Buy,
+            Price(100),
+            Qty(10),
+            1,
+        )
+        .unwrap();
+        book.insert(
+            OrderId(2),
+            ParticipantId(2),
+            Side::Buy,
+            Price(100),
+            Qty(10),
+            2,
+        )
+        .unwrap();
+        let removed = book
+            .amend(OrderId(1), ParticipantId(1), Price(100), Qty(4), 3)
+            .expect("amend");
+        assert_eq!(removed.price, Price(100));
+        assert_eq!(removed.remaining, Qty(10));
+        assert_eq!(removed.qty, Qty(10));
+
+        let snapshot = book.snapshot();
+        assert_eq!(
+            snapshot
+                .orders
+                .iter()
+                .map(|order| order.order_id)
+                .collect::<Vec<_>>(),
+            vec![OrderId(2), OrderId(1)],
+            "an amended order goes to the back of its level"
+        );
+        assert_eq!(snapshot.orders[1].remaining, Qty(4));
+        assert_eq!(snapshot.orders[1].seq, 3);
+        assert_eq!(book.depth_qty(Side::Buy), 14);
+        book.check_invariants().expect("amended book is consistent");
+    }
+
+    #[test]
+    fn amend_moves_between_levels_and_updates_the_best_cache() {
+        let mut book = Book::new(&config());
+        book.insert(
+            OrderId(1),
+            ParticipantId(1),
+            Side::Buy,
+            Price(100),
+            Qty(10),
+            1,
+        )
+        .unwrap();
+        book.insert(
+            OrderId(2),
+            ParticipantId(2),
+            Side::Buy,
+            Price(101),
+            Qty(5),
+            2,
+        )
+        .unwrap();
+        assert_eq!(book.best_bid(), Some(Price(101)));
+
+        book.amend(OrderId(2), ParticipantId(2), Price(100), Qty(5), 3)
+            .expect("amend down");
+        assert_eq!(book.best_bid(), Some(Price(100)));
+        assert_eq!(book.depth_qty(Side::Buy), 15);
+        book.check_invariants().expect("amended book is consistent");
+
+        book.amend(OrderId(1), ParticipantId(1), Price(102), Qty(3), 4)
+            .expect("amend up");
+        assert_eq!(book.best_bid(), Some(Price(102)));
+        assert_eq!(book.depth_qty(Side::Buy), 8);
+        book.check_invariants().expect("amended book is consistent");
+    }
+
+    #[test]
+    fn amend_refuses_a_foreign_order_and_a_size_increase() {
+        let mut book = Book::new(&config());
+        book.insert(
+            OrderId(1),
+            ParticipantId(1),
+            Side::Sell,
+            Price(110),
+            Qty(10),
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            book.amend(OrderId(1), ParticipantId(2), Price(110), Qty(5), 2)
+                .expect_err("a foreign order cannot be amended"),
+            BookError::UnknownOrder(OrderId(1))
+        );
+        assert_eq!(
+            book.amend(OrderId(1), ParticipantId(1), Price(110), Qty(11), 2)
+                .expect_err("size cannot grow"),
+            BookError::InvalidQty(11)
+        );
+        assert_eq!(
+            book.amend(OrderId(1), ParticipantId(1), Price(50), Qty(5), 2)
+                .expect_err("the new price is outside the ladder"),
+            BookError::PriceOutOfRange(Price(50))
+        );
+        assert_eq!(book.order_count(), 1);
+        assert_eq!(book.depth_qty(Side::Sell), 10);
+        book.check_invariants()
+            .expect("refusals leave the book untouched");
     }
 
     #[test]

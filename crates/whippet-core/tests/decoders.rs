@@ -104,6 +104,7 @@ fn command_kind_strategy() -> impl Strategy<Value = CommandKind> {
         Just(CommandKind::Halt),
         Just(CommandKind::Resume),
         Just(CommandKind::SetSession),
+        Just(CommandKind::Amend),
     ]
 }
 
@@ -114,6 +115,7 @@ fn exec_kind_strategy() -> impl Strategy<Value = ExecKind> {
         Just(ExecKind::Filled),
         Just(ExecKind::PartiallyFilled),
         Just(ExecKind::Cancelled),
+        Just(ExecKind::Amended),
     ]
 }
 
@@ -132,6 +134,9 @@ fn reject_reason_strategy() -> impl Strategy<Value = RejectReason> {
         Just(RejectReason::Halted),
         Just(RejectReason::Internal),
         Just(RejectReason::SessionNotOpen),
+        Just(RejectReason::RiskLimit),
+        Just(RejectReason::AmendQtyIncrease),
+        Just(RejectReason::AmendWouldCross),
     ]
 }
 
@@ -144,6 +149,7 @@ fn md_kind_strategy() -> impl Strategy<Value = MdKind> {
         Just(MdKind::Bbo),
         Just(MdKind::Status),
         Just(MdKind::Snapshot),
+        Just(MdKind::Replace),
     ]
 }
 
@@ -703,6 +709,27 @@ fn minimal_command() -> Command {
 }
 
 #[test]
+fn amend_command_roundtrips_in_the_fixed_layout() {
+    let command = Command::amend(
+        symbol(),
+        OrderId(7),
+        Price(1_234),
+        Qty(5),
+        ParticipantId(9),
+        42,
+    );
+    let bytes = command.encode();
+    assert_eq!(bytes.len(), COMMAND_ENCODED_LEN);
+    let decoded = Command::decode(&bytes).expect("an amend command decodes");
+    assert_eq!(decoded, command);
+    assert_eq!(decoded.kind, CommandKind::Amend);
+    assert_eq!(decoded.order_id, OrderId(7));
+    assert_eq!(decoded.price, Price(1_234));
+    assert_eq!(decoded.qty, Qty(5));
+    assert_eq!(decoded.participant, ParticipantId(9));
+}
+
+#[test]
 fn empty_input_is_a_typed_error() {
     assert!(Command::decode(&[]).is_err());
     assert!(ExecutionReport::decode(&[]).is_err());
@@ -855,14 +882,14 @@ fn every_unknown_discriminant_is_a_typed_error() {
         );
         assert_eq!(
             CommandKind::from_code(code).is_ok(),
-            (1u8..=6).contains(&code)
+            (1u8..=7).contains(&code)
         );
-        assert_eq!(ExecKind::from_code(code).is_ok(), (1u8..=5).contains(&code));
-        assert_eq!(MdKind::from_code(code).is_ok(), (1u8..=7).contains(&code));
+        assert_eq!(ExecKind::from_code(code).is_ok(), (1u8..=6).contains(&code));
+        assert_eq!(MdKind::from_code(code).is_ok(), (1u8..=8).contains(&code));
         assert_eq!(SessionState::from_code(code).is_ok(), code <= 2);
     }
     for code in 0..=u16::MAX {
-        assert_eq!(RejectReason::from_code(code).is_ok(), code <= 13);
+        assert_eq!(RejectReason::from_code(code).is_ok(), code <= 15);
     }
 
     // A patch to the kind byte must be caught, not ignored.

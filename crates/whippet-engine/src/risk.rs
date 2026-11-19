@@ -193,6 +193,81 @@ impl RiskTable {
         Ok(())
     }
 
+    /// Check an amendment before it reaches the book.
+    ///
+    /// The projection removes the order's old open contribution and adds the
+    /// replacement, then applies the same bounds as [`RiskTable::check_new_order`].
+    /// The check is read-only: a refusal leaves the table untouched, and the
+    /// caller applies [`RiskTable::on_cancel`] + [`RiskTable::on_rest`] only
+    /// after this returns `Ok`.
+    ///
+    /// The order is known to be resting, so its old contribution must be
+    /// present. A mismatch is a caller bug, asserted in debug builds and
+    /// clamped in release rather than panicking on the shard thread.
+    pub fn check_amend(
+        &self,
+        participant: ParticipantId,
+        side: Side,
+        old_price_cents: u128,
+        old_qty: u64,
+        new_price_cents: u128,
+        new_qty: u64,
+    ) -> Result<(), RiskViolation> {
+        let entry = self.entry(participant);
+        let limits = entry.limits;
+        if limits.is_unrestricted() {
+            return Ok(());
+        }
+        let old_qty128 = u128::from(old_qty);
+        let new_qty128 = u128::from(new_qty);
+        let mut projected = entry.exposure;
+        match side {
+            Side::Buy => {
+                debug_assert!(projected.open_buy_qty >= old_qty128);
+                debug_assert!(
+                    projected.open_buy_notional_cents >= old_price_cents.saturating_mul(old_qty128)
+                );
+                projected.open_buy_qty = projected
+                    .open_buy_qty
+                    .saturating_sub(old_qty128)
+                    .saturating_add(new_qty128);
+                projected.open_buy_notional_cents = projected
+                    .open_buy_notional_cents
+                    .saturating_sub(old_price_cents.saturating_mul(old_qty128))
+                    .saturating_add(new_price_cents.saturating_mul(new_qty128));
+            }
+            Side::Sell => {
+                debug_assert!(projected.open_sell_qty >= old_qty128);
+                projected.open_sell_qty = projected
+                    .open_sell_qty
+                    .saturating_sub(old_qty128)
+                    .saturating_add(new_qty128);
+            }
+        }
+
+        if limits.max_net_qty > 0 {
+            let bound = i128::from(limits.max_net_qty);
+            let long = projected.worst_long();
+            let short = projected.worst_short();
+            if long > bound || short < -bound {
+                return Err(RiskViolation::NetQty {
+                    limit: limits.max_net_qty,
+                    worst_case: if long > bound { long } else { short },
+                });
+            }
+        }
+        if side == Side::Buy && limits.max_open_buy_notional_cents > 0 {
+            let worst_case = projected.open_buy_notional_cents;
+            if worst_case > u128::from(limits.max_open_buy_notional_cents) {
+                return Err(RiskViolation::OpenBuyNotional {
+                    limit: limits.max_open_buy_notional_cents,
+                    worst_case,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// A new resting order: its full remaining quantity is now open.
     pub fn on_rest(&mut self, participant: ParticipantId, side: Side, price_cents: u128, qty: u64) {
         let exposure = &mut self.entries.entry(participant).or_default().exposure;
@@ -463,6 +538,65 @@ mod tests {
         table
             .check_new_order(participant(), Side::Buy, 1, 10_000, true)
             .expect("exactly at the notional limit is allowed");
+    }
+
+    #[test]
+    fn amend_projects_the_replacement_without_mutating() {
+        let mut table = RiskTable::default();
+        table.set_limits(participant(), limits(100, 1_500));
+        table.on_rest(participant(), Side::Buy, 100, 10);
+        let before = table.entry(participant());
+
+        // Raising the price at the same size would breach the notional bound.
+        assert_eq!(
+            table.check_amend(participant(), Side::Buy, 100, 10, 200, 10),
+            Err(RiskViolation::OpenBuyNotional {
+                limit: 1_500,
+                worst_case: 2_000
+            })
+        );
+        assert_eq!(
+            table.entry(participant()),
+            before,
+            "a refused amendment leaves the exposure untouched"
+        );
+
+        // Shrinking to the same notional fits, and so does a pure size cut.
+        table
+            .check_amend(participant(), Side::Buy, 100, 10, 200, 5)
+            .expect("5 lots at 200 cents is exactly the 1,000-cent exposure");
+        table
+            .check_amend(participant(), Side::Buy, 100, 10, 100, 8)
+            .expect("a size cut cannot breach the notional bound");
+        assert_eq!(table.entry(participant()), before);
+
+        // Applying the accepted replacement moves the open contribution.
+        table.on_cancel(participant(), Side::Buy, 100, 10);
+        table.on_rest(participant(), Side::Buy, 200, 5);
+        let exposure = table.entry(participant()).exposure;
+        assert_eq!(exposure.open_buy_qty, 5);
+        assert_eq!(exposure.open_buy_notional_cents, 1_000);
+    }
+
+    #[test]
+    fn amend_projects_the_net_bound_on_both_sides() {
+        let mut table = RiskTable::default();
+        table.set_limits(participant(), limits(20, 0));
+        table.on_take(participant(), Side::Buy, 15);
+        table.on_rest(participant(), Side::Sell, 100, 5);
+        // Worst-case short stays at -5, so shrinking the sell is fine.
+        table
+            .check_amend(participant(), Side::Sell, 100, 5, 100, 3)
+            .expect("a reduction cannot breach the net bound");
+        // A hypothetical increase would, which the engine refuses before the
+        // risk check; the projection itself catches it too.
+        assert_eq!(
+            table.check_amend(participant(), Side::Sell, 100, 5, 100, 40),
+            Err(RiskViolation::NetQty {
+                limit: 20,
+                worst_case: -25
+            })
+        );
     }
 
     #[test]

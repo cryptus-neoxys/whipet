@@ -447,9 +447,10 @@ pub struct TurboAck {
 ///
 /// The engine reports a refusal as a `Rejected` execution carrying the incoming
 /// order id and the reason; an acceptance is an `Accepted` execution for the
-/// same id. A cancel that succeeded emits only a `Cancelled` execution, so the
-/// default is "accepted with no reject reason". Maker-side events (fills,
-/// cancelled resting orders) carry other ids or kinds and are ignored.
+/// same id. A successful cancel emits only a `Cancelled` execution and a
+/// successful amend only an `Amended` execution, so the default is "accepted
+/// with no reject reason". Maker-side events (fills, cancelled resting orders)
+/// carry other ids or kinds and are ignored.
 pub fn turbo_ack(seq: u64, command: &Command, out: &EngineOutput) -> TurboAck {
     for execution in &out.executions {
         if execution.order_id != command.order_id {
@@ -468,6 +469,13 @@ pub fn turbo_ack(seq: u64, command: &Command, out: &EngineOutput) -> TurboAck {
                     seq,
                     accepted: false,
                     reject: execution.reason,
+                };
+            }
+            ExecKind::Amended => {
+                return TurboAck {
+                    seq,
+                    accepted: true,
+                    reject: RejectReason::None,
                 };
             }
             _ => {}

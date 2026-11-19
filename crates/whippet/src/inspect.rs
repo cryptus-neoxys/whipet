@@ -171,6 +171,7 @@ pub fn filter_audit(records: &[AuditRecord], filter: &AuditFilter) -> Vec<AuditR
 pub enum OrderEventKind {
     NewOrder,
     Cancel,
+    Amend,
     Halt,
     Resume,
     SetSession,
@@ -182,6 +183,7 @@ impl OrderEventKind {
         match self {
             Self::NewOrder => "new_order",
             Self::Cancel => "cancel",
+            Self::Amend => "amend",
             Self::Halt => "halt",
             Self::Resume => "resume",
             Self::SetSession => "set_session",
@@ -195,6 +197,7 @@ impl From<CommandKind> for OrderEventKind {
         match kind {
             CommandKind::NewOrder => Self::NewOrder,
             CommandKind::Cancel => Self::Cancel,
+            CommandKind::Amend => Self::Amend,
             CommandKind::Halt => Self::Halt,
             CommandKind::Resume => Self::Resume,
             CommandKind::SetSession => Self::SetSession,
@@ -212,10 +215,11 @@ pub struct OrderEvent {
     pub symbol: Symbol,
     pub participant: ParticipantId,
     /// Price in integer ticks (the protocol calls it a price; the CLI contract
-    /// names the column `price_cents`). `NewOrder` only: cancel and control
-    /// commands carry no price.
+    /// names the column `price_cents`). Present for `NewOrder` and `Amend`;
+    /// cancel and control commands carry no price.
     pub price_cents: Option<i64>,
-    /// Quantity in integer units. `NewOrder` only.
+    /// Quantity in integer units. `NewOrder` carries the requested quantity
+    /// and `Amend` the new remaining quantity.
     pub qty: Option<u64>,
     pub timestamp_ns: u64,
 }
@@ -302,7 +306,9 @@ pub fn build_order_trace(
         }
         let kind = OrderEventKind::from(command.kind);
         let (price_cents, qty) = match kind {
-            OrderEventKind::NewOrder => (Some(command.price.0), Some(command.qty.0)),
+            OrderEventKind::NewOrder | OrderEventKind::Amend => {
+                (Some(command.price.0), Some(command.qty.0))
+            }
             OrderEventKind::Cancel
             | OrderEventKind::Halt
             | OrderEventKind::Resume
@@ -365,18 +371,20 @@ pub fn build_order_trace(
         }
     }
 
-    // A cause offset must land on a decoded NewOrder or Cancel record for the
-    // same symbol. Halt and resume emit market data, never execution reports,
-    // so a control record at the cause offset is evidence of a bad record or a
-    // bad reader, not a resolved cause.
+    // A cause offset must land on a decoded NewOrder, Cancel, or Amend record
+    // for the same symbol. Halt and resume emit market data, never execution
+    // reports, so a control record at the cause offset is evidence of a bad
+    // record or a bad reader, not a resolved cause.
     let mut unresolved_cause_offsets = Vec::new();
     for event in &exec_events {
         let resolved = command_at
             .get(&event.cause_offset)
             .and_then(|command| *command)
             .is_some_and(|command| {
-                matches!(command.kind, CommandKind::NewOrder | CommandKind::Cancel)
-                    && command.symbol == event.symbol
+                matches!(
+                    command.kind,
+                    CommandKind::NewOrder | CommandKind::Cancel | CommandKind::Amend
+                ) && command.symbol == event.symbol
             });
         if !resolved {
             unresolved_cause_offsets.push(event.cause_offset);
