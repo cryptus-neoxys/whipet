@@ -1,5 +1,11 @@
 SHELL := /bin/bash
-COMPOSE := docker compose -f deploy/compose.yaml
+# Compose looks for `.env` beside the compose file, not in the repo root where
+# `scripts/gen-secrets.sh` writes it. Pass the root file explicitly when it
+# exists. This is recursive on purpose: `up` depends on `secrets`, which may
+# create `.env` during the same make invocation, and a `:=` assignment would
+# have already frozen the check to "absent".
+COMPOSE_ENV = $(if $(wildcard .env),--env-file .env,)
+COMPOSE = docker compose $(COMPOSE_ENV) -f deploy/compose.yaml
 
 .PHONY: help secrets up down demo bench bench-smoke bench-sweep bench-tcp bench-fanout bench-matcher soak crash-test crash-matrix retention-plan audit order-trace surveillance positions verify verify-strict verify-dev replay replay-strict replay-dev doctor reset logs build dashboard ci obs chaos ha ps
 
@@ -49,8 +55,8 @@ up: secrets
 	@printf '\nWhippet: http://localhost:8080\n'
 
 down:
-	@docker compose -f deploy/compose.yaml -f deploy/compose.obs.yaml --profile "*" down --remove-orphans >/dev/null 2>&1 || true
-	@docker compose -f deploy/compose.yaml -f deploy/compose.chaos.yaml --profile "*" down --remove-orphans >/dev/null 2>&1 || true
+	@$(COMPOSE) -f deploy/compose.obs.yaml --profile "*" down --remove-orphans >/dev/null 2>&1 || true
+	@$(COMPOSE) -f deploy/compose.chaos.yaml --profile "*" down --remove-orphans >/dev/null 2>&1 || true
 	$(COMPOSE) --profile "*" down --remove-orphans
 
 demo:
@@ -151,10 +157,10 @@ ci:
 	cargo test --workspace --all-targets
 	cd apps/dashboard && pnpm install --frozen-lockfile && pnpm build
 	@scripts/gen-secrets.sh >/dev/null
-	docker compose -f deploy/compose.yaml config -q
-	docker compose -f deploy/compose.yaml -f deploy/compose.obs.yaml --profile obs config -q
-	docker compose -f deploy/compose.yaml -f deploy/compose.chaos.yaml --profile chaos config -q
-	docker compose -f deploy/compose.ha.yaml config -q
+	$(COMPOSE) config -q
+	$(COMPOSE) -f deploy/compose.obs.yaml --profile obs config -q
+	$(COMPOSE) -f deploy/compose.chaos.yaml --profile chaos config -q
+	docker compose $(COMPOSE_ENV) -f deploy/compose.ha.yaml config -q
 
 obs:
 	$(COMPOSE) -f deploy/compose.obs.yaml --profile obs up -d
@@ -165,7 +171,7 @@ chaos:
 
 ha:
 	@scripts/gen-secrets.sh
-	docker compose -f deploy/compose.ha.yaml up --build -d
+	docker compose $(COMPOSE_ENV) -f deploy/compose.ha.yaml up --build -d
 
 ps:
 	$(COMPOSE) ps
