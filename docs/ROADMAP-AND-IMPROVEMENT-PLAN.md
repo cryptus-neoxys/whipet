@@ -489,7 +489,7 @@ Deliverables:
 - Double-entry cash/position ledger and settlement simulation.
 - Sequenced market-data delta feed with snapshot/resume/gap recovery.
 - Trade tape and BBO/status event completeness.
-- Selected additional order types (amend/replace, stop, iceberg, auction) based on demonstrable use cases.
+- Selected additional order types (amend/replace, stop, iceberg, auction) based on demonstrable use cases. Amend/replace shipped as `POST /api/amend` with engine risk projection and `amended`/`replace` output kinds (ADR 0027); stop, iceberg, and auction remain open.
 - Audit and basic surveillance pipeline.
 
 **Exit gate:** deterministic end-to-end scenarios show account balances, positions, risk rejections, executions, market data and ledger entries all reconcile to the same trade identities after restart/replay.

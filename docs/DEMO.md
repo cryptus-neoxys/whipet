@@ -54,6 +54,7 @@ docker compose -f deploy/compose.yaml exec node whippet healthcheck
 | `POST` | `/api/orders` | Submit a new order. |
 | `POST` | `/api/orders/batch` | Up to 256 same-symbol orders in one Iggy append; `?acks=none` omits the per-order array. |
 | `POST` | `/api/cancel` | Cancel a resting order by id. |
+| `POST` | `/api/amend` | Replace a resting order's price/quantity under the same id; loses priority. |
 | `GET` | `/readyz` | 200 only when the journal is reachable and every shard is alive. |
 | `GET` | `/api/state` | Full market-data and metrics state. |
 | `GET` | `/api/health` | Liveness plus Iggy connectivity. |

@@ -37,8 +37,25 @@ ticks to quote currency.
 | `fok` | Reject unless the full quantity is immediately executable. |
 | `post_only` | Reject if the order would cross; otherwise rest. |
 
-Cancel is supported. Cancel/replace is modelled as cancel plus a new order with a new id, which
-loses time priority. Stop orders, icebergs, pegged orders, auctions, and multi-leg strategies are
+Cancel (`POST /api/cancel`) removes a resting order by id and is allowed in
+every halt/session state, because withdrawing risk must stay available.
+
+## Amend/replace
+
+`POST /api/amend` atomically replaces a resting order's price and remaining
+quantity. The order keeps its id, moves to the back of its new price level, and
+therefore loses time priority (ADR 0027).
+
+- The new quantity must be positive and no larger than the current remaining
+  quantity. A size increase is a new order, not a replacement.
+- The new price must not cross the opposite best. Amend never takes liquidity;
+  cancel and submit a new order when a cross is intended.
+- Only the owner can amend. A non-owner gets `unknown_order`, the same answer
+  as an unknown id.
+- Amend is new risk, so it is gated by halt and session like a new order. A
+  cancel remains available in every state.
+
+Stop orders, icebergs, pegged orders, auctions, and multi-leg strategies are
 out of scope for this build.
 
 ## Self-trade prevention
@@ -50,8 +67,9 @@ order keeps its own priority if it later rests.
 ## Execution reports
 
 Every accepted order produces an `accepted` report. Fills produce `partially_filled` or `filled`
-reports with the maker order id. A cancelled remainder produces `cancelled`. A rejected order
-produces `rejected` with a reason. Reports carry the input offset that caused them, so replay can
+reports with the maker order id. A successful amend produces `amended` with the new price and
+remaining quantity. A cancelled remainder produces `cancelled`. A rejected order produces
+`rejected` with a reason. Reports carry the input offset that caused them, so replay can
 reconstruct the same sequence.
 
 ## Market data
@@ -61,6 +79,8 @@ Whippet publishes **MBO** (market-by-order) deltas:
 - `add` — a new resting order;
 - `reduce` — a resting order's remaining quantity changed;
 - `remove` — a resting order left the book;
+- `replace` — a resting order kept its id but moved to a new price/quantity and
+  lost priority; apply it as remove-then-add for the same id;
 - `trade` — a fill happened;
 - `snapshot` — the top N levels per side, used for recovery and late joiners.
 

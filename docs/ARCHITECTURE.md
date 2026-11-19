@@ -229,10 +229,11 @@ and there is no rebalancing.
 `SymbolEngine::process` is a synchronous function:
 
 1. Update `last_offset` and `last_ts_ns`.
-2. Dispatch to cancel or new order.
+2. Dispatch to cancel, amend, or new order.
 3. Validate: symbol, halt/session state, quantity, price, ladder bounds,
    duplicate id, post-only crossing, FOK fillability, and the participant's
-   engine risk bounds.
+   engine risk bounds. An amend also checks ownership, no size increase, and
+   no crossing price (ADR 0027).
 4. Record the order in the dedup table.
 5. Match against the opposite side in price-time priority.
 6. Emit executions and MD events into the caller's reused `EngineOutput`.
@@ -249,10 +250,12 @@ order. The only clock in the trading path is the gateway's timestamp when it
 builds the command, and it is informational.
 
 Implemented order types: limit (GTC), market with a 500 bps collar, IOC, FOK,
-and post-only. Cancel removes a resting order. Self-trade prevention cancels
-the resting order and emits a maker cancellation; the aggressor keeps its
-remaining quantity. There are no stop, iceberg, pegged, trailing, auction, or
-multi-leg orders. Halt, session, and risk changes are log-ordered operator
+and post-only. Cancel removes a resting order. Amend atomically replaces a
+resting order's price and remaining quantity under the same id, losing time
+priority, refusing size increases and crossing prices. Self-trade prevention
+cancels the resting order and emits a maker cancellation; the aggressor keeps
+its remaining quantity. There are no stop, iceberg, pegged, trailing, auction,
+or multi-leg orders. Halt, session, and risk changes are log-ordered operator
 commands with an audited HTTP control plane; see ADRs 0015, 0018, and 0026.
 
 ## Single writer, not a pinned thread

@@ -8,6 +8,16 @@ Whippet is pre-1.0; minor releases may change internal APIs.
 
 ## [Unreleased]
 
+### Added
+
+- Amend/replace: `POST /api/amend` atomically replaces a resting order's price
+  and remaining quantity under the same id. The replacement loses time
+  priority, may not increase size, and may not cross the opposite best. The
+  engine projects the change through the participant's risk limits before
+  mutating, emits `amended` + `replace`, and leaves a refused order live. TCP
+  `Submit` accepts `Amend`; replay and snapshot v6 need no format change
+  (ADR 0027).
+
 ### Fixed
 
 - `positions` and the ledger now convert the log's tick prices to quote cents

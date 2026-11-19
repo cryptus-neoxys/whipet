@@ -6,8 +6,8 @@ project, not for every venue or vendor.
 ## Market structure
 
 **MBO (market by order).** A feed that publishes changes to individual resting
-orders: add, reduce, remove. Whippet's `md` topic is MBO. It lets a consumer
-reconstruct price levels, not just the top of book.
+orders: add, reduce, remove, replace. Whippet's `md` topic is MBO. It lets a
+consumer reconstruct price levels, not just the top of book.
 
 **MBP (market by price).** A feed that publishes aggregated price levels. A
 consumer sees quantity at a price but not which orders make it up. Whippet
@@ -31,6 +31,13 @@ ask) is a bug; the matcher never leaves one at rest.
 **Self-trade prevention (STP).** Whippet uses cancel-resting: if an incoming
 order would trade with a resting order from the same participant, the resting
 order is cancelled and the incoming order continues.
+
+**Amend (cancel-replace).** An atomic replacement of a resting order's price
+and remaining quantity. The order keeps its id and loses time priority; size
+may not increase and the new price may not cross the opposite best. The engine
+emits an `amended` execution report and a `replace` market-data event (ADR
+0027). Distinct from a client cancel plus a new order, which uses a new id and
+is two log records.
 
 **Order id.** A 128-bit id derived with BLAKE3 from `(symbol,
 client_order_id)`. The same client id always maps to the same order id, which

@@ -45,6 +45,10 @@ Filled / Cancelled / Rejected are terminal
   consecutive duplicate and covers every live id.
 - The soft capacity may be exceeded only while every live entry is active;
   eviction never removes a resting order.
+- An amend does not transition the dedup status: the target stays `Resting`
+  because it never leaves the book. The amend command carries the existing
+  order id, so a refusal must not call the creation-path `reject` helper; it
+  emits a report without touching the table.
 - `from_entries` rejects malformed terminal indices, non-terminal targets, and
   duplicate indices; the live state hash/eviction order is preserved.
 
@@ -76,6 +80,11 @@ Execution output (`EngineOutput::check_invariants` and
   terminal cancel remainder, equal the accepted qty;
 - role flags are exclusive; `Accepted` is TAKER or RESTED; an STP maker cancel
   is `FLAG_MAKER`; a client cancel reports the removed order's side/price.
+- `Amended` is the sole execution of its output, carries `FLAG_RESTED`, a
+  positive price and quantity, `remaining == qty`, no maker leg, and no reject
+  reason; exactly one `Replace` MD event carries the same id, side, price, and
+  quantity. A `Replace` without an `Amended` is equally invalid. An amendment
+  never mixes with an `Accepted` or terminal report for the same id.
 
 It found and fixed two bugs: a cancel report used the fixed-layout command side
 instead of the removed order's side, and a post-acceptance cancel hardcoded
@@ -87,8 +96,9 @@ instead of the removed order's side, and a post-acceptance cancel hardcoded
 
 - `SessionState`: `pre_open`/`open`/`closed`; default `open`.
 - `can_accept_new_orders()` is true only for an open, non-halted instrument.
-  Cancels are allowed in every combination; halt is checked before session so
-  a halted market reports `halted` rather than `session_not_open`.
+  Cancels are allowed in every combination; amend is new risk and uses the
+  same gate as a new order. Halt is checked before session so a halted market
+  reports `halted` rather than `session_not_open`.
 - Status MD events and snapshots carry the two fields in one flag byte
   (`halted` bit 0, session bits 1–2); `TradingStatus::to_md_flags`/
   `from_md_flags` round-trip all six combinations.
@@ -116,6 +126,11 @@ Per-participant limits are engine state, not an edge filter:
   buy notional, a cancel/STP removal subtracts them, a taker or maker fill
   moves `net_qty` (the maker's resting quantity leaves with the fill), and an
   opposite fill that nets to zero prunes a flat unrestricted entry.
+- An amend is projected before it is applied: `check_amend` removes the old
+  order's open contribution and adds the replacement, then applies the same
+  net and resting-buy-notional bounds. The check is read-only; only an
+  accepted replacement applies `on_cancel` followed by `on_rest`. A refusal
+  leaves the old charge exactly in place.
 - `RiskTable::check_invariants` requires strictly ordered participant entries
   and no empty entry; `check_against_orders` re-derives every participant's
   open quantity and buy notional from the book at the instrument's tick size
@@ -254,7 +269,7 @@ failure paths that mark only the failing role.
 
 - Each symbol has a monotonic `BookPhase`:
   `AwaitingSnapshot -> Seeded`. A book-state delta (`Add`/`Reduce`/`Remove`/
-  `Trade`/`Bbo`) before a baseline image is refused, counted by
+  `Replace`/`Trade`/`Bbo`) before a baseline image is refused, counted by
   `events_without_baseline`, and does not advance `seq`; `seq` advances iff the
   event applied. `Status` may apply before the image (it carries no depth).
   A snapshot at the current seq is accepted while awaiting (a replayed status
@@ -267,7 +282,9 @@ failure paths that mark only the failing role.
   counts, tick-grid prices, best bid < best ask, depth totals equal to level
   sums, and, for a complete order snapshot, level aggregates equal to the refs
   posted at that price. Reduce-to-zero is a cancel (the ref and empty level
-  leave); an add overflow is refused whole, not saturated.
+  leave); an add overflow is refused whole, not saturated. A `Replace` is
+  remove-then-add for the same ref: it is projected before mutation, so a
+  level/depth overflow refuses the event with the old ref still in place.
 - `MdHub::check_invariants` requires configured symbols/ticks, every book
   valid, `state.sequence == max(book.seq)`, a bounded tape whose per-symbol
   seq strictly increases (the tape is global; seq spaces are per symbol), and

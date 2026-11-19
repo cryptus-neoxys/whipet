@@ -21,7 +21,7 @@ credentials explicitly.
 | `WHIPPET_IGGY_USER` | `iggy` | Iggy username. Compose must pass a non-default account. |
 | `WHIPPET_IGGY_PASSWORD` | `iggy` | Iggy password. Compose must pass a non-default secret. |
 | `WHIPPET_IGGY_PASSWORD_FILE` | unset | Read the Iggy password from a file instead of the environment. Compose points this at `/run/secrets/iggy_root_password`; the container entrypoint also exports the value. |
-| `WHIPPET_API_TOKEN` | unset | Optional legacy bearer token for `/api/orders`, `/api/orders/batch`, and `/api/cancel`, bound to `WHIPPET_API_PARTICIPANT`. Prefer `WHIPPET_API_TOKENS` when more than one desk submits orders. |
+| `WHIPPET_API_TOKEN` | unset | Optional legacy bearer token for `/api/orders`, `/api/orders/batch`, `/api/cancel`, and `/api/amend`, bound to `WHIPPET_API_PARTICIPANT`. Prefer `WHIPPET_API_TOKENS` when more than one desk submits orders. |
 | `WHIPPET_API_PARTICIPANT` | `api` | Participant identity bound to the legacy single token. A request naming a different participant is rejected with 403. |
 | `WHIPPET_RATE_LIMIT_PER_SEC` | `0` | Optional per-IP ingress limit; `0` disables. Shared by HTTP and TCP, charged per order before validation: a batch reserves `N` tokens for its `N` orders up front, and a batch larger than the per-second budget is rejected. A rejected request returns HTTP 429 `rate_limited` with a `Retry-After: 1` header (TCP returns the `RateLimited` error code). |
 | `WHIPPET_MAX_WS_CONNECTIONS` | `2048` | Concurrent WebSocket subscriber cap. |
