@@ -4140,6 +4140,150 @@ mod tests {
     }
 
     #[test]
+    fn risk_net_limit_charges_every_order_type() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &set_risk(2, 1, 0), 0);
+        process(&mut engine, &limit(Side::Sell, 150, 10, 1, 1), 1);
+
+        // Net exposure is charged before matching, so an order that would
+        // fill immediately is still refused when the candidate quantity
+        // breaches the bound.
+        for (offset, order_type) in [
+            (2u64, OrderType::Ioc),
+            (3, OrderType::Fok),
+            (4, OrderType::Market),
+        ] {
+            let mut order = limit(
+                Side::Buy,
+                if order_type == OrderType::Market {
+                    0
+                } else {
+                    150
+                },
+                2,
+                10 + u128::from(offset),
+                2,
+            );
+            order.order_type = order_type;
+            let out = process(&mut engine, &order, offset);
+            assert_eq!(
+                out.executions[0].reason,
+                RejectReason::RiskLimit,
+                "{order_type:?} must be charged net quantity"
+            );
+        }
+
+        // A post-only buy cannot rest above the bound either. Tick 120 is in
+        // band and below the resting ask, so risk is the only refusal.
+        let mut post_only = limit(Side::Buy, 120, 2, 20, 2);
+        post_only.order_type = OrderType::PostOnly;
+        let out = process(&mut engine, &post_only, 5);
+        assert_eq!(out.executions[0].reason, RejectReason::RiskLimit);
+        assert_eq!(
+            engine.book().order_count(),
+            1,
+            "only the unconstrained liquidity order may rest"
+        );
+        engine
+            .check_invariants()
+            .expect("refused orders leave no exposure");
+    }
+
+    #[test]
+    fn risk_buy_notional_is_charged_only_when_the_order_can_rest() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &set_risk(2, 0, 20_000), 0);
+        process(&mut engine, &limit(Side::Sell, 150, 4, 1, 1), 1);
+
+        // A crossing limit is charged its full quantity before matching: two
+        // lots at 150 ticks (15,000 cents each) are 30,000 quote cents even
+        // though both would fill.
+        let out = process(&mut engine, &limit(Side::Buy, 150, 2, 2, 2), 2);
+        assert_eq!(out.executions[0].reason, RejectReason::RiskLimit);
+
+        // IOC and FOK cannot rest, so they add no buy notional and may fill.
+        for (offset, order_type, id) in [(3u64, OrderType::Ioc, 3u128), (4, OrderType::Fok, 4)] {
+            let mut order = limit(Side::Buy, 150, 1, id, 2);
+            order.order_type = order_type;
+            let out = process(&mut engine, &order, offset);
+            assert_eq!(
+                out.executions.last().unwrap().kind,
+                ExecKind::Filled,
+                "{order_type:?} fills without resting"
+            );
+        }
+
+        // PostOnly can rest, so it is charged: one lot at 120 ticks (12,000
+        // cents) fits in the 20,000-cent bound, a second does not.
+        let mut post_only = limit(Side::Buy, 120, 1, 5, 2);
+        post_only.order_type = OrderType::PostOnly;
+        let out = process(&mut engine, &post_only, 5);
+        assert_eq!(out.executions[0].kind, ExecKind::Accepted);
+        let mut second = limit(Side::Buy, 120, 1, 6, 2);
+        second.order_type = OrderType::PostOnly;
+        let out = process(&mut engine, &second, 6);
+        assert_eq!(out.executions[0].reason, RejectReason::RiskLimit);
+        engine
+            .check_invariants()
+            .expect("only the post-only order holds notional");
+    }
+
+    #[test]
+    fn replacing_limits_preserves_existing_exposure() {
+        let mut engine = SymbolEngine::new(config());
+        process(&mut engine, &set_risk(2, 10, 0), 0);
+        process(&mut engine, &limit(Side::Sell, 150, 4, 10, 1), 1);
+        process(&mut engine, &limit(Side::Buy, 150, 4, 11, 2), 2);
+
+        // Tighten to 6 while the participant is already net long 4: a 2-lot
+        // resting buy reaches the bound, a third lot would breach it.
+        process(&mut engine, &set_risk(2, 6, 0), 3);
+        let out = process(&mut engine, &limit(Side::Buy, 120, 2, 20, 2), 4);
+        assert_eq!(out.executions[0].kind, ExecKind::Accepted);
+        let out = process(&mut engine, &limit(Side::Buy, 120, 1, 21, 2), 5);
+        assert_eq!(out.executions[0].reason, RejectReason::RiskLimit);
+
+        // Loosening admits the same order.
+        process(&mut engine, &set_risk(2, 8, 0), 6);
+        let out = process(&mut engine, &limit(Side::Buy, 120, 1, 22, 2), 7);
+        assert_eq!(out.executions[0].kind, ExecKind::Accepted);
+
+        // Clearing the limits preserves the position and open interest; the
+        // entry is pruned only once exposure is flat.
+        process(&mut engine, &set_risk(2, 0, 0), 8);
+        let entry = engine.risk_table().entry(ParticipantId(2));
+        assert_eq!(entry.limits, RiskLimits::default());
+        assert_eq!(entry.exposure.net_qty, 4);
+        assert_eq!(entry.exposure.open_buy_qty, 3);
+
+        for (offset, order_id) in [(9u64, OrderId(20)), (10, OrderId(21)), (11, OrderId(22))] {
+            process(
+                &mut engine,
+                &Command::cancel(symbol(), order_id, ParticipantId(2), offset + 1),
+                offset,
+            );
+        }
+        let entry = engine.risk_table().entry(ParticipantId(2));
+        assert_eq!(entry.exposure.open_buy_qty, 0);
+        assert_eq!(entry.exposure.net_qty, 4);
+        // Exposure is tracked for every participant, not only constrained
+        // ones: participant 1 sold the opening 4 lots and is net short 4.
+        assert_eq!(engine.risk_table().len(), 2);
+        assert_eq!(
+            engine.risk_table().entry(ParticipantId(1)).exposure.net_qty,
+            -4
+        );
+
+        // Flatten the position against another participant's bid.
+        process(&mut engine, &limit(Side::Buy, 120, 4, 30, 1), 12);
+        process(&mut engine, &limit(Side::Sell, 120, 4, 31, 2), 13);
+        assert!(engine.risk_table().is_empty());
+        engine
+            .check_invariants()
+            .expect("flat exposure prunes the entry");
+    }
+
+    #[test]
     fn buy_notional_limit_uses_quote_cents() {
         // The instrument's tick is 100 cents, so one tick is 10,000 cents of
         // notional for a one-unit order.

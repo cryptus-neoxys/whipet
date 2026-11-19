@@ -448,17 +448,16 @@ async fn admin_endpoints_are_rate_limited_with_ingress() {
     assert_eq!(second_body["code"], "rate_limited");
 }
 
-/// The turbo path: the halt goes through the shard lane, a matcher applies it,
-/// and the ack's offset is the matcher's local seq. The audit record still
-/// goes through the durable group-commit writer, so it is readable from the
-/// journal even in turbo mode.
+/// A turbo node with one live lane for BTC-USD, drained by a blocking matcher
+/// thread that applies each command to a real `ShardEngine` and acks with its
+/// local seq. Audit records go through the durable group-commit writer, so
+/// they are readable from the journal even in turbo mode.
 ///
 /// Limitation: the lane's write-behind journaling (the shard writer's job in
-/// `run_engine_shard`) is not part of this harness, so the test asserts the
-/// lane/ack/audit contract rather than the durable Orders record the
+/// `run_engine_shard`) is not part of this harness, so tests using it assert
+/// the lane/ack/audit contract rather than the durable Orders record the
 /// write-behind would append.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn turbo_halt_matches_through_the_lane_and_audits() {
+fn turbo_node() -> (tempfile::TempDir, Arc<NodeContext>, Router) {
     let tempdir = tempfile::tempdir().expect("temp dir");
     let exchange = ExchangeConfig::default();
     let snapshot_dir = tempdir.path().join("snapshots");
@@ -556,6 +555,17 @@ async fn turbo_halt_matches_through_the_lane_and_audits() {
     });
 
     let app = gateway::router(Arc::clone(&ctx));
+    (tempdir, ctx, app)
+}
+
+/// The turbo halt path: the halt goes through the shard lane, the matcher
+/// applies it, and the ack's offset is the matcher's local seq. The audit
+/// record still goes through the durable group-commit writer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turbo_halt_matches_through_the_lane_and_audits() {
+    let (_tempdir, ctx, app) = turbo_node();
+    let partition = symbol().partition(ctx.exchange().partitions);
+
     let (status, body) = post_admin(
         &app,
         "halt",
@@ -586,6 +596,57 @@ async fn turbo_halt_matches_through_the_lane_and_audits() {
     assert_eq!(audit["halted"], true);
     assert_eq!(audit["order_offset"], 0);
     assert_eq!(audit["reason"], "turbo drill");
+    assert_eq!(audit["service"], "whippet");
+    assert_eq!(audits[0].offset, ack.audit_offset);
+}
+
+/// The turbo risk path: the `SetRisk` command goes through the same shard lane
+/// as a halt, so the ack offset is the matcher's local seq and the audit record
+/// is still durable. The durable test above proves the engine enforces the
+/// limit; this one pins the turbo lane/ack/audit contract for risk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turbo_risk_matches_through_the_lane_and_audits() {
+    let (_tempdir, ctx, app) = turbo_node();
+    let partition = symbol().partition(ctx.exchange().partitions);
+
+    let (status, body) = post_admin(
+        &app,
+        "risk",
+        "BTC-USD",
+        Some(json!({
+            "participant": "alice",
+            "max_net_qty": 1,
+            "max_open_buy_notional_cents": 0,
+            "reason": "turbo risk drill"
+        })),
+        Some(OPERATOR_TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ack: AdminAck = serde_json::from_value(body).expect("risk ack");
+    assert_eq!(ack.action, "set_risk");
+    assert_eq!(ack.operator, OPERATOR_NAME);
+    assert_eq!(ack.partition, partition);
+    assert_eq!(ack.participant.as_deref(), Some("alice"));
+    assert_eq!(ack.max_net_qty, Some(1));
+    assert_eq!(ack.max_open_buy_notional_cents, Some(0));
+    assert_eq!(ack.offset, 0, "the turbo offset is the matcher's local seq");
+
+    let memory = match &*ctx.journal {
+        Journal::Memory(journal) => journal,
+        Journal::Iggy(_) => panic!("the turbo test uses the memory journal"),
+    };
+    let audits = audit_records_from(memory, ctx.exchange(), symbol());
+    assert_eq!(audits.len(), 1);
+    let audit: Value = serde_json::from_slice(&audits[0].payload).expect("audit json");
+    assert_eq!(audit["operator"], OPERATOR_NAME);
+    assert_eq!(audit["action"], "set_risk");
+    assert_eq!(audit["symbol"], "BTC-USD");
+    assert_eq!(audit["participant"], "alice");
+    assert_eq!(audit["max_net_qty"], 1);
+    assert_eq!(audit["max_open_buy_notional_cents"], 0);
+    assert_eq!(audit["order_offset"], 0);
+    assert_eq!(audit["reason"], "turbo risk drill");
     assert_eq!(audit["service"], "whippet");
     assert_eq!(audits[0].offset, ack.audit_offset);
 }

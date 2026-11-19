@@ -712,6 +712,34 @@ mod tests {
     }
 
     #[test]
+    fn restore_rejects_a_rehashed_risk_table_that_disagrees_with_the_book() {
+        let exchange = test_exchange();
+        let mut snapshot = engine_with_one_order(&exchange).snapshot_state();
+        assert!(
+            !snapshot.symbols[0].risk.is_empty(),
+            "the resting order must be tracked as exposure"
+        );
+
+        // Drop the resting buy from the risk table while leaving the book
+        // untouched, then recompute the hash. The stored hash can no longer
+        // catch the tamper, so only the structural risk/book comparison can.
+        snapshot.symbols[0]
+            .risk
+            .on_cancel(ParticipantId(1), Side::Buy, 40_000 * 100, 1);
+        assert!(snapshot.symbols[0].risk.is_empty());
+        whippet_engine::fill_symbol_hashes(&mut snapshot);
+
+        match ShardEngine::from_snapshot(&exchange, snapshot) {
+            Ok(_) => panic!("a risk table that disagrees with the book was restored"),
+            Err(error) => {
+                let message = error.to_string();
+                assert!(message.contains("risk"), "{message}");
+                assert!(message.contains("disagrees with the book"), "{message}");
+            }
+        }
+    }
+
+    #[test]
     fn snapshot_round_trip_preserves_the_session() {
         use whippet_core::protocol::SessionState;
 
