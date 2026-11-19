@@ -25,7 +25,7 @@ use whippet::auth::ApiToken;
 use whippet::config::{JournalKind, NodeConfig};
 use whippet::context::NodeContext;
 use whippet::gateway;
-use whippet::turbo::{TurboAck, TurboConfig, TurboIngress};
+use whippet::turbo::{TurboConfig, TurboIngress, turbo_ack};
 use whippet_core::api::AdminAck;
 use whippet_core::config::{ExchangeConfig, Mode};
 use whippet_core::ids::{ParticipantId, Symbol};
@@ -516,16 +516,13 @@ fn turbo_node() -> (tempfile::TempDir, Arc<NodeContext>, Router) {
     std::thread::Builder::new()
         .name("admin-turbo-matcher".into())
         .spawn(move || {
-            let mut engine = ShardEngine::new_with_snapshot_interval(0, &shard_exchange, 10_000);
+            let mut engine =
+                ShardEngine::new_with_snapshot_interval(partition, &shard_exchange, 10_000);
             let mut seq = 0u64;
             while let Some(entry) = receiver.blocking_recv() {
                 let mut out = EngineOutput::default();
-                let accepted = engine.process(&entry.command, seq, &mut out).is_ok();
-                let _ = entry.ack.send(TurboAck {
-                    seq,
-                    accepted,
-                    reject: RejectReason::DuplicateOrderId,
-                });
+                let _ = engine.process(&entry.command, seq, &mut out);
+                let _ = entry.ack.send(turbo_ack(seq, &entry.command, &out));
                 seq += 1;
             }
         })
@@ -649,6 +646,21 @@ async fn turbo_risk_matches_through_the_lane_and_audits() {
     assert_eq!(audit["reason"], "turbo risk drill");
     assert_eq!(audit["service"], "whippet");
     assert_eq!(audits[0].offset, ack.audit_offset);
+
+    // Two orders behind the command: the first fits the one-lot bound, the
+    // second would leave a two-lot worst case. The turbo ack carries the
+    // engine's refusal, which proves the lane applied the limit in order.
+    let (status, first) = submit_order(&app, "turbo-risk-1").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["status"], "matched");
+    assert_eq!(first["reject"], Value::Null);
+    assert_eq!(first["offset"], 1);
+
+    let (status, second) = submit_order(&app, "turbo-risk-2").await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["status"], "rejected");
+    assert_eq!(second["reject"], "risk_limit");
+    assert_eq!(second["offset"], 2);
 }
 
 /// The session endpoint inherits the operator namespace: with no operator
