@@ -187,6 +187,41 @@ async fn submit_order(app: &Router, client_order_id: &str) -> (StatusCode, Value
     )
 }
 
+async fn amend_order(
+    app: &Router,
+    order_id: &str,
+    price_cents: i64,
+    qty: u64,
+) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/amend")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "symbol": "BTC-USD",
+                "order_id": order_id,
+                "price_cents": price_cents,
+                "qty": qty,
+                "participant": "alice",
+            }))
+            .expect("serialize request"),
+        ))
+        .expect("valid request");
+    let response = app.clone().oneshot(request).await.expect("router responds");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body collects")
+        .to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).expect("json response"),
+    )
+}
+
 /// The Audit-topic records for `symbol`, in offset order.
 fn audit_records(node: &TestNode, symbol: Symbol) -> Vec<JournalRecord> {
     let partitions = Topic::Audit.partition_count(node.ctx.exchange());
@@ -661,6 +696,60 @@ async fn turbo_risk_matches_through_the_lane_and_audits() {
     assert_eq!(second["status"], "rejected");
     assert_eq!(second["reject"], "risk_limit");
     assert_eq!(second["offset"], 2);
+}
+
+/// The turbo amend path: the replacement goes through the same lane as an
+/// order, and the engine's risk projection sees the resting order's old
+/// exposure. Tightening the notional bound after the order rests makes the
+/// direction of the amendment observable in the ack: moving down fits, moving
+/// back up does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turbo_amend_matches_through_the_lane_and_is_risk_checked() {
+    let (_tempdir, _ctx, app) = turbo_node();
+
+    let (status, body) = submit_order(&app, "turbo-amend-1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "matched");
+    assert_eq!(body["offset"], 0);
+    let order_id = body["order_id"]
+        .as_str()
+        .expect("the ack carries the order id")
+        .to_string();
+
+    // The resting order is 6,500,000 quote cents. Tighten the bound to
+    // 6,400,000 while preserving that exposure, so only a downward amend fits.
+    let (status, body) = post_admin(
+        &app,
+        "risk",
+        "BTC-USD",
+        Some(json!({
+            "participant": "alice",
+            "max_net_qty": 0,
+            "max_open_buy_notional_cents": 6_400_000,
+            "reason": "turbo amend drill"
+        })),
+        Some(OPERATOR_TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = amend_order(&app, &order_id, 6_400_000, 1).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "amend_matched");
+    assert_eq!(body["offset"], 2, "the turbo offset is the matcher's seq");
+    assert_eq!(body["guarantee"], "matched_unjournaled");
+    assert_eq!(body["order_id"], order_id);
+
+    // Moving the bid back up would exceed the tightened bound.
+    let (status, body) = amend_order(&app, &order_id, 6_500_000, 1).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "amend_rejected");
+    assert_eq!(body["offset"], 3);
+
+    // A malformed amendment is refused at the gateway, before the lane.
+    let (status, body) = amend_order(&app, &order_id, 6_400_000, 0).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_qty");
 }
 
 /// The session endpoint inherits the operator namespace: with no operator

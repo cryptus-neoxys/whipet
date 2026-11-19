@@ -29,7 +29,7 @@ use whippet::context::NodeContext;
 use whippet::gateway;
 use whippet::health::{ShardRole, ShardState};
 use whippet_core::api::{
-    BatchOrderAck, BatchOrderRequest, BatchOrderRequestRef, CancelAck, HealthView,
+    AmendAck, BatchOrderAck, BatchOrderRequest, BatchOrderRequestRef, CancelAck, HealthView,
     MAX_BATCH_ORDERS, OrderAck, OrderRequest, OrderRequestRef, StateView,
 };
 use whippet_core::config::Mode;
@@ -515,6 +515,139 @@ async fn cancel_endpoint_appends_and_the_engine_removes_the_order() {
             .executions
             .iter()
             .any(|exec| exec.kind == ExecKind::Cancelled)
+    );
+}
+
+#[tokio::test]
+async fn amend_endpoint_appends_and_the_engine_replaces_the_order() {
+    let node = TestNode::new();
+    let app = gateway::router(Arc::clone(&node.ctx));
+
+    let (status, body) = post(
+        &app,
+        "/api/orders",
+        json!({
+            "symbol": "BTC-USD",
+            "side": "buy",
+            "price_cents": 6_500_000,
+            "qty": 10,
+            "client_order_id": "amend-1",
+            "participant": "alice",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let order: OrderAck = serde_json::from_value(body).expect("order ack");
+
+    let (status, body) = post(
+        &app,
+        "/api/amend",
+        json!({
+            "symbol": "BTC-USD",
+            "order_id": order.order_id.to_hex(),
+            "price_cents": 6_400_000,
+            "qty": 4,
+            "participant": "alice",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let amend: AmendAck = serde_json::from_value(body).expect("amend ack");
+    assert_eq!(amend.order_id, order.order_id);
+    assert_eq!(amend.partition, 1);
+    assert_eq!(amend.offset, 1);
+    assert_eq!(amend.status, "amend_accepted_by_log");
+
+    let records = node.orders(symbol());
+    assert_eq!(records.len(), 2);
+    let amend_command = Command::decode(&records[1].payload).expect("amend payload");
+    assert_eq!(amend_command.kind, CommandKind::Amend);
+    assert_eq!(amend_command.order_id, order.order_id);
+    assert_eq!(amend_command.price, Price(64_000));
+    assert_eq!(amend_command.qty, Qty(4));
+    assert_eq!(amend_command.participant, ParticipantId::derive("alice"));
+
+    let processed = node.process_orders(symbol());
+    assert_eq!(processed.engine.book().order_count(), 1);
+    assert_eq!(
+        processed.engine.book().best_bid(),
+        Some(Price(64_000)),
+        "the replacement moved to the new price"
+    );
+    assert!(
+        processed
+            .executions
+            .iter()
+            .any(|exec| exec.kind == ExecKind::Amended)
+    );
+    assert!(
+        processed
+            .md
+            .iter()
+            .any(|event| event.kind == MdKind::Replace)
+    );
+    assert!(
+        processed
+            .executions
+            .iter()
+            .all(|exec| exec.kind != ExecKind::Rejected),
+        "the amend was admitted"
+    );
+}
+
+#[tokio::test]
+async fn amend_rejects_malformed_requests_before_the_log() {
+    let node = TestNode::new();
+    let app = gateway::router(Arc::clone(&node.ctx));
+
+    let (status, body) = post(
+        &app,
+        "/api/amend",
+        json!({
+            "symbol": "BTC-USD",
+            "order_id": "00000000000000000000000000000001",
+            "price_cents": 6_400_000,
+            "qty": 0,
+            "participant": "alice",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_qty");
+
+    let (status, body) = post(
+        &app,
+        "/api/amend",
+        json!({
+            "symbol": "BTC-USD",
+            "order_id": "00000000000000000000000000000001",
+            "price_cents": 0,
+            "qty": 4,
+            "participant": "alice",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_price");
+
+    let (status, body) = post(
+        &app,
+        "/api/amend",
+        json!({
+            "symbol": "NOPE-USD",
+            "order_id": "00000000000000000000000000000001",
+            "price_cents": 6_400_000,
+            "qty": 4,
+            "participant": "alice",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "unknown_symbol");
+
+    assert!(
+        node.orders(symbol()).is_empty(),
+        "a malformed amendment never consumes an orders-log offset"
     );
 }
 

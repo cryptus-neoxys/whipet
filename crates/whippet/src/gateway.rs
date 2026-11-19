@@ -26,10 +26,11 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing::warn;
 use whippet_core::api::{
-    AdminAck, AdminRequest, ApiError, BatchOrderAck, BatchOrderRequest, BatchOrderRequestRef,
-    CancelAck, CancelRequest, GUARANTEE_DURABLE, GUARANTEE_TURBO, HealthView, MAX_BATCH_ORDERS,
-    MdFeedMessage, MdFeedResync, OrderAck, OrderRequest, OrderRequestRef, RiskRequest,
-    SessionRequest, ShardHealthView, StateView, TradeView, WsClientMessage, WsServerMessage,
+    AdminAck, AdminRequest, AmendAck, AmendRequest, ApiError, BatchOrderAck, BatchOrderRequest,
+    BatchOrderRequestRef, CancelAck, CancelRequest, GUARANTEE_DURABLE, GUARANTEE_TURBO, HealthView,
+    MAX_BATCH_ORDERS, MdFeedMessage, MdFeedResync, OrderAck, OrderRequest, OrderRequestRef,
+    RiskRequest, SessionRequest, ShardHealthView, StateView, TradeView, WsClientMessage,
+    WsServerMessage,
 };
 use whippet_core::headers::{HeaderMode, MessageMeta, SCHEMA_ORDER};
 use whippet_core::ids::{OrderId, ParticipantId, Price, Qty, Seq, Symbol};
@@ -78,6 +79,7 @@ pub fn router(ctx: Arc<NodeContext>) -> Router {
         .route("/api/orders", post(submit_order))
         .route("/api/orders/batch", post(submit_orders))
         .route("/api/cancel", post(cancel_order))
+        .route("/api/amend", post(amend_order))
         // Operator endpoints sit inside the ingress router so they inherit the
         // same per-IP rate-limit middleware as order ingress; no special case.
         .route(
@@ -825,6 +827,45 @@ fn validate_cancel(
     )
 }
 
+/// Amend validation. The target price and quantity are checked here so a
+/// malformed request never consumes an orders-log offset; the engine still
+/// owns ownership, crossing, size-increase, session, halt, and risk checks.
+fn validate_amend(
+    ctx: &NodeContext,
+    request: &AmendRequest,
+    caller: Option<&str>,
+    participants: &ParticipantCache,
+) -> Result<(ParticipantId, Price), (StatusCode, Json<ApiError>)> {
+    let instrument = ctx.exchange().instrument(request.symbol).ok_or_else(|| {
+        bad_request(
+            "unknown_symbol",
+            format!("unknown symbol {}", request.symbol),
+        )
+    })?;
+    if request.price_cents <= 0 {
+        return Err(bad_request(
+            "invalid_price",
+            "price_cents must be greater than zero",
+        ));
+    }
+    if request.qty == 0 {
+        return Err(bad_request("invalid_qty", "qty must be greater than zero"));
+    }
+    if request.qty > 1_000_000_000 {
+        return Err(bad_request("invalid_qty", "qty is unreasonably large"));
+    }
+    let price = instrument
+        .ticks_from_cents(request.price_cents)
+        .map_err(|error| bad_request("invalid_price", error.to_string()))?;
+    let participant = resolve_participant_id(
+        caller,
+        None,
+        request.participant.as_deref(),
+        Some(participants),
+    )?;
+    Ok((participant, price))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_fields(
     ctx: &NodeContext,
@@ -1034,6 +1075,88 @@ async fn cancel_order(
         offset: append.base_offset,
         mode: ctx.config.mode,
         status: "cancel_accepted_by_log".into(),
+        guarantee: GUARANTEE_DURABLE.into(),
+    }))
+}
+
+async fn amend_order(
+    State(ctx): State<Arc<NodeContext>>,
+    Extension(participants): Extension<Arc<ParticipantCache>>,
+    headers: HeaderMap,
+    body: Body,
+) -> ApiResult<AmendAck> {
+    ensure_shards_ready(&ctx)?;
+    let caller = authenticate(&ctx, &headers)?;
+    let started = Instant::now();
+    let mut stage_at = Instant::now();
+    let bytes = read_json_body(&headers, body).await?;
+    let parsed: Result<AmendRequest, _> = serde_json::from_slice(&bytes);
+    ctx.metrics
+        .record_stage_us(Stage::GatewayParse, split_elapsed(&mut stage_at));
+    let request = parsed.map_err(invalid_json)?;
+    let validated = validate_amend(&ctx, &request, caller, &participants);
+    ctx.metrics
+        .record_stage_us(Stage::GatewayValidate, split_elapsed(&mut stage_at));
+    let (participant, price) = validated?;
+    let timestamp_ns = now_ns();
+    let command = Command::amend(
+        request.symbol,
+        request.order_id,
+        price,
+        Qty(request.qty),
+        participant,
+        timestamp_ns,
+    );
+    let partition = request.symbol.partition(ctx.exchange().partitions);
+    let meta = MessageMeta::new(
+        request.symbol,
+        Seq(0),
+        "amend",
+        SCHEMA_ORDER,
+        request.order_id.0,
+    );
+    let message = JournalMessage::new_named(command.encode(), meta.named_pairs(HeaderMode::Full));
+    ctx.metrics
+        .record_stage_us(Stage::GatewayEncode, split_elapsed(&mut stage_at));
+    if ctx.turbo.is_some() {
+        let receiver = turbo_enqueue(&ctx, partition, command, message)?;
+        let ack = turbo_await(receiver).await?;
+        ctx.metrics
+            .record_stage_us(Stage::GatewayAppend, split_elapsed(&mut stage_at));
+        let elapsed = started.elapsed();
+        ctx.metrics.record_ingress();
+        ctx.metrics
+            .record_ingress_latency_us(elapsed.as_micros() as u64);
+        ctx.metrics
+            .record_turbo_ack_latency_us(elapsed.as_micros() as u64);
+        return Ok(Json(AmendAck {
+            order_id: request.order_id,
+            symbol: request.symbol,
+            partition,
+            offset: ack.seq,
+            mode: ctx.config.mode,
+            status: if ack.accepted {
+                "amend_matched".into()
+            } else {
+                "amend_rejected".into()
+            },
+            guarantee: GUARANTEE_TURBO.into(),
+        }));
+    }
+    let append = ctx
+        .group_commit
+        .append(Topic::Orders, partition, vec![message])
+        .await;
+    ctx.metrics
+        .record_stage_us(Stage::GatewayAppend, split_elapsed(&mut stage_at));
+    let append = append.map_err(journal_unavailable)?;
+    Ok(Json(AmendAck {
+        order_id: request.order_id,
+        symbol: request.symbol,
+        partition: append.partition,
+        offset: append.base_offset,
+        mode: ctx.config.mode,
+        status: "amend_accepted_by_log".into(),
         guarantee: GUARANTEE_DURABLE.into(),
     }))
 }

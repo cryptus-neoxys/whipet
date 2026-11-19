@@ -105,6 +105,19 @@ pub struct CancelRequest {
     pub participant: Option<String>,
 }
 
+/// Amend request body. The order id is unchanged; `price_cents` and `qty` are
+/// the replacement price in quote cents and new remaining quantity. The engine
+/// refuses a size increase and a price that would cross the opposite best.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AmendRequest {
+    pub symbol: Symbol,
+    pub order_id: OrderId,
+    pub price_cents: i64,
+    pub qty: u64,
+    #[serde(default)]
+    pub participant: Option<String>,
+}
+
 /// Durable ack label: the order record is in the Iggy log.
 pub const GUARANTEE_DURABLE: &str = "accepted_by_log";
 
@@ -133,6 +146,17 @@ pub struct OrderAck {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelAck {
+    pub order_id: OrderId,
+    pub symbol: Symbol,
+    pub partition: u32,
+    pub offset: u64,
+    pub mode: Mode,
+    pub status: String,
+    pub guarantee: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AmendAck {
     pub order_id: OrderId,
     pub symbol: Symbol,
     pub partition: u32,
