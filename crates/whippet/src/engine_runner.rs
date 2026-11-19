@@ -25,7 +25,7 @@ use crate::commit::{
 use crate::context::NodeContext;
 use crate::health::{ShardRole, ShardState};
 use crate::snapshot::{SequencedSnapshot, SnapshotWriter};
-use crate::turbo::{TurboAck, TurboAdmission, TurboEntry};
+use crate::turbo::{TurboAck, TurboAdmission, TurboEntry, turbo_ack};
 
 /// An output append is retried this many times before the shard fails. Without
 /// a bound, a wedged output topic stalls matching while the gateway keeps
@@ -1159,43 +1159,6 @@ pub fn run_matcher(
         output_queued.load(Ordering::Relaxed),
         SHARD_RING_CAPACITY as u32,
     );
-}
-
-/// Turn one processed turbo command into its acknowledgement.
-///
-/// The engine reports a refusal as a `Rejected` execution carrying the incoming
-/// order id and the reason; an acceptance is an `Accepted` execution for the
-/// same id. A cancel that succeeded emits only a `Cancelled` execution, so the
-/// default is "accepted with no reject reason". Maker-side events (fills,
-/// cancelled resting orders) carry other ids or kinds and are ignored.
-fn turbo_ack(seq: u64, command: &Command, out: &EngineOutput) -> TurboAck {
-    for execution in &out.executions {
-        if execution.order_id != command.order_id {
-            continue;
-        }
-        match execution.kind {
-            ExecKind::Accepted => {
-                return TurboAck {
-                    seq,
-                    accepted: true,
-                    reject: RejectReason::None,
-                };
-            }
-            ExecKind::Rejected => {
-                return TurboAck {
-                    seq,
-                    accepted: false,
-                    reject: execution.reason,
-                };
-            }
-            _ => {}
-        }
-    }
-    TurboAck {
-        seq,
-        accepted: true,
-        reject: RejectReason::None,
-    }
 }
 
 /// Merge a later matcher batch into the writer's current group.

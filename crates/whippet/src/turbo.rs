@@ -33,7 +33,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
-use whippet_core::protocol::{Command, RejectReason};
+use whippet_core::protocol::{Command, ExecKind, RejectReason};
+use whippet_engine::EngineOutput;
 use whippet_journal::JournalMessage;
 
 /// Default number of commands allowed in one shard's uncommitted window.
@@ -440,6 +441,43 @@ pub struct TurboAck {
     /// False when the engine rejected the command (see `reject`).
     pub accepted: bool,
     pub reject: RejectReason,
+}
+
+/// Turn one processed turbo command into its acknowledgement.
+///
+/// The engine reports a refusal as a `Rejected` execution carrying the incoming
+/// order id and the reason; an acceptance is an `Accepted` execution for the
+/// same id. A cancel that succeeded emits only a `Cancelled` execution, so the
+/// default is "accepted with no reject reason". Maker-side events (fills,
+/// cancelled resting orders) carry other ids or kinds and are ignored.
+pub fn turbo_ack(seq: u64, command: &Command, out: &EngineOutput) -> TurboAck {
+    for execution in &out.executions {
+        if execution.order_id != command.order_id {
+            continue;
+        }
+        match execution.kind {
+            ExecKind::Accepted => {
+                return TurboAck {
+                    seq,
+                    accepted: true,
+                    reject: RejectReason::None,
+                };
+            }
+            ExecKind::Rejected => {
+                return TurboAck {
+                    seq,
+                    accepted: false,
+                    reject: execution.reason,
+                };
+            }
+            _ => {}
+        }
+    }
+    TurboAck {
+        seq,
+        accepted: true,
+        reject: RejectReason::None,
+    }
 }
 
 /// Why a turbo submit could not be queued for matching.
